@@ -177,6 +177,8 @@ class SecureTerminal(QPlainTextEdit):
         # escapes). OSC 52 clipboard and OSC 8 hyperlinks stay blocked regardless.
         self._allow_title = False
         self._last_title = ''
+        # persistent output cursor for line mode (see _append_runs)
+        self._out_cursor = None
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._render_tui)
@@ -294,6 +296,7 @@ class SecureTerminal(QPlainTextEdit):
         which changes TERM (fixed at fork time)."""
         self.shutdown()
         self.clear()
+        self._out_cursor = None       # the cleared document invalidates it
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -554,8 +557,16 @@ class SecureTerminal(QPlainTextEdit):
         self._append_runs([(text, None)])
 
     def _append_runs(self, runs):
-        cursor = self.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        # The output cursor persists across writes, like a real terminal cursor.
+        # A program may leave it mid-line -- zsh, for one, redraws its prompt with
+        # a carriage return and leaves trailing fill spaces beyond the cursor --
+        # and the next write (the echo of what you type) must land there, not at
+        # the end of the document. Resetting to End each time is what put a wall
+        # of spaces before your input.
+        cursor = self._out_cursor
+        if cursor is None:
+            cursor = self.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
         move = QTextCursor.MoveOperation
         keep = QTextCursor.MoveMode.KeepAnchor
         sep = 0x2029
@@ -569,8 +580,9 @@ class SecureTerminal(QPlainTextEdit):
             # output, so a carriage return glued to a newline carries no cursor
             # meaning and must NOT redraw the line -- collapse it first.
             text = text.replace('\r\n', '\n')
-            # Fast path: ordinary output carries no cursor controls -> append.
-            if '\x08' not in text and '\r' not in text:
+            # Fast path: plain output appended at the end of the document. When
+            # the cursor is mid-line, fall through to overwrite semantics.
+            if cursor.atEnd() and '\x08' not in text and '\r' not in text:
                 cursor.insertText(text, fmt)
                 continue
             # Slow path: honor the two line-local cursor controls the shell's
@@ -604,6 +616,7 @@ class SecureTerminal(QPlainTextEdit):
                         cursor.insertText(ch, fmt)   # overwrite the cell
                     else:
                         cursor.insertText(ch, fmt)   # end of line -> append
+        self._out_cursor = cursor
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
 
