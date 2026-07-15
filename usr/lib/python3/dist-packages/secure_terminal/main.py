@@ -230,6 +230,16 @@ def main():
     app.setApplicationName('secure-terminal')
     _install_signal_quit(app)
 
+    # Auto-reap exited shells so closing a tab (which hangs up the child
+    # asynchronously) cannot leave a defunct process behind: on Linux, ignoring
+    # SIGCHLD makes the kernel reap children itself. We never wait() on a child
+    # for its status; a tab notices its shell ended from EOF on the pty, not a
+    # wait, so this does not race with anything.
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    except (OSError, ValueError, AttributeError):
+        pass
+
     window = MainWindow()
     window.show()
 

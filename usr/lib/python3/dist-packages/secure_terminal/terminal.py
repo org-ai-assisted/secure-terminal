@@ -12,9 +12,17 @@ Design (see https://secure-terminal.github.io):
   ANSI/OSC escape sequences are removed and every byte that is not printable
   ASCII (plus tab, newline and backspace) is dropped. There is no escape parser,
   so a hostile filename, a forged status line or a Trojan-Source comment cannot
-  redraw or reorder what you read. Backspace is the single exception: it erases
-  one character to its left and never crosses a line, so the shell's line editor
-  can rub out a typo without opening the door to cursor addressing.
+  redraw or reorder what you read. Backspace is the single exception, and a
+  necessary one: the interactive shell echoes its line editing as backspaces
+  (readline sends "\b \b" to rub out a character, and uses backspaces to redraw
+  after tab-completion and history recall) regardless of the pty's echo flag, so
+  a terminal that dropped them could not display line editing at all. We honor a
+  backspace as a destructive cursor-left, bounded to the current line: it can
+  never reach an earlier line or the scrollback. The residual is that a program
+  which prints its own backspaces can rewrite text WITHIN the line it is on
+  (e.g. "bad\b\b\bok" shows "ok"); this is far narrower than cursor addressing
+  and cannot touch already-committed lines, but it is the one lie this terminal
+  cannot fully refuse without breaking interactive editing.
 
 - PASTE is sanitized the same way before it reaches the shell, so invisible or
   bidi characters copied from a web page never enter your command line.
@@ -180,6 +188,12 @@ class SecureTerminal(QPlainTextEdit):
                 os.kill(self._pid, signal.SIGHUP)
             except OSError:
                 pass
+            # SIGHUP is asynchronous, so the child may still be alive here; a
+            # one-shot waitpid would return (0, 0) and reap nothing. Reaping is
+            # therefore left to the process-wide SIGCHLD=SIG_IGN handler (see
+            # main.main), which the kernel honors whenever the child does exit.
+            # The WNOHANG call only mops up a child that has already died, e.g.
+            # when the widget is used without that handler installed.
             try:
                 os.waitpid(self._pid, os.WNOHANG)
             except (OSError, ChildProcessError):
