@@ -8,11 +8,18 @@ The secure-terminal widget.
 
 Design (see https://secure-terminal.github.io):
 
-- DISPLAY is printable-ASCII only. Program output is passed through sanitize():
-  ANSI/OSC escape sequences are removed and every byte that is not printable
-  ASCII (plus tab, newline and backspace) is dropped. There is no escape parser,
-  so a hostile filename, a forged status line or a Trojan-Source comment cannot
-  redraw or reorder what you read. Two cursor controls are honored, and both are
+- DISPLAY is printable-ASCII by default. Program output is passed through
+  render_output(): ANSI/OSC escape sequences are removed and, in the default
+  'strip' mode, every character that is not printable ASCII (plus tab and
+  newline) becomes '_', the way sanitize-string/stcat neutralize a log. There is
+  no escape parser, so a hostile filename, a forged status line or a Trojan-
+  Source comment cannot redraw or reorder what you read. Two optional display
+  modes trade some of that for readability, per tab: 'show' renders a non-ASCII
+  character as its glyph when it is printable (str.isprintable() excludes the
+  invisible, bidi and format characters that make unicode deceptive), so a log
+  with legitimate unicode is readable while the dangerous classes still collapse
+  to '_'; 'reveal' shows every non-ASCII character as a <U+XXXX> badge so you can
+  inspect exactly what is there. Two cursor controls are honored, and both are
   necessary: the interactive shell echoes its line editing with backspace and
   carriage return (readline sends "\b \b" to rub out a character and redraw after
   tab-completion/history; zsh returns to column 0 with a carriage return to draw
@@ -51,6 +58,7 @@ import pty
 import re
 import fcntl
 import signal
+import codecs
 
 from PyQt6.QtCore import QSocketNotifier, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor, QColor, QPalette
@@ -64,25 +72,50 @@ THEMES = {
 }
 BASE_POINT_SIZE = 11
 
+# How non-ASCII / unsafe content in program OUTPUT is shown:
+#   'strip'  -- replace with '_' (default, safe), as sanitize-string/stcat do.
+#   'show'   -- render a non-ASCII character as its glyph when it is printable
+#               (str.isprintable() excludes the invisible, bidi and format
+#               characters that make unicode deceptive), so a log with useful
+#               unicode is readable; control still becomes '_'.
+#   'reveal' -- replace with a visible <U+XXXX> codepoint badge, to inspect.
+DISPLAY_MODES = ('strip', 'show', 'reveal')
+
 # CSI (ESC [ ...), OSC (ESC ] ... BEL/ST) and other two-byte escapes.
 _ANSI = re.compile(
-    rb'\x1b\[[0-9;?]*[ -/]*[@-~]'
-    rb'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?'
-    rb'|\x1b[@-Z\\-_]'
+    r'\x1b\[[0-9;?]*[ -/]*[@-~]'
+    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?'
+    r'|\x1b[@-Z\\-_]'
 )
 
 
-def sanitize_bytes(data):
-    """Return printable-ASCII text (plus tab/newline) and the two interactive
-    cursor controls backspace (0x08) and carriage return (0x0D) from raw terminal
-    bytes. The shell's line editor emits both -- backspace to erase a character,
-    carriage return to redraw a line from column 0 (e.g. zsh's prompt, a progress
-    bar) -- and _append() honors each as a line-local edit. They are the only
-    control effects we interpret, and neither can reach beyond the current line."""
-    data = _ANSI.sub(b'', data)
-    kept = bytes(b for b in data
-                 if b in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= b <= 0x7E)
-    return kept.decode('ascii', 'ignore')
+def render_output(text, mode='strip'):
+    """Turn decoded child output into safe display text under one display mode.
+    Escape sequences are always removed (there is no ANSI parser). Printable
+    ASCII, tab and newline, and the two interactive cursor controls backspace
+    (0x08) and carriage return (0x0D) always pass through -- _append() honors the
+    latter two as line-local edits. Everything else is handled per `mode`
+    (see DISPLAY_MODES)."""
+    text = _ANSI.sub('', text)
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        if cp in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= cp <= 0x7E:
+            out.append(ch)
+        elif mode == 'reveal':
+            out.append('<U+%04X>' % cp)
+        elif mode == 'show' and cp >= 0x80 and ch.isprintable():
+            out.append(ch)
+        else:
+            out.append('_')
+    return ''.join(out)
+
+
+def sanitize_bytes(data, mode='strip'):
+    """Convenience wrapper: decode raw bytes 1:1 (latin-1) and render. Used by
+    tests and any all-ASCII path; the live output stream in _on_readable uses an
+    incremental UTF-8 decoder so multi-byte characters survive read boundaries."""
+    return render_output(data.decode('latin-1'), mode)
 
 
 def sanitize_paste(text):
@@ -120,6 +153,11 @@ class SecureTerminal(QPlainTextEdit):
         self._theme = 'dark'
         self.apply_theme(self._theme)
 
+        # display mode for non-ASCII output, and an incremental UTF-8 decoder so
+        # a multi-byte character split across two os.read() chunks still decodes.
+        self._mode = 'strip'
+        self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
+
         self._notifier = None
         self._fd = None
         self._pid = None
@@ -147,6 +185,15 @@ class SecureTerminal(QPlainTextEdit):
 
     def current_theme(self):
         return self._theme
+
+    def apply_mode(self, mode):
+        """Set the display mode for non-ASCII output. Affects future output only;
+        already-rendered text is left as it was shown."""
+        if mode in DISPLAY_MODES:
+            self._mode = mode
+
+    def current_mode(self):
+        return self._mode
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -186,7 +233,7 @@ class SecureTerminal(QPlainTextEdit):
                 self._notifier.setEnabled(False)
             self.shell_exited.emit()
             return
-        self._append(sanitize_bytes(data))
+        self._append(render_output(self._decoder.decode(data), self._mode))
 
     def shutdown(self):
         """Detach the notifier, close the master fd and hang up the child. Used

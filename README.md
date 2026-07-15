@@ -50,6 +50,11 @@ The safety model above does not cost you the usual conveniences:
   in the top right (Up/Down keys or type a value). `Ctrl+0` resets to 100%.
 - **Themes.** White-on-black and black-on-white, under **View -> Theme**. Plain,
   high-contrast, no syntax coloring.
+- **Unicode display mode** (top bar, per tab, default **Strip**). Strip replaces
+  non-ASCII with `_` (safe). Show renders legitimate unicode as glyphs so you can
+  read a log, while still neutralizing the invisible, bidi and homoglyph classes.
+  Reveal shows every non-ASCII character as a `<U+XXXX>` badge to inspect exactly
+  what is there. Escapes are stripped in every mode.
 - **Menu bar** for the same actions, discoverable rather than memorized.
 
 ## What it does not do (on purpose)

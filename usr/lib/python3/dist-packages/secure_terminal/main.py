@@ -12,7 +12,7 @@ from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QToolBar, QSpinBox, QLabel,
-    QWidget, QSizePolicy,
+    QWidget, QSizePolicy, QComboBox,
 )
 
 from secure_terminal.terminal import SecureTerminal
@@ -27,6 +27,13 @@ THEME_LABELS = [
     ('Light (black on white)', 'light'),
 ]
 
+# menu / combo label -> display-mode key in terminal.DISPLAY_MODES
+MODE_LABELS = [
+    ('Strip unicode (safe)', 'strip'),
+    ('Show unicode', 'show'),
+    ('Reveal unicode', 'reveal'),
+]
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -38,6 +45,7 @@ class MainWindow(QMainWindow):
         # own theme and zoom, which the chrome below reflects and edits.
         self._default_theme = 'dark'
         self._default_zoom = 100
+        self._default_mode = 'strip'
 
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
@@ -48,6 +56,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
 
         self._theme_actions = {}
+        self._mode_actions = {}
         self._build_menu()
         self._build_toolbar()
         self.new_tab()
@@ -64,6 +73,7 @@ class MainWindow(QMainWindow):
         term = SecureTerminal()
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
+        term.apply_mode(self._default_mode)
         term.zoom_step.connect(self._on_zoom_step)
         term.shell_exited.connect(lambda t=term: self._on_shell_exited(t))
         index = self.tabs.addTab(term, 'shell')
@@ -122,6 +132,12 @@ class MainWindow(QMainWindow):
         active = term.current_theme()
         for key, action in self._theme_actions.items():
             action.setChecked(key == active)
+        mode = term.current_mode()
+        for key, action in self._mode_actions.items():
+            action.setChecked(key == mode)
+        self.mode_box.blockSignals(True)
+        self.mode_box.setCurrentIndex(self.mode_box.findData(mode))
+        self.mode_box.blockSignals(False)
         self._update_terminate_enabled()
 
     # -- zoom: per current tab ------------------------------------------------
@@ -157,6 +173,21 @@ class MainWindow(QMainWindow):
         term = self.current()
         if term is not None:
             term.apply_theme(theme)
+
+    # -- unicode display mode: per current tab --------------------------------
+    def set_mode(self, mode):
+        term = self.current()
+        if term is not None:
+            term.apply_mode(mode)
+        # keep menu + combo in agreement whichever was used
+        for key, action in self._mode_actions.items():
+            action.setChecked(key == mode)
+        self.mode_box.blockSignals(True)
+        self.mode_box.setCurrentIndex(self.mode_box.findData(mode))
+        self.mode_box.blockSignals(False)
+
+    def _on_mode_box(self, index):
+        self.set_mode(self.mode_box.itemData(index))
 
     # -- chrome ---------------------------------------------------------------
     def _build_menu(self):
@@ -232,6 +263,17 @@ class MainWindow(QMainWindow):
             theme_menu.addAction(act)
             self._theme_actions[key] = act
 
+        mode_menu = view_menu.addMenu('&Unicode')
+        mode_group = QActionGroup(self)
+        mode_group.setExclusive(True)
+        for label, key in MODE_LABELS:
+            act = QAction(label, self, checkable=True)
+            act.setChecked(key == self._default_mode)
+            act.triggered.connect(lambda _checked, k=key: self.set_mode(k))
+            mode_group.addAction(act)
+            mode_menu.addAction(act)
+            self._mode_actions[key] = act
+
     def _build_toolbar(self):
         bar = QToolBar('Main', self)
         bar.setMovable(False)
@@ -249,6 +291,18 @@ class MainWindow(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding,
                              QSizePolicy.Policy.Preferred)
         bar.addWidget(spacer)
+
+        bar.addWidget(QLabel('Unicode ', bar))
+        self.mode_box = QComboBox(bar)
+        for label, key in MODE_LABELS:
+            self.mode_box.addItem(label, key)
+        self.mode_box.setCurrentIndex(self.mode_box.findData(self._default_mode))
+        self.mode_box.setToolTip(
+            'How the current tab shows non-ASCII output: Strip (safe, default), '
+            'Show (render legitimate unicode), or Reveal (as <U+XXXX> to inspect)')
+        self.mode_box.currentIndexChanged.connect(self._on_mode_box)
+        bar.addWidget(self.mode_box)
+        bar.addSeparator()
 
         bar.addWidget(QLabel('Zoom ', bar))
         self.zoom_box = QSpinBox(bar)
