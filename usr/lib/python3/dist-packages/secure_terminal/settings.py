@@ -17,7 +17,8 @@ Only files ending in .conf are read. Within each directory files are applied in
 lexical order of filename (so 10-*.conf before 90-*.conf), and the directories
 are applied lowest to highest, so a later KEY overrides an earlier one and the
 user always wins over a system seed. The application writes its own settings to a
-high-numbered user file (99-user.conf) so its changes override the seeds.
+mid-numbered user file (50_user.conf): it beats the system seeds, and a user can
+still drop a higher-numbered .conf to override even the app's own choices.
 
 Loading is fully defensive: a missing/unreadable file, a malformed line or an
 unknown key never raises and never crashes; the value falls back to its default.
@@ -28,7 +29,9 @@ import os
 import glob
 
 _APP = 'secure-terminal'
-_USER_FILE = '99-user.conf'       # where the app writes; sorts last -> wins
+# where the app writes its own settings. 50 leaves room for a user to drop a
+# higher-numbered .conf that overrides even the app's choices.
+_USER_FILE = '50_user.conf'
 
 
 def _user_config_dir():

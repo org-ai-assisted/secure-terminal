@@ -77,7 +77,8 @@ The safety model above does not cost you the usual conveniences:
   `~/.config/secure-terminal.d/` -- so a distro or admin can seed defaults and
   the user overrides them. Only `*.conf` files are read; within a directory they
   apply in lexical order, later winning. The app writes its own settings to
-  `~/.config/secure-terminal.d/99-user.conf`. **Settings -> Folders & Files...**
+  `~/.config/secure-terminal.d/50_user.conf` (a higher-numbered `.conf` you drop
+  in wins over it). **Settings -> Folders & Files...**
   shows every location with Copy and Open buttons.
 - **Tabs you can name and colour.** Double-click a tab to rename it; right-click
   for rename, a colour, or close. Handy when several tabs each run a different
