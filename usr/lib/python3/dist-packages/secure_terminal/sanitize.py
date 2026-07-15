@@ -121,6 +121,23 @@ def sanitize_paste(text):
     return ''.join(out)
 
 
+def tui_cell(ch, mode):
+    """Sanitize a single screen cell's character for TUI-mode display. Keeps
+    printable ASCII; renders a printable non-ASCII glyph only in 'show'/'reveal'
+    (a reveal <U+XXXX> badge cannot fit one fixed cell, so it collapses to the
+    glyph there); otherwise '_'. Always exactly one character, to preserve the
+    grid, and the invisible/bidi/format classes are still neutralized because
+    str.isprintable() excludes them."""
+    if not ch:
+        return ' '
+    cp = ord(ch)
+    if 0x20 <= cp <= 0x7E:
+        return ch
+    if mode in ('show', 'reveal') and cp >= 0x80 and ch.isprintable():
+        return ch
+    return '_'
+
+
 def paste_findings(text):
     """Classify a to-be-pasted string as (has_unicode, has_control), so a paste
     of anything but plain ASCII + tab/newline can be flagged before it is sent to

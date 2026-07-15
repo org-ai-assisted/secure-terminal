@@ -47,10 +47,13 @@ Design (see https://secure-terminal.github.io):
   terminate_foreground() is the guaranteed panic button (SIGTERM then SIGKILL)
   for a program that ignores all of the above.
 
-This is a deliberately minimal, line-oriented terminal. It is not a curses host:
-TERM is advertised as "dumb", and full-screen TUIs (nano, vim, emacs) are out of
-scope by design, because supporting them means parsing exactly the escape
-sequences this terminal exists to refuse.
+This is a deliberately minimal, line-oriented terminal by default: TERM is
+"dumb" and no escapes are parsed. An opt-in TUI mode (apply_tui) interprets
+escapes through a pyte screen model so full-screen programs (ssh, an editor, the
+Claude Code CLI) work; even then every cell is still character-filtered and pyte
+has no OS reach (it cannot set the title or touch the clipboard). The window
+flags TUI mode with a visible risk indicator; the strict line mode remains the
+safe-by-construction default.
 """
 
 import os
@@ -59,6 +62,13 @@ import re
 import fcntl
 import signal
 import codecs
+import struct
+import termios
+
+try:
+    import pyte
+except ImportError:                      # TUI mode is unavailable without pyte
+    pyte = None
 
 from PyQt6.QtCore import QSocketNotifier, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor, QColor, QPalette, QTextCharFormat
@@ -71,12 +81,42 @@ from secure_terminal.sanitize import (
     THEMES, BASE_POINT_SIZE, ANSI_PALETTE, DISPLAY_MODES,
     ANSI_RE as _ANSI, SGR_RE as _SGR,
     colors_allowed, too_close, render_output, sanitize_bytes, sanitize_paste,
-    paste_findings, parse_sgr,
+    paste_findings, parse_sgr, tui_cell,
 )
+
+
+def tui_available():
+    return pyte is not None
 
 
 def _rgb(color):
     return (color.red(), color.green(), color.blue())
+
+
+# pyte colour name -> ANSI_PALETTE index (bold promotes to the bright variant).
+_PYTE_COLOR = {
+    'black': 0, 'red': 1, 'green': 2, 'brown': 3,
+    'blue': 4, 'magenta': 5, 'cyan': 6, 'white': 7,
+}
+
+
+def _build_tui_keys():
+    """Qt.Key -> the VT byte sequence a TUI program expects. Built lazily since
+    it references Qt.Key values."""
+    k = Qt.Key
+    return {
+        k.Key_Return: b'\r', k.Key_Enter: b'\r',
+        k.Key_Backspace: b'\x7f', k.Key_Tab: b'\t', k.Key_Escape: b'\x1b',
+        k.Key_Up: b'\x1b[A', k.Key_Down: b'\x1b[B',
+        k.Key_Right: b'\x1b[C', k.Key_Left: b'\x1b[D',
+        k.Key_Home: b'\x1b[H', k.Key_End: b'\x1b[F',
+        k.Key_PageUp: b'\x1b[5~', k.Key_PageDown: b'\x1b[6~',
+        k.Key_Insert: b'\x1b[2~', k.Key_Delete: b'\x1b[3~',
+        k.Key_F1: b'\x1bOP', k.Key_F2: b'\x1bOQ', k.Key_F3: b'\x1bOR',
+        k.Key_F4: b'\x1bOS', k.Key_F5: b'\x1b[15~', k.Key_F6: b'\x1b[17~',
+        k.Key_F7: b'\x1b[18~', k.Key_F8: b'\x1b[19~', k.Key_F9: b'\x1b[20~',
+        k.Key_F10: b'\x1b[21~', k.Key_F11: b'\x1b[23~', k.Key_F12: b'\x1b[24~',
+    }
 
 
 class SecureTerminal(QPlainTextEdit):
@@ -85,7 +125,7 @@ class SecureTerminal(QPlainTextEdit):
     # Ctrl+wheel over the widget asks the window to zoom by +1/-1 step
     zoom_step = pyqtSignal(int)
 
-    def __init__(self, parent=None, command=None):
+    def __init__(self, parent=None, command=None, tui=False):
         super().__init__(parent)
         self.setUndoRedoEnabled(False)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
@@ -116,6 +156,18 @@ class SecureTerminal(QPlainTextEdit):
         # seconds the paste-warning "Allow" button stays disabled.
         self._paste_delay = 3
 
+        # TUI mode: interpret escapes through a pyte screen so full-screen
+        # programs (ssh, Claude Code) work. Off by default; the strict, no-parser
+        # line mode above is the safe default.
+        self._tui = bool(tui) and tui_available()
+        self._command = command
+        self._screen = None
+        self._stream = None
+        self._fmt_cache = {}
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render_tui)
+
         self._notifier = None
         self._fd = None
         self._pid = None
@@ -129,6 +181,9 @@ class SecureTerminal(QPlainTextEdit):
         pal.setColor(QPalette.ColorRole.Base, QColor(base))
         pal.setColor(QPalette.ColorRole.Text, QColor(text))
         self.setPalette(pal)
+        self._fmt_cache = {}          # theme changes the resolved cell colours
+        if self.tui_active():
+            self._render_timer.start(16)
 
     def apply_zoom(self, percent):
         percent = max(10, min(1000, int(percent)))
@@ -137,6 +192,7 @@ class SecureTerminal(QPlainTextEdit):
         font = self.font()
         font.setPointSize(size)
         self.setFont(font)
+        self._sync_tui_size()          # font change resizes the grid
 
     def current_zoom(self):
         return self._zoom
@@ -167,6 +223,148 @@ class SecureTerminal(QPlainTextEdit):
 
     def current_paste_delay(self):
         return self._paste_delay
+
+    # -- TUI mode -------------------------------------------------------------
+    def apply_tui(self, enabled):
+        """Turn TUI mode on/off. Because TERM is fixed at fork time, the shell is
+        re-started; a no-op when the state is unchanged or pyte is missing."""
+        enabled = bool(enabled) and tui_available()
+        if enabled == self._tui:
+            return
+        self._tui = enabled
+        self._restart()
+
+    def current_tui(self):
+        return self._tui
+
+    def tui_active(self):
+        return getattr(self, '_tui', False) and tui_available()
+
+    def _grid_size(self):
+        """Columns and rows that fit the viewport at the current font."""
+        metrics = self.fontMetrics()
+        char_w = metrics.horizontalAdvance('M') or 1
+        char_h = metrics.height() or 1
+        vp = self.viewport()
+        cols = max(2, vp.width() // char_w)
+        rows = max(2, vp.height() // char_h)
+        return cols, rows
+
+    def _set_winsize(self, cols, rows):
+        if self._fd is None:
+            return
+        try:
+            fcntl.ioctl(self._fd, termios.TIOCSWINSZ,
+                        struct.pack('HHHH', rows, cols, 0, 0))
+        except OSError:
+            pass
+
+    def _make_screen(self):
+        cols, rows = self._grid_size()
+        self._screen = pyte.Screen(cols, rows)
+        self._stream = pyte.ByteStream(self._screen)
+        self._set_winsize(cols, rows)
+
+    def _restart(self):
+        """Tear down the child and start a fresh one. Used when TUI mode toggles,
+        which changes TERM (fixed at fork time)."""
+        self.shutdown()
+        self.clear()
+        self._screen = None
+        self._stream = None
+        self._fmt_cache = {}
+        self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        self._sgr_reset()
+        self._start(self._command)
+
+    def _sync_tui_size(self):
+        if not (self.tui_active() and self._screen is not None):
+            return
+        cols, rows = self._grid_size()
+        if (cols, rows) != (self._screen.columns, self._screen.lines):
+            self._screen.resize(rows, cols)
+        self._set_winsize(cols, rows)
+        self._render_timer.start(16)
+
+    def _pyte_qcolor(self, color, default, bright=False):
+        if not color or color == 'default':
+            return QColor(default) if default is not None else None
+        idx = _PYTE_COLOR.get(color)
+        if idx is not None:
+            return QColor(ANSI_PALETTE[idx + 8 if bright else idx])
+        col = QColor('#' + color)          # 256/truecolor as a 6-hex string
+        if col.isValid():
+            return col
+        return QColor(default) if default is not None else None
+
+    def _pyte_format(self, cell):
+        key = (cell.fg, cell.bg, cell.bold, cell.reverse, cell.underscore)
+        fmt = self._fmt_cache.get(key)
+        if fmt is not None:
+            return fmt
+        base_bg, base_fg = THEMES.get(self._theme, THEMES['dark'])
+        fg = self._pyte_qcolor(cell.fg, base_fg, bright=cell.bold)
+        bg = self._pyte_qcolor(cell.bg, None)
+        if cell.reverse:
+            fg, bg = (bg if bg is not None else QColor(base_bg)), \
+                     (fg if fg is not None else QColor(base_fg))
+        if fg is None:
+            fg = QColor(base_fg)
+        eff_bg = bg if bg is not None else QColor(base_bg)
+        if too_close(_rgb(fg), _rgb(eff_bg)):   # same contrast guard as colours
+            fg = QColor(base_fg)
+            if bg is not None and too_close(_rgb(fg), _rgb(bg)):
+                bg = None
+        fmt = QTextCharFormat()
+        fmt.setForeground(fg)
+        if bg is not None:
+            fmt.setBackground(bg)
+        if cell.bold:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        if cell.underscore:
+            fmt.setFontUnderline(True)
+        self._fmt_cache[key] = fmt
+        return fmt
+
+    def _render_tui(self):
+        """Repaint the whole pyte screen grid into the widget. Every cell's
+        character is still ASCII/unicode-filtered (tui_cell), so a program can
+        position and colour text but cannot smuggle a deceptive glyph."""
+        screen = self._screen
+        if screen is None:
+            return
+        self.setUpdatesEnabled(False)
+        self.clear()
+        cursor = self.textCursor()
+        last = screen.lines - 1
+        for y in range(screen.lines):
+            row = screen.buffer[y]
+            run_text = ''
+            run_fmt = None
+            for x in range(screen.columns):
+                cell = row[x]
+                fmt = self._pyte_format(cell)
+                ch = tui_cell(cell.data, self._mode)
+                if run_text and fmt is run_fmt:
+                    run_text += ch
+                else:
+                    if run_text:
+                        cursor.insertText(run_text, run_fmt)
+                    run_text, run_fmt = ch, fmt
+            if run_text:
+                cursor.insertText(run_text, run_fmt)
+            if y != last:
+                cursor.insertText('\n')
+        self.setUpdatesEnabled(True)
+        if not screen.cursor.hidden:
+            block = self.document().findBlockByNumber(
+                min(screen.cursor.y, last))
+            if block.isValid():
+                pos = block.position() + min(screen.cursor.x, screen.columns)
+                tc = self.textCursor()
+                tc.setPosition(min(pos, self.document().characterCount() - 1))
+                self.setTextCursor(tc)
+        self.viewport().update()
 
     # -- optional ANSI colours ------------------------------------------------
     def apply_colors(self, enabled):
@@ -243,8 +441,10 @@ class SecureTerminal(QPlainTextEdit):
     def _start(self, command):
         pid, fd = pty.fork()
         if pid == 0:
-            # child
-            os.environ['TERM'] = 'dumb'          # discourage escape-heavy output
+            # child. In line mode advertise a dumb terminal so programs do not
+            # emit escape-heavy output; in TUI mode advertise a real terminal so
+            # ncurses / Claude Code / a remote shell over ssh drive it properly.
+            os.environ['TERM'] = 'xterm-256color' if self._tui else 'dumb'
             os.environ.setdefault('PAGER', 'cat')
             shell = command or os.environ.get('SHELL') or '/bin/bash'
             try:
@@ -257,6 +457,8 @@ class SecureTerminal(QPlainTextEdit):
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         self._notifier = QSocketNotifier(fd, QSocketNotifier.Type.Read, self)
         self._notifier.activated.connect(self._on_readable)
+        if self._tui:
+            self._make_screen()
 
     def _on_readable(self):
         try:
@@ -267,6 +469,11 @@ class SecureTerminal(QPlainTextEdit):
             if self._notifier is not None:
                 self._notifier.setEnabled(False)
             self.shell_exited.emit()
+            return
+        if self.tui_active() and self._stream is not None:
+            self._stream.feed(data)
+            if not self._render_timer.isActive():
+                self._render_timer.start(16)     # coalesce bursts into ~60fps
             return
         self._append_runs(self._render_runs(self._decoder.decode(data)))
 
@@ -427,11 +634,20 @@ class SecureTerminal(QPlainTextEdit):
         return True
 
     # -- input: printable ASCII + signal-key allowlist ------------------------
+    _TUI_KEYS = None      # built lazily below (needs Qt.Key at call time)
+
     def keyPressEvent(self, event):
         key = event.key()
         mods = event.modifiers()
         ctrl = mods & Qt.KeyboardModifier.ControlModifier
         shift = mods & Qt.KeyboardModifier.ShiftModifier
+
+        # In TUI mode the running program owns the keyboard: Ctrl+Shift+<key>
+        # still reaches the window shortcuts, but everything else is encoded as
+        # VT input (arrows, function keys, control bytes) and sent raw.
+        if self.tui_active() and not (ctrl and shift):
+            self._tui_key(event)
+            return
 
         # Ctrl+Shift+<key> is reserved for the window (copy/paste, new/close tab,
         # zoom); let those fall through to the QAction shortcuts.
@@ -473,6 +689,41 @@ class SecureTerminal(QPlainTextEdit):
             self._write(text.encode('ascii'))
         # non-ASCII input and arrow/navigation keys are intentionally ignored
 
+    def _tui_key(self, event):
+        """Encode a keystroke as VT input for the program in TUI mode."""
+        key = event.key()
+        mods = event.modifiers()
+        ctrl = mods & Qt.KeyboardModifier.ControlModifier
+        shift = mods & Qt.KeyboardModifier.ShiftModifier
+        alt = mods & Qt.KeyboardModifier.AltModifier
+
+        if SecureTerminal._TUI_KEYS is None:
+            SecureTerminal._TUI_KEYS = _build_tui_keys()
+
+        if key == Qt.Key.Key_Tab and shift:
+            self._write(b'\x1b[Z')                  # back-tab
+            return
+        seq = SecureTerminal._TUI_KEYS.get(key)
+        if seq is not None:
+            self._write(seq)
+            return
+        # Ctrl+letter -> the corresponding control byte (Ctrl+C -> 0x03), which
+        # the program receives; the Terminate action stays the escape hatch.
+        if ctrl and not shift and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            self._write(bytes([key & 0x1f]))
+            return
+        text = event.text()
+        if text and len(text) == 1 and ord(text) < 0x20:
+            self._write(text.encode('latin-1'))     # e.g. Ctrl+[ -> ESC
+            return
+        if text and all(0x20 <= ord(c) <= 0x7E for c in text):
+            self._write((b'\x1b' if alt else b'') + text.encode('ascii'))
+        # non-ASCII input is still dropped
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_tui_size()
+
     # -- paste: warn on, then sanitize, anything unusual ----------------------
     def insertFromMimeData(self, source):
         raw = source.text()
@@ -484,5 +735,12 @@ class SecureTerminal(QPlainTextEdit):
             if not PasteWarningDialog.confirm(raw, self._paste_delay, self):
                 return
         safe = sanitize_paste(raw)
-        if safe:
-            self._write(safe.encode('ascii'))
+        if not safe:
+            return
+        data = safe.encode('ascii')
+        # Bracketed paste when the TUI program asked for it (DEC mode 2004), so a
+        # multi-line paste is delivered as data, not interpreted as keystrokes.
+        if self.tui_active() and self._screen is not None \
+                and 2004 in getattr(self._screen, 'mode', ()):
+            data = b'\x1b[200~' + data + b'\x1b[201~'
+        self._write(data)

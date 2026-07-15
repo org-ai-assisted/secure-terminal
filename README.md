@@ -69,13 +69,34 @@ The safety model above does not cost you the usual conveniences:
   KEY=value file you can edit by hand.
 - **Menu bar** for the same actions, discoverable rather than memorized.
 
+## TUI mode (opt-in, run full-screen programs)
+
+The strict line mode above cannot run curses apps, because they are driven
+entirely by the escape sequences it refuses to parse. **TUI mode** (top bar and
+**View -> TUI mode**, per tab, default off, needs `python3-pyte`) relaxes that so
+you can run `ssh`, an editor, or the Claude Code CLI. A yellow indicator and a
+hover tooltip flag it while it is active, because it is a deliberate,
+lower-guarantee mode:
+
+- Escapes are interpreted, but inside an isolated in-memory screen model (`pyte`)
+  that has no OS reach: it **cannot set the window title or touch the system
+  clipboard**, so those spoofing/exfil vectors stay closed.
+- Every character placed on the screen is **still ASCII/unicode-filtered**, so a
+  program can position and colour text but cannot smuggle an invisible, bidi or
+  homoglyph character into what you read.
+- Colours use the same contrast guard, so nothing can be painted invisibly.
+
+What you give up: a program can draw a *misleading interface* within its own
+screen (a fake prompt, say), so only run programs you trust. This is
+"restricted-emulator safe," not "safe by construction." The default line mode,
+and everything the project's guarantees rest on, is unchanged.
+
 ## What it does not do (on purpose)
 
-- **No full-screen TUIs** (nano, vim, emacs, htop). Curses apps are driven
-  entirely by control and escape sequences, exactly what this terminal refuses
-  to parse. Run those in a normal terminal you already treat as untrusted.
 - **No non-ASCII by default.** Additional character sets may become opt-in much
   later, always as an explicit allowlist, never a general decoder.
+- **No terminal side-effects.** No window-title control, no clipboard escape
+  (OSC 52), no hyperlink escapes, in either mode.
 
 This is a deliberately minimal, line-oriented first version. Backspace works, but
 because the display neutralizes the escapes readline uses to redraw, richer

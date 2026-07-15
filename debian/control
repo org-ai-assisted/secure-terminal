@@ -14,6 +14,7 @@ Architecture: all
 Depends: ${misc:Depends},
  python3,
  python3-pyqt6
+Recommends: python3-pyte
 Description: a terminal where paste is safe by construction
  secure-terminal is a small, line-oriented terminal for pasting commands into,
  and reading text out of, without worrying about invisible characters, bidi
@@ -24,7 +25,9 @@ Description: a terminal where paste is safe by construction
  .
  Input forwards printable ASCII plus a tiny allowlist of control keys that the
  pseudo-terminal turns into signals: Ctrl+C (SIGINT), Ctrl+Z (SIGTSTP),
- Ctrl+\\ (SIGQUIT) and Ctrl+D (EOF). It is not a curses host: full-screen TUIs
- (nano, vim, emacs) are out of scope by design, because supporting them means
- parsing exactly the escape sequences this terminal exists to refuse. Built with
- Python and Qt6.
+ Ctrl+\\ (SIGQUIT) and Ctrl+D (EOF). An opt-in, clearly-flagged TUI mode
+ (python3-pyte) can run full-screen programs such as ssh, an editor or the
+ Claude Code CLI by interpreting escapes inside an isolated screen model that
+ still filters every character and cannot touch the title or clipboard; the
+ strict line mode remains the safe-by-construction default. Built with Python
+ and Qt6.

@@ -16,7 +16,18 @@ from PyQt6.QtWidgets import (
 )
 
 from secure_terminal import settings
-from secure_terminal.terminal import SecureTerminal, THEMES, DISPLAY_MODES
+from secure_terminal.terminal import (
+    SecureTerminal, THEMES, DISPLAY_MODES, tui_available,
+)
+
+TUI_TOOLTIP = (
+    'TUI mode runs full-screen programs (ssh, an editor, Claude Code) by '
+    'interpreting the terminal escape sequences the strict default mode refuses. '
+    'It stays confined to an isolated screen model: the window title and system '
+    'clipboard cannot be touched, and every character is still '
+    'ASCII/unicode-filtered, so invisible or homoglyph text cannot hide. But a '
+    'program CAN draw a misleading interface within its screen, so only run '
+    'programs you trust. The default line mode remains safe by construction.')
 
 ZOOM_MIN = 25
 ZOOM_MAX = 400
@@ -84,6 +95,7 @@ class MainWindow(QMainWindow):
             self._paste_delay = max(0, min(60, int(cfg['paste_delay'])))
         except (KeyError, ValueError):
             self._paste_delay = 3
+        self._default_tui = cfg.get('tui') == 'true'
 
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
@@ -108,7 +120,7 @@ class MainWindow(QMainWindow):
 
     # -- tabs, each its own shell over its own pseudo-terminal -----------------
     def new_tab(self):
-        term = SecureTerminal()
+        term = SecureTerminal(tui=self._default_tui)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.apply_mode(self._default_mode)
@@ -180,6 +192,8 @@ class MainWindow(QMainWindow):
         self.mode_box.setCurrentIndex(self.mode_box.findData(mode))
         self.mode_box.blockSignals(False)
         self.act_colors.setChecked(term.colors_enabled())
+        self.act_tui.setChecked(term.current_tui())
+        self._update_tui_indicator()
         self._update_terminate_enabled()
 
     # -- zoom: per current tab ------------------------------------------------
@@ -245,6 +259,23 @@ class MainWindow(QMainWindow):
         self._default_colors = bool(enabled)
         self._persist()
 
+    def set_tui(self, enabled):
+        term = self.current()
+        if term is not None:
+            term.apply_tui(enabled)
+            # a strict-stripped screen makes a TUI unreadable, so lean to 'show'
+            if enabled and term.current_mode() == 'strip':
+                self.set_mode('show')
+        self._default_tui = bool(enabled)
+        self.act_tui.setChecked(enabled)
+        self._update_tui_indicator()
+        self._persist()
+
+    def _update_tui_indicator(self):
+        term = self.current()
+        active = term is not None and term.tui_active()
+        self.tui_dot_action.setVisible(active)
+
     def set_scrollback(self, lines):
         self._scrollback = int(lines)
         for i in range(self.tabs.count()):
@@ -282,6 +313,7 @@ class MainWindow(QMainWindow):
             'colors': 'true' if self._default_colors else 'false',
             'scrollback': str(self._scrollback),
             'paste_delay': str(self._paste_delay),
+            'tui': 'true' if self._default_tui else 'false',
         })
 
     # -- chrome ---------------------------------------------------------------
@@ -388,6 +420,16 @@ class MainWindow(QMainWindow):
         self.act_colors.toggled.connect(self.set_colors)
         view_menu.addAction(self.act_colors)
 
+        self.act_tui = QAction('&TUI mode (run full-screen programs)', self,
+                               checkable=True)
+        self.act_tui.setChecked(self._default_tui)
+        self.act_tui.setEnabled(tui_available())
+        self.act_tui.setToolTip(TUI_TOOLTIP)
+        if not tui_available():
+            self.act_tui.setText('TUI mode (needs python3-pyte)')
+        self.act_tui.toggled.connect(self.set_tui)
+        view_menu.addAction(self.act_tui)
+
         view_menu.addSeparator()
         sb_menu = view_menu.addMenu('&Scrollback')
         sb_group = QActionGroup(self)
@@ -438,6 +480,17 @@ class MainWindow(QMainWindow):
         self.mode_box.currentIndexChanged.connect(self._on_mode_box)
         bar.addWidget(self.mode_box)
         bar.addAction(self.act_colors)
+        bar.addSeparator()
+
+        bar.addAction(self.act_tui)
+        # yellow risk indicator, shown only while TUI mode is active. A toolbar
+        # widget is shown/hidden through the QAction addWidget() returns.
+        self.tui_dot = QLabel(bar)
+        self.tui_dot.setFixedSize(14, 14)
+        self.tui_dot.setStyleSheet('background-color:#e5a50a; border-radius:7px;')
+        self.tui_dot.setToolTip(TUI_TOOLTIP)
+        self.tui_dot_action = bar.addWidget(self.tui_dot)
+        self.tui_dot_action.setVisible(False)
         bar.addSeparator()
 
         bar.addWidget(QLabel('Zoom ', bar))
