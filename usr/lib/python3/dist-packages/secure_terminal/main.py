@@ -8,8 +8,8 @@
 import signal
 import sys
 
-from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QToolBar, QSpinBox, QLabel,
     QWidget, QSizePolicy,
@@ -34,29 +34,41 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('secure-terminal')
         self.resize(820, 520)
 
-        self._zoom = 100
-        self._theme = 'dark'
+        # Global defaults inherited by every NEW tab; each tab then carries its
+        # own theme and zoom, which the chrome below reflects and edits.
+        self._default_theme = 'dark'
+        self._default_zoom = 100
 
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.currentChanged.connect(self._sync_chrome_to_tab)
         self.setCentralWidget(self.tabs)
 
+        self._theme_actions = {}
         self._build_menu()
         self._build_toolbar()
         self.new_tab()
 
+        # Enable Terminate only while a program (not just the shell) is running.
+        # There is no event for a foreground-pgrp change, so poll cheaply.
+        self._fg_poll = QTimer(self)
+        self._fg_poll.timeout.connect(self._update_terminate_enabled)
+        self._fg_poll.start(400)
+        self._update_terminate_enabled()
+
     # -- tabs, each its own shell over its own pseudo-terminal -----------------
     def new_tab(self):
         term = SecureTerminal()
-        term.apply_theme(self._theme)
-        term.apply_zoom(self._zoom)
+        term.apply_theme(self._default_theme)
+        term.apply_zoom(self._default_zoom)
         term.zoom_step.connect(self._on_zoom_step)
         term.shell_exited.connect(lambda t=term: self._on_shell_exited(t))
         index = self.tabs.addTab(term, 'shell')
         self.tabs.setCurrentIndex(index)
+        self._sync_chrome_to_tab()
         term.setFocus()
 
     def close_tab(self, index):
@@ -74,6 +86,16 @@ class MainWindow(QMainWindow):
         if index != -1:
             self.close_tab(index)
 
+    def terminate_foreground(self):
+        term = self.current()
+        if term is not None:
+            term.terminate_foreground()
+
+    def _update_terminate_enabled(self):
+        term = self.current()
+        self.act_terminate.setEnabled(
+            term is not None and term.has_foreground_program())
+
     def current(self):
         return self.tabs.currentWidget()
 
@@ -89,79 +111,111 @@ class MainWindow(QMainWindow):
             term.paste()
             term.setFocus()
 
-    # -- zoom -----------------------------------------------------------------
+    # -- keep the toolbar/menu showing the CURRENT tab's theme and zoom -------
+    def _sync_chrome_to_tab(self, *_args):
+        term = self.current()
+        if term is None:
+            return
+        self.zoom_box.blockSignals(True)
+        self.zoom_box.setValue(term.current_zoom())
+        self.zoom_box.blockSignals(False)
+        active = term.current_theme()
+        for key, action in self._theme_actions.items():
+            action.setChecked(key == active)
+        self._update_terminate_enabled()
+
+    # -- zoom: per current tab ------------------------------------------------
     def set_zoom(self, percent):
         percent = max(ZOOM_MIN, min(ZOOM_MAX, int(percent)))
-        self._zoom = percent
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).apply_zoom(percent)
+        term = self.current()
+        if term is not None:
+            term.apply_zoom(percent)
         self.zoom_box.blockSignals(True)
         self.zoom_box.setValue(percent)
         self.zoom_box.blockSignals(False)
 
     def _on_zoom_step(self, direction):
-        self.set_zoom(self._zoom + direction * ZOOM_STEP)
+        term = self.current()
+        if term is not None:
+            self.set_zoom(term.current_zoom() + direction * ZOOM_STEP)
 
     def zoom_in(self):
-        self.set_zoom(self._zoom + ZOOM_STEP)
+        term = self.current()
+        if term is not None:
+            self.set_zoom(term.current_zoom() + ZOOM_STEP)
 
     def zoom_out(self):
-        self.set_zoom(self._zoom - ZOOM_STEP)
+        term = self.current()
+        if term is not None:
+            self.set_zoom(term.current_zoom() - ZOOM_STEP)
 
     def zoom_reset(self):
         self.set_zoom(100)
 
-    # -- theme ----------------------------------------------------------------
+    # -- theme: per current tab -----------------------------------------------
     def set_theme(self, theme):
-        self._theme = theme
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).apply_theme(theme)
+        term = self.current()
+        if term is not None:
+            term.apply_theme(theme)
 
     # -- chrome ---------------------------------------------------------------
     def _build_menu(self):
         bar = self.menuBar()
 
         file_menu = bar.addMenu('&File')
-        act_new = QAction('New &Tab', self)
-        act_new.setShortcut(QKeySequence('Ctrl+Shift+T'))
-        act_new.triggered.connect(self.new_tab)
-        file_menu.addAction(act_new)
+        self.act_new = QAction(QIcon.fromTheme('tab-new'), 'New &Tab', self)
+        self.act_new.setShortcut(QKeySequence('Ctrl+Shift+T'))
+        self.act_new.triggered.connect(self.new_tab)
+        file_menu.addAction(self.act_new)
 
-        act_close = QAction('&Close Tab', self)
-        act_close.setShortcut(QKeySequence('Ctrl+Shift+W'))
-        act_close.triggered.connect(
+        self.act_close = QAction(QIcon.fromTheme('window-close'),
+                                 '&Close Tab', self)
+        self.act_close.setShortcut(QKeySequence('Ctrl+Shift+W'))
+        self.act_close.triggered.connect(
             lambda: self.close_tab(self.tabs.currentIndex()))
-        file_menu.addAction(act_close)
+        file_menu.addAction(self.act_close)
 
         file_menu.addSeparator()
-        act_quit = QAction('&Quit', self)
+        self.act_terminate = QAction(QIcon.fromTheme('process-stop'),
+                                     '&Terminate Program', self)
+        self.act_terminate.setShortcut(QKeySequence('Ctrl+Shift+K'))
+        self.act_terminate.setToolTip(
+            'Force-terminate the running program (SIGTERM, then SIGKILL). '
+            'Use when Ctrl+C and Ctrl+\\ are ignored, e.g. a stuck full-screen '
+            'program.')
+        self.act_terminate.triggered.connect(self.terminate_foreground)
+        file_menu.addAction(self.act_terminate)
+
+        file_menu.addSeparator()
+        act_quit = QAction(QIcon.fromTheme('application-exit'), '&Quit', self)
         act_quit.setShortcut(QKeySequence('Ctrl+Q'))
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
 
         edit_menu = bar.addMenu('&Edit')
-        self.act_copy = QAction('&Copy', self)
+        self.act_copy = QAction(QIcon.fromTheme('edit-copy'), '&Copy', self)
         self.act_copy.setShortcut(QKeySequence('Ctrl+Shift+C'))
         self.act_copy.triggered.connect(self.copy_selection)
         edit_menu.addAction(self.act_copy)
 
-        self.act_paste = QAction('&Paste', self)
+        self.act_paste = QAction(QIcon.fromTheme('edit-paste'), '&Paste', self)
         self.act_paste.setShortcut(QKeySequence('Ctrl+Shift+V'))
         self.act_paste.triggered.connect(self.paste_clipboard)
         edit_menu.addAction(self.act_paste)
 
         view_menu = bar.addMenu('&View')
-        act_zin = QAction('Zoom &In', self)
+        act_zin = QAction(QIcon.fromTheme('zoom-in'), 'Zoom &In', self)
         act_zin.setShortcut(QKeySequence.StandardKey.ZoomIn)
         act_zin.triggered.connect(self.zoom_in)
         view_menu.addAction(act_zin)
 
-        act_zout = QAction('Zoom &Out', self)
+        act_zout = QAction(QIcon.fromTheme('zoom-out'), 'Zoom &Out', self)
         act_zout.setShortcut(QKeySequence.StandardKey.ZoomOut)
         act_zout.triggered.connect(self.zoom_out)
         view_menu.addAction(act_zout)
 
-        act_zreset = QAction('&Reset Zoom', self)
+        act_zreset = QAction(QIcon.fromTheme('zoom-original'),
+                             '&Reset Zoom', self)
         act_zreset.setShortcut(QKeySequence('Ctrl+0'))
         act_zreset.triggered.connect(self.zoom_reset)
         view_menu.addAction(act_zreset)
@@ -172,18 +226,24 @@ class MainWindow(QMainWindow):
         group.setExclusive(True)
         for label, key in THEME_LABELS:
             act = QAction(label, self, checkable=True)
-            act.setChecked(key == self._theme)
+            act.setChecked(key == self._default_theme)
             act.triggered.connect(lambda _checked, k=key: self.set_theme(k))
             group.addAction(act)
             theme_menu.addAction(act)
+            self._theme_actions[key] = act
 
     def _build_toolbar(self):
         bar = QToolBar('Main', self)
         bar.setMovable(False)
+        bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(bar)
 
+        bar.addAction(self.act_new)
+        bar.addSeparator()
         bar.addAction(self.act_copy)
         bar.addAction(self.act_paste)
+        bar.addSeparator()
+        bar.addAction(self.act_terminate)
 
         spacer = QWidget(bar)
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding,
@@ -195,9 +255,9 @@ class MainWindow(QMainWindow):
         self.zoom_box.setRange(ZOOM_MIN, ZOOM_MAX)
         self.zoom_box.setSingleStep(ZOOM_STEP)
         self.zoom_box.setSuffix('%')
-        self.zoom_box.setValue(self._zoom)
-        self.zoom_box.setToolTip('Text size (Up/Down or type a value; '
-                                 'Ctrl+wheel over the terminal)')
+        self.zoom_box.setValue(self._default_zoom)
+        self.zoom_box.setToolTip('Text size of the current tab (Up/Down or type '
+                                 'a value; Ctrl+wheel over the terminal)')
         self.zoom_box.valueChanged.connect(self.set_zoom)
         bar.addWidget(self.zoom_box)
 

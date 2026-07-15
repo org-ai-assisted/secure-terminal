@@ -27,10 +27,13 @@ Design (see https://secure-terminal.github.io):
 - PASTE is sanitized the same way before it reaches the shell, so invisible or
   bidi characters copied from a web page never enter your command line.
 
-- INPUT forwards printable ASCII and a tiny allowlist of control keys that the
-  pseudo-terminal line discipline turns into signals:
-    Ctrl+C -> SIGINT, Ctrl+Z -> SIGTSTP, Ctrl+\\ -> SIGQUIT, Ctrl+D -> EOF.
-  We only write the control byte; the kernel does the rest. One-directional.
+- INPUT forwards printable ASCII and a tiny allowlist of control keys. The
+  signal keys deliver a real signal to the foreground process group
+  (Ctrl+C -> SIGINT, Ctrl+Z -> SIGTSTP, Ctrl+\\ -> SIGQUIT) so they work even
+  against a raw-mode program that would swallow the control byte; Ctrl+D (EOF)
+  and Ctrl+L (clear) are written as line-discipline bytes. Still one-directional.
+  terminate_foreground() is the guaranteed panic button (SIGTERM then SIGKILL)
+  for a program that ignores all of the above.
 
 This is a deliberately minimal, line-oriented terminal. It is not a curses host:
 TERM is advertised as "dumb", and full-screen TUIs (nano, vim, emacs) are out of
@@ -44,7 +47,7 @@ import re
 import fcntl
 import signal
 
-from PyQt6.QtCore import QSocketNotifier, Qt, pyqtSignal
+from PyQt6.QtCore import QSocketNotifier, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor, QColor, QPalette
 from PyQt6.QtWidgets import QPlainTextEdit
 
@@ -130,6 +133,12 @@ class SecureTerminal(QPlainTextEdit):
         font = self.font()
         font.setPointSize(size)
         self.setFont(font)
+
+    def current_zoom(self):
+        return self._zoom
+
+    def current_theme(self):
+        return self._theme
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -231,6 +240,68 @@ class SecureTerminal(QPlainTextEdit):
         except OSError:
             pass
 
+    # -- signalling the foreground program ------------------------------------
+    def _foreground_pgrp(self):
+        """The terminal's foreground process group, or None. This is the running
+        command (e.g. nano), not necessarily the shell."""
+        if self._fd is None:
+            return None
+        try:
+            pgrp = os.tcgetpgrp(self._fd)
+        except OSError:
+            return None
+        return pgrp if pgrp > 0 else None
+
+    def has_foreground_program(self):
+        """True when a program other than the shell holds the foreground, i.e.
+        there is something for Terminate to act on."""
+        pgrp = self._foreground_pgrp()
+        if pgrp is None:
+            return False
+        if self._pid is not None and pgrp == os.getpgid(self._pid):
+            return False
+        return True
+
+    def signal_foreground(self, sig):
+        """Send a signal to the foreground process group so it takes effect even
+        against a raw-mode program that would ignore the control byte."""
+        pgrp = self._foreground_pgrp()
+        if pgrp is None:
+            return
+        try:
+            os.killpg(pgrp, sig)
+        except OSError:
+            pass
+
+    def terminate_foreground(self):
+        """Guaranteed escape hatch for a program that ignores Ctrl+C / Ctrl+\\
+        (a stuck TUI): SIGTERM the foreground process group now, then SIGKILL any
+        survivor after a grace period. A no-op when only the shell is in the
+        foreground, so the panic button never kills your shell out from under a
+        bare prompt. Returns True when a program was actually signalled."""
+        pgrp = self._foreground_pgrp()
+        if pgrp is None:
+            return False
+        # Only the shell is running (nothing to terminate).
+        if self._pid is not None and pgrp == os.getpgid(self._pid):
+            return False
+        try:
+            os.killpg(pgrp, signal.SIGTERM)
+        except OSError:
+            return False
+
+        def _kill_survivor(target=pgrp):
+            try:
+                os.killpg(target, 0)      # still alive?
+            except OSError:
+                return                    # already gone
+            try:
+                os.killpg(target, signal.SIGKILL)
+            except OSError:
+                pass
+        QTimer.singleShot(2000, _kill_survivor)
+        return True
+
     # -- input: printable ASCII + signal-key allowlist ------------------------
     def keyPressEvent(self, event):
         key = event.key()
@@ -241,15 +312,26 @@ class SecureTerminal(QPlainTextEdit):
         # Ctrl+Shift+<key> is reserved for the window (copy/paste, new/close tab,
         # zoom); let those fall through to the QAction shortcuts.
         if ctrl and not shift:
-            mapping = {
-                Qt.Key.Key_C: b'\x03',        # SIGINT
-                Qt.Key.Key_Z: b'\x1a',        # SIGTSTP
-                Qt.Key.Key_Backslash: b'\x1c',  # SIGQUIT
+            # The signal keys deliver a REAL signal to the terminal's foreground
+            # process group, not just the control byte. In cooked mode the effect
+            # is the same, but a program in raw mode (nano, less, a pager) reads
+            # the byte as an ordinary keystroke and would never be interrupted;
+            # the signal reaches it regardless. Still one-directional.
+            sig_map = {
+                Qt.Key.Key_C: signal.SIGINT,
+                Qt.Key.Key_Z: signal.SIGTSTP,
+                Qt.Key.Key_Backslash: signal.SIGQUIT,
+            }
+            # EOF and clear are line-discipline bytes, not signals.
+            byte_map = {
                 Qt.Key.Key_D: b'\x04',        # EOF
                 Qt.Key.Key_L: b'\x0c',        # form feed (clear)
             }
-            if key in mapping:
-                self._write(mapping[key])
+            if key in sig_map:
+                self.signal_foreground(sig_map[key])
+                return
+            if key in byte_map:
+                self._write(byte_map[key])
                 return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
