@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import (
     QWidget, QSizePolicy, QComboBox,
 )
 
-from secure_terminal.terminal import SecureTerminal
+from secure_terminal import settings
+from secure_terminal.terminal import SecureTerminal, THEMES, DISPLAY_MODES
 
 ZOOM_MIN = 25
 ZOOM_MAX = 400
@@ -43,10 +44,19 @@ class MainWindow(QMainWindow):
 
         # Global defaults inherited by every NEW tab; each tab then carries its
         # own theme and zoom, which the chrome below reflects and edits.
-        self._default_theme = 'dark'
-        self._default_zoom = 100
-        self._default_mode = 'strip'
-        self._default_colors = False
+        # Global defaults, loaded from ~/.config; each is validated so a hand-
+        # edited or stale config can never crash or set a bogus value. Changing
+        # any of them (below) updates the default and re-persists.
+        cfg = settings.load()
+        self._default_theme = cfg.get('theme') if cfg.get('theme') in THEMES \
+            else 'dark'
+        self._default_mode = cfg.get('unicode_mode') \
+            if cfg.get('unicode_mode') in DISPLAY_MODES else 'strip'
+        self._default_colors = cfg.get('colors') == 'true'
+        try:
+            self._default_zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(cfg['zoom'])))
+        except (KeyError, ValueError):
+            self._default_zoom = 100
 
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
@@ -152,6 +162,8 @@ class MainWindow(QMainWindow):
         self.zoom_box.blockSignals(True)
         self.zoom_box.setValue(percent)
         self.zoom_box.blockSignals(False)
+        self._default_zoom = percent
+        self._persist()
 
     def _on_zoom_step(self, direction):
         term = self.current()
@@ -176,6 +188,8 @@ class MainWindow(QMainWindow):
         term = self.current()
         if term is not None:
             term.apply_theme(theme)
+        self._default_theme = theme
+        self._persist()
 
     # -- unicode display mode: per current tab --------------------------------
     def set_mode(self, mode):
@@ -188,6 +202,8 @@ class MainWindow(QMainWindow):
         self.mode_box.blockSignals(True)
         self.mode_box.setCurrentIndex(self.mode_box.findData(mode))
         self.mode_box.blockSignals(False)
+        self._default_mode = mode
+        self._persist()
 
     def _on_mode_box(self, index):
         self.set_mode(self.mode_box.itemData(index))
@@ -197,6 +213,16 @@ class MainWindow(QMainWindow):
         if term is not None:
             term.apply_colors(enabled)
         self.act_colors.setChecked(enabled)
+        self._default_colors = bool(enabled)
+        self._persist()
+
+    def _persist(self):
+        settings.save({
+            'theme': self._default_theme,
+            'zoom': str(self._default_zoom),
+            'unicode_mode': self._default_mode,
+            'colors': 'true' if self._default_colors else 'false',
+        })
 
     # -- chrome ---------------------------------------------------------------
     def _build_menu(self):
