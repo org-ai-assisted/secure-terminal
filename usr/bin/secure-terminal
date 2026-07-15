@@ -5,7 +5,17 @@
 
 ## AI-Assisted
 
+import os
 import sys
+
+## Run straight from a source checkout, not only when installed. When installed,
+## the module is under /usr/lib/python3/dist-packages (already on sys.path); from
+## a checkout it is under <repo>/usr/lib/python3/dist-packages, so add that.
+_dev = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+    'lib', 'python3', 'dist-packages')
+if os.path.isdir(os.path.join(_dev, 'secure_terminal')):
+    sys.path.insert(0, _dev)
 
 from secure_terminal.main import main
 

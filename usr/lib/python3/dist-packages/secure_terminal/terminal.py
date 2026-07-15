@@ -10,9 +10,11 @@ Design (see https://secure-terminal.github.io):
 
 - DISPLAY is printable-ASCII only. Program output is passed through sanitize():
   ANSI/OSC escape sequences are removed and every byte that is not printable
-  ASCII (plus tab and newline) is dropped. There is no escape parser, so a
-  hostile filename, a forged status line or a Trojan-Source comment cannot
-  redraw or reorder what you read.
+  ASCII (plus tab, newline and backspace) is dropped. There is no escape parser,
+  so a hostile filename, a forged status line or a Trojan-Source comment cannot
+  redraw or reorder what you read. Backspace is the single exception: it erases
+  one character to its left and never crosses a line, so the shell's line editor
+  can rub out a typo without opening the door to cursor addressing.
 
 - PASTE is sanitized the same way before it reaches the shell, so invisible or
   bidi characters copied from a web page never enter your command line.
@@ -46,9 +48,12 @@ _ANSI = re.compile(
 
 
 def sanitize_bytes(data):
-    """Return printable-ASCII text (plus tab/newline) from raw terminal bytes."""
+    """Return printable-ASCII text (plus tab/newline/backspace) from raw terminal
+    bytes. Backspace (0x08) is kept because the shell's line editor emits it to
+    erase a character; _append() honors it as a destructive cursor-left. It is
+    the one control effect we interpret, and it stays inside the current line."""
     data = _ANSI.sub(b'', data)
-    kept = bytes(b for b in data if b in (0x09, 0x0A) or 0x20 <= b <= 0x7E)
+    kept = bytes(b for b in data if b in (0x08, 0x09, 0x0A) or 0x20 <= b <= 0x7E)
     return kept.decode('ascii', 'ignore')
 
 
@@ -121,7 +126,21 @@ class SecureTerminal(QPlainTextEdit):
             return
         cursor = self.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(text)
+        # Honor backspace (0x08) as a destructive cursor-left so the shell's line
+        # editor can rub out a character (readline echoes "\b \b" to erase one).
+        # We never cross a line boundary, so it cannot rewrite earlier output the
+        # way an escape sequence could; U+2029 is Qt's block/newline separator.
+        parts = text.split('\x08')
+        cursor.insertText(parts[0])
+        for part in parts[1:]:
+            probe = QTextCursor(cursor)
+            probe.movePosition(QTextCursor.MoveOperation.Left,
+                               QTextCursor.MoveMode.KeepAnchor)
+            sel = probe.selectedText()
+            if sel and ord(sel[0]) not in (0x0A, 0x2029):
+                probe.removeSelectedText()
+                cursor = probe
+            cursor.insertText(part)
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
 
