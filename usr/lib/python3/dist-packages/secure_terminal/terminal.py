@@ -197,6 +197,9 @@ class SecureTerminal(QPlainTextEdit):
         self._colors = False
         self._sgr_reset()
 
+        # scrollback limit in lines (0 = unlimited, the QPlainTextEdit default).
+        self._scrollback = 0
+
         self._notifier = None
         self._fd = None
         self._pid = None
@@ -233,6 +236,15 @@ class SecureTerminal(QPlainTextEdit):
 
     def current_mode(self):
         return self._mode
+
+    def apply_scrollback(self, lines):
+        """Limit retained scrollback to `lines` blocks (0 = unlimited)."""
+        lines = max(0, int(lines))
+        self._scrollback = lines
+        self.setMaximumBlockCount(lines)
+
+    def current_scrollback(self):
+        return self._scrollback
 
     # -- optional ANSI colours ------------------------------------------------
     def apply_colors(self, enabled):

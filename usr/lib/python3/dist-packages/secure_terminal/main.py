@@ -12,7 +12,7 @@ from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QToolBar, QSpinBox, QLabel,
-    QWidget, QSizePolicy, QComboBox,
+    QWidget, QSizePolicy, QComboBox, QFileDialog,
 )
 
 from secure_terminal import settings
@@ -33,6 +33,14 @@ MODE_LABELS = [
     ('Strip unicode (safe)', 'strip'),
     ('Show unicode', 'show'),
     ('Reveal unicode', 'reveal'),
+]
+
+# menu label -> scrollback limit in lines (0 = unlimited)
+SCROLLBACK_CHOICES = [
+    ('1,000 lines', 1000),
+    ('10,000 lines', 10000),
+    ('100,000 lines', 100000),
+    ('Unlimited', 0),
 ]
 
 
@@ -57,6 +65,13 @@ class MainWindow(QMainWindow):
             self._default_zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(cfg['zoom'])))
         except (KeyError, ValueError):
             self._default_zoom = 100
+        valid_scrollback = {lines for _, lines in SCROLLBACK_CHOICES}
+        try:
+            self._scrollback = int(cfg['scrollback'])
+            if self._scrollback not in valid_scrollback:
+                self._scrollback = 0
+        except (KeyError, ValueError):
+            self._scrollback = 0
 
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
@@ -86,6 +101,7 @@ class MainWindow(QMainWindow):
         term.apply_zoom(self._default_zoom)
         term.apply_mode(self._default_mode)
         term.apply_colors(self._default_colors)
+        term.apply_scrollback(self._scrollback)
         term.zoom_step.connect(self._on_zoom_step)
         term.shell_exited.connect(lambda t=term: self._on_shell_exited(t))
         index = self.tabs.addTab(term, 'shell')
@@ -216,12 +232,36 @@ class MainWindow(QMainWindow):
         self._default_colors = bool(enabled)
         self._persist()
 
+    def set_scrollback(self, lines):
+        self._scrollback = int(lines)
+        for i in range(self.tabs.count()):
+            self.tabs.widget(i).apply_scrollback(lines)
+        self._persist()
+
+    def save_transcript(self):
+        term = self.current()
+        if term is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save Transcript', 'secure-terminal-transcript.txt',
+            'Text files (*.txt);;All files (*)')
+        if not path:
+            return
+        # The buffer is already sanitized plain ASCII, so the saved file is safe
+        # to open anywhere -- unlike a normal terminal's raw log.
+        try:
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write(term.toPlainText())
+        except OSError:
+            pass
+
     def _persist(self):
         settings.save({
             'theme': self._default_theme,
             'zoom': str(self._default_zoom),
             'unicode_mode': self._default_mode,
             'colors': 'true' if self._default_colors else 'false',
+            'scrollback': str(self._scrollback),
         })
 
     # -- chrome ---------------------------------------------------------------
@@ -240,6 +280,15 @@ class MainWindow(QMainWindow):
         self.act_close.triggered.connect(
             lambda: self.close_tab(self.tabs.currentIndex()))
         file_menu.addAction(self.act_close)
+
+        self.act_save = QAction(QIcon.fromTheme('document-save'),
+                                '&Save Transcript...', self)
+        self.act_save.setShortcut(QKeySequence('Ctrl+Shift+S'))
+        self.act_save.setToolTip(
+            'Save this tab\'s scrollback to a file. It is already sanitized '
+            'plain ASCII, so the saved file is safe to open anywhere.')
+        self.act_save.triggered.connect(self.save_transcript)
+        file_menu.addAction(self.act_save)
 
         file_menu.addSeparator()
         self.act_terminate = QAction(QIcon.fromTheme('process-stop'),
@@ -318,6 +367,17 @@ class MainWindow(QMainWindow):
             'invisibly, and forced off by NO_COLOR or TERM=dumb.')
         self.act_colors.toggled.connect(self.set_colors)
         view_menu.addAction(self.act_colors)
+
+        view_menu.addSeparator()
+        sb_menu = view_menu.addMenu('&Scrollback')
+        sb_group = QActionGroup(self)
+        sb_group.setExclusive(True)
+        for label, lines in SCROLLBACK_CHOICES:
+            act = QAction(label, self, checkable=True)
+            act.setChecked(lines == self._scrollback)
+            act.triggered.connect(lambda _checked, n=lines: self.set_scrollback(n))
+            sb_group.addAction(act)
+            sb_menu.addAction(act)
 
     def _build_toolbar(self):
         bar = QToolBar('Main', self)

@@ -55,6 +55,14 @@ The safety model above does not cost you the usual conveniences:
   read a log, while still neutralizing the invisible, bidi and homoglyph classes.
   Reveal shows every non-ASCII character as a `<U+XXXX>` badge to inspect exactly
   what is there. Escapes are stripped in every mode.
+- **Save transcript** (File menu, `Ctrl+Shift+S`). Writes the current tab's
+  scrollback to a file. Because the buffer is already sanitized plain ASCII, the
+  saved file is safe to open anywhere, unlike a normal terminal's raw log.
+- **Scrollback length** (View menu): 1,000 / 10,000 / 100,000 lines or Unlimited
+  (default). Kept in memory only, not written to disk.
+- **Persistent settings**: theme, zoom, unicode mode, colors and scrollback are
+  remembered between runs in `~/.config/secure-terminal/config`, a plain
+  KEY=value file you can edit by hand.
 - **Menu bar** for the same actions, discoverable rather than memorized.
 
 ## What it does not do (on purpose)
