@@ -116,6 +116,8 @@ class MainWindow(QMainWindow):
 
         self._theme_actions = {}
         self._mode_actions = {}
+        self._user_titles = {}       # term -> user-set tab name
+        self._prog_titles = {}       # term -> program (OSC) title
         self._build_menu()
         self._build_toolbar()
         self.new_tab()
@@ -151,6 +153,8 @@ class MainWindow(QMainWindow):
         if term is None:
             return
         term.shutdown()
+        self._user_titles.pop(term, None)
+        self._prog_titles.pop(term, None)
         self.tabs.removeTab(index)
         term.deleteLater()
         if self.tabs.count() == 0:
@@ -161,15 +165,35 @@ class MainWindow(QMainWindow):
         if index != -1:
             self.close_tab(index)
 
-    # -- tab label: rename + colour -------------------------------------------
+    # -- tab label: user name + program title kept separately -----------------
     def rename_tab(self, index):
         if index < 0:
             return
+        term = self.tabs.widget(index)
+        current = self._user_titles.get(term, '')
         name, ok = QInputDialog.getText(
-            self, 'Rename Tab', 'Tab name:', text=self.tabs.tabText(index))
+            self, 'Rename Tab', 'Tab name:',
+            text=current or self.tabs.tabText(index))
         if ok:
-            # plain text only; setTabText does not interpret markup
-            self.tabs.setTabText(index, name.strip() or 'shell')
+            # a user name takes precedence over any program-set title, and is
+            # not lost when a program later sets its own title.
+            self._user_titles[term] = name.strip()
+            self._refresh_tab_label(term)
+
+    def _refresh_tab_label(self, term):
+        index = self.tabs.indexOf(term)
+        if index < 0:
+            return
+        user = self._user_titles.get(term)
+        program = self._prog_titles.get(term)
+        # plain text only; setTabText does not interpret markup
+        self.tabs.setTabText(index, user or program or 'shell')
+        parts = []
+        if user:
+            parts.append('name: ' + user)
+        if program:
+            parts.append('program: ' + program)
+        self.tabs.setTabToolTip(index, '\n'.join(parts))
 
     def set_tab_color(self, index, color):
         if index < 0:
@@ -338,9 +362,9 @@ class MainWindow(QMainWindow):
         self._persist()
 
     def _on_tab_title(self, term, title):
-        index = self.tabs.indexOf(term)
-        if index != -1 and title:
-            self.tabs.setTabText(index, title)
+        if title:
+            self._prog_titles[term] = title
+            self._refresh_tab_label(term)
 
     def _on_notify(self, text):
         # passive, non-intrusive: a timed status-bar message, already ASCII-safe
