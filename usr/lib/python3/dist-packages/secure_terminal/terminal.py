@@ -17,14 +17,17 @@ Design (see https://secure-terminal.github.io):
   carriage return (readline sends "\b \b" to rub out a character and redraw after
   tab-completion/history; zsh returns to column 0 with a carriage return to draw
   its prompt) regardless of the pty's echo flag, so a terminal that dropped them
-  could not display line editing at all. Backspace erases the character to its
-  left; carriage return clears the current line back to column 0. BOTH are
-  bounded to the current line and can never reach an earlier line or the
-  scrollback. The residual is that a program which prints its own backspaces or
-  carriage returns can rewrite text WITHIN the line it is on (e.g. "bad\b\b\bok"
-  shows "ok"); this is far narrower than cursor addressing and cannot touch
-  already-committed lines, but it is the one lie this terminal cannot fully
-  refuse without breaking interactive editing.
+  could not display line editing at all. Terminal overwrite semantics apply on
+  the current line: backspace moves the cursor one cell left, a bare carriage
+  return moves it to column 0, and a printable character overwrites the cell
+  under the cursor (never inserting-and-shifting). "\r\n" is collapsed to "\n"
+  first, since the pty maps every newline to CRLF and that carriage return is
+  only a line ending. BOTH controls are bounded to the current line and can
+  never reach an earlier line or the scrollback. The residual is that a program
+  which prints its own backspaces or carriage returns can rewrite text WITHIN
+  the line it is on (e.g. "bad\b\b\bok" shows "ok"); this is far narrower than
+  cursor addressing and cannot touch already-committed lines, but it is the one
+  lie this terminal cannot fully refuse without breaking interactive editing.
 
 - PASTE is sanitized the same way before it reaches the shell, so invisible or
   bidi characters copied from a web page never enter your command line.
@@ -217,47 +220,53 @@ class SecureTerminal(QPlainTextEdit):
     def _append(self, text):
         if not text:
             return
+        # CRLF is just a line ending: the pty maps every "\n" to "\r\n" on
+        # output, so a carriage return glued to a newline carries no cursor
+        # meaning and must NOT redraw the line -- collapse it first.
+        text = text.replace('\r\n', '\n')
         cursor = self.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        # Fast path: ordinary output carries no cursor controls, so insert whole.
+        # Fast path: ordinary output now carries no cursor controls -> append.
         if '\x08' not in text and '\r' not in text:
             cursor.insertText(text)
             self.setTextCursor(cursor)
             self.ensureCursorVisible()
             return
         # Slow path: honor the two line-local cursor controls the shell's line
-        # editor emits. Backspace (0x08) erases the character to its left;
-        # carriage return (0x0D) clears the current line back to column 0 so it
-        # can be redrawn (zsh's prompt, a progress bar). Neither crosses a line
-        # boundary, so program output can never rewrite an earlier line or the
-        # scrollback; U+2029 is Qt's block (newline) separator.
+        # editor emits, with terminal overwrite semantics. Backspace (0x08)
+        # moves the cursor one cell left; a bare carriage return (0x0D) moves it
+        # to column 0; a printable character OVERWRITES the cell under the cursor
+        # (a real terminal never inserts-and-shifts) and only appends at the end
+        # of the line. All of it is bounded to the current line -- a program can
+        # never reach an earlier line or the scrollback -- and there is still no
+        # vertical or absolute cursor movement, because those arrive as escape
+        # sequences, which are stripped. U+2029 is Qt's block (newline) separator.
         move = QTextCursor.MoveOperation
         keep = QTextCursor.MoveMode.KeepAnchor
-        run = ''
+        sep = 0x2029
         for ch in text:
-            if ch == '\x08':
-                if run:
-                    cursor.insertText(run)
-                    run = ''
+            if ch == '\n':
+                cursor.movePosition(move.EndOfBlock)
+                cursor.insertText('\n')
+            elif ch == '\r':
+                cursor.movePosition(move.StartOfBlock)
+            elif ch == '\x08':
                 probe = QTextCursor(cursor)
                 probe.movePosition(move.Left, keep)
                 sel = probe.selectedText()
-                if sel and ord(sel[0]) not in (0x0A, 0x2029):
-                    probe.removeSelectedText()
-                    cursor = probe
-            elif ch == '\r':
-                if run:
-                    cursor.insertText(run)
-                    run = ''
-                probe = QTextCursor(cursor)
-                probe.movePosition(move.StartOfBlock, keep)
-                if probe.selectedText():
-                    probe.removeSelectedText()
-                    cursor = probe
+                if sel and ord(sel[0]) != sep:
+                    cursor.movePosition(move.Left)
             else:
-                run += ch
-        if run:
-            cursor.insertText(run)
+                probe = QTextCursor(cursor)
+                probe.movePosition(move.Right, keep)
+                sel = probe.selectedText()
+                if sel and ord(sel[0]) != sep:
+                    # overwrite the cell under the cursor: select it with the
+                    # main cursor and replace, so the cursor stays consistent.
+                    cursor.movePosition(move.Right, keep)
+                    cursor.insertText(ch)
+                else:
+                    cursor.insertText(ch)         # end of line -> append
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
 
