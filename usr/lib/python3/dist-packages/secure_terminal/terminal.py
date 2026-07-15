@@ -166,6 +166,22 @@ def sanitize_paste(text):
     return ''.join(out)
 
 
+def paste_findings(text):
+    """Classify a to-be-pasted string as (has_unicode, has_control), so a paste
+    of anything but plain ASCII + tab/newline can be flagged before it is sent to
+    the shell."""
+    has_unicode = has_control = False
+    for ch in text:
+        cp = ord(ch)
+        if ch in ('\n', '\r', '\t') or 0x20 <= cp <= 0x7E:
+            continue
+        if cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
+            has_control = True
+        else:
+            has_unicode = True
+    return has_unicode, has_control
+
+
 class SecureTerminal(QPlainTextEdit):
     # emitted when the child shell exits, so the window can close its tab
     shell_exited = pyqtSignal()
@@ -199,6 +215,9 @@ class SecureTerminal(QPlainTextEdit):
 
         # scrollback limit in lines (0 = unlimited, the QPlainTextEdit default).
         self._scrollback = 0
+
+        # seconds the paste-warning "Allow" button stays disabled.
+        self._paste_delay = 3
 
         self._notifier = None
         self._fd = None
@@ -245,6 +264,12 @@ class SecureTerminal(QPlainTextEdit):
 
     def current_scrollback(self):
         return self._scrollback
+
+    def apply_paste_delay(self, seconds):
+        self._paste_delay = max(0, int(seconds))
+
+    def current_paste_delay(self):
+        return self._paste_delay
 
     # -- optional ANSI colours ------------------------------------------------
     def apply_colors(self, enabled):
@@ -583,8 +608,16 @@ class SecureTerminal(QPlainTextEdit):
             self._write(text.encode('ascii'))
         # non-ASCII input and arrow/navigation keys are intentionally ignored
 
-    # -- paste: sanitize before it reaches the shell --------------------------
+    # -- paste: warn on, then sanitize, anything unusual ----------------------
     def insertFromMimeData(self, source):
-        safe = sanitize_paste(source.text())
+        raw = source.text()
+        # A plain-ASCII paste goes straight through; only warn when the clipboard
+        # carries unicode or control characters -- the case worth a second look.
+        has_unicode, has_control = paste_findings(raw)
+        if has_unicode or has_control:
+            from secure_terminal.dialog import PasteWarningDialog
+            if not PasteWarningDialog.confirm(raw, self._paste_delay, self):
+                return
+        safe = sanitize_paste(raw)
         if safe:
             self._write(safe.encode('ascii'))

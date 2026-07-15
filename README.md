@@ -20,9 +20,13 @@ removed at the source.
 - **No escape-sequence interpretation.** There is no ANSI parser to attack. The
   terminal advertises `TERM=dumb` and honors no cursor moves, colors, alternate
   screens or OSC hyperlinks from the child process.
-- **Sanitized paste.** Pasted text is stripped to printable ASCII before it
-  reaches the shell, so invisible or bidi characters never enter your command
-  line.
+- **Sanitized paste, with a warning.** Pasted text is stripped to printable
+  ASCII before it reaches the shell, so invisible or bidi characters never enter
+  your command line. When a paste actually contains unicode or control
+  characters, a dialog first shows it two ways side by side, the original and a
+  Reveal rendering that makes every hidden character visible, and holds the
+  Allow button disabled for a few seconds (configurable) so a stray Enter cannot
+  wave a hostile paste through. A plain-ASCII paste is not interrupted.
 - **Tiny input allowlist.** You type printable ASCII plus a small set of control
   keys that the pseudo-terminal turns into signals:
 

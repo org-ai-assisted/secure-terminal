@@ -43,6 +43,14 @@ SCROLLBACK_CHOICES = [
     ('Unlimited', 0),
 ]
 
+# menu label -> paste-warning "Allow" delay in seconds
+PASTE_DELAY_CHOICES = [
+    ('No delay', 0),
+    ('1 second', 1),
+    ('3 seconds', 3),
+    ('5 seconds', 5),
+]
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -72,6 +80,10 @@ class MainWindow(QMainWindow):
                 self._scrollback = 0
         except (KeyError, ValueError):
             self._scrollback = 0
+        try:
+            self._paste_delay = max(0, min(60, int(cfg['paste_delay'])))
+        except (KeyError, ValueError):
+            self._paste_delay = 3
 
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
@@ -102,6 +114,7 @@ class MainWindow(QMainWindow):
         term.apply_mode(self._default_mode)
         term.apply_colors(self._default_colors)
         term.apply_scrollback(self._scrollback)
+        term.apply_paste_delay(self._paste_delay)
         term.zoom_step.connect(self._on_zoom_step)
         term.shell_exited.connect(lambda t=term: self._on_shell_exited(t))
         index = self.tabs.addTab(term, 'shell')
@@ -238,6 +251,12 @@ class MainWindow(QMainWindow):
             self.tabs.widget(i).apply_scrollback(lines)
         self._persist()
 
+    def set_paste_delay(self, seconds):
+        self._paste_delay = int(seconds)
+        for i in range(self.tabs.count()):
+            self.tabs.widget(i).apply_paste_delay(seconds)
+        self._persist()
+
     def save_transcript(self):
         term = self.current()
         if term is None:
@@ -262,6 +281,7 @@ class MainWindow(QMainWindow):
             'unicode_mode': self._default_mode,
             'colors': 'true' if self._default_colors else 'false',
             'scrollback': str(self._scrollback),
+            'paste_delay': str(self._paste_delay),
         })
 
     # -- chrome ---------------------------------------------------------------
@@ -378,6 +398,16 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _checked, n=lines: self.set_scrollback(n))
             sb_group.addAction(act)
             sb_menu.addAction(act)
+
+        pd_menu = view_menu.addMenu('&Paste delay')
+        pd_group = QActionGroup(self)
+        pd_group.setExclusive(True)
+        for label, secs in PASTE_DELAY_CHOICES:
+            act = QAction(label, self, checkable=True)
+            act.setChecked(secs == self._paste_delay)
+            act.triggered.connect(lambda _checked, n=secs: self.set_paste_delay(n))
+            pd_group.addAction(act)
+            pd_menu.addAction(act)
 
     def _build_toolbar(self):
         bar = QToolBar('Main', self)
