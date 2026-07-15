@@ -64,122 +64,19 @@ from PyQt6.QtCore import QSocketNotifier, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor, QColor, QPalette, QTextCharFormat
 from PyQt6.QtWidgets import QPlainTextEdit
 
-# Standard 16-colour ANSI palette (xterm-ish); indexes 0-7 normal, 8-15 bright.
-ANSI_PALETTE = [
-    '#000000', '#cd0000', '#00cd00', '#cdcd00',
-    '#0000ee', '#cd00cd', '#00cdcd', '#e5e5e5',
-    '#7f7f7f', '#ff0000', '#00ff00', '#ffff00',
-    '#5c5cff', '#ff00ff', '#00ffff', '#ffffff',
-]
-
-
-def colors_allowed():
-    """False when the environment says never colour -- NO_COLOR is set (per the
-    no-color.org spec: presence, any value) or the outer TERM is 'dumb'. Colours
-    are opt-in per tab anyway; this lets the environment force them off."""
-    if os.environ.get('NO_COLOR'):
-        return False
-    if os.environ.get('TERM', '') == 'dumb':
-        return False
-    return True
-
-
-def _luminance(color):
-    return 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
-
-
-def _too_close(a, b):
-    """True when two colours are so close that text would be near-invisible --
-    the guard that stops a program painting black-on-black. Kept low so ordinary
-    colours (e.g. red on a near-black background) are still allowed; it only
-    catches genuinely unreadable, deceptive combinations."""
-    return abs(_luminance(a) - _luminance(b)) < 30
-
-# name -> (background, foreground). "dark" is white-on-black, "light" is the
-# reverse; both are plain, high-contrast, no syntax coloring.
-THEMES = {
-    'dark':  ('#14161b', '#e6e6e6'),
-    'light': ('#ffffff', '#1a1a1a'),
-}
-BASE_POINT_SIZE = 11
-
-# How non-ASCII / unsafe content in program OUTPUT is shown:
-#   'strip'  -- replace with '_' (default, safe), as sanitize-string/stcat do.
-#   'show'   -- render a non-ASCII character as its glyph when it is printable
-#               (str.isprintable() excludes the invisible, bidi and format
-#               characters that make unicode deceptive), so a log with useful
-#               unicode is readable; control still becomes '_'.
-#   'reveal' -- replace with a visible <U+XXXX> codepoint badge, to inspect.
-DISPLAY_MODES = ('strip', 'show', 'reveal')
-
-# CSI (ESC [ ...), OSC (ESC ] ... BEL/ST) and other two-byte escapes.
-_ANSI = re.compile(
-    r'\x1b\[[0-9;?]*[ -/]*[@-~]'
-    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?'
-    r'|\x1b[@-Z\\-_]'
+# The pure, Qt-free sanitization core (also tested directly by dist-ai). Names
+# are re-exported here so terminal.py stays the single import point for the rest
+# of the package (main.py, dialog.py).
+from secure_terminal.sanitize import (
+    THEMES, BASE_POINT_SIZE, ANSI_PALETTE, DISPLAY_MODES,
+    ANSI_RE as _ANSI, SGR_RE as _SGR,
+    colors_allowed, too_close, render_output, sanitize_bytes, sanitize_paste,
+    paste_findings, parse_sgr,
 )
 
-# SGR: ESC [ <params> m -- the only escape sequence honored, and only when
-# colours are enabled. Everything else is still stripped.
-_SGR = re.compile(r'\x1b\[([0-9;]*)m')
 
-
-def render_output(text, mode='strip'):
-    """Turn decoded child output into safe display text under one display mode.
-    Escape sequences are always removed (there is no ANSI parser). Printable
-    ASCII, tab and newline, and the two interactive cursor controls backspace
-    (0x08) and carriage return (0x0D) always pass through -- _append() honors the
-    latter two as line-local edits. Everything else is handled per `mode`
-    (see DISPLAY_MODES)."""
-    text = _ANSI.sub('', text)
-    out = []
-    for ch in text:
-        cp = ord(ch)
-        if cp in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= cp <= 0x7E:
-            out.append(ch)
-        elif mode == 'reveal':
-            out.append('<U+%04X>' % cp)
-        elif mode == 'show' and cp >= 0x80 and ch.isprintable():
-            out.append(ch)
-        else:
-            out.append('_')
-    return ''.join(out)
-
-
-def sanitize_bytes(data, mode='strip'):
-    """Convenience wrapper: decode raw bytes 1:1 (latin-1) and render. Used by
-    tests and any all-ASCII path; the live output stream in _on_readable uses an
-    incremental UTF-8 decoder so multi-byte characters survive read boundaries."""
-    return render_output(data.decode('latin-1'), mode)
-
-
-def sanitize_paste(text):
-    """Strip a pasted string to printable ASCII; newlines become carriage returns."""
-    out = []
-    for ch in text:
-        cp = ord(ch)
-        if ch == '\n' or ch == '\r':
-            out.append('\r')
-        elif ch == '\t' or 0x20 <= cp <= 0x7E:
-            out.append(ch)
-        # everything else (invisible, bidi, homoglyph, control) is dropped
-    return ''.join(out)
-
-
-def paste_findings(text):
-    """Classify a to-be-pasted string as (has_unicode, has_control), so a paste
-    of anything but plain ASCII + tab/newline can be flagged before it is sent to
-    the shell."""
-    has_unicode = has_control = False
-    for ch in text:
-        cp = ord(ch)
-        if ch in ('\n', '\r', '\t') or 0x20 <= cp <= 0x7E:
-            continue
-        if cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
-            has_control = True
-        else:
-            has_unicode = True
-    return has_unicode, has_control
+def _rgb(color):
+    return (color.red(), color.green(), color.blue())
 
 
 class SecureTerminal(QPlainTextEdit):
@@ -283,63 +180,31 @@ class SecureTerminal(QPlainTextEdit):
         return self._colors and colors_allowed()
 
     def _sgr_reset(self):
-        self._sgr_fg = None      # palette index, or None for the default
-        self._sgr_bg = None
-        self._sgr_bold = False
+        # palette indexes (or None for default) + bold; folded by parse_sgr.
+        self._sgr = {'fg': None, 'bg': None, 'bold': False}
 
     def _apply_sgr(self, param_str):
-        nums = [int(p) if p.isdigit() else 0
-                for p in (param_str.split(';') if param_str else ['0'])]
-        i = 0
-        while i < len(nums):
-            n = nums[i]
-            if n == 0:
-                self._sgr_reset()
-            elif n == 1:
-                self._sgr_bold = True
-            elif n == 22:
-                self._sgr_bold = False
-            elif 30 <= n <= 37:
-                self._sgr_fg = n - 30
-            elif 90 <= n <= 97:
-                self._sgr_fg = n - 90 + 8
-            elif n == 39:
-                self._sgr_fg = None
-            elif 40 <= n <= 47:
-                self._sgr_bg = n - 40
-            elif 100 <= n <= 107:
-                self._sgr_bg = n - 100 + 8
-            elif n == 49:
-                self._sgr_bg = None
-            elif n in (38, 48):
-                # 8-bit (5;n) and 24-bit (2;r;g;b) colours: consume the extra
-                # parameters and fall back to the default (not in the safe set).
-                if i + 1 < len(nums) and nums[i + 1] == 5:
-                    i += 2
-                elif i + 1 < len(nums) and nums[i + 1] == 2:
-                    i += 4
-            i += 1
+        parse_sgr(param_str, self._sgr)
 
     def _current_format(self):
         """Build the QTextCharFormat for the current SGR state, guarding against
         an unreadable foreground/background combination."""
         fmt = QTextCharFormat()
-        if self._sgr_fg is None and self._sgr_bg is None and not self._sgr_bold:
+        fg_i, bg_i, bold = self._sgr['fg'], self._sgr['bg'], self._sgr['bold']
+        if fg_i is None and bg_i is None and not bold:
             return fmt
         base_bg, base_fg = THEMES.get(self._theme, THEMES['dark'])
-        fg = QColor(ANSI_PALETTE[self._sgr_fg]) if self._sgr_fg is not None \
-            else QColor(base_fg)
-        bg = QColor(ANSI_PALETTE[self._sgr_bg]) if self._sgr_bg is not None \
-            else None
+        fg = QColor(ANSI_PALETTE[fg_i]) if fg_i is not None else QColor(base_fg)
+        bg = QColor(ANSI_PALETTE[bg_i]) if bg_i is not None else None
         eff_bg = bg if bg is not None else QColor(base_bg)
-        if _too_close(fg, eff_bg):
+        if too_close(_rgb(fg), _rgb(eff_bg)):
             fg = QColor(base_fg)          # never let the text vanish
-            if bg is not None and _too_close(fg, bg):
+            if bg is not None and too_close(_rgb(fg), _rgb(bg)):
                 bg = None                 # base text collides with the bg -> drop it
         fmt.setForeground(fg)
         if bg is not None:
             fmt.setBackground(bg)
-        if self._sgr_bold:
+        if bold:
             fmt.setFontWeight(QFont.Weight.Bold)
         return fmt
 

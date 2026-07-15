@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+
+# debian build artifacts
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/secure-terminal/
