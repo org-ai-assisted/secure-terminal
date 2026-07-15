@@ -1,5 +1,5 @@
 ## Config for the org-ai-assisted/dist-ai reusable test workflow.
-## The widget test suite runs secure-terminal offscreen, so the container needs
-## PyQt6 and pyte on top of python3.
+## The widget suite runs secure-terminal offscreen (PyQt6 + pyte) and the fuzz
+## suite uses hypothesis, so the container needs these on top of python3.
 dist-ai-tests:
-  apt-packages: "python3 python3-pyqt6 python3-pyte"
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis"
