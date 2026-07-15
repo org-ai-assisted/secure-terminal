@@ -71,9 +71,14 @@ The safety model above does not cost you the usual conveniences:
   resurrected. Turn it off, or clear the saved session, from the File menu; when
   off, nothing is written. An unlimited tab's saved scrollback is capped so the
   file cannot grow without bound.
-- **Persistent settings**: theme, zoom, unicode mode, colors, scrollback and the
-  other toggles are remembered between runs in `~/.config/secure-terminal/config`,
-  a plain KEY=value file you can edit by hand.
+- **Persistent settings** in systemd-style drop-in directories. Settings are
+  KEY=value `.conf` files read, lowest precedence first, from
+  `/etc/secure-terminal.d/`, `/usr/local/etc/secure-terminal.d/` and
+  `~/.config/secure-terminal.d/` -- so a distro or admin can seed defaults and
+  the user overrides them. Only `*.conf` files are read; within a directory they
+  apply in lexical order, later winning. The app writes its own settings to
+  `~/.config/secure-terminal.d/99-user.conf`. **Settings -> Folders & Files...**
+  shows every location with Copy and Open buttons.
 - **Tabs you can name and colour.** Double-click a tab to rename it; right-click
   for rename, a colour, or close. Handy when several tabs each run a different
   TUI. A user name and a program-set title are kept separately (your name wins as

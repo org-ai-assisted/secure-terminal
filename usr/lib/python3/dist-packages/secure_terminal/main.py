@@ -5,17 +5,19 @@
 
 """Application entry point and main window for secure-terminal."""
 
+import os
 import signal
 import sys
 
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, QUrl
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QIcon, QColor, QPixmap,
+    QDesktopServices,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QToolBar, QSpinBox, QLabel,
     QWidget, QSizePolicy, QComboBox, QFileDialog, QInputDialog, QColorDialog,
-    QMenu,
+    QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
 )
 
 from secure_terminal import settings, session
@@ -635,6 +637,14 @@ class MainWindow(QMainWindow):
             pd_group.addAction(act)
             pd_menu.addAction(act)
 
+        settings_menu = bar.addMenu('&Settings')
+        act_locations = QAction('&Folders & Files...', self)
+        act_locations.setToolTip(
+            'Show where settings and session state are stored, with buttons to '
+            'copy the path or open the folder.')
+        act_locations.triggered.connect(self.show_locations)
+        settings_menu.addAction(act_locations)
+
     def _build_toolbar(self):
         bar = QToolBar('Main', self)
         bar.setMovable(False)
@@ -717,6 +727,46 @@ class MainWindow(QMainWindow):
 
     def clear_saved_session(self):
         session.clear()
+
+    # -- settings / state locations -------------------------------------------
+    def _open_path(self, path):
+        # open the folder in the file manager; fall back to its parent when the
+        # path itself does not exist yet (e.g. an unused drop-in dir).
+        target = path if os.path.exists(path) else os.path.dirname(path)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(target))
+
+    def show_locations(self):
+        rows = [('Settings (written here)', settings.user_config_file())]
+        labels = ['System drop-in', 'Local drop-in', 'User drop-in']
+        for label, directory in zip(labels, settings.config_dirs()):
+            rows.append((label, directory))
+        rows.append(('Saved session', session.session_path()))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Folders & Files')
+        grid = QGridLayout(dialog)
+        grid.addWidget(QLabel(
+            'Settings are read from these .conf drop-in directories (later '
+            'overrides earlier); the app writes to the first file. Session state '
+            'is separate.'), 0, 0, 1, 4)
+        for row, (label, path) in enumerate(rows, start=1):
+            grid.addWidget(QLabel(label), row, 0)
+            field = QLineEdit(path)
+            field.setReadOnly(True)
+            field.setMinimumWidth(380)
+            grid.addWidget(field, row, 1)
+            copy = QPushButton('Copy')
+            copy.clicked.connect(
+                lambda _checked, p=path: QApplication.clipboard().setText(p))
+            grid.addWidget(copy, row, 2)
+            open_button = QPushButton('Open')
+            open_button.clicked.connect(
+                lambda _checked, p=path: self._open_path(p))
+            grid.addWidget(open_button, row, 3)
+        close = QPushButton('Close')
+        close.clicked.connect(dialog.accept)
+        grid.addWidget(close, len(rows) + 1, 3)
+        dialog.exec()
 
     # -- lifecycle ------------------------------------------------------------
     def closeEvent(self, event):
