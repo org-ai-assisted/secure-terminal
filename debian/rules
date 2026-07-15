@@ -3,5 +3,10 @@
 ## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
+## No --with python3: dh_python3 rewrites the "#!/usr/bin/python3 -Bsu" shebang
+## (dropping -Bsu) and byte-compiles the module to .pyc at install time. We want
+## neither -- the launcher runs with -B so no bytecode cache is ever written --
+## so the module is shipped as plain .py via debian/install and dependencies are
+## declared explicitly in debian/control.
 %:
-	dh $@ --with python3
+	dh $@
