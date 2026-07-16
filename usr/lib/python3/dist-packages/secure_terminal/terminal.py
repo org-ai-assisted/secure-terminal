@@ -49,8 +49,8 @@ Design (see https://secure-terminal.github.io):
 
 This is a deliberately minimal, line-oriented terminal by default: TERM is
 "dumb" and no escapes are parsed. An opt-in TUI mode (apply_tui) interprets
-escapes through a pyte screen model so full-screen programs (ssh, an editor, the
-Claude Code CLI) work; even then every cell is still character-filtered and pyte
+escapes through a pyte screen model so full-screen programs (ssh, vim, htop,
+tmux) work; even then every cell is still character-filtered and pyte
 has no OS reach (it cannot set the title or touch the clipboard). The window
 flags TUI mode with a visible risk indicator; the strict line mode remains the
 safe-by-construction default.
@@ -164,7 +164,7 @@ class SecureTerminal(QPlainTextEdit):
         self._paste_delay = 3
 
         # TUI mode: interpret escapes through a pyte screen so full-screen
-        # programs (ssh, Claude Code) work. Off by default; the strict, no-parser
+        # programs (ssh, vim, htop, tmux) work. Off by default; the strict, no-parser
         # line mode above is the safe default.
         self._tui = bool(tui) and tui_available()
         self._command = command
@@ -470,7 +470,7 @@ class SecureTerminal(QPlainTextEdit):
         if pid == 0:
             # child. In line mode advertise a dumb terminal so programs do not
             # emit escape-heavy output; in TUI mode advertise a real terminal so
-            # ncurses / Claude Code / a remote shell over ssh drive it properly.
+            # ncurses / an editor / a remote shell over ssh drive it properly.
             os.environ['TERM'] = 'xterm-256color' if self._tui else 'dumb'
             os.environ.setdefault('PAGER', 'cat')
             # `command` is an optional program to run (split like a shell word

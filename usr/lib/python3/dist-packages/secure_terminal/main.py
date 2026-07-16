@@ -26,7 +26,7 @@ from secure_terminal.terminal import (
 )
 
 TUI_TOOLTIP = (
-    'TUI mode runs full-screen programs (ssh, an editor, Claude Code) by '
+    'TUI mode runs full-screen programs (ssh, vim, htop, tmux) by '
     'interpreting the terminal escape sequences the strict default mode refuses. '
     'It stays confined to an isolated screen model: the window title and system '
     'clipboard cannot be touched, and every character is still '
