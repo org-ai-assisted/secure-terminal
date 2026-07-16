@@ -39,7 +39,7 @@ TUI_TOOLTIP = (
     'clipboard cannot be touched, and every character is still '
     'ASCII/unicode-filtered, so invisible or homoglyph text cannot hide. But a '
     'program CAN draw a misleading interface within its screen, so only run '
-    'programs you trust. The default line mode remains safe by construction.')
+    'programs you trust. The default CLI mode remains safe by construction.')
 
 ZOOM_MIN = 25
 ZOOM_MAX = 400
@@ -827,7 +827,7 @@ class MainWindow(QMainWindow):
 
     def _mode_level(self):
         """The interpretation (mode) risk axis: TUI interprets escapes in a
-        confined screen (yellow); the strict line mode is green."""
+        confined screen (yellow); the strict CLI mode is green."""
         term = self.current()
         if term is not None and term.tui_active():
             return ('#e5a50a', 'TUI',
@@ -842,12 +842,17 @@ class MainWindow(QMainWindow):
                     'program you run (nano, bash) has your normal user access, as '
                     'in any terminal, and can still draw a misleading interface '
                     'within its own screen, so only run programs you trust.\n\n'
-                    'Turn TUI mode off to return to the safe line mode.')
-        return ('#1f8a54', 'Line',
-                'Mode: LINE (green, the safe default).\n\n'
-                'No escape parser (TERM=dumb): program output is reduced to '
-                'printable ASCII and every escape sequence is removed. There is '
-                'nothing on screen a program can use to deceive you.')
+                    'Turn TUI mode off to return to the safe CLI mode.')
+        return ('#1f8a54', 'CLI',
+                'Mode: CLI (green, the safe default).\n\n'
+                'No escape parser (TERM=dumb): every escape sequence in program '
+                'output is removed -- in every unicode display mode. So merely '
+                'viewing a file or log (the "cat a crafted file and it runs a '
+                'command" risk) cannot execute anything here, whatever the '
+                'unicode setting.\n\n'
+                'How non-ASCII characters themselves are shown is the separate '
+                'unicode setting (Strip / Reveal / Show); none of those re-enable '
+                'escapes, so none can be used to deceive you into running code.')
 
     def _update_security_indicator(self):
         for lamp, level, axis in (
@@ -1244,9 +1249,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         body = QLabel(
             'A terminal where paste is safe by construction.<br><br>'
-            'Program output is reduced to printable ASCII with no escape parser, '
-            'so a printed or pasted lie cannot redraw, reorder or hide what you '
-            'see. Pasting is sanitized and warned on. It is written in a '
+            'There is no escape parser, so every escape sequence in program '
+            'output is removed and a printed or pasted lie cannot redraw, '
+            'reorder or hide what you see -- and merely viewing a file cannot run '
+            'code. Non-ASCII characters are stripped, revealed or shown as you '
+            'choose. Pasting is sanitized and warned on. It is written in a '
             'memory-safe language.<br><br>'
             '<a href="https://secure-terminal.github.io">secure-terminal.github.io</a>'
             '<br><a href="https://output-lies.github.io">output-lies.github.io</a>'
@@ -1522,7 +1529,7 @@ class MainWindow(QMainWindow):
         # full-screen). TUI is the riskier choice, so its chip is yellow.
         mode_frame, self._tui_buttons = self._chip_group('mode:', (
             ('cli', 'CLI', None,
-             'Line mode: program output is reduced to safe display, the default.'),
+             'CLI mode: program output is shown as safe display, the default.'),
             ('tui', 'TUI', '#e5a50a', TUI_TOOLTIP),
         ), lambda k: self.set_tui(k == 'tui'))
         self._tui_frame = mode_frame
@@ -1722,7 +1729,7 @@ def _launch_parser(with_globals):
     p.add_argument('--tui', action='store_true', default=None,
                    help='start this tab in TUI mode')
     p.add_argument('--no-tui', dest='tui', action='store_false',
-                   help='start this tab in line mode')
+                   help='start this tab in CLI mode')
     p.add_argument('--mode', choices=list(DISPLAY_MODES),
                    help='initial unicode display mode')
     p.add_argument('-e', '--command', dest='cmd_string', metavar='STRING',

@@ -711,7 +711,7 @@ class SecureTerminal(QPlainTextEdit):
         if not self._tui_hint_shown and entered:
             self._tui_hint_shown = True
             self._advise('This program wants a full-screen interface, which the '
-                         'safe line mode cannot draw. Turn on TUI mode to run it '
+                         'safe CLI mode cannot draw. Turn on TUI mode to run it '
                          'here.')
 
     def _feed_stream(self, data):
