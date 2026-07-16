@@ -54,14 +54,13 @@ SGR_RE = re.compile(r'\x1b\[([0-9;]*)m')
 
 
 def colors_allowed():
-    """False when the environment says never colour -- NO_COLOR is set (per the
-    no-color.org spec: presence, any value) or the outer TERM is 'dumb'. Colours
-    are opt-in per tab anyway; this lets the environment force them off."""
-    if os.environ.get('NO_COLOR'):
-        return False
-    if os.environ.get('TERM', '') == 'dumb':
-        return False
-    return True
+    """False only when NO_COLOR is set (per no-color.org: presence, any value),
+    a legitimate user-wide opt-out. Colours are opt-in per tab anyway. The
+    terminal's OWN launch TERM is deliberately NOT consulted: it renders to a
+    screen, not to its parent, so being started from a dumb context -- e.g. from
+    another terminal running in line mode -- must not silently disable the
+    Colors toggle (that was a real "why don't my ls/zsh colours show" bug)."""
+    return not os.environ.get('NO_COLOR')
 
 
 def luminance(color):

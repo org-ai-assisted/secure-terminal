@@ -684,7 +684,7 @@ class MainWindow(QMainWindow):
         self.act_colors.setToolTip(
             'Render a safe subset of ANSI colors (16-color SGR) in the current '
             'tab. Off by default; contrast-guarded so text can never be painted '
-            'invisibly, and forced off by NO_COLOR or TERM=dumb.')
+            'invisibly, and forced off only by NO_COLOR.')
         self.act_colors.toggled.connect(self.set_colors)
         view_menu.addAction(self.act_colors)
 
