@@ -1520,6 +1520,10 @@ class MainWindow(QMainWindow):
             btn.setCheckable(True)
             btn.setToolTip(tip)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            # A toolbar chip must not steal keyboard focus from the terminal:
+            # otherwise clicking it to change the mode stops the terminal's caret
+            # from blinking (it looks like the cursor vanished).
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             # A safety-coloured dot (the old toolbar symbol) on the risk-bearing
             # chips: yellow Strip, green Reveal, red Show, yellow TUI. It shows the
             # risk colour at a glance even when the chip is not the selected one.
