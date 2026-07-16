@@ -1010,7 +1010,31 @@ class SecureTerminal(QPlainTextEdit):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._sync_tui_size()
+        if self.tui_active():
+            self._sync_tui_size()        # resizes the pyte screen and the pty
+        else:
+            # Line mode still needs the pty's winsize kept in step with the
+            # widget: the shell reads COLUMNS from it, and zsh pads its prompt
+            # with trailing fill to that width. Left at the fork-time default
+            # (80), that fill (and the clickable void it creates) lands in the
+            # middle of a wider window instead of at the true right edge.
+            self._set_winsize(*self._grid_size())
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        # A terminal caret is not click-positionable: typed input always goes to
+        # the shell at the output cursor, never where you click. A plain click
+        # that moved the blinking caret elsewhere -- e.g. into zsh's trailing
+        # prompt fill -- would only mislead (a caret blinking where you cannot
+        # type). Keep a drag-selection for copy; otherwise snap the caret back.
+        if self.textCursor().hasSelection():
+            return
+        if self._out_cursor is not None:
+            self.setTextCursor(self._out_cursor)
+        else:
+            tc = self.textCursor()
+            tc.movePosition(QTextCursor.MoveOperation.End)
+            self.setTextCursor(tc)
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
     def insertFromMimeData(self, source):
