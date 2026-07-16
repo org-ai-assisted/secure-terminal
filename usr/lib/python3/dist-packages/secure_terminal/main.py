@@ -503,27 +503,12 @@ class MainWindow(QMainWindow):
         self._persist()
 
     def _sync_mode_toggles(self, mode):
-        """Reflect the display mode in the Show/Reveal toggles without
-        re-triggering them: Show on for 'show', Reveal on for 'reveal', both off
-        for the safe 'strip' default."""
-        for action, key in ((self.act_show, 'show'), (self.act_reveal, 'reveal')):
-            action.blockSignals(True)
-            action.setChecked(mode == key)
-            action.blockSignals(False)
-
-    def _on_show_toggled(self, on):
-        # set_mode('show') syncs Reveal off; unchecking Show falls back to Strip
-        # unless Reveal is on.
-        if on:
-            self.set_mode('show')
-        elif not self.act_reveal.isChecked():
-            self.set_mode('strip')
-
-    def _on_reveal_toggled(self, on):
-        if on:
-            self.set_mode('reveal')
-        elif not self.act_show.isChecked():
-            self.set_mode('strip')
+        """Check the button for the active display mode in the exclusive group.
+        setChecked() does not fire triggered, so this cannot loop back into
+        set_mode."""
+        action = self._mode_actions.get(mode)
+        if action is not None and not action.isChecked():
+            action.setChecked(True)
 
     def set_colors(self, enabled):
         term = self.current()
@@ -551,74 +536,82 @@ class MainWindow(QMainWindow):
         active = term is not None and term.tui_active()
         self.tui_dot_action.setVisible(active)
 
-    # -- security indicator: a traffic light for the current tab's exposure ----
+    # -- security indicator: two lamps, one per independent risk axis ---------
     def _build_security_indicator(self):
-        self.sec_button = QPushButton(self)
-        self.sec_button.setFlat(True)
-        self.sec_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.sec_button.clicked.connect(self._show_security_details)
-        self.statusBar().addPermanentWidget(self.sec_button)
+        self.sec_display = QPushButton(self)
+        self.sec_mode = QPushButton(self)
+        for lamp in (self.sec_display, self.sec_mode):
+            lamp.setFlat(True)
+            lamp.setCursor(Qt.CursorShape.PointingHandCursor)
+            lamp.clicked.connect(self._show_security_details)
+            self.statusBar().addPermanentWidget(lamp)
         self._update_security_indicator()
 
-    def _security_level(self):
-        """The current tab's exposure as (colour, short, detail). Highest risk
-        wins: rendering unicode (show/reveal) is red even in TUI mode, because a
-        deceptive glyph on screen is riskier than a confined full-screen program;
-        TUI alone is yellow; the strict line+strip default is green."""
+    def _display_level(self):
+        """The display (unicode) risk axis as (colour, short, detail). Show
+        renders deceptive glyphs (red); strip and reveal are safe (green) --
+        reveal shows the exact <U+XXXX> codepoint, so nothing can pose as a
+        look-alike."""
         term = self.current()
         mode = term.current_mode() if term is not None else 'strip'
-        tui = term.tui_active() if term is not None else False
-        if mode in ('show', 'reveal'):
-            return ('#d83933', 'Unicode shown',
-                    'RED -- unicode output is being rendered ('
-                    + mode + ' mode).\n\n'
-                    'Non-ASCII glyphs are drawn on screen, so a look-alike '
-                    '(homoglyph) character can make text read as something it is '
-                    'not. The invisible, bidi and control classes are still '
-                    'neutralized, and typing/pasting is still sanitized, but a '
-                    'rendered glyph can still deceive the eye. This is treated as '
-                    'the highest risk -- higher than TUI mode -- because the '
-                    'deception is in what you are reading.\n\n'
-                    'Switch Show and Reveal off to return to the safe default.')
-        if tui:
-            return ('#e5a50a', 'TUI mode',
-                    'YELLOW -- TUI mode is active.\n\n'
+        if mode == 'show':
+            return ('#d83933', 'Show',
+                    'Display: SHOW (red).\n\n'
+                    'Non-ASCII output is drawn as its glyph, so a look-alike '
+                    '(homoglyph) can pose as an ASCII character and text can read '
+                    'as something it is not. The invisible, bidi and control '
+                    'classes are still neutralized and pasting is still sanitized, '
+                    'but a rendered glyph can deceive the eye. This is the highest '
+                    'risk, above TUI mode, because the deception is in what you '
+                    'read.\n\nSwitch to Strip or Reveal to remove it.')
+        label = 'Reveal' if mode == 'reveal' else 'Strip'
+        detail = ('Every non-ASCII character is shown as a <U+XXXX> badge: you '
+                  'see the exact codepoint, so nothing can pose as a look-alike.'
+                  if mode == 'reveal' else
+                  'Non-ASCII output becomes "_": nothing deceptive is drawn.')
+        return ('#1f8a54', label,
+                'Display: ' + label.upper() + ' (green, safe).\n\n' + detail
+                + ' Escape sequences are removed and pasting is sanitized either '
+                  'way.')
+
+    def _mode_level(self):
+        """The interpretation (mode) risk axis: TUI interprets escapes in a
+        confined screen (yellow); the strict line mode is green."""
+        term = self.current()
+        if term is not None and term.tui_active():
+            return ('#e5a50a', 'TUI',
+                    'Mode: TUI (yellow).\n\n'
                     'Escape sequences are interpreted through a confined screen '
                     'model so full-screen programs (ssh, vim, htop, tmux) work. '
                     'Every cell is still character-filtered and the model has no '
-                    'OS reach (it cannot touch the clipboard or, unless you allow '
-                    'it, the window title). A program can still draw a misleading '
-                    'interface within its own screen, so only run programs you '
-                    'trust.\n\n'
+                    'OS reach (no clipboard, and no window title unless you allow '
+                    'it). A program can still draw a misleading interface within '
+                    'its own screen, so only run programs you trust.\n\n'
                     'Turn TUI mode off to return to the safe line mode.')
-        return ('#1f8a54', 'Safe',
-                'GREEN -- the strict, safe default.\n\n'
-                'Line mode with no escape parser (TERM=dumb): program output is '
-                'reduced to printable ASCII, every escape sequence is removed, '
-                'and non-ASCII is shown as "_". Pasting is sanitized and warned '
-                'on. There is nothing on screen a program can use to deceive '
-                'you.')
+        return ('#1f8a54', 'Line',
+                'Mode: LINE (green, the safe default).\n\n'
+                'No escape parser (TERM=dumb): program output is reduced to '
+                'printable ASCII and every escape sequence is removed. There is '
+                'nothing on screen a program can use to deceive you.')
 
     def _update_security_indicator(self):
-        color, short, _detail = self._security_level()
-        self.sec_button.setIcon(_dot_icon(color))
-        self.sec_button.setText(' ' + short)
-        self.sec_button.setToolTip('Security level: ' + short
-                                   + ' -- click for details')
+        for lamp, level, axis in (
+                (self.sec_display, self._display_level(), 'Display'),
+                (self.sec_mode, self._mode_level(), 'Mode')):
+            colour, short, _detail = level
+            lamp.setIcon(_dot_icon(colour))
+            lamp.setText(' ' + short)
+            lamp.setToolTip(axis + ': ' + short + ' -- click for details')
 
     def _show_security_details(self):
-        color, short, detail = self._security_level()
+        detail = self._display_level()[2] + '\n\n' + self._mode_level()[2]
         dialog = QDialog(self)
-        dialog.setWindowTitle('Security level: ' + short)
+        dialog.setWindowTitle('Security level')
         layout = QVBoxLayout(dialog)
-        heading = QLabel(short)
-        heading.setStyleSheet('font-weight:bold; color:%s; font-size:15px;' % color)
-        layout.addWidget(heading)
-        # a read-only, selectable body so the explanation can be copied and
-        # discussed (a tooltip is too small and cannot be copied)
+        # read-only, selectable so the explanation can be copied and discussed
         body = QPlainTextEdit(detail)
         body.setReadOnly(True)
-        body.setMinimumSize(460, 220)
+        body.setMinimumSize(480, 300)
         layout.addWidget(body)
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -813,27 +806,36 @@ class MainWindow(QMainWindow):
             theme_menu.addAction(act)
             self._theme_actions[key] = act
 
-        # Two on/off toggles instead of a three-way choice: off/off is Strip (the
-        # safe default), Show renders glyphs, Reveal shows <U+XXXX> badges; each
-        # turns the other off.
+        # Three mutually-exclusive display modes as a colour-coded segmented
+        # control. Ordered Strip, Reveal, Show so Strip and Show are never
+        # adjacent, and so the colour runs safe-to-risky left to right: strip and
+        # reveal are green (nothing deceptive is drawn -- reveal shows the exact
+        # codepoint), show is red (a rendered glyph can be a look-alike).
         mode_menu = view_menu.addMenu('&Unicode')
-        self.act_show = QAction(
-            _toggle_icon('accessories-character-map', 'S', '#1f8a54'),
-            '&Show unicode', self, checkable=True)
-        self.act_show.setToolTip(
-            'Render legitimate non-ASCII output as its glyph instead of "_". Off '
-            'is the safe default (strip). The invisible, bidi and control classes '
-            'are still neutralized.')
-        self.act_show.toggled.connect(self._on_show_toggled)
-        mode_menu.addAction(self.act_show)
-        self.act_reveal = QAction(
-            _toggle_icon('edit-find', 'R', '#8250df'),
-            '&Reveal unicode', self, checkable=True)
-        self.act_reveal.setToolTip(
-            'Show every non-ASCII character as a <U+XXXX> badge, to inspect '
-            'exactly what is there. Turning it on turns Show off.')
-        self.act_reveal.toggled.connect(self._on_reveal_toggled)
-        mode_menu.addAction(self.act_reveal)
+        self._mode_group = QActionGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_actions = {}
+        for label, key, colour, tip in (
+            ('&Strip', 'strip', '#1f8a54',
+             'Non-ASCII output becomes "_": the safe default, nothing deceptive '
+             'is drawn.'),
+            ('&Reveal', 'reveal', '#1f8a54',
+             'Show every non-ASCII character as a <U+XXXX> badge: safe, you see '
+             'the exact codepoint, nothing can pose as a look-alike.'),
+            ('S&how', 'show', '#d83933',
+             'Render non-ASCII output as its glyph. Least safe: a look-alike '
+             '(homoglyph) can pose as an ASCII character. The invisible, bidi and '
+             'control classes are still neutralized.'),
+        ):
+            act = QAction(_dot_icon(colour), label, self, checkable=True)
+            act.setToolTip(tip)
+            act.triggered.connect(lambda _checked, k=key: self.set_mode(k))
+            self._mode_group.addAction(act)
+            mode_menu.addAction(act)
+            self._mode_actions[key] = act
+        self.act_strip = self._mode_actions['strip']
+        self.act_reveal = self._mode_actions['reveal']
+        self.act_show = self._mode_actions['show']
         self._sync_mode_toggles(self._default_mode)
 
         view_menu.addSeparator()
@@ -1141,8 +1143,9 @@ class MainWindow(QMainWindow):
                              QSizePolicy.Policy.Preferred)
         bar.addWidget(spacer)
 
-        bar.addAction(self.act_show)
+        bar.addAction(self.act_strip)
         bar.addAction(self.act_reveal)
+        bar.addAction(self.act_show)
         bar.addAction(self.act_colors)
         bar.addSeparator()
 
