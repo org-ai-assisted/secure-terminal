@@ -65,6 +65,7 @@ risk indicator; the strict line mode remains the safe-by-construction default.
 import os
 import pty
 import re
+import time
 import fcntl
 import signal
 import codecs
@@ -246,6 +247,9 @@ class SecureTerminal(QPlainTextEdit):
         # restart). Maintained from the output stream (alt-screen enter/leave).
         self._alt_screen = False
         self._grid_shown = False      # is the fixed pyte grid currently on screen
+        # Local caret echoes (^C, ^\) awaiting possible de-duplication against the
+        # shell's own echo: [(text, deadline_monotonic), ...]. See _echo_caret.
+        self._pending_caret = []
         # optional command hook (opt-in): config dict or None, plus the current
         # typed input line so it can be judged before Enter submits it.
         self._hook = None
@@ -702,6 +706,7 @@ class SecureTerminal(QPlainTextEdit):
 
         # line mode: retain the raw output (for a mode re-render) and display it
         # through the escape-stripping pipeline.
+        text = self._absorb_caret(text)         # drop a shell's duplicate ^C echo
         self._raw += text
         if len(self._raw) > self._RAW_MAX:
             self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output
@@ -778,6 +783,35 @@ class SecureTerminal(QPlainTextEdit):
         self._sgr = {'fg': 3, 'bg': None, 'bold': True}      # yellow, bold
         self._feed_line('\n[secure-terminal] ' + message + '\n')
         self._sgr = saved
+
+    def _echo_caret(self, s):
+        """Locally echo a signal key in caret notation (^C, ^\\) so pressing it is
+        always visible -- secure-terminal's job is to make the invisible visible,
+        and a shell (zsh) may print nothing. To avoid a double under a shell that
+        DOES echo (bash's readline prints ^C), remember it briefly so the shell's
+        own copy in the next output is absorbed (see _absorb_caret)."""
+        self._raw += s
+        if len(self._raw) > self._RAW_MAX:
+            self._raw = self._raw[-self._RAW_MAX:]
+        self._feed_line(s)
+        self._pending_caret.append((s, time.monotonic() + 0.4))
+
+    def _absorb_caret(self, text):
+        """If we just locally echoed a caret (^C, ^\\) and the shell's own echo of
+        it appears at the very start of the next output, drop that one copy so the
+        user sees a single caret, not two. Expires quickly (0.4s) so an unrelated
+        later '^C' in normal output is never swallowed."""
+        if not self._pending_caret:
+            return text
+        now = time.monotonic()
+        self._pending_caret = [p for p in self._pending_caret if p[1] >= now]
+        for entry in list(self._pending_caret):
+            token = entry[0]
+            idx = text.find(token)
+            if 0 <= idx <= 2:                 # only near the very start of output
+                text = text[:idx] + text[idx + len(token):]
+                self._pending_caret.remove(entry)
+        return text
 
     def _feed_line(self, text):
         """The single line-mode output path: advance the logical cell buffer by
@@ -943,9 +977,12 @@ class SecureTerminal(QPlainTextEdit):
             # add no local echo -- that would double-print under bash.
             if key == Qt.Key.Key_Backslash:
                 self._write(b'\x1c')          # Ctrl+\ -> SIGQUIT (cooked)
+                self._echo_caret('^\\')       # make the signal visible
                 return
             if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
                 self._write(bytes([key & 0x1f]))   # Ctrl+C -> 0x03, Ctrl+L -> 0x0c
+                if key == Qt.Key.Key_C:
+                    self._echo_caret('^C')    # make the interrupt visible
                 if key in (Qt.Key.Key_C, Qt.Key.Key_U):
                     self._line_buffer = ''    # SIGINT / kill-line discards the line
                     self._line_dirty = False
