@@ -1331,27 +1331,47 @@ class SecureTerminal(QPlainTextEdit):
         """The source code point of a neutralized/revealed character under a
         viewport point, or None. First the char format's tagged code point (every
         marked cell carries it, in every mode -- even the strip "_"); then, for a
-        readable glyph shown as-is (show mode), the non-ASCII character itself."""
+        readable glyph shown as-is (show mode), the non-ASCII character itself.
+
+        cursorForPosition snaps to the nearest insertion boundary; the glyph under
+        the point is the character on one side of it. We navigate by CHARACTER (so
+        an astral pair is one step, never split at a surrogate) and pick the side
+        whose visual box actually contains the point -- comparing against min/max of
+        the two caret rects, so a right-to-left run needs no left-to-right guess."""
         cursor = self.cursorForPosition(pos)
+        for step in (QTextCursor.MoveOperation.NextCharacter,
+                     QTextCursor.MoveOperation.PreviousCharacter):
+            probe = QTextCursor(cursor)
+            if not probe.movePosition(step, QTextCursor.MoveMode.KeepAnchor):
+                continue
+            cp = self._cp_in_box(probe.selectionStart(), probe.selectionEnd(), pos)
+            if cp is not None:
+                return cp
+        return None
+
+    def _cp_in_box(self, a, b, pos):
+        """The inspectable code point of the character spanning document positions
+        [a, b) if the point falls inside its visual box, else None. The box is the
+        span between the two boundary caret rects (min/max, so it is correct in a
+        right-to-left run too)."""
         doc = self.document()
-        p = cursor.position()
-        # cursorForPosition snaps to the NEAREST insertion boundary, so the glyph
-        # under the point is on one side of it. Compare the point to that boundary
-        # to pick the correct single character -- never claim the adjacent glyph.
-        start = p if pos.x() >= self.cursorRect(cursor).x() else p - 1
-        if start < 0 or start >= doc.characterCount() - 1:
+        ca, cb = QTextCursor(doc), QTextCursor(doc)
+        ca.setPosition(a)
+        cb.setPosition(b)
+        ra, rb = self.cursorRect(ca), self.cursorRect(cb)
+        if not (min(ra.x(), rb.x()) <= pos.x() <= max(ra.x(), rb.x())
+                and min(ra.top(), rb.top()) <= pos.y() <= max(ra.bottom(), rb.bottom())):
             return None
-        probe = QTextCursor(doc)
-        probe.setPosition(start)
-        probe.movePosition(QTextCursor.MoveOperation.NextCharacter,
-                           QTextCursor.MoveMode.KeepAnchor)
-        cp = probe.charFormat().property(_CP_PROP)
+        fwd = QTextCursor(doc)
+        fwd.setPosition(a)
+        fwd.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
+        cp = fwd.charFormat().property(_CP_PROP)
         if cp is not None:
             return int(cp)
-        text = probe.selectedText()
+        text = fwd.selectedText()
         # a readable non-ASCII glyph (show mode) keeps no tag but IS its own code
-        # point; skip Qt's block/line separators (U+2028/U+2029) and a lone UTF-16
-        # surrogate half (a point can land on either unit of an astral glyph).
+        # point; skip Qt's block/line separators (U+2028/U+2029). A whole astral
+        # char comes back as one Python code point here (grapheme-aware nav).
         if len(text) == 1:
             o = ord(text)
             if o > 0x7F and not 0xD800 <= o <= 0xDFFF and o not in (0x2028, 0x2029):
