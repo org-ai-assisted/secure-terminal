@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import shlex
+import argparse
 
 from PyQt6.QtCore import QTimer, Qt, QUrl, QRect, qInstallMessageHandler
 from PyQt6.QtGui import (
@@ -161,10 +162,11 @@ def _dot_icon(color):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, launch=None):
         super().__init__()
         self.setWindowTitle('secure-terminal')
         self.resize(820, 520)
+        self._launch = launch
 
         # Global defaults inherited by every NEW tab; each tab then carries its
         # own theme and zoom, which the chrome below reflects and edits.
@@ -231,11 +233,17 @@ class MainWindow(QMainWindow):
         self._build_security_indicator()
         self._apply_locks()
 
-        # restore the previous session (tabs + scrollback) if enabled
-        restored = session.load() if self._persist_session else []
-        for info in restored:
-            if isinstance(info, dict):
-                self._restore_tab(info)
+        # Launch-CLI tabs take precedence over a restored session: opening
+        # `secure-terminal --title x -- htop` should give you exactly that.
+        if launch is not None and launch.tabs:
+            for spec in launch.tabs:
+                self._open_launch_tab(spec)
+        else:
+            # restore the previous session (tabs + scrollback) if enabled
+            restored = session.load() if self._persist_session else []
+            for info in restored:
+                if isinstance(info, dict):
+                    self._restore_tab(info)
         if self.tabs.count() == 0:
             self.new_tab()
 
@@ -293,6 +301,28 @@ class MainWindow(QMainWindow):
         term.apply_paste_delay(self._paste_delay)
         term.apply_allow_title(self._default_allow_title)
         self._add_tab(term)
+
+    def _open_launch_tab(self, spec):
+        """Open a tab from a parsed launch spec (--title/--tui/--mode/command).
+        Admin locks still win: a locked mode or TUI setting is NOT overridable
+        from the command line."""
+        tui = self._default_tui if (spec.get('tui') is None
+                                    or 'tui' in self._locked) else spec['tui']
+        term = SecureTerminal(tui=tui, command=spec.get('command') or None)
+        term.apply_theme(self._default_theme)
+        term.apply_zoom(self._default_zoom)
+        mode = spec.get('mode')
+        if mode not in DISPLAY_MODES or 'unicode_mode' in self._locked:
+            mode = self._default_mode
+        term.apply_mode(mode)
+        term.apply_colors(self._default_colors)
+        term.apply_scrollback(self._scrollback)
+        term.apply_paste_delay(self._paste_delay)
+        term.apply_allow_title(self._default_allow_title)
+        self._add_tab(term)
+        if spec.get('title'):
+            self._user_titles[term] = spec['title']
+            self._refresh_tab_label(term)
 
     def _restore_tab(self, info):
         """Recreate a tab from saved session state: its settings, name, colour
@@ -1383,10 +1413,109 @@ def _quiet_font_warnings():
     qInstallMessageHandler(handler)
 
 
+class _Launch:
+    """The parsed launch command line: window identity, an optional session file,
+    Qt pass-through args, and a list of tab specs to open."""
+
+    def __init__(self):
+        self.wm_class = None       # --class  -> WM_CLASS class / Wayland app-id
+        self.wm_name = None        # --name   -> WM_CLASS instance (X11)
+        self.session = None        # --session FILE
+        self.qt_args = []          # unrecognized args, handed to Qt
+        self.tabs = []             # [{title, tui, mode, command}]
+
+
+def _launch_parser(with_globals):
+    """The per-tab option parser; the first group also carries the global options
+    (window identity, session, --version)."""
+    p = argparse.ArgumentParser(
+        prog='secure-terminal', add_help=with_globals,
+        description='A terminal that shows untrusted output safely.',
+        epilog="Run a command with '-- PROGRAM ARGS' (a real argv, no shell "
+               "reparse). Open several tabs by repeating --tab.")
+    if with_globals:
+        p.add_argument('--version', action='version',
+                       version='secure-terminal ' + APP_VERSION)
+        p.add_argument('--class', dest='wm_class', metavar='CLASS',
+                       help='window WM_CLASS / Wayland app-id (for WM rules)')
+        p.add_argument('--name', dest='wm_name', metavar='NAME',
+                       help='window WM_CLASS instance name (X11)')
+        p.add_argument('--session', metavar='FILE',
+                       help='open the tabs described in a session file')
+    p.add_argument('--title', help='initial tab title')
+    p.add_argument('--tui', action='store_true', default=None,
+                   help='start this tab in TUI mode')
+    p.add_argument('--no-tui', dest='tui', action='store_false',
+                   help='start this tab in line mode')
+    p.add_argument('--mode', choices=list(DISPLAY_MODES),
+                   help='initial unicode display mode')
+    p.add_argument('-e', '--command', dest='cmd_string', metavar='STRING',
+                   help='run STRING (shell-split, no shell); prefer -- for a real argv')
+    return p
+
+
+def _parse_launch_args(argv):
+    """Parse the launch CLI into a _Launch. Grammar:
+        secure-terminal [GLOBAL] [TABOPTS] [--tab [TABOPTS]]... [-- PROGRAM ARGS]
+    Everything after the first '--' is a real argv command for the LAST tab;
+    '--tab' before that starts an additional tab. argparse handles --help/--version
+    and errors (exit) itself, which is correct for a CLI (before Qt starts)."""
+    launch = _Launch()
+    command = None
+    if '--' in argv:
+        cut = argv.index('--')
+        command = list(argv[cut + 1:])       # verbatim argv, no shell reparse
+        argv = argv[:cut]
+    groups, current = [], []
+    for token in argv:
+        if token == '--tab':
+            groups.append(current)
+            current = []
+        else:
+            current.append(token)
+    groups.append(current)
+    for index, group in enumerate(groups):
+        parser = _launch_parser(index == 0)
+        if index == 0:
+            namespace, leftover = parser.parse_known_args(group)
+            launch.qt_args = leftover         # e.g. Qt's -platform / -style
+            launch.wm_class = namespace.wm_class
+            launch.wm_name = namespace.wm_name
+            launch.session = namespace.session
+        else:
+            namespace = parser.parse_args(group)
+        launch.tabs.append({
+            'title': namespace.title, 'tui': namespace.tui,
+            'mode': namespace.mode, 'command': namespace.cmd_string})
+    if command is not None:
+        launch.tabs[-1]['command'] = command
+
+    def _empty(spec):
+        return not any(spec[k] is not None
+                       for k in ('title', 'tui', 'mode', 'command'))
+
+    # A leading '--tab' means the first tab IS that group; drop the empty
+    # placeholder for tokens before it (its globals were already read).
+    if len(launch.tabs) > 1 and _empty(launch.tabs[0]):
+        launch.tabs.pop(0)
+    # A bare "secure-terminal" (one empty group, no command/session) specifies no
+    # tabs -> normal startup (restore session or a default tab).
+    if len(launch.tabs) == 1 and launch.session is None and _empty(launch.tabs[0]):
+        launch.tabs = []
+    return launch
+
+
 def main():
     _quiet_font_warnings()
-    app = QApplication(sys.argv)
+    launch = _parse_launch_args(sys.argv[1:])
+    qt_argv = [sys.argv[0]] + launch.qt_args
+    if launch.wm_name:
+        qt_argv += ['-name', launch.wm_name]     # Qt X11 resource/instance name
+    app = QApplication(qt_argv)
     app.setApplicationName('secure-terminal')
+    if launch.wm_class:
+        # Wayland app-id and, on Qt6/XCB, the WM_CLASS class part.
+        app.setDesktopFileName(launch.wm_class)
     _install_signal_quit(app)
 
     # Auto-reap exited shells so closing a tab (which hangs up the child
@@ -1399,7 +1528,7 @@ def main():
     except (OSError, ValueError, AttributeError):
         pass            # if we cannot auto-reap, tabs simply reap on exit
 
-    window = MainWindow()
+    window = MainWindow(launch=launch)
     window.show()
 
     return app.exec()

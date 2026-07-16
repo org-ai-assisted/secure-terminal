@@ -602,9 +602,13 @@ class SecureTerminal(QPlainTextEdit):
             # is what lets a full-screen program actually run once TUI mode is on.
             os.environ['TERM'] = 'xterm-256color'
             os.environ.setdefault('PAGER', 'cat')
-            # `command` is an optional program to run (split like a shell word
-            # list, e.g. "ssh -p 22 host"); with none we run the login shell.
-            argv = shlex.split(command) if command else []
+            # `command` is an optional program to run: a list is used verbatim as
+            # argv (the "-- prog args" CLI form, no shell reparse), a string is
+            # split like a shell word list ("ssh -p 22 host"); none -> login shell.
+            if isinstance(command, (list, tuple)):
+                argv = [str(a) for a in command]
+            else:
+                argv = shlex.split(command) if command else []
             if not argv:
                 argv = [os.environ.get('SHELL') or '/bin/bash']
             try:
