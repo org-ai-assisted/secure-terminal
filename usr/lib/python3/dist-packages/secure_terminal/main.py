@@ -250,7 +250,7 @@ class MainWindow(QMainWindow):
         term.title_changed.connect(
             lambda title, t=term: self._on_tab_title(t, title))
         term.notified.connect(self._on_notify)
-        index = self.tabs.addTab(term, 'shell')
+        index = self.tabs.addTab(term, term.cwd_basename() or 'shell')
         self.tabs.setCurrentIndex(index)
         self._sync_chrome_to_tab()
         term.setFocus()
@@ -361,8 +361,11 @@ class MainWindow(QMainWindow):
             return
         user = self._user_titles.get(term)
         program = self._prog_titles.get(term)
-        # plain text only; setTabText does not interpret markup
-        self.tabs.setTabText(index, user or program or 'shell')
+        # plain text only; setTabText does not interpret markup. The default is
+        # the working-directory name (tracked live by the fg poll), which says far
+        # more than a static "shell"; fall back to "shell" only if it is unreadable.
+        default = term.cwd_basename() or 'shell'
+        self.tabs.setTabText(index, user or program or default)
         parts = []
         if user:
             parts.append('name: ' + user)
@@ -412,6 +415,11 @@ class MainWindow(QMainWindow):
         term = self.current()
         self.act_terminate.setEnabled(
             term is not None and term.has_foreground_program())
+        # Keep the current tab's default label in step with its working directory
+        # (only when it is not overridden by a user or program title).
+        if term is not None and not self._user_titles.get(term) \
+                and not self._prog_titles.get(term):
+            self._refresh_tab_label(term)
 
     def current(self):
         return self.tabs.currentWidget()

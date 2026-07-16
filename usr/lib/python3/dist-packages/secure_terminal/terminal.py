@@ -850,6 +850,25 @@ class SecureTerminal(QPlainTextEdit):
             return None
         return pgrp if pgrp > 0 else None
 
+    def cwd_basename(self):
+        """The basename of the foreground process's working directory (the shell's
+        when nothing else runs), for a useful default tab label -- "~" for home,
+        else the directory name. None if it cannot be read. This is a far more
+        informative default than a static "shell": it tracks where you are as you
+        cd around."""
+        pgrp = self._foreground_pgrp()
+        pid = pgrp if pgrp is not None else self._pid
+        if pid is None:
+            return None
+        try:
+            path = os.readlink('/proc/%d/cwd' % pid)
+        except OSError:
+            return None
+        home = os.path.expanduser('~')
+        if path == home:
+            return '~'
+        return os.path.basename(path.rstrip('/')) or '/'
+
     def has_foreground_program(self):
         """True when a program other than the shell holds the foreground, i.e.
         there is something for Terminate to act on."""
