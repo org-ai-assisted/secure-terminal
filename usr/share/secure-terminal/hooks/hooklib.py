@@ -76,9 +76,11 @@ def read_file(name):
 
 def read_rules(name):
     """Parse a rules file into a list of (verdict, pattern, message, suggestion).
-    Lines are `verdict | regex | message | suggestion?` (pipe-separated); blank
-    lines and #-comments are ignored. Returns None if the file is absent, so the
-    caller keeps its built-in default."""
+    Fields are separated by ' | ' (space-pipe-space), NOT a bare '|', so a regex
+    alternation like (curl|wget) -- which has no spaces around its pipe -- is not
+    split. Format: `verdict | regex | message | suggestion?`. Blank lines and
+    #-comments are ignored. Returns None if the file is absent, so the caller
+    keeps its built-in default."""
     text = read_file(name)
     if text is None:
         return None
@@ -87,7 +89,7 @@ def read_rules(name):
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-        parts = [p.strip() for p in line.split('|')]
+        parts = [p.strip() for p in line.split(' | ')]
         if len(parts) < 2 or parts[0] not in ('allow', 'block', 'ask'):
             continue
         verdict, pattern = parts[0], parts[1]
