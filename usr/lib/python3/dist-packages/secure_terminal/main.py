@@ -234,6 +234,10 @@ class MainWindow(QMainWindow):
         bar = self.tabs.tabBar()
         bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         bar.customContextMenuRequested.connect(self._tab_context_menu)
+        # a pointing-hand cursor over the tab bar hints that a tab is interactive
+        # (double-click to rename the title, right-click for rename/colour/close).
+        bar.setCursor(Qt.CursorShape.PointingHandCursor)
+        bar.setToolTip('Double-click to rename this tab; right-click for more.')
         self.setCentralWidget(self.tabs)
 
         self._theme_actions = {}
