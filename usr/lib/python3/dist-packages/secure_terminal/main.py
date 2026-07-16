@@ -43,6 +43,11 @@ TUI_TOOLTIP = (
 
 ZOOM_MIN = 25
 ZOOM_MAX = 400
+
+# Cycled to auto-colour new tabs so a tab differs from its neighbour; distinct,
+# theme-readable hues. A user-set tab colour overrides the auto one.
+TAB_PALETTE = ('#e5484d', '#e5a50a', '#1f8a54', '#3b9eff',
+               '#a06cff', '#e06c9f', '#2ab0a0', '#c07a3a')
 ZOOM_STEP = 10
 
 # menu label -> theme key in terminal.THEMES
@@ -195,6 +200,8 @@ class MainWindow(QMainWindow):
         # contrast guard keeps text readable. An explicit saved 'false' still wins.
         self._default_colors = cfg.get('colors', 'true') == 'true'
         self._default_markings = cfg.get('colored_markings', 'true') == 'true'
+        self._auto_tab_colors = cfg.get('auto_tab_colors', 'true') == 'true'
+        self._auto_color_idx = 0      # cycles TAB_PALETTE so neighbours differ
         try:
             self._default_zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(cfg['zoom'])))
         except (KeyError, ValueError):
@@ -292,6 +299,12 @@ class MainWindow(QMainWindow):
         term.notified.connect(self._on_notify)
         index = self.tabs.addTab(term, term.cwd_basename() or 'shell')
         self.tabs.setCurrentIndex(index)
+        # auto-colour the new tab (cycled so it differs from its neighbour) unless
+        # one is already set (a restored or user-chosen colour wins).
+        if self._auto_tab_colors and term not in self._tab_colors:
+            color = TAB_PALETTE[self._auto_color_idx % len(TAB_PALETTE)]
+            self._auto_color_idx += 1
+            self.set_tab_color(index, QColor(color))
         self._sync_chrome_to_tab()
         term.setFocus()
         return index
@@ -756,6 +769,11 @@ class MainWindow(QMainWindow):
         self._default_colors = bool(enabled)
         self._persist()
 
+    def set_auto_tab_colors(self, enabled):
+        self._auto_tab_colors = bool(enabled)
+        self.act_auto_tab_colors.setChecked(enabled)
+        self._persist()               # affects new tabs; existing keep their colour
+
     def set_markings(self, enabled):
         if 'colored_markings' in self._locked:
             return                        # admin-locked; not user-changeable
@@ -1008,6 +1026,7 @@ class MainWindow(QMainWindow):
             'unicode_mode': self._default_mode,
             'colors': 'true' if self._default_colors else 'false',
             'colored_markings': 'true' if self._default_markings else 'false',
+            'auto_tab_colors': 'true' if self._auto_tab_colors else 'false',
             'scrollback': str(self._scrollback),
             'paste_delay': str(self._paste_delay),
             'tui': 'true' if self._default_tui else 'false',
@@ -1198,6 +1217,16 @@ class MainWindow(QMainWindow):
             'by default; independent of the ANSI Colors setting.')
         self.act_markings.toggled.connect(self.set_markings)
         view_menu.addAction(self.act_markings)
+
+        self.act_auto_tab_colors = QAction('&Automatic tab colours', self,
+                                           checkable=True)
+        self.act_auto_tab_colors.setChecked(self._auto_tab_colors)
+        self.act_auto_tab_colors.setToolTip(
+            'Give each new tab a colour that differs from its neighbour, so tabs '
+            'are easy to tell apart at a glance. On by default; a colour you set '
+            'on a tab (right-click) overrides the automatic one.')
+        self.act_auto_tab_colors.toggled.connect(self.set_auto_tab_colors)
+        view_menu.addAction(self.act_auto_tab_colors)
 
         self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', '#e5a50a'),
                                '&TUI mode', self, checkable=True)
