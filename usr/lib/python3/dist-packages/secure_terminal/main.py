@@ -8,6 +8,7 @@
 import os
 import signal
 import sys
+import shlex
 
 from PyQt6.QtCore import QTimer, Qt, QUrl, QRect, qInstallMessageHandler
 from PyQt6.QtGui import (
@@ -118,6 +119,33 @@ def _toggle_icon(theme_name, letter, color):
     return _letter_icon(letter, color)
 
 
+def _read_hook_config(cfg):
+    """Build the opt-in command-hook config from a settings drop-in, or None when
+    no handler is configured. Keys: command_hook (the handler command line, empty
+    = off) plus optional command_hook_transcript (none|tail:N|full),
+    command_hook_timeout (seconds), command_hook_on_error (allow|block)."""
+    raw = (cfg.get('command_hook') or '').strip()
+    if not raw:
+        return None
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    try:
+        timeout = int(cfg.get('command_hook_timeout') or 10)
+    except ValueError:
+        timeout = 10
+    return {
+        'argv': argv,
+        'transcript': cfg.get('command_hook_transcript') or 'none',
+        'timeout': timeout,
+        'on_error': 'block' if cfg.get('command_hook_on_error') == 'block'
+                    else 'allow',
+    }
+
+
 def _dot_icon(color):
     """A filled circle in `color` -- the traffic-light lamp of the security
     indicator (green safe / yellow TUI / red unicode-shown)."""
@@ -168,6 +196,8 @@ class MainWindow(QMainWindow):
         self._default_allow_title = cfg.get('allow_title') == 'true'
         # session persistence is on unless explicitly disabled
         self._persist_session = cfg.get('persist_session') != 'false'
+        # optional opt-in command hook, configured only via a settings drop-in
+        self._hook_config = _read_hook_config(cfg)
 
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
@@ -210,6 +240,8 @@ class MainWindow(QMainWindow):
         term.zoom_step.connect(self._on_zoom_step)
         term.tab_step.connect(self._on_tab_step)
         term.tab_move.connect(self._on_tab_move)
+        term.apply_hook(self._hook_config)
+        term.hook_notice.connect(self._on_hook_notice)
         term.shell_exited.connect(lambda t=term: self._on_shell_exited(t))
         term.title_changed.connect(
             lambda title, t=term: self._on_tab_title(t, title))
@@ -615,6 +647,10 @@ class MainWindow(QMainWindow):
     def _on_notify(self, text):
         # passive, non-intrusive: a timed status-bar message, already ASCII-safe
         self.statusBar().showMessage('Notification: ' + text, 6000)
+
+    def _on_hook_notice(self, message):
+        # the command hook's advisory (already sanitized in hook.evaluate)
+        self.statusBar().showMessage('Command hook: ' + message, 8000)
 
     def set_scrollback(self, lines):
         self._scrollback = int(lines)

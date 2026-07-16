@@ -1,0 +1,81 @@
+#!/usr/bin/python3 -Bsu
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+"""
+Example secure-terminal command hook.
+
+secure-terminal ships no policy and no AI; this is a sample handler you point it
+at. Enable it with a settings drop-in, e.g. ~/.config/secure-terminal.d/50_user.conf:
+
+    command_hook=/usr/share/secure-terminal/hooks/example-hook
+    command_hook_on_error=allow
+    command_hook_transcript=none
+
+The protocol (see secure_terminal.hook):
+  - stdin  is a JSON request:  {"version":1,"command":..,"cwd":..,"tab":..,
+                                "transcript":..?}
+  - stdout is a JSON verdict:  {"verdict":"allow|block|ask|need_transcript",
+                                "message":..?,"suggestion":..?}
+
+This example uses only local rules (no network, fast). To judge with an AI
+instead, replace decide() with a call that pipes the command to your model, e.g.
+`claude --print`, and parse its answer -- keeping that logic HERE, out of the
+terminal. Return need_transcript on the first pass to have secure-terminal call
+you again with the scrollback attached (the cheap-then-escalate pattern), so the
+long/expensive/injection-prone transcript is only sent when you actually need it.
+"""
+
+import sys
+import json
+import re
+
+# commands to refuse outright, with a safer suggestion where one is obvious
+_BLOCK = [
+    (re.compile(r'\brm\s+-\w*[rf]\w*\s+/(\s|$)'),
+     'Refusing "rm -rf /": this deletes everything.', ''),
+    (re.compile(r':\(\)\s*\{.*\|\s*:\s*&\s*\}\s*;'),
+     'Refusing a fork bomb.', ''),
+]
+# commands to double-check with the user before running
+_ASK = [
+    (re.compile(r'\bcurl\b.*\|\s*(sudo\s+)?(ba)?sh\b'),
+     'This pipes a download straight into a shell. Read the script first.'),
+    (re.compile(r'\bwget\b.*\|\s*(sudo\s+)?(ba)?sh\b'),
+     'This pipes a download straight into a shell. Read the script first.'),
+    (re.compile(r'\bchmod\s+-R\s+777\b'),
+     'chmod -R 777 makes everything world-writable.'),
+    (re.compile(r'\bdd\b.*\bof=/dev/[sh]d'),
+     'dd writing to a raw disk device can destroy data.'),
+]
+
+
+def decide(command):
+    for pattern, message, suggestion in _BLOCK:
+        if pattern.search(command):
+            return {'verdict': 'block', 'message': message,
+                    'suggestion': suggestion}
+    for pattern, message in _ASK:
+        if pattern.search(command):
+            return {'verdict': 'ask', 'message': message}
+    return {'verdict': 'allow'}
+
+
+def main():
+    try:
+        request = json.load(sys.stdin)
+    except (ValueError, OSError):
+        # a malformed request -> allow (secure-terminal also fails open by
+        # default); never crash, never block the user's terminal on a bug here.
+        print(json.dumps({'verdict': 'allow'}))
+        return 0
+    command = request.get('command', '') if isinstance(request, dict) else ''
+    print(json.dumps(decide(command)))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -39,13 +39,14 @@ Design (see https://secure-terminal.github.io):
 - PASTE is sanitized the same way before it reaches the shell, so invisible or
   bidi characters copied from a web page never enter your command line.
 
-- INPUT forwards printable ASCII and a tiny allowlist of control keys. The
-  signal keys deliver a real signal to the foreground process group
-  (Ctrl+C -> SIGINT, Ctrl+Z -> SIGTSTP, Ctrl+\\ -> SIGQUIT) so they work even
-  against a raw-mode program that would swallow the control byte; Ctrl+D (EOF)
-  and Ctrl+L (clear) are written as line-discipline bytes. Still one-directional.
-  terminate_foreground() is the guaranteed panic button (SIGTERM then SIGKILL)
-  for a program that ignores all of the above.
+- INPUT forwards printable characters and the control keys, each sent as its
+  control byte exactly as a real terminal does (Ctrl+C -> 0x03, Ctrl+\\ -> 0x1c,
+  readline's Ctrl+A/R/U ...): a cooked shell's line discipline turns 0x03 into
+  SIGINT, while a raw-mode program reads the byte itself (so an app's own "press
+  Ctrl+C again to exit" works). Still one-directional. terminate_foreground() is
+  the guaranteed panic button (SIGTERM then SIGKILL) for a program that ignores
+  all of the above. An opt-in command hook (apply_hook) can additionally judge a
+  typed line before Enter submits it.
 
 This is a deliberately minimal, line-oriented terminal by default: TERM is
 "dumb" and no escapes are parsed. An opt-in TUI mode (apply_tui) interprets
@@ -132,6 +133,8 @@ class SecureTerminal(QPlainTextEdit):
     # move the current tab. Handled at the widget because it owns the keyboard.
     tab_step = pyqtSignal(int)
     tab_move = pyqtSignal(int)
+    # the command hook produced an advisory message to surface (status bar)
+    hook_notice = pyqtSignal(str)
     # a program set the title / sent a notification (only when allowed)
     title_changed = pyqtSignal(str)
     notified = pyqtSignal(str)
@@ -195,6 +198,10 @@ class SecureTerminal(QPlainTextEdit):
         self._last_title = ''
         # persistent output cursor for line mode (see _append_runs)
         self._out_cursor = None
+        # optional command hook (opt-in): config dict or None, plus the current
+        # typed input line so it can be judged before Enter submits it.
+        self._hook = None
+        self._line_buffer = ''
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._render_tui)
@@ -332,6 +339,7 @@ class SecureTerminal(QPlainTextEdit):
         self.clear()
         self._out_cursor = None       # the cleared document invalidates it
         self._raw = ''                # a fresh shell starts a fresh raw buffer
+        self._line_buffer = ''
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -809,12 +817,20 @@ class SecureTerminal(QPlainTextEdit):
                 return
             if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
                 self._write(bytes([key & 0x1f]))   # Ctrl+C -> 0x03, Ctrl+L -> 0x0c
+                if key in (Qt.Key.Key_C, Qt.Key.Key_U):
+                    self._line_buffer = ''    # SIGINT / kill-line discards the line
                 return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            # The command hook (if configured) judges the typed line before Enter
+            # submits it; it may block, ask, or offer a safer command.
+            if self._hook is not None and self._hook_intercept():
+                return
+            self._line_buffer = ''
             self._write(b'\r')
             return
         if key == Qt.Key.Key_Backspace:
+            self._line_buffer = self._line_buffer[:-1]
             self._write(b'\x7f')
             return
         if key == Qt.Key.Key_Tab:
@@ -838,6 +854,7 @@ class SecureTerminal(QPlainTextEdit):
         # reachable from a keyboard anyway. How it then DISPLAYS is still the
         # display mode's call (strip shows '_', show shows the glyph).
         if text and all(ch.isprintable() for ch in text):
+            self._line_buffer += text
             self._write(text.encode('utf-8'))
         # non-printable input and arrow/navigation keys are intentionally ignored
 
@@ -859,6 +876,96 @@ class SecureTerminal(QPlainTextEdit):
         else:
             return False
         return True
+
+    # -- command hook: judge the typed line before Enter submits it -----------
+    def apply_hook(self, config):
+        """Enable the command hook (a dict with keys argv, timeout, on_error,
+        transcript) or disable it with None."""
+        self._hook = config or None
+
+    def hook_enabled(self):
+        return self._hook is not None
+
+    def _foreground_cwd(self):
+        pgrp = self._foreground_pgrp()
+        if pgrp:
+            try:
+                return os.readlink('/proc/%d/cwd' % pgrp)
+            except OSError:
+                pass            # gone / not readable -> no cwd
+        return ''
+
+    def _hook_transcript(self):
+        setting = (self._hook or {}).get('transcript', 'none')
+        if setting == 'full':
+            return self.toPlainText()
+        if setting.startswith('tail:'):
+            try:
+                count = int(setting.split(':', 1)[1])
+            except ValueError:
+                count = 0
+            if count > 0:
+                return '\n'.join(self.toPlainText().split('\n')[-count:])
+        return ''
+
+    def _hook_intercept(self):
+        """Judge the typed line through the hook before it is submitted. Returns
+        True when the hook handled the Enter (blocked, or asked and decided);
+        False to let the normal path submit the line unchanged."""
+        from secure_terminal import hook
+        command = self._line_buffer
+        if not command.strip():
+            return False
+        result = hook.evaluate(
+            self._hook['argv'], command,
+            timeout=self._hook.get('timeout', 10),
+            on_error=self._hook.get('on_error', 'allow'),
+            cwd=self._foreground_cwd(),
+            transcript_provider=self._hook_transcript)
+        if result['message']:
+            self.hook_notice.emit(result['message'])
+        if result['verdict'] == 'allow':
+            return False
+        action = self._hook_ask(command, result)     # 'run' | 'suggest' | 'discard'
+        if action == 'run':
+            self._line_buffer = ''
+            self._write(b'\r')
+            return True
+        self._write(b'\x15')          # Ctrl+U: discard the typed line in the shell
+        self._line_buffer = ''
+        if action == 'suggest' and result['suggestion']:
+            # insert the suggested command for review -- never with a newline, so
+            # it never auto-runs; the user presses Enter (and is re-judged).
+            self._write(result['suggestion'].encode('ascii', 'ignore'))
+            self._line_buffer = result['suggestion']
+        return True
+
+    def _hook_ask(self, command, result):
+        """Prompt for a blocked/ask verdict. Returns 'run', 'suggest' or
+        'discard'. A 'block' with no suggestion needs no prompt (just discard)."""
+        from PyQt6.QtWidgets import QMessageBox
+        if result['verdict'] == 'block' and not result['suggestion']:
+            return 'discard'
+        text = ('The command hook flagged this command:\n\n  ' + command
+                + (('\n\n' + result['message']) if result['message'] else ''))
+        box = QMessageBox(QMessageBox.Icon.Warning, 'Command hook', text, parent=self)
+        run_btn = None
+        if result['verdict'] == 'ask':
+            run_btn = box.addButton('Run as typed',
+                                    QMessageBox.ButtonRole.AcceptRole)
+        suggest_btn = None
+        if result['suggestion']:
+            suggest_btn = box.addButton('Use: ' + result['suggestion'][:40],
+                                        QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is run_btn and run_btn is not None:
+            return 'run'
+        if clicked is suggest_btn and suggest_btn is not None:
+            return 'suggest'
+        return 'discard'
 
     def _tui_key(self, event):
         """Encode a keystroke as VT input for the program in TUI mode."""
