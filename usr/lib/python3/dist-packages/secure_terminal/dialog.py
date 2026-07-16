@@ -20,7 +20,9 @@ from PyQt6.QtWidgets import (
 
 # import the pure helpers from the core, not from terminal, to avoid an import
 # cycle (terminal imports this dialog lazily for the paste warning).
-from secure_terminal.sanitize import render_output, paste_findings
+from secure_terminal.sanitize import (
+    render_output, classify_paste, sanitize_paste,
+)
 
 
 class PasteWarningDialog(QDialog):
@@ -30,13 +32,13 @@ class PasteWarningDialog(QDialog):
         self.setModal(True)
         self._remaining = max(0, int(delay_seconds))
 
-        has_unicode, has_control = paste_findings(text)
-        detected = []
-        if has_unicode:
-            detected.append('unicode')
-        if has_control:
-            detected.append('control characters')
-        headline = 'This paste contains ' + ' and '.join(detected) + '.'
+        findings = classify_paste(text)
+        parts = ['%d %s%s' % (count, label, '' if count == 1 else 's')
+                 for label, count in findings]
+        if parts:
+            headline = 'This paste hides ' + ', '.join(parts) + '.'
+        else:
+            headline = 'This paste contains hidden characters.'
 
         outer = QVBoxLayout(self)
 
@@ -53,23 +55,29 @@ class PasteWarningDialog(QDialog):
         outer.addLayout(row)
 
         outer.addWidget(QLabel(
-            'Only sanitized plain ASCII will be sent to the shell. Review it '
-            'first: the left pane is how it looks, the right pane reveals every '
-            'hidden character.'))
+            'Review it before it reaches the shell: the left pane is how it '
+            'looks, the middle pane reveals every hidden character as a <U+XXXX> '
+            'badge, and the right pane is exactly the sanitized ASCII that will '
+            'be sent if you allow it.'))
 
-        # side-by-side previews
+        # side-by-side previews: as-copied, revealed, and the sanitized result
         grid = QGridLayout()
         grid.addWidget(QLabel('Original (as copied)'), 0, 0)
         grid.addWidget(QLabel('Reveal (what is really there)'), 0, 1)
+        grid.addWidget(QLabel('Will be sent (sanitized)'), 0, 2)
         original = QPlainTextEdit(text)
         original.setReadOnly(True)
         revealed = QPlainTextEdit(render_output(text, 'reveal'))
         revealed.setReadOnly(True)
-        for view in (original, revealed):
+        # sanitize_paste submits lines with '\r'; show them as newlines here
+        sent = QPlainTextEdit(sanitize_paste(text).replace('\r', '\n'))
+        sent.setReadOnly(True)
+        for view in (original, revealed, sent):
             view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-            view.setMinimumSize(320, 160)
+            view.setMinimumSize(240, 160)
         grid.addWidget(original, 1, 0)
         grid.addWidget(revealed, 1, 1)
+        grid.addWidget(sent, 1, 2)
         outer.addLayout(grid)
 
         # buttons: Reject (default focus) and a countdown-gated Allow

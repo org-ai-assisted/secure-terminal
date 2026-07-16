@@ -211,6 +211,32 @@ def paste_findings(text):
     return has_unicode, has_control
 
 
+def classify_paste(text):
+    """Name and count the classes of non-plain-ASCII characters in a paste, so a
+    warning can say exactly what is hidden in it ("2 bidirectional controls, 1
+    invisible character") instead of a bare "contains unicode" -- the user has a
+    right to know what a copied string really carries. Returns an ordered list of
+    (label, count) for the classes present, most alarming first; label is a
+    singular noun the caller pluralizes."""
+    counts = {}
+    for ch in text:
+        cp = ord(ch)
+        if ch in ('\n', '\r', '\t') or 0x20 <= cp <= 0x7E:
+            continue
+        if cp in (0x200E, 0x200F) or 0x202A <= cp <= 0x202E or 0x2066 <= cp <= 0x2069:
+            key = 'bidirectional control'
+        elif cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
+            key = 'control character'
+        elif not ch.isprintable():
+            key = 'invisible character'
+        else:
+            key = 'non-ASCII character'   # homoglyphs and other printable non-ASCII
+        counts[key] = counts.get(key, 0) + 1
+    order = ('bidirectional control', 'control character',
+             'invisible character', 'non-ASCII character')
+    return [(label, counts[label]) for label in order if label in counts]
+
+
 def parse_sgr(param_str, state):
     """Fold one SGR parameter string into `state` -- a dict with keys 'fg', 'bg'
     (palette index or None) and 'bold' (bool). Pure so the colour logic can be
