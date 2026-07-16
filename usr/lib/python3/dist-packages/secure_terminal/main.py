@@ -1482,6 +1482,15 @@ class MainWindow(QMainWindow):
             checked = colour or '#3b7ddd'
             css += ('QFrame#chip QPushButton#chip_%s:checked'
                     '{background:%s;color:#fff;font-weight:600}' % (key, checked))
+            if colour:
+                # hover previews the option's safety colour (a light tint), so a
+                # user sees that Show / TUI are the less-safe, red/yellow choices
+                # before committing the click.
+                h = colour.lstrip('#')
+                tint = 'rgba(%d,%d,%d,0.22)' % (
+                    int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+                css += ('QFrame#chip QPushButton#chip_%s:hover:!checked'
+                        '{background:%s}' % (key, tint))
             btn.toggled.connect(
                 lambda on, k=key: (on and not self._syncing) and on_select(k))
             group.addButton(btn)
