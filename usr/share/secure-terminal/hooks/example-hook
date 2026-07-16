@@ -29,36 +29,53 @@ you again with the scrollback attached (the cheap-then-escalate pattern), so the
 long/expensive/injection-prone transcript is only sent when you actually need it.
 """
 
+import os
 import sys
 import json
 import re
 
-# Commands to refuse outright. Piping a downloaded script into a privileged
-# shell is the classic supply-chain footgun. (Illustrations elsewhere use an
-# RFC-invalid host, so they are harmless even if one is ever run.)
-_BLOCK = [
-    (re.compile(r'\b(curl|wget)\b.*\|\s*sudo\s+(ba)?sh\b'),
+# hooklib (sibling file) loads the rules from the drop-in tiers, so the allow /
+# block / ask policy is documented, editable configuration -- not baked-in code.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import hooklib          # noqa: E402  pylint: disable=wrong-import-position
+
+# The DEFAULT rules (verdict, regex, message, suggestion). An admin (or a user,
+# if allowed) documents/edits them in example-hook-rules.conf. Piping a
+# downloaded script into a privileged shell is the classic supply-chain footgun.
+_DEFAULT_RULES = [
+    ('block', r'\b(curl|wget)\b.*\|\s*sudo\s+(ba)?sh\b',
      'Refusing to pipe a downloaded script into a root shell.', ''),
+    ('ask', r'\b(curl|wget)\b.*\|\s*(ba)?sh\b',
+     'This pipes a downloaded script straight into a shell. Read it first.', ''),
+    ('ask', r'\bgit\s+push\b.*(--force|(\s|=)-f\b)',
+     'A force-push can overwrite history on the remote.', ''),
+    ('ask', r'^\s*sudo\b', 'This runs with root privileges.', ''),
 ]
-# Commands to double-check with the user before running.
-_ASK = [
-    (re.compile(r'\b(curl|wget)\b.*\|\s*(ba)?sh\b'),
-     'This pipes a downloaded script straight into a shell. Read it first.'),
-    (re.compile(r'\bgit\s+push\b.*(--force|(\s|=)-f\b)'),
-     'A force-push can overwrite history on the remote.'),
-    (re.compile(r'^\s*sudo\b'),
-     'This runs with root privileges.'),
-]
+
+
+def _load_rules():
+    source = hooklib.read_rules('example-hook-rules.conf')
+    if source is None:
+        source = _DEFAULT_RULES
+    compiled = []
+    for verdict, pattern, message, suggestion in source:
+        try:
+            compiled.append((verdict, re.compile(pattern), message, suggestion))
+        except re.error:
+            continue                 # skip a malformed custom pattern
+    if not compiled:                 # a wholly-bad file -> fall back to defaults
+        compiled = [(v, re.compile(p), m, s) for v, p, m, s in _DEFAULT_RULES]
+    return compiled
+
+
+_RULES = _load_rules()
 
 
 def decide(command):
-    for pattern, message, suggestion in _BLOCK:
+    for verdict, pattern, message, suggestion in _RULES:
         if pattern.search(command):
-            return {'verdict': 'block', 'message': message,
+            return {'verdict': verdict, 'message': message,
                     'suggestion': suggestion}
-    for pattern, message in _ASK:
-        if pattern.search(command):
-            return {'verdict': 'ask', 'message': message}
     return {'verdict': 'allow'}
 
 
