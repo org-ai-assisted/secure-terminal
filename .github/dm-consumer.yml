@@ -1,4 +1,17 @@
-## Config for the org-ai-assisted/dist-ai reusable test workflow.
+## Per-repo parameter overrides. Read at workflow runtime by the reusable
+## workflows in developer-meta-files. Top-level keys mirror the consumer-template
+## basename without the 'consumer-' prefix.
+##
+## Spec:
+## https://github.com/org-ai-assisted/developer-meta-files/blob/master/agents/github-actions-consumer-templates.md
+
+coverity:
+  ## scan.coverity.com project name. The URL renders the slash as a dash for
+  ## display ('/projects/secure-terminal-secure-terminal') but the API
+  ## form-parameter requires the actual slash.
+  project-name:    "secure-terminal/secure-terminal"
+  canonical-repos: "secure-terminal/secure-terminal,org-ai-assisted/secure-terminal"
+
 ## The widget suite runs secure-terminal offscreen (PyQt6 + pyte) and the fuzz
 ## suite uses hypothesis, so the container needs these on top of python3.
 dist-ai-tests:
