@@ -219,6 +219,7 @@ class MainWindow(QMainWindow):
         self._theme_actions = {}
         self._user_titles = {}       # term -> user-set tab name
         self._prog_titles = {}       # term -> program (OSC) title
+        self._pre_tui_mode = {}      # term -> display mode to restore after TUI
         self._tab_colors = {}        # term -> tab colour name (for persistence)
         self._build_menu()
         self._build_toolbar()
@@ -459,9 +460,18 @@ class MainWindow(QMainWindow):
         for key, action in self._theme_actions.items():
             action.setChecked(key == active)
         self._sync_mode_toggles(term.current_mode())
-        self.act_colors.setChecked(term.colors_enabled())
-        self.act_tui.setChecked(term.current_tui())
-        self.act_title.setChecked(term.allow_title_enabled())
+        # These are connected via `toggled`, which fires on a programmatic
+        # setChecked too -- so reflecting the current tab's state here would call
+        # set_colors/set_tui/set_title and rewrite the persisted defaults on every
+        # tab switch (and set_tui would even force the tab's mode). Block signals
+        # so a tab switch only DISPLAYS state, never mutates it.
+        for action, value in (
+                (self.act_colors, term.colors_enabled()),
+                (self.act_tui, term.current_tui()),
+                (self.act_title, term.allow_title_enabled())):
+            action.blockSignals(True)
+            action.setChecked(value)
+            action.blockSignals(False)
         self._update_tui_indicator()
         self._update_security_indicator()
         self._update_terminate_enabled()
@@ -534,9 +544,20 @@ class MainWindow(QMainWindow):
         term = self.current()
         if term is not None:
             term.apply_tui(enabled)
-            # a strict-stripped screen makes a TUI unreadable, so lean to 'show'
-            if enabled and term.current_mode() == 'strip':
-                self.set_mode('show')
+            if enabled:
+                # A strip-stripped screen makes a TUI unreadable (box-drawing
+                # becomes '_'), so lean this TAB to 'show'. Do it on the term only
+                # -- NOT via set_mode, which would persist 'show' as the global
+                # default for every future tab -- and remember the prior mode so
+                # turning TUI off restores it.
+                if term.current_mode() == 'strip':
+                    self._pre_tui_mode[term] = term.current_mode()
+                    term.apply_mode('show')
+            else:
+                prior = self._pre_tui_mode.pop(term, None)
+                if prior is not None:
+                    term.apply_mode(prior)
+            self._sync_mode_toggles(term.current_mode())
         self._default_tui = bool(enabled)
         self.act_tui.setChecked(enabled)
         self._update_tui_indicator()

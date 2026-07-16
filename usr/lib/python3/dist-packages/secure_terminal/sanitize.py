@@ -15,6 +15,42 @@ safe to display and names the class of anything that is not; the widget layer
 
 import os
 import re
+import unicodedata
+
+# two-letter Unicode general categories -> a readable name, so the reveal-badge
+# tooltip can say "Currency Symbol" rather than only "Sc".
+_CATEGORY_NAMES = {
+    'Cc': 'Control', 'Cf': 'Format', 'Co': 'Private Use', 'Cs': 'Surrogate',
+    'Cn': 'Unassigned',
+    'Ll': 'Lowercase Letter', 'Lm': 'Modifier Letter', 'Lo': 'Other Letter',
+    'Lt': 'Titlecase Letter', 'Lu': 'Uppercase Letter',
+    'Mc': 'Spacing Mark', 'Me': 'Enclosing Mark', 'Mn': 'Nonspacing Mark',
+    'Nd': 'Decimal Number', 'Nl': 'Letter Number', 'No': 'Other Number',
+    'Pc': 'Connector Punctuation', 'Pd': 'Dash Punctuation',
+    'Pe': 'Close Punctuation', 'Pf': 'Final Punctuation',
+    'Pi': 'Initial Punctuation', 'Po': 'Other Punctuation',
+    'Ps': 'Open Punctuation', 'Sc': 'Currency Symbol', 'Sk': 'Modifier Symbol',
+    'Sm': 'Math Symbol', 'So': 'Other Symbol', 'Zl': 'Line Separator',
+    'Zp': 'Paragraph Separator', 'Zs': 'Space Separator',
+}
+
+
+def describe_codepoint(cp):
+    """Human description of a Unicode code point for the reveal-badge tooltip:
+    its name, general category (long and short) and the \\u escape -- the same
+    detail `unicode-show` prints, because "<U+20AC>" alone means nothing to most
+    people. Pure, so it is unit-tested; the widget only positions the popup."""
+    if not isinstance(cp, int) or cp < 0 or cp > 0x10FFFF:
+        return 'U+???? (not a code point)'
+    ch = chr(cp)
+    try:
+        name = unicodedata.name(ch)
+    except ValueError:
+        name = 'unnamed code point'
+    cat = unicodedata.category(ch)
+    cat_long = _CATEGORY_NAMES.get(cat, cat)
+    esc = '\\u%04x' % cp if cp <= 0xFFFF else '\\U%08x' % cp
+    return 'U+%04X  %s\n%s (%s)   %s' % (cp, name, cat_long, cat, esc)
 
 # name -> (background, foreground). "dark" is white-on-black, "light" is the
 # reverse; both are plain, high-contrast, no syntax coloring.
@@ -43,7 +79,11 @@ DISPLAY_MODES = ('strip', 'show', 'reveal')
 
 # CSI (ESC [ ...), OSC (ESC ] ... BEL/ST) and other two-byte escapes.
 ANSI_RE = re.compile(
-    r'\x1b\[[0-9;?]*[ -/]*[@-~]'
+    # CSI: ESC [ , parameter bytes 0x30-0x3F (0-9 : ; < = > ?), intermediate
+    # bytes 0x20-0x2F, a final byte 0x40-0x7E. The parameter class must span the
+    # whole 0x30-0x3F range, or a private-prefix sequence a capable-TERM program
+    # emits (e.g. modifyOtherKeys "\x1b[>4;2m", "\x1b[?25l") is left unstripped.
+    r'\x1b\[[0-?]*[ -/]*[@-~]'
     r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?'
     r'|\x1b[@-Z\\-_]'
 )
@@ -212,9 +252,14 @@ def sanitize_title(text, limit=80):
 
 
 def _cell_cp_safe(cp, mode):
+    # Only 'show' renders a non-ASCII glyph in a TUI cell. 'reveal' cannot: a
+    # <U+XXXX> badge is many columns wide and would break the fixed grid, so
+    # reveal falls back to the safe '_' here (same as strip). This keeps the
+    # display honest -- a homoglyph never renders as its glyph under the green
+    # "reveal is safe/lossless" lamp; to read the exact codepoint, use line mode.
     if 0x20 <= cp <= 0x7E:
         return True
-    return mode in ('show', 'reveal') and cp >= 0x80
+    return mode == 'show' and cp >= 0x80
 
 
 def tui_cell(ch, mode):

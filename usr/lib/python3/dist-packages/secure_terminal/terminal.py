@@ -77,9 +77,9 @@ try:
 except ImportError:                      # TUI mode is unavailable without pyte
     pyte = None
 
-from PyQt6.QtCore import QSocketNotifier, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent
 from PyQt6.QtGui import QFont, QTextCursor, QColor, QPalette, QTextCharFormat
-from PyQt6.QtWidgets import QPlainTextEdit
+from PyQt6.QtWidgets import QPlainTextEdit, QToolTip
 
 # The pure, Qt-free sanitization core (also tested directly by dist-ai). Names
 # are re-exported here so terminal.py stays the single import point for the rest
@@ -90,8 +90,12 @@ from secure_terminal.sanitize import (
     colors_allowed, too_close, render_output, sanitize_paste,
     sanitize_paste_unicode,
     paste_findings, parse_sgr, tui_cell, sanitize_title, apply_line_edits,
-    wants_full_screen, leaves_full_screen,
+    wants_full_screen, leaves_full_screen, describe_codepoint,
+    _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
+
+# a revealed non-ASCII character, e.g. "<U+20AC>"; hovering one shows what it is.
+_BADGE_RE = re.compile(r'<U\+([0-9A-Fa-f]+)>')
 
 # OSC 9 ";<text>" (BEL or ST terminated): the iTerm2-style desktop notification.
 _OSC9 = re.compile(rb'\x1b\]9;([^\x07\x1b]*)(?:\x07|\x1b\\)')
@@ -345,10 +349,11 @@ class SecureTerminal(QPlainTextEdit):
             self.setVerticalScrollBarPolicy(
                 Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             # Show the current screen at once. If a full-screen program is already
-            # running its frames were fed in the background, so the screen is up to
-            # date; otherwise a fresh (blank) screen is created and the next
-            # program to draw fills it.
-            if self._screen is None:
+            # running (_alt_screen) its frames were fed in the background, so the
+            # screen is up to date. Otherwise start from a FRESH blank screen: a
+            # leftover screen from an earlier TUI session holds a stale frame (it
+            # is not fed in plain line mode), which must not be shown as if live.
+            if self._screen is None or not self._alt_screen:
                 self._make_screen()
             self._render_tui()
         else:
@@ -619,8 +624,13 @@ class SecureTerminal(QPlainTextEdit):
     def _on_readable(self):
         try:
             data = os.read(self._fd, 65536)
-        except (OSError, BlockingIOError):
-            return
+        except BlockingIOError:
+            return                        # nothing ready yet (non-blocking fd)
+        except OSError:
+            # After the child exits, reading a pty master raises EIO on Linux
+            # rather than returning b''. Treat any read error as end-of-file, or a
+            # level-triggered notifier on the errored fd spins a core forever.
+            data = b''
         if not data:
             if self._notifier is not None:
                 self._notifier.setEnabled(False)
@@ -630,15 +640,22 @@ class SecureTerminal(QPlainTextEdit):
         # Track whether a full-screen program holds the alternate screen. While it
         # does, keep the pyte screen fed even in line mode, so flipping to TUI mode
         # shows its current frame at once (no restart, the program keeps running).
+        # Resolve enter/leave by LAST occurrence in the chunk, so a chunk that
+        # carries both (one program quits and another starts) ends in the right
+        # state rather than always enter-wins.
         entered = wants_full_screen(text)
         left = leaves_full_screen(text)
-        if entered:
-            self._alt_screen = True
-        if left:
-            self._alt_screen = False
-            self._tui_hint_shown = False   # a later full-screen app may re-advise
+        if entered or left:
+            last_enter = max((text.rfind(s) for s in _ALT_ENTER), default=-1)
+            last_leave = max((text.rfind(s) for s in _ALT_LEAVE), default=-1)
+            self._alt_screen = last_enter > last_leave
+            if not self._alt_screen:
+                self._tui_hint_shown = False   # a later full-screen app re-advises
 
-        if self.tui_active() or self._alt_screen:
+        # Feed the background pyte screen only when pyte is actually available; on
+        # a box without python3-pyte, _alt_screen can still be set (detection is
+        # pure) but pyte.Screen() would crash and wedge the tab.
+        if (self.tui_active() or self._alt_screen) and pyte is not None:
             if self._screen is None:
                 self._make_screen()
             self._feed_stream(data)
@@ -875,7 +892,11 @@ class SecureTerminal(QPlainTextEdit):
         pgrp = self._foreground_pgrp()
         if pgrp is None:
             return False
-        if self._pid is not None and pgrp == os.getpgid(self._pid):
+        try:
+            shell_pgrp = os.getpgid(self._pid) if self._pid is not None else None
+        except ProcessLookupError:
+            return False                  # shell already gone (auto-reaped)
+        if shell_pgrp is not None and pgrp == shell_pgrp:
             return False
         return True
 
@@ -1147,15 +1168,38 @@ class SecureTerminal(QPlainTextEdit):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.tui_active():
-            self._sync_tui_size()        # resizes the pyte screen and the pty
+        if self.tui_active() or (self._alt_screen and self._screen is not None):
+            # TUI mode, or a full-screen program held in the background while in
+            # line mode: keep the pyte screen and the pty at the (scrollbar-
+            # independent) grid, so a later flip to TUI needs no resize.
+            self._sync_tui_size()
         else:
-            # Line mode still needs the pty's winsize kept in step with the
+            # Plain line mode still needs the pty's winsize kept in step with the
             # widget: the shell reads COLUMNS from it, and zsh pads its prompt
             # with trailing fill to that width. Left at the fork-time default
             # (80), that fill (and the clickable void it creates) lands in the
             # middle of a wider window instead of at the true right edge.
             self._set_winsize(*self._grid_size())
+
+    def event(self, e):
+        # Hovering a reveal badge (<U+XXXX>) explains what the character actually
+        # is -- name, category and escape -- because the bare codepoint means
+        # nothing to most people. Nothing else needs a tooltip.
+        if e.type() == QEvent.Type.ToolTip:
+            pos = self.viewport().mapFromGlobal(e.globalPos())
+            cursor = self.cursorForPosition(pos)
+            col = cursor.positionInBlock()
+            text = cursor.block().text()
+            for m in _BADGE_RE.finditer(text):
+                if m.start() <= col <= m.end():
+                    QToolTip.showText(
+                        e.globalPos(), describe_codepoint(int(m.group(1), 16)),
+                        self)
+                    return True
+            QToolTip.hideText()
+            e.ignore()
+            return True
+        return super().event(e)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
