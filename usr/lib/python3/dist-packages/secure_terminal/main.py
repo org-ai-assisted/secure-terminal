@@ -816,6 +816,15 @@ class MainWindow(QMainWindow):
                     'see the exact codepoint, so nothing can pose as a look-alike '
                     'and nothing is silently dropped. Escape sequences are removed '
                     'and pasting is sanitized.')
+        if mode == 'detail':
+            return ('#1f8a54', 'Detail',
+                    'Display: DETAIL (green, safe).\n\n'
+                    'Like Reveal but verbose: every non-ASCII character is shown '
+                    'as a <U+XXXX NAME> badge -- the exact codepoint plus its '
+                    'official Unicode name -- so a homoglyph reads as its '
+                    'identity, not just a number (the annotation unicode-show '
+                    'prints). Escape sequences are removed and pasting is '
+                    'sanitized.')
         return ('#e5a50a', 'Strip',
                 'Display: STRIP (yellow).\n\n'
                 'Non-ASCII output becomes "_": safe -- nothing deceptive is drawn '
@@ -1103,11 +1112,12 @@ class MainWindow(QMainWindow):
             theme_menu.addAction(act)
             self._theme_actions[key] = act
 
-        # Three mutually-exclusive display modes as a colour-coded segmented
-        # control. Ordered Strip, Reveal, Show so Strip and Show are never
-        # adjacent. Reveal is green (safe AND lossless -- the exact codepoint is
-        # shown); Strip is yellow (safe but lossy -- non-ASCII collapses to a "_"
-        # that is easy to overlook); Show is red (a rendered glyph can deceive).
+        # Mutually-exclusive display modes as a colour-coded segmented control.
+        # Ordered Strip, Reveal, Detail, Show so Strip and Show are never
+        # adjacent. Reveal and Detail are green (safe AND lossless -- the exact
+        # codepoint is shown, Detail also names it); Strip is yellow (safe but
+        # lossy -- non-ASCII collapses to a "_" that is easy to overlook); Show is
+        # red (a rendered glyph can deceive).
         mode_menu = view_menu.addMenu('&Unicode')
         self._mode_group = QActionGroup(self)
         self._mode_group.setExclusive(True)
@@ -1121,6 +1131,10 @@ class MainWindow(QMainWindow):
              'Show every non-ASCII character as a <U+XXXX> badge: safe and '
              'lossless, you see the exact codepoint, nothing can pose as a '
              'look-alike.'),
+            ('De&tail', 'detail', '#1f8a54',
+             'Like Reveal but verbose: <U+XXXX NAME>, the codepoint plus its '
+             'official Unicode name inline (what unicode-show annotates), so a '
+             'homoglyph reads as its identity, not just a number.'),
             ('S&how', 'show', '#d83933',
              'Render non-ASCII output as its glyph. Least safe: a look-alike '
              '(homoglyph) can pose as an ASCII character. The invisible, bidi and '
@@ -1134,6 +1148,7 @@ class MainWindow(QMainWindow):
             self._mode_actions[key] = act
         self.act_strip = self._mode_actions['strip']
         self.act_reveal = self._mode_actions['reveal']
+        self.act_detail = self._mode_actions['detail']
         self.act_show = self._mode_actions['show']
         self._sync_mode_toggles(self._default_mode)
 
@@ -1537,6 +1552,7 @@ class MainWindow(QMainWindow):
         uni_frame, self._mode_buttons = self._chip_group('unicode:', (
             ('strip', 'Strip', '#e5a50a', self.act_strip.toolTip()),
             ('reveal', 'Reveal', '#1f8a54', self.act_reveal.toolTip()),
+            ('detail', 'Detail', '#1f8a54', self.act_detail.toolTip()),
             ('show', 'Show', '#d83933', self.act_show.toolTip()),
         ), self.set_mode)
         bar.addWidget(uni_frame)

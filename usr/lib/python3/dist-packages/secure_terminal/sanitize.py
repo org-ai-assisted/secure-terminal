@@ -75,7 +75,20 @@ ANSI_PALETTE = [
 #               characters that make unicode deceptive), so a log with useful
 #               unicode is readable; control still becomes '_'.
 #   'reveal' -- replace with a visible <U+XXXX> codepoint badge, to inspect.
-DISPLAY_MODES = ('strip', 'show', 'reveal')
+#   'detail' -- like reveal but verbose: <U+XXXX NAME>, the codepoint plus its
+#               official Unicode name inline (what `unicode-show` annotates), so
+#               a homoglyph reads as its identity, not just a number.
+DISPLAY_MODES = ('strip', 'show', 'reveal', 'detail')
+
+
+def _detail_badge(cp):
+    """A verbose reveal badge: <U+XXXX NAME>, all printable ASCII (Unicode names
+    are ASCII), so it is safe in every display and never re-enables an escape."""
+    try:
+        name = unicodedata.name(chr(cp))
+    except (ValueError, TypeError):
+        name = 'UNNAMED'
+    return '<U+%04X %s>' % (cp, name)
 
 # CSI (ESC [ ...), OSC (ESC ] ... BEL/ST) and other two-byte escapes.
 ANSI_RE = re.compile(
@@ -130,6 +143,8 @@ def render_output(text, mode='strip'):
         cp = ord(ch)
         if cp in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= cp <= 0x7E:
             out.append(ch)
+        elif mode == 'detail':
+            out.append(_detail_badge(cp))
         elif mode == 'reveal':
             out.append('<U+%04X>' % cp)
         elif mode == 'show' and cp >= 0x80 and ch.isprintable():
