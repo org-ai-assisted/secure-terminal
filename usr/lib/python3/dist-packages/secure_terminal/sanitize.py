@@ -374,11 +374,16 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
     def emit(ch, key):
         disp = render_output(ch, mode)
         # a neutralized/revealed char (its display differs from the source) is a
-        # "marking"; colour it by risk class when colored markings are on --
-        # independent of the ANSI-colour toggle. Past _RUN_CAP runs (a flood),
-        # stop marking so the runs re-coalesce and the UI cannot wedge.
-        if markings and disp != ch and len(runs) < _RUN_CAP:
-            add(disp, (MARK_KEY, marking_class(ord(ch))))
+        # "marking": tag it with its risk CLASS -- for colouring when colored
+        # markings are on, independent of the ANSI-colour toggle (None when off, so
+        # no colour) -- and always with its source CODEPOINT, so the widget can
+        # describe the real character on hover/click in every mode (even the strip
+        # "_", which otherwise keeps no trace of what it replaced). Past _RUN_CAP
+        # runs (a flood), stop tagging so the runs re-coalesce and the UI cannot
+        # wedge; distinct codepoints no longer merge, but the cap still bounds it.
+        if disp != ch and len(runs) < _RUN_CAP:
+            cls = marking_class(ord(ch)) if markings else None
+            add(disp, (MARK_KEY, cls, ord(ch)))
         else:
             add(disp, key if colors else None)
 

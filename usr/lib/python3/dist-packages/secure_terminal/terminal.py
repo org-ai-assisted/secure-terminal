@@ -80,8 +80,10 @@ except ImportError:                      # TUI mode is unavailable without pyte
 
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData)
-from PyQt6.QtGui import QFont, QTextCursor, QColor, QPalette, QTextCharFormat
-from PyQt6.QtWidgets import QPlainTextEdit, QToolTip
+from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
+                         QTextFormat, QGuiApplication)
+from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
+                             QHBoxLayout, QLabel, QPushButton)
 
 # The pure, Qt-free sanitization core (also tested directly by dist-ai). Names
 # are re-exported here so terminal.py stays the single import point for the rest
@@ -92,12 +94,22 @@ from secure_terminal.sanitize import (
     sanitize_paste_unicode,
     paste_findings, tui_cell, sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL,
-    wants_full_screen, leaves_full_screen, describe_codepoint,
+    wants_full_screen, leaves_full_screen, describe_codepoint, marking_class,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 
-# a revealed non-ASCII character, e.g. "<U+20AC>"; hovering one shows what it is.
-_BADGE_RE = re.compile(r'<U\+([0-9A-Fa-f]+)>')
+# Custom char-format property carrying a marked cell's SOURCE code point, so the
+# widget can describe the real character on hover/click regardless of how it is
+# displayed (the strip "_", a reveal/detail badge, a control shown as "_").
+_CP_PROP = QTextFormat.Property.UserProperty + 1
+
+# Human-readable gloss for each risk class (marking_class), for the click popup.
+_RISK_LABELS = {
+    'bidi':      'bidirectional control -- can reorder text (the worst deception)',
+    'invisible': 'invisible -- zero-width, BOM or line/paragraph separator',
+    'control':   'control character -- C0, DEL or C1',
+    'nonascii':  'other non-ASCII -- can be a look-alike (homoglyph)',
+}
 
 # OSC 9 ";<text>" (BEL or ST terminated): the iTerm2-style desktop notification.
 _OSC9 = re.compile(rb'\x1b\]9;([^\x07\x1b]*)(?:\x07|\x1b\\)')
@@ -635,15 +647,19 @@ class SecureTerminal(QPlainTextEdit):
 
     def _fmt_from_key(self, key):
         """QTextCharFormat for a cell's SGR key (a sorted-items tuple), or the
-        default format for None. A (MARK_KEY, class) key colours a neutralized /
-        revealed marking by its risk class. Cached; a theme change clears it."""
+        default format for None. A (MARK_KEY, class, codepoint) key colours a
+        neutralized / revealed marking by its risk class (class None = no colour,
+        colored markings off) and carries the source code point so hover/click can
+        describe it. Cached; a theme change clears it."""
         if key is None:
             return QTextCharFormat()
-        if isinstance(key, tuple) and len(key) == 2 and key[0] == MARK_KEY:
+        if isinstance(key, tuple) and len(key) == 3 and key[0] == MARK_KEY:
             fmt = self._line_fmt_cache.get(key)
             if fmt is None:
                 fmt = QTextCharFormat()
-                fmt.setForeground(QColor(self.MARKING_COLORS[key[1]]))
+                if key[1] is not None:
+                    fmt.setForeground(QColor(self.MARKING_COLORS[key[1]]))
+                fmt.setProperty(_CP_PROP, key[2])
                 self._line_fmt_cache[key] = fmt
             return fmt
         fmt = self._line_fmt_cache.get(key)
@@ -1305,25 +1321,86 @@ class SecureTerminal(QPlainTextEdit):
             # middle of a wider window instead of at the true right edge.
             self._set_winsize(*self._grid_size())
 
+    def _cp_at(self, pos):
+        """The source code point of a neutralized/revealed character under a
+        viewport point, or None. First the char format's tagged code point (every
+        marked cell carries it, in every mode -- even the strip "_"); then, for a
+        readable glyph shown as-is (show mode), the non-ASCII character itself."""
+        cursor = self.cursorForPosition(pos)
+        doc = self.document()
+        p = cursor.position()
+        # cursorForPosition snaps to a boundary, so the hovered cell is the char to
+        # the left or the right; probe both.
+        for start in (p, p - 1):
+            if start < 0 or start >= doc.characterCount() - 1:
+                continue
+            probe = QTextCursor(doc)
+            probe.setPosition(start)
+            probe.movePosition(QTextCursor.MoveOperation.NextCharacter,
+                               QTextCursor.MoveMode.KeepAnchor)
+            cp = probe.charFormat().property(_CP_PROP)
+            if cp is not None:
+                return int(cp)
+            text = probe.selectedText()
+            # a readable non-ASCII glyph (show mode) keeps no tag but IS its own
+            # code point; exclude Qt's block/line separators (U+2028/U+2029).
+            if len(text) == 1 and ord(text) > 0x7F and ord(text) not in (0x2028, 0x2029):
+                return ord(text)
+        return None
+
     def event(self, e):
-        # Hovering a reveal badge (<U+XXXX>) explains what the character actually
-        # is -- name, category and escape -- because the bare codepoint means
-        # nothing to most people. Nothing else needs a tooltip.
+        # Hovering a neutralized/revealed character explains what it actually is --
+        # name, category, escape -- because the display ("_", a <U+XXXX> badge, or
+        # a look-alike glyph) does not, on its own, reveal its identity.
         if e.type() == QEvent.Type.ToolTip:
             pos = self.viewport().mapFromGlobal(e.globalPos())
-            cursor = self.cursorForPosition(pos)
-            col = cursor.positionInBlock()
-            text = cursor.block().text()
-            for m in _BADGE_RE.finditer(text):
-                if m.start() <= col <= m.end():
-                    QToolTip.showText(
-                        e.globalPos(), describe_codepoint(int(m.group(1), 16)),
-                        self)
-                    return True
+            cp = self._cp_at(pos)
+            if cp is not None:
+                QToolTip.showText(e.globalPos(), describe_codepoint(cp), self)
+                return True
             QToolTip.hideText()
             e.ignore()
             return True
         return super().event(e)
+
+    def mouseDoubleClickEvent(self, event):
+        # Double-clicking a neutralized/revealed character opens an ACTIVE popup
+        # (unlike the passive hover tooltip): its text can be selected and copied,
+        # and it stays open while you work. A double-click elsewhere selects a word
+        # as usual.
+        cp = self._cp_at(event.position().toPoint())
+        if cp is not None:
+            self._show_char_popup(cp, event.globalPosition().toPoint())
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _show_char_popup(self, cp, global_point):
+        """A small, dismissible, copyable popup describing a character. Copies the
+        \\uXXXX ESCAPE, not the raw glyph -- putting a bidi override or homoglyph
+        on the clipboard is the very hazard this terminal guards against."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Character U+%04X' % cp)
+        col = QVBoxLayout(dlg)
+        info = QLabel(describe_codepoint(cp) + '\nRisk: '
+                      + _RISK_LABELS.get(marking_class(cp), marking_class(cp)), dlg)
+        info.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        col.addWidget(info)
+        esc = '\\u%04x' % cp if cp <= 0xFFFF else '\\U%08x' % cp
+        row = QHBoxLayout()
+        copy = QPushButton('Copy ' + esc, dlg)
+        copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(esc))
+        close = QPushButton('Close', dlg)
+        close.setDefault(True)
+        close.clicked.connect(dlg.close)
+        row.addWidget(copy)
+        row.addStretch(1)
+        row.addWidget(close)
+        col.addLayout(row)
+        dlg.move(global_point)
+        self._char_popup = dlg          # keep a reference so it is not GC'd
+        dlg.show()
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
