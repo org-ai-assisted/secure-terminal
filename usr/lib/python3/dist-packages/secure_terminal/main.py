@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QWidget, QSizePolicy, QFileDialog, QInputDialog, QColorDialog,
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit,
+    QComboBox, QCheckBox, QFormLayout,
 )
 
 from secure_terminal import settings, session
@@ -852,6 +853,13 @@ class MainWindow(QMainWindow):
             tabs_menu.addAction(act)
 
         settings_menu = bar.addMenu('&Settings')
+        act_global = QAction('&Global Settings...', self)
+        act_global.setToolTip(
+            'Set the defaults for every tab in one place; changes apply to all '
+            'open tabs and to new ones.')
+        act_global.triggered.connect(self.show_global_settings)
+        settings_menu.addAction(act_global)
+        settings_menu.addSeparator()
         act_locations = QAction('&Folders & Files...', self)
         act_locations.setToolTip(
             'Show where settings and session state are stored, with buttons to '
@@ -894,6 +902,110 @@ class MainWindow(QMainWindow):
         buttons.addWidget(close)
         layout.addLayout(buttons)
         dialog.exec()
+
+    def show_global_settings(self):
+        """One dialog for the defaults that otherwise live scattered across the
+        View menu. On accept the choices apply to every open tab and become the
+        default for new ones."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Global settings')
+        form = QFormLayout(dialog)
+
+        theme = QComboBox()
+        for label, key in THEME_LABELS:
+            theme.addItem(label, key)
+        theme.setCurrentIndex(theme.findData(self._default_theme))
+        form.addRow('Theme', theme)
+
+        zoom = QSpinBox()
+        zoom.setRange(ZOOM_MIN, ZOOM_MAX)
+        zoom.setSingleStep(ZOOM_STEP)
+        zoom.setSuffix('%')
+        zoom.setValue(self._default_zoom)
+        form.addRow('Zoom', zoom)
+
+        mode = QComboBox()
+        for label, key in (('Strip (safe)', 'strip'), ('Show unicode', 'show'),
+                           ('Reveal unicode', 'reveal')):
+            mode.addItem(label, key)
+        mode.setCurrentIndex(mode.findData(self._default_mode))
+        form.addRow('Unicode', mode)
+
+        colors = QCheckBox()
+        colors.setChecked(self._default_colors)
+        form.addRow('Colors', colors)
+
+        tui = QCheckBox()
+        tui.setChecked(self._default_tui)
+        tui.setEnabled(tui_available())
+        form.addRow('TUI mode (new tabs)', tui)
+
+        title = QCheckBox()
+        title.setChecked(self._default_allow_title)
+        form.addRow('Allow program title / notifications', title)
+
+        scrollback = QComboBox()
+        for label, lines in SCROLLBACK_CHOICES:
+            scrollback.addItem(label, lines)
+        scrollback.setCurrentIndex(scrollback.findData(self._scrollback))
+        form.addRow('Scrollback', scrollback)
+
+        pdelay = QComboBox()
+        for label, secs in PASTE_DELAY_CHOICES:
+            pdelay.addItem(label, secs)
+        pdelay.setCurrentIndex(pdelay.findData(self._paste_delay))
+        form.addRow('Paste delay', pdelay)
+
+        persist = QCheckBox()
+        persist.setChecked(self._persist_session)
+        form.addRow('Restore session on start', persist)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton('Cancel')
+        cancel.clicked.connect(dialog.reject)
+        apply_all = QPushButton('Apply to all tabs')
+        apply_all.setDefault(True)
+        apply_all.clicked.connect(dialog.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(apply_all)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_global({
+            'theme': theme.currentData(), 'zoom': zoom.value(),
+            'mode': mode.currentData(), 'colors': colors.isChecked(),
+            'tui': tui.isChecked(), 'allow_title': title.isChecked(),
+            'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
+            'persist': persist.isChecked(),
+        })
+
+    def _apply_global(self, opts):
+        """Apply the global-settings choices to every open tab and store the new
+        defaults. TUI mode changes only the default for new tabs -- switching it
+        would restart the shell in each existing tab, throwing away running work,
+        which a settings dialog must not do."""
+        self._default_theme = opts['theme']
+        self._default_zoom = opts['zoom']
+        self._default_mode = opts['mode']
+        self._default_colors = opts['colors']
+        self._default_tui = opts['tui']
+        self._default_allow_title = opts['allow_title']
+        self._scrollback = opts['scrollback']
+        self._paste_delay = opts['paste_delay']
+        for index in range(self.tabs.count()):
+            term = self.tabs.widget(index)
+            term.apply_theme(opts['theme'])
+            term.apply_zoom(opts['zoom'])
+            term.apply_mode(opts['mode'])
+            term.apply_colors(opts['colors'])
+            term.apply_allow_title(opts['allow_title'])
+            term.apply_scrollback(opts['scrollback'])
+            term.apply_paste_delay(opts['paste_delay'])
+        self.set_persist_session(opts['persist'])
+        self._sync_chrome_to_tab()
+        self._persist()
 
     def _build_toolbar(self):
         bar = QToolBar('Main', self)
