@@ -540,7 +540,7 @@ class SecureTerminal(QPlainTextEdit):
             self.shell_exited.emit()
             return
         if self.tui_active() and self._stream is not None:
-            self._stream.feed(data)
+            self._feed_stream(data)
             if not self._render_timer.isActive():
                 self._render_timer.start(16)     # coalesce bursts into ~60fps
             if self._allow_title:
@@ -551,6 +551,16 @@ class SecureTerminal(QPlainTextEdit):
         if len(self._raw) > self._RAW_MAX:
             self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output
         self._append_runs(self._render_runs(text))
+
+    def _feed_stream(self, data):
+        """Feed bytes to the pyte parser, containing any error. pyte parses
+        untrusted program output, and a version quirk or an odd sequence (real
+        htop/vim/tmux emit private SGR that some pyte builds mishandle) must never
+        crash the terminal -- worst case a rendering glitch, never a core dump."""
+        try:
+            self._stream.feed(data)
+        except Exception:            # noqa: BLE001 -- third-party parser, any error
+            pass
 
     def _handle_title_and_notify(self, data):
         """When the "modern protocol" setting is on, surface the program's title
