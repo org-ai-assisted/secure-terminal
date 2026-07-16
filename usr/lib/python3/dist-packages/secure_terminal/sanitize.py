@@ -99,6 +99,26 @@ def render_output(text, mode='strip'):
     return ''.join(out)
 
 
+# The alternate-screen enable sequences (private DEC modes). A program that
+# switches to the alternate screen buffer is a full-screen (TUI) app -- htop,
+# vim, less -- which line mode, having no escape parser, cannot draw. Detecting
+# this lets the widget hint that TUI mode is needed, rather than showing garbage.
+_ALT_SCREEN = ('\x1b[?1049h', '\x1b[?1047h', '\x1b[?47h')
+_ALT_SCREEN_OFF = ('\x1b[?1049l', '\x1b[?1047l', '\x1b[?47l')
+
+
+def wants_full_screen(text):
+    """True when the output tries to switch to the alternate screen buffer, the
+    tell of a full-screen (TUI) program that cannot render in line mode."""
+    return any(seq in text for seq in _ALT_SCREEN)
+
+
+def leaves_full_screen(text):
+    """True when the output leaves the alternate screen buffer -- the full-screen
+    program (htop, vim) has exited and the shell's primary screen is back."""
+    return any(seq in text for seq in _ALT_SCREEN_OFF)
+
+
 def sanitize_bytes(data, mode='strip'):
     """Convenience wrapper: decode raw bytes 1:1 (latin-1) and render. Used by
     tests and any all-ASCII path; the live output stream uses an incremental

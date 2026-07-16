@@ -176,7 +176,11 @@ class MainWindow(QMainWindow):
             else 'dark'
         self._default_mode = cfg.get('unicode_mode') \
             if cfg.get('unicode_mode') in DISPLAY_MODES else 'strip'
-        self._default_colors = cfg.get('colors') == 'true'
+        # Colours on by default: with a capable TERM the shell prompt, ls, git
+        # and friends emit SGR colour, and a terminal that silently dropped it
+        # looks broken. Parsing is bounded (16 palette colours) and the renderer's
+        # contrast guard keeps text readable. An explicit saved 'false' still wins.
+        self._default_colors = cfg.get('colors', 'true') == 'true'
         try:
             self._default_zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(cfg['zoom'])))
         except (KeyError, ValueError):
@@ -549,9 +553,9 @@ class MainWindow(QMainWindow):
 
     def _display_level(self):
         """The display (unicode) risk axis as (colour, short, detail). Show
-        renders deceptive glyphs (red); strip and reveal are safe (green) --
-        reveal shows the exact <U+XXXX> codepoint, so nothing can pose as a
-        look-alike."""
+        renders deceptive glyphs (red). Reveal is safe AND lossless -- the exact
+        <U+XXXX> codepoint is shown (green). Strip is safe but LOSSY -- non-ASCII
+        collapses to a single "_" that is easy to overlook (yellow)."""
         term = self.current()
         mode = term.current_mode() if term is not None else 'strip'
         if mode == 'show':
@@ -564,15 +568,21 @@ class MainWindow(QMainWindow):
                     'but a rendered glyph can deceive the eye. This is the highest '
                     'risk, above TUI mode, because the deception is in what you '
                     'read.\n\nSwitch to Strip or Reveal to remove it.')
-        label = 'Reveal' if mode == 'reveal' else 'Strip'
-        detail = ('Every non-ASCII character is shown as a <U+XXXX> badge: you '
-                  'see the exact codepoint, so nothing can pose as a look-alike.'
-                  if mode == 'reveal' else
-                  'Non-ASCII output becomes "_": nothing deceptive is drawn.')
-        return ('#1f8a54', label,
-                'Display: ' + label.upper() + ' (green, safe).\n\n' + detail
-                + ' Escape sequences are removed and pasting is sanitized either '
-                  'way.')
+        if mode == 'reveal':
+            return ('#1f8a54', 'Reveal',
+                    'Display: REVEAL (green, safe).\n\n'
+                    'Every non-ASCII character is shown as a <U+XXXX> badge: you '
+                    'see the exact codepoint, so nothing can pose as a look-alike '
+                    'and nothing is silently dropped. Escape sequences are removed '
+                    'and pasting is sanitized.')
+        return ('#e5a50a', 'Strip',
+                'Display: STRIP (yellow).\n\n'
+                'Non-ASCII output becomes "_": safe -- nothing deceptive is drawn '
+                '-- but lossy. A single "_" is easy to overlook (far less visible '
+                'than a revealed <U+XXXX> badge), so you may not notice that '
+                'hidden characters were there at all. Switch to Reveal to see the '
+                'exact codepoints. Escape sequences are removed and pasting is '
+                'sanitized either way.')
 
     def _mode_level(self):
         """The interpretation (mode) risk axis: TUI interprets escapes in a
@@ -812,20 +822,22 @@ class MainWindow(QMainWindow):
 
         # Three mutually-exclusive display modes as a colour-coded segmented
         # control. Ordered Strip, Reveal, Show so Strip and Show are never
-        # adjacent, and so the colour runs safe-to-risky left to right: strip and
-        # reveal are green (nothing deceptive is drawn -- reveal shows the exact
-        # codepoint), show is red (a rendered glyph can be a look-alike).
+        # adjacent. Reveal is green (safe AND lossless -- the exact codepoint is
+        # shown); Strip is yellow (safe but lossy -- non-ASCII collapses to a "_"
+        # that is easy to overlook); Show is red (a rendered glyph can deceive).
         mode_menu = view_menu.addMenu('&Unicode')
         self._mode_group = QActionGroup(self)
         self._mode_group.setExclusive(True)
         self._mode_actions = {}
         for label, key, colour, tip in (
-            ('&Strip', 'strip', '#1f8a54',
-             'Non-ASCII output becomes "_": the safe default, nothing deceptive '
-             'is drawn.'),
+            ('&Strip', 'strip', '#e5a50a',
+             'Non-ASCII output becomes "_": safe, but lossy -- a single "_" is '
+             'easy to overlook, so you may not notice hidden characters were '
+             'there. Reveal is more informative.'),
             ('&Reveal', 'reveal', '#1f8a54',
-             'Show every non-ASCII character as a <U+XXXX> badge: safe, you see '
-             'the exact codepoint, nothing can pose as a look-alike.'),
+             'Show every non-ASCII character as a <U+XXXX> badge: safe and '
+             'lossless, you see the exact codepoint, nothing can pose as a '
+             'look-alike.'),
             ('S&how', 'show', '#d83933',
              'Render non-ASCII output as its glyph. Least safe: a look-alike '
              '(homoglyph) can pose as an ASCII character. The invisible, bidi and '

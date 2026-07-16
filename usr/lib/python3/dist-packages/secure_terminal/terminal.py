@@ -48,15 +48,18 @@ Design (see https://secure-terminal.github.io):
   all of the above. An opt-in command hook (apply_hook) can additionally judge a
   typed line before Enter submits it.
 
-This is a deliberately minimal, line-oriented terminal by default: TERM is
-"dumb" and no escapes are parsed. An opt-in TUI mode (apply_tui) interprets
+This is a deliberately minimal, line-oriented terminal by default: no escape
+parser at all -- every escape sequence in the output is stripped in the renderer
+(safety does not rest on TERM, which is a normal xterm-256color, but on that
+unconditional stripping). An opt-in TUI mode (apply_tui) instead interprets
 escapes through a pyte screen model so full-screen programs (ssh, vim, htop,
-tmux) work; even then every cell is still character-filtered and pyte
-only builds a screen model, so program output cannot drive it to set the title
-or touch the clipboard the way a real terminal's escape handling can (the
-programs you run still have your normal user access). The window
-flags TUI mode with a visible risk indicator; the strict line mode remains the
-safe-by-construction default.
+tmux) work; mode is only a rendering choice over the same byte stream, so it
+switches without restarting the shell and a running program survives the switch.
+Even in TUI mode every cell is still character-filtered and pyte only builds a
+screen model, so program output cannot drive it to set the title or touch the
+clipboard the way a real terminal's escape handling can (the programs you run
+still have your normal user access). The window flags TUI mode with a visible
+risk indicator; the strict line mode remains the safe-by-construction default.
 """
 
 import os
@@ -87,6 +90,7 @@ from secure_terminal.sanitize import (
     colors_allowed, too_close, render_output, sanitize_paste,
     sanitize_paste_unicode,
     paste_findings, parse_sgr, tui_cell, sanitize_title, apply_line_edits,
+    wants_full_screen, leaves_full_screen,
 )
 
 # OSC 9 ";<text>" (BEL or ST terminated): the iTerm2-style desktop notification.
@@ -124,6 +128,19 @@ def _build_tui_keys():
         k.Key_F4: b'\x1bOS', k.Key_F5: b'\x1b[15~', k.Key_F6: b'\x1b[17~',
         k.Key_F7: b'\x1b[18~', k.Key_F8: b'\x1b[19~', k.Key_F9: b'\x1b[20~',
         k.Key_F10: b'\x1b[21~', k.Key_F11: b'\x1b[23~', k.Key_F12: b'\x1b[24~',
+    }
+
+
+def _build_line_edit_keys():
+    """Qt.Key -> VT byte sequence for the keys line mode forwards to the shell's
+    own line editor: history recall (Up/Down), intra-line movement (Left/Right/
+    Home/End) and forward delete. Built lazily (references Qt.Key)."""
+    k = Qt.Key
+    return {
+        k.Key_Up: b'\x1b[A', k.Key_Down: b'\x1b[B',
+        k.Key_Right: b'\x1b[C', k.Key_Left: b'\x1b[D',
+        k.Key_Home: b'\x1b[H', k.Key_End: b'\x1b[F',
+        k.Key_Delete: b'\x1b[3~',
     }
 
 
@@ -194,6 +211,10 @@ class SecureTerminal(QPlainTextEdit):
         # programs (ssh, vim, htop, tmux) work. Off by default; the strict, no-parser
         # line mode above is the safe default.
         self._tui = bool(tui) and tui_available()
+        if self._tui:
+            # a TUI screen is fixed; no scrollback scrollbar (see apply_tui)
+            self.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._command = command
         self._screen = None
         self._stream = None
@@ -206,6 +227,14 @@ class SecureTerminal(QPlainTextEdit):
         self._last_title = ''
         # persistent output cursor for line mode (see _append_runs)
         self._out_cursor = None
+        # show the "this program wants TUI mode" advisory at most once per
+        # full-screen program, so one that redraws every second does not spam it.
+        self._tui_hint_shown = False
+        # True while a full-screen program holds the alternate screen buffer. The
+        # pyte screen is then kept fed in the background even in line mode, so
+        # flipping to TUI mode shows the program's current frame instantly (no
+        # restart). Maintained from the output stream (alt-screen enter/leave).
+        self._alt_screen = False
         # optional command hook (opt-in): config dict or None, plus the current
         # typed input line so it can be judged before Enter submits it.
         self._hook = None
@@ -246,6 +275,8 @@ class SecureTerminal(QPlainTextEdit):
         font.setPointSize(size)
         self.setFont(font)
         self._sync_tui_size()          # font change resizes the grid
+        if self.tui_active():
+            self._render_timer.start(16)   # repaint at the new glyph size
 
     def current_zoom(self):
         return self._zoom
@@ -297,13 +328,38 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- TUI mode -------------------------------------------------------------
     def apply_tui(self, enabled):
-        """Turn TUI mode on/off. Because TERM is fixed at fork time, the shell is
-        re-started; a no-op when the state is unchanged or pyte is missing."""
+        """Turn TUI mode on/off without restarting the shell. Mode is only a
+        rendering choice over the same byte stream, so a running program (htop,
+        an ssh session) keeps running across the switch. A no-op when unchanged or
+        pyte is missing."""
         enabled = bool(enabled) and tui_available()
         if enabled == self._tui:
             return
         self._tui = enabled
-        self._restart()
+        if enabled:
+            # A TUI screen is fixed (no scrollback), so hide the vertical
+            # scrollbar. Because the pyte grid is scrollbar-independent
+            # (_tui_grid_size), toggling it does not change the grid, so no
+            # pyte.resize() fires -- which is what preserves the running program's
+            # frame across the switch.
+            self.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            # Show the current screen at once. If a full-screen program is already
+            # running its frames were fed in the background, so the screen is up to
+            # date; otherwise a fresh (blank) screen is created and the next
+            # program to draw fills it.
+            if self._screen is None:
+                self._make_screen()
+            self._render_tui()
+        else:
+            self.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            # Back to line mode: stop the TUI repaint and rebuild the scrolling
+            # document from the retained raw output. A full-screen program that is
+            # still running keeps drawing into the background pyte screen (so
+            # re-enabling is instant) while its stripped output also appends here.
+            self._render_timer.stop()
+            self._rerender()
 
     def current_tui(self):
         return self._tui
@@ -318,12 +374,33 @@ class SecureTerminal(QPlainTextEdit):
         return getattr(self, '_tui', False) and tui_available()
 
     def _grid_size(self):
-        """Columns and rows that fit the viewport at the current font."""
+        """Columns and rows that fit the viewport at the current font. Used for
+        the LINE-mode winsize, so it tracks the actual text width (scrollbar
+        excluded), matching how the shell wraps and fills the prompt."""
         metrics = self.fontMetrics()
         char_w = metrics.horizontalAdvance('M') or 1
         char_h = metrics.height() or 1
         vp = self.viewport()
         cols = max(2, vp.width() // char_w)
+        rows = max(2, vp.height() // char_h)
+        return cols, rows
+
+    def _tui_grid_size(self):
+        """The grid for the pyte screen: scrollbar-INDEPENDENT, because TUI mode
+        hides the vertical scrollbar. Computing it the same whether or not the
+        line-mode scrollbar is currently shown means flipping into TUI mode (which
+        toggles that scrollbar) does not change the grid, so it triggers no
+        pyte.resize() -- and pyte.resize() clears the alternate screen, which would
+        wipe the running program's frame we are switching in to see."""
+        metrics = self.fontMetrics()
+        char_w = metrics.horizontalAdvance('M') or 1
+        char_h = metrics.height() or 1
+        vp = self.viewport()
+        width = vp.width()
+        bar = self.verticalScrollBar()
+        if bar is not None and bar.isVisible():
+            width += bar.width()          # reclaim the space TUI mode will not use
+        cols = max(2, width // char_w)
         rows = max(2, vp.height() // char_h)
         return cols, rows
 
@@ -337,34 +414,23 @@ class SecureTerminal(QPlainTextEdit):
             pass            # a closed/invalid pty just misses this resize
 
     def _make_screen(self):
-        cols, rows = self._grid_size()
+        cols, rows = self._tui_grid_size()
         self._screen = pyte.Screen(cols, rows)
         self._stream = pyte.ByteStream(self._screen)
         self._set_winsize(cols, rows)
 
-    def _restart(self):
-        """Tear down the child and start a fresh one. Used when TUI mode toggles,
-        which changes TERM (fixed at fork time)."""
-        self.shutdown()
-        self.clear()
-        self._out_cursor = None       # the cleared document invalidates it
-        self._raw = ''                # a fresh shell starts a fresh raw buffer
-        self._line_buffer = ''
-        self._screen = None
-        self._stream = None
-        self._fmt_cache = {}
-        self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
-        self._sgr_reset()
-        self._start(self._command)
-
     def _sync_tui_size(self):
-        if not (self.tui_active() and self._screen is not None):
+        if self._screen is None:
             return
-        cols, rows = self._grid_size()
-        if (cols, rows) != (self._screen.columns, self._screen.lines):
-            self._screen.resize(rows, cols)
+        cols, rows = self._tui_grid_size()
+        if (cols, rows) == (self._screen.columns, self._screen.lines):
+            return                        # no real change -> no destructive resize
+        # pyte.resize() clears the alternate screen; the running program redraws
+        # on the SIGWINCH from the new winsize, so do not force a render here (that
+        # would flash a blank frame). The document keeps the last frame until the
+        # program's redraw arrives.
+        self._screen.resize(rows, cols)
         self._set_winsize(cols, rows)
-        self._render_timer.start(16)
 
     def _pyte_qcolor(self, color, default, bright=False):
         if not color or color == 'default':
@@ -524,10 +590,13 @@ class SecureTerminal(QPlainTextEdit):
     def _start(self, command):
         pid, fd = pty.fork()
         if pid == 0:
-            # child. In line mode advertise a dumb terminal so programs do not
-            # emit escape-heavy output; in TUI mode advertise a real terminal so
-            # ncurses / an editor / a remote shell over ssh drive it properly.
-            os.environ['TERM'] = 'xterm-256color' if self._tui else 'dumb'
+            # child. Always advertise a real terminal: mode (line vs TUI) is now a
+            # pure rendering choice over the SAME byte stream, switchable without a
+            # restart, so the shell must not be pinned to a dumb terminal it cannot
+            # change later. Safety does not rest on TERM: line mode strips every
+            # escape in the renderer regardless (fuzz-proven), and a capable TERM
+            # is what lets a full-screen program actually run once TUI mode is on.
+            os.environ['TERM'] = 'xterm-256color'
             os.environ.setdefault('PAGER', 'cat')
             # `command` is an optional program to run (split like a shell word
             # list, e.g. "ssh -p 22 host"); with none we run the login shell.
@@ -557,18 +626,43 @@ class SecureTerminal(QPlainTextEdit):
                 self._notifier.setEnabled(False)
             self.shell_exited.emit()
             return
-        if self.tui_active() and self._stream is not None:
+        text = self._decoder.decode(data)
+        # Track whether a full-screen program holds the alternate screen. While it
+        # does, keep the pyte screen fed even in line mode, so flipping to TUI mode
+        # shows its current frame at once (no restart, the program keeps running).
+        entered = wants_full_screen(text)
+        left = leaves_full_screen(text)
+        if entered:
+            self._alt_screen = True
+        if left:
+            self._alt_screen = False
+            self._tui_hint_shown = False   # a later full-screen app may re-advise
+
+        if self.tui_active() or self._alt_screen:
+            if self._screen is None:
+                self._make_screen()
             self._feed_stream(data)
+
+        if self.tui_active():
             if not self._render_timer.isActive():
                 self._render_timer.start(16)     # coalesce bursts into ~60fps
             if self._allow_title:
                 self._handle_title_and_notify(data)
             return
-        text = self._decoder.decode(data)
+
+        # line mode: retain the raw output (for a mode re-render) and display it
+        # through the escape-stripping pipeline.
         self._raw += text
         if len(self._raw) > self._RAW_MAX:
             self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output
         self._append_runs(self._render_runs(text))
+        # A full-screen program (htop, vim) is unusable in line mode -- its
+        # escapes are stripped, leaving garbage. Point the user at TUI mode once.
+        if not self._tui_hint_shown and entered:
+            self._tui_hint_shown = True
+            self._advise('This program wants a full-screen interface, which the '
+                         'safe line mode cannot draw. Turn on TUI mode to run it '
+                         'here.')
 
     def _feed_stream(self, data):
         """Feed bytes to the pyte parser, containing any error. pyte parses
@@ -625,6 +719,15 @@ class SecureTerminal(QPlainTextEdit):
 
     def _append(self, text):
         self._append_runs([(text, None)])
+
+    def _advise(self, message):
+        """Append a one-line advisory from the terminal itself (not the running
+        program), styled distinctly (yellow, italic) and clearly marked so it
+        cannot be mistaken for program output."""
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor('#e5a50a'))
+        fmt.setFontItalic(True)
+        self._append_runs([('\n[secure-terminal] ' + message + '\n', fmt)])
 
     def _append_plain(self, text):
         """Bulk line-mode append for uncolored output: resolve the line-editing
@@ -788,6 +891,7 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- input: printable ASCII + signal-key allowlist ------------------------
     _TUI_KEYS = None      # built lazily below (needs Qt.Key at call time)
+    _LINE_KEYS = None     # line-mode cursor/history keys, built lazily
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -846,6 +950,20 @@ class SecureTerminal(QPlainTextEdit):
         if key == Qt.Key.Key_Tab:
             self._write(b'\t')
             return
+
+        # Line editing and history: forward the cursor/history/delete keys to the
+        # shell's own line editor (readline/zle). Up/Down recall previous commands,
+        # Left/Right and Home/End move within the line, Delete removes forward.
+        # These are input you typed -- sent to the shell, whose redraw returns as
+        # ordinary output the renderer sanitizes. Shift+navigation is reserved for
+        # scrollback (below), so only the unmodified keys forward here.
+        if not shift and not ctrl:
+            if SecureTerminal._LINE_KEYS is None:
+                SecureTerminal._LINE_KEYS = _build_line_edit_keys()
+            seq = SecureTerminal._LINE_KEYS.get(key)
+            if seq is not None:
+                self._write(seq)
+                return
 
         # Scrollback navigation. In line mode there is no full-screen program to
         # own these keys, so scroll the buffer: Shift+PageUp/Down a page and
