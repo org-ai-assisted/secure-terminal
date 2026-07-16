@@ -209,6 +209,14 @@ class SecureTerminal(QPlainTextEdit):
         # newline-free flood cannot build one pathologically long block (the
         # QPlainTextEdit layout of which is quadratic).
         self._MAX_LINE = 8192
+        # Autowrap width: the number of columns we report to the child via the
+        # winsize, so output hard-wraps at exactly the width the shell/program
+        # formats to. Without this, a shell that pads to the width and relies on
+        # the terminal wrapping (zsh's PROMPT_SP / PROMPT_EOL_MARK end-of-line
+        # marker) collapses its marker and the next prompt onto one logical line,
+        # showing spurious trailing lines after a file with no final newline.
+        # Updated by _set_winsize; falls back to _MAX_LINE until first sized.
+        self._cols = 0
 
         # seconds the paste-warning "Allow" button stays disabled.
         self._paste_delay = 3
@@ -446,6 +454,9 @@ class SecureTerminal(QPlainTextEdit):
         return cols, rows
 
     def _set_winsize(self, cols, rows):
+        # Remember the width we tell the child, so line-mode output wraps at the
+        # same column the shell formats to (see self._cols / _feed_line).
+        self._cols = cols
         if self._fd is None:
             return
         try:
@@ -847,8 +858,11 @@ class SecureTerminal(QPlainTextEdit):
         cursor/erase ops, strips every other escape) and repaint the current line.
         Replaces the old strip-then-QTextCursor path; the cell model is what lets
         a reveal badge edit as one character."""
+        # Hard-wrap at the reported terminal width (never below a sane floor, and
+        # capped so a pathological newline-free flood still bounds each block).
+        wrap = self._cols if 8 <= self._cols <= self._MAX_LINE else self._MAX_LINE
         completed, self._line_cells, self._line_col, self._sgr = feed_line_edits(
-            self._line_cells, self._line_col, self._sgr, text, self._MAX_LINE)
+            self._line_cells, self._line_col, self._sgr, text, wrap)
         self._paint_line(completed)
 
     def _paint_line(self, completed):
