@@ -245,6 +245,7 @@ class SecureTerminal(QPlainTextEdit):
         # flipping to TUI mode shows the program's current frame instantly (no
         # restart). Maintained from the output stream (alt-screen enter/leave).
         self._alt_screen = False
+        self._grid_shown = False      # is the fixed pyte grid currently on screen
         # optional command hook (opt-in): config dict or None, plus the current
         # typed input line so it can be judged before Enter submits it.
         self._hook = None
@@ -309,10 +310,11 @@ class SecureTerminal(QPlainTextEdit):
         self._rerender()
 
     def _rerender(self):
-        """Re-display existing output under the current display mode. In TUI mode
-        the pyte screen is simply repainted; in line mode the retained raw output
-        is replayed through the render pipeline from a clean document."""
-        if self.tui_active():
+        """Re-display existing output under the current display mode. While a
+        full-screen program owns the grid the pyte screen is simply repainted;
+        otherwise (CLI, or TUI at a shell prompt) the retained raw output is
+        replayed through the render pipeline from a clean document."""
+        if self._grid_mode():
             self._render_tui()
             return
         self.clear()
@@ -348,35 +350,51 @@ class SecureTerminal(QPlainTextEdit):
         """Turn TUI mode on/off without restarting the shell. Mode is only a
         rendering choice over the same byte stream, so a running program (htop,
         an ssh session) keeps running across the switch. A no-op when unchanged or
-        pyte is missing."""
+        pyte is missing.
+
+        Enabling TUI does NOT blank the scrolling history: the fixed pyte grid
+        only takes over the screen while a full-screen program is actually on the
+        alternate screen (_grid_mode). With just a shell, TUI stays in line
+        display with the scrollback intact, so toggling CLI<->TUI back and forth
+        never loses history."""
         enabled = bool(enabled) and tui_available()
         if enabled == self._tui:
             return
         self._tui = enabled
-        if enabled:
-            # A TUI screen is fixed (no scrollback), so hide the vertical
-            # scrollbar. Because the pyte grid is scrollbar-independent
-            # (_tui_grid_size), toggling it does not change the grid, so no
-            # pyte.resize() fires -- which is what preserves the running program's
-            # frame across the switch.
+        self._sync_display()
+
+    def _grid_mode(self):
+        """True when the fixed pyte grid should own the screen: TUI enabled AND a
+        full-screen program is actually drawing on the alternate screen. TUI
+        without such a program stays in line display, so the scrollback shows."""
+        return self.tui_active() and self._alt_screen
+
+    def _sync_display(self):
+        """Match the on-screen view to the current mode. The fixed pyte grid owns
+        the screen only while a full-screen program runs under TUI; otherwise the
+        scrolling line document does, and its scrollback is never blanked by a
+        mode toggle -- it is only rebuilt when LEAVING the grid (a program
+        exited), so entering/leaving TUI at a shell prompt is a visual no-op."""
+        grid = self._grid_mode()
+        was_grid = self._grid_shown
+        self._grid_shown = grid
+        if grid:
+            # The pyte grid is scrollbar-independent (_tui_grid_size), so hiding
+            # the scrollbar fires no pyte.resize() -- which preserves a running
+            # program's frame across the switch.
             self.setVerticalScrollBarPolicy(
                 Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            # Show the current screen at once. If a full-screen program is already
-            # running (_alt_screen) its frames were fed in the background, so the
-            # screen is up to date. Otherwise start from a FRESH blank screen: a
-            # leftover screen from an earlier TUI session holds a stale frame (it
-            # is not fed in plain line mode), which must not be shown as if live.
-            if self._screen is None or not self._alt_screen:
+            if self._screen is None:
                 self._make_screen()
             self._render_tui()
-        else:
-            self.setVerticalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-            # Back to line mode: stop the TUI repaint and rebuild the scrolling
-            # document from the retained raw output. A full-screen program that is
-            # still running keeps drawing into the background pyte screen (so
-            # re-enabling is instant) while its stripped output also appends here.
-            self._render_timer.stop()
+            return
+        self._render_timer.stop()
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        if was_grid:
+            # A full-screen program just exited: rebuild the scrolling document
+            # from retained output. When we were already in line display (CLI, or
+            # TUI with no program), the document already holds the full
+            # scrollback, so leave it untouched -- no flicker, no history loss.
             self._rerender()
 
     def current_tui(self):
@@ -648,10 +666,13 @@ class SecureTerminal(QPlainTextEdit):
         # state rather than always enter-wins.
         entered = wants_full_screen(text)
         left = leaves_full_screen(text)
+        alt_changed = False
         if entered or left:
             last_enter = max((text.rfind(s) for s in _ALT_ENTER), default=-1)
             last_leave = max((text.rfind(s) for s in _ALT_LEAVE), default=-1)
+            was_alt = self._alt_screen
             self._alt_screen = last_enter > last_leave
+            alt_changed = self._alt_screen != was_alt
             if not self._alt_screen:
                 self._tui_hint_shown = False   # a later full-screen app re-advises
 
@@ -663,11 +684,20 @@ class SecureTerminal(QPlainTextEdit):
                 self._make_screen()
             self._feed_stream(data)
 
-        if self.tui_active():
+        # A full-screen program entering/leaving the alternate screen under TUI
+        # flips the on-screen view between the fixed grid and the scrolling
+        # document; sync the scrollbar and repaint on that transition.
+        if alt_changed and self.tui_active():
+            self._sync_display()
+
+        # Titles/notifications are a TUI-mode feature, independent of whether a
+        # full-screen program currently owns the grid.
+        if self.tui_active() and self._allow_title:
+            self._handle_title_and_notify(data)
+
+        if self._grid_mode():
             if not self._render_timer.isActive():
                 self._render_timer.start(16)     # coalesce bursts into ~60fps
-            if self._allow_title:
-                self._handle_title_and_notify(data)
             return
 
         # line mode: retain the raw output (for a mode re-render) and display it
