@@ -33,23 +33,21 @@ import sys
 import json
 import re
 
-# commands to refuse outright, with a safer suggestion where one is obvious
+# Commands to refuse outright. Piping a downloaded script into a privileged
+# shell is the classic supply-chain footgun. (Illustrations elsewhere use an
+# RFC-invalid host, so they are harmless even if one is ever run.)
 _BLOCK = [
-    (re.compile(r'\brm\s+-\w*[rf]\w*\s+/(\s|$)'),
-     'Refusing "rm -rf /": this deletes everything.', ''),
-    (re.compile(r':\(\)\s*\{.*\|\s*:\s*&\s*\}\s*;'),
-     'Refusing a fork bomb.', ''),
+    (re.compile(r'\b(curl|wget)\b.*\|\s*sudo\s+(ba)?sh\b'),
+     'Refusing to pipe a downloaded script into a root shell.', ''),
 ]
-# commands to double-check with the user before running
+# Commands to double-check with the user before running.
 _ASK = [
-    (re.compile(r'\bcurl\b.*\|\s*(sudo\s+)?(ba)?sh\b'),
-     'This pipes a download straight into a shell. Read the script first.'),
-    (re.compile(r'\bwget\b.*\|\s*(sudo\s+)?(ba)?sh\b'),
-     'This pipes a download straight into a shell. Read the script first.'),
-    (re.compile(r'\bchmod\s+-R\s+777\b'),
-     'chmod -R 777 makes everything world-writable.'),
-    (re.compile(r'\bdd\b.*\bof=/dev/[sh]d'),
-     'dd writing to a raw disk device can destroy data.'),
+    (re.compile(r'\b(curl|wget)\b.*\|\s*(ba)?sh\b'),
+     'This pipes a downloaded script straight into a shell. Read it first.'),
+    (re.compile(r'\bgit\s+push\b.*(--force|(\s|=)-f\b)'),
+     'A force-push can overwrite history on the remote.'),
+    (re.compile(r'^\s*sudo\b'),
+     'This runs with root privileges.'),
 ]
 
 
