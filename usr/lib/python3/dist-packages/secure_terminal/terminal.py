@@ -934,6 +934,13 @@ class SecureTerminal(QPlainTextEdit):
             # own "press Ctrl+C again to exit" work. Sending a real signal here
             # broke that. The Terminate action stays the escape hatch for a raw
             # program that ignores its interrupt. Still one-directional.
+            #
+            # Caret echo (^C) is the tty/shell's job, not ours -- and we already
+            # show it wherever a real terminal does: the tty's ECHOCTL echoes ^C
+            # for a cooked program, and bash's readline prints it at the prompt,
+            # both arriving here as ordinary printable output. zsh's ZLE chooses
+            # not to print it at its prompt (verified: identical in xterm), so we
+            # add no local echo -- that would double-print under bash.
             if key == Qt.Key.Key_Backslash:
                 self._write(b'\x1c')          # Ctrl+\ -> SIGQUIT (cooked)
                 return
