@@ -1162,7 +1162,12 @@ class MainWindow(QMainWindow):
             'Let a program set the tab title (OSC 0/2) and send notifications '
             '(OSC 9), the modern terminal protocol. Off by default; only takes '
             'effect in TUI mode. Titles and notifications are sanitized to plain '
-            'ASCII. Clipboard-write and hyperlink escapes stay blocked.')
+            'ASCII. Clipboard-write and hyperlink escapes stay blocked.\n\n'
+            'Low residual risk: the most a program can do is choose the ASCII '
+            'text you see in the title or a notification (a spoofing surface); '
+            'it cannot run code, inject escapes or read your clipboard. So this '
+            'is a plain toggle without a danger lamp -- reserving those for the '
+            'higher-risk TUI and Show modes.')
         self.act_title.toggled.connect(self.set_allow_title)
         view_menu.addAction(self.act_title)
 
