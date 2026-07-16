@@ -9,7 +9,7 @@ import os
 import signal
 import sys
 
-from PyQt6.QtCore import QTimer, Qt, QUrl
+from PyQt6.QtCore import QTimer, Qt, QUrl, qInstallMessageHandler
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QIcon, QColor, QPixmap,
     QDesktopServices,
@@ -796,7 +796,27 @@ def _install_signal_quit(app):
     wake.start(200)
 
 
+def _is_font_noise(category, message):
+    """True for the harmless 'qt.text.font.db: OpenType support missing for ...'
+    warnings Qt logs when show mode renders a codepoint from a complex script
+    whose installed monospace font lacks shaping tables. A flood of decoded
+    random bytes ("cat /dev/random" in show mode) emits thousands of these."""
+    return category == 'qt.text.font.db' or 'OpenType support missing' in message
+
+
+def _quiet_font_warnings():
+    """Drop the font-shaping warnings (see _is_font_noise) and pass everything
+    else through. They are emitted straight to the message handler and ignore
+    QT_LOGGING_RULES, so a handler is the only thing that catches them."""
+    def handler(_mode, context, message):
+        if _is_font_noise(getattr(context, 'category', '') or '', message):
+            return
+        sys.stderr.write(message + '\n')
+    qInstallMessageHandler(handler)
+
+
 def main():
+    _quiet_font_warnings()
     app = QApplication(sys.argv)
     app.setApplicationName('secure-terminal')
     _install_signal_quit(app)
