@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.hypothesis/
 
 # debian build artifacts
 debian/.debhelper/
