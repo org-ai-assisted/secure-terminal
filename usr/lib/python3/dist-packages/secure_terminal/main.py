@@ -47,9 +47,29 @@ THEME_LABELS = [
 ]
 
 # menu / combo label -> display-mode key in terminal.DISPLAY_MODES
-# Shown in the About dialog. Kept in step with debian/changelog by hand (the
-# module ships as plain .py, so there is no package metadata to read at runtime).
-APP_VERSION = '0.0.1'
+def _read_version(paths=None):
+    """The version is baked from debian/changelog into a file at build time (see
+    debian/rules) and read here. Fail open: a missing or unreadable file yields
+    'unknown' so a source checkout or a partial install still starts."""
+    if paths is None:
+        base = os.path.abspath(__file__)
+        for _ in range(6):        # .../usr/lib/python3/dist-packages/secure_terminal/main.py -> repo root
+            base = os.path.dirname(base)
+        paths = ['/usr/share/secure-terminal/version',
+                 os.path.join(base, 'usr', 'share', 'secure-terminal', 'version')]
+    for path in paths:
+        try:
+            with open(path, encoding='utf-8') as handle:
+                version = handle.read().strip()
+        except OSError:
+            continue
+        if version:
+            return version
+    return 'unknown'
+
+
+# Shown in the About dialog.
+APP_VERSION = _read_version()
 
 # menu label -> scrollback limit in lines (0 = unlimited)
 SCROLLBACK_CHOICES = [

@@ -11,6 +11,13 @@
 %:
 	dh $@
 
+## Bake the version from debian/changelog into a file the app reads at runtime,
+## straight into the staging tree so the source stays pristine.
+execute_after_dh_install:
+	install -d debian/secure-terminal/usr/share/secure-terminal
+	dpkg-parsechangelog -S Version \
+		> debian/secure-terminal/usr/share/secure-terminal/version
+
 ## Register the AppArmor profile and reload it on install/upgrade (and handle
 ## removal), via debhelper's dh_apparmor.
 override_dh_installdeb:
