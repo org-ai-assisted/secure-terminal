@@ -249,6 +249,10 @@ class SecureTerminal(QPlainTextEdit):
         # typed input line so it can be judged before Enter submits it.
         self._hook = None
         self._line_buffer = ''
+        # set when history recall / cursor editing desyncs _line_buffer from the
+        # real shell line, so the hook fails safe (asks) rather than judge a stale
+        # line. See keyPressEvent (line-edit keys) and _hook_intercept.
+        self._line_dirty = False
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._render_tui)
@@ -903,6 +907,7 @@ class SecureTerminal(QPlainTextEdit):
                 self._write(bytes([key & 0x1f]))   # Ctrl+C -> 0x03, Ctrl+L -> 0x0c
                 if key in (Qt.Key.Key_C, Qt.Key.Key_U):
                     self._line_buffer = ''    # SIGINT / kill-line discards the line
+                    self._line_dirty = False
                 return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -911,6 +916,7 @@ class SecureTerminal(QPlainTextEdit):
             if self._hook is not None and self._hook_intercept():
                 return
             self._line_buffer = ''
+            self._line_dirty = False
             self._write(b'\r')
             return
         if key == Qt.Key.Key_Backspace:
@@ -932,6 +938,13 @@ class SecureTerminal(QPlainTextEdit):
                 SecureTerminal._LINE_KEYS = _build_line_edit_keys()
             seq = SecureTerminal._LINE_KEYS.get(key)
             if seq is not None:
+                # History recall / intra-line cursor editing happens inside the
+                # shell's line editor, which we do not mirror -- so once one of
+                # these is used, _line_buffer no longer reflects the real command.
+                # Mark it, so the hook fails safe (asks) instead of judging a
+                # stale or empty line. Only matters when a hook is configured.
+                if self._hook is not None:
+                    self._line_dirty = True
                 self._write(seq)
                 return
 
@@ -1011,6 +1024,24 @@ class SecureTerminal(QPlainTextEdit):
         True when the hook handled the Enter (blocked, or asked and decided);
         False to let the normal path submit the line unchanged."""
         from secure_terminal import hook
+        # If the line was recalled from history or edited with the cursor keys,
+        # _line_buffer no longer matches what the shell will run, so judging it
+        # would be misleading (it could wave a dangerous recalled command through).
+        # Fail safe: ask the user to confirm the line the hook could not read.
+        if self._line_dirty:
+            action = self._hook_ask('(recalled / edited line)', {
+                'verdict': 'ask',
+                'message': 'This line was recalled from history or edited in '
+                           'place, so the command hook could not read it. Review '
+                           'it before it runs.',
+                'suggestion': ''})
+            self._line_buffer = ''
+            self._line_dirty = False
+            if action == 'run':
+                self._write(b'\r')
+            else:
+                self._write(b'\x15')          # Ctrl+U: discard the line
+            return True
         command = self._line_buffer
         if not command.strip():
             return False
