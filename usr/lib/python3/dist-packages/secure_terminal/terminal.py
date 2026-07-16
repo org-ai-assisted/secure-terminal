@@ -156,6 +156,11 @@ class SecureTerminal(QPlainTextEdit):
         # a multi-byte character split across two os.read() chunks still decodes.
         self._mode = 'strip'
         self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        # Retain the raw decoded output (line mode) so a display-mode change can
+        # re-render the WHOLE buffer, not just new output. Bounded so a flood
+        # cannot grow it without limit; the oldest output is dropped first.
+        self._raw = ''
+        self._RAW_MAX = 1_000_000
 
         # optional ANSI colours (off by default); SGR parser state.
         self._colors = False
@@ -197,7 +202,9 @@ class SecureTerminal(QPlainTextEdit):
         # restored scrollback from a previous session, shown as history above
         # the fresh shell (line mode; a TUI tab repaints over it on first draw).
         if history:
-            self._append(history if history.endswith('\n') else history + '\n')
+            restored = history if history.endswith('\n') else history + '\n'
+            self._raw = restored          # so a mode toggle re-renders it too
+            self._append(restored)
 
         self._notifier = None
         self._fd = None
@@ -232,10 +239,26 @@ class SecureTerminal(QPlainTextEdit):
         return self._theme
 
     def apply_mode(self, mode):
-        """Set the display mode for non-ASCII output. Affects future output only;
-        already-rendered text is left as it was shown."""
-        if mode in DISPLAY_MODES:
-            self._mode = mode
+        """Set the display mode for non-ASCII output and re-render the existing
+        buffer under it -- a mode change affects the whole scrollback, not only
+        new output, so toggling strip/show/reveal re-reads what is already there."""
+        if mode not in DISPLAY_MODES or mode == self._mode:
+            return
+        self._mode = mode
+        self._rerender()
+
+    def _rerender(self):
+        """Re-display existing output under the current display mode. In TUI mode
+        the pyte screen is simply repainted; in line mode the retained raw output
+        is replayed through the render pipeline from a clean document."""
+        if self.tui_active():
+            self._render_tui()
+            return
+        self.clear()
+        self._out_cursor = None
+        self._sgr_reset()                 # replay SGR colours from a clean slate
+        if self._raw:
+            self._append_runs(self._render_runs(self._raw))
 
     def current_mode(self):
         return self._mode
@@ -308,6 +331,7 @@ class SecureTerminal(QPlainTextEdit):
         self.shutdown()
         self.clear()
         self._out_cursor = None       # the cleared document invalidates it
+        self._raw = ''                # a fresh shell starts a fresh raw buffer
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -406,8 +430,11 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- optional ANSI colours ------------------------------------------------
     def apply_colors(self, enabled):
+        if bool(enabled) == self._colors:
+            return
         self._colors = bool(enabled)
         self._sgr_reset()
+        self._rerender()      # re-colour (or un-colour) the existing buffer too
 
     def colors_enabled(self):
         return self._colors
@@ -519,7 +546,11 @@ class SecureTerminal(QPlainTextEdit):
             if self._allow_title:
                 self._handle_title_and_notify(data)
             return
-        self._append_runs(self._render_runs(self._decoder.decode(data)))
+        text = self._decoder.decode(data)
+        self._raw += text
+        if len(self._raw) > self._RAW_MAX:
+            self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output
+        self._append_runs(self._render_runs(text))
 
     def _handle_title_and_notify(self, data):
         """When the "modern protocol" setting is on, surface the program's title
