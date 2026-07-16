@@ -400,6 +400,11 @@ class SecureTerminal(QPlainTextEdit):
                 Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             if self._screen is None:
                 self._make_screen()
+            else:
+                # A program started in CLI mode made its screen at the CLI size;
+                # entering the grid must resize it to the full (scrollbar-hidden)
+                # window so it redraws full-screen (SIGWINCH), not at ~60%.
+                self._sync_tui_size()
             self._render_tui()
             return
         self._render_timer.stop()
