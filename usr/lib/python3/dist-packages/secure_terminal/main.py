@@ -1490,7 +1490,8 @@ class MainWindow(QMainWindow):
 
     def show_locations(self):
         rows = [('Settings (written here)', settings.user_config_file())]
-        labels = ['System drop-in', 'Local drop-in', 'User drop-in']
+        labels = ['Built-in defaults', 'System drop-in', 'Local drop-in',
+                  'User drop-in']
         for label, directory in zip(labels, settings.config_dirs()):
             rows.append((label, directory))
         rows.append(('Saved session', session.session_path()))

@@ -9,8 +9,9 @@ Settings are KEY=value plain text spread over *.conf files in drop-in
 directories, so a distro or an admin can seed defaults and the user can override
 them:
 
-    /etc/secure-terminal.d/*.conf              (distro / system seed, lowest)
-    /usr/local/etc/secure-terminal.d/*.conf    (local admin)
+    /usr/lib/secure-terminal.d/*.conf          (built-in vendor defaults, lowest)
+    /etc/secure-terminal.d/*.conf              (distro / system administrator)
+    /usr/local/etc/secure-terminal.d/*.conf    (local administrator)
     ~/.config/secure-terminal.d/*.conf         (user, highest)
 
 Only files ending in .conf are read. Within each directory files are applied in
@@ -20,8 +21,8 @@ user always wins over a system seed. The application writes its own settings to 
 mid-numbered user file (50_user.conf): it beats the system seeds, and a user can
 still drop a higher-numbered .conf to override even the app's own choices.
 
-Hardening / corporate lockdown: a PRIVILEGED directory (/etc, /usr/local/etc)
-may declare `lock=key1,key2,...`. A locked key is enforced from the system layer
+Hardening / corporate lockdown: a PRIVILEGED directory (/usr/lib, /etc,
+/usr/local/etc) may declare `lock=key1,key2,...`. A locked key is enforced from the system layer
 and the user config CANNOT override it -- such an attempt is ignored and reported
 in Config.violations, and the application greys out the matching control. `lock`
 is honored only from the privileged directories; a user config can neither lock
@@ -53,10 +54,17 @@ def _user_config_dir():
 
 
 def _system_dirs():
-    """The PRIVILEGED drop-in directories (root-writable), lowest first. Settings
-    here can LOCK a key so the unprivileged user config cannot override it -- for
-    corporate / hardened deployments."""
+    """The PRIVILEGED drop-in directories (root-writable), lowest precedence first:
+
+        /usr/lib/secure-terminal.d   built-in vendor defaults (the shipped package)
+        /etc/secure-terminal.d       distro / system administrator
+        /usr/local/etc/secure-terminal.d  local administrator
+
+    Any of them may LOCK a key so the unprivileged user config cannot override it
+    (corporate / hardened deployments). Vendor defaults live in /usr/lib so a user
+    or admin overrides them in a higher tier without editing a packaged file."""
     return [
+        os.path.join('/usr/lib', _APP + '.d'),
         os.path.join('/etc', _APP + '.d'),
         os.path.join('/usr/local/etc', _APP + '.d'),
     ]
@@ -155,8 +163,8 @@ def save(values, locked=()):
         lines = [
             '## secure-terminal settings, written by the application.',
             '## One KEY=value per line. Additional .conf drop-ins in',
-            '## /etc/secure-terminal.d, /usr/local/etc/secure-terminal.d and',
-            '## this directory are also read, in lexical then directory order.',
+            '## /usr/lib, /etc and /usr/local/etc secure-terminal.d and this',
+            '## directory are also read, in lexical then directory order.',
             '## Admin-locked keys (via `lock=` in a system directory) are not',
             '## written here; they cannot be overridden from your home config.',
         ]

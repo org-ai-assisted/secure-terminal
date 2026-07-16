@@ -4,4 +4,4 @@ usr/lib/python3/dist-packages/secure_terminal usr/lib/python3/dist-packages/
 usr/share/applications/secure-terminal.desktop usr/share/applications/
 usr/share/secure-terminal/hooks usr/share/secure-terminal/
 etc/apparmor.d/secure-terminal etc/apparmor.d/
-etc/secure-terminal.d etc/
+usr/lib/secure-terminal.d usr/lib/

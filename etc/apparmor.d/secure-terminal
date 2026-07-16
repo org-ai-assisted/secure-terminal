@@ -37,6 +37,7 @@ profile secure-terminal /usr/bin/secure-terminal {
   /usr/share/icons/{,**} r,
 
   # settings drop-ins (system + user) and per-tab session state
+  /usr/lib/secure-terminal.d/{,**} r,
   /etc/secure-terminal.d/{,**} r,
   /usr/local/etc/secure-terminal.d/{,**} r,
   owner @{HOME}/.config/secure-terminal.d/ rw,
