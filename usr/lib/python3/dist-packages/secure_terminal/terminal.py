@@ -650,17 +650,6 @@ class SecureTerminal(QPlainTextEdit):
             return False
         return True
 
-    def signal_foreground(self, sig):
-        """Send a signal to the foreground process group so it takes effect even
-        against a raw-mode program that would ignore the control byte."""
-        pgrp = self._foreground_pgrp()
-        if pgrp is None:
-            return
-        try:
-            os.killpg(pgrp, sig)
-        except OSError:
-            pass            # the group already exited -> nothing to signal
-
     def terminate_foreground(self):
         """Guaranteed escape hatch for a program that ignores Ctrl+C / Ctrl+\\
         (a stuck TUI): SIGTERM the foreground process group now, then SIGKILL any
@@ -709,26 +698,19 @@ class SecureTerminal(QPlainTextEdit):
         # Ctrl+Shift+<key> is reserved for the window (copy/paste, new/close tab,
         # zoom); let those fall through to the QAction shortcuts.
         if ctrl and not shift:
-            # The signal keys deliver a REAL signal to the terminal's foreground
-            # process group, not just the control byte. In cooked mode the effect
-            # is the same, but a program in raw mode (nano, less, a pager) reads
-            # the byte as an ordinary keystroke and would never be interrupted;
-            # the signal reaches it regardless. Still one-directional.
-            sig_map = {
-                Qt.Key.Key_C: signal.SIGINT,
-                Qt.Key.Key_Z: signal.SIGTSTP,
-                Qt.Key.Key_Backslash: signal.SIGQUIT,
-            }
-            # EOF and clear are line-discipline bytes, not signals.
-            byte_map = {
-                Qt.Key.Key_D: b'\x04',        # EOF
-                Qt.Key.Key_L: b'\x0c',        # form feed (clear)
-            }
-            if key in sig_map:
-                self.signal_foreground(sig_map[key])
+            # Send the control byte to the pty, exactly as a real terminal does.
+            # In cooked mode the line discipline turns 0x03/0x1a/0x1c into
+            # SIGINT/SIGTSTP/SIGQUIT for the foreground process group; a raw-mode
+            # program (an editor, a pager, Claude Code) instead reads the byte
+            # itself -- which is what makes readline's Ctrl+A/W/R/U and an app's
+            # own "press Ctrl+C again to exit" work. Sending a real signal here
+            # broke that. The Terminate action stays the escape hatch for a raw
+            # program that ignores its interrupt. Still one-directional.
+            if key == Qt.Key.Key_Backslash:
+                self._write(b'\x1c')          # Ctrl+\ -> SIGQUIT (cooked)
                 return
-            if key in byte_map:
-                self._write(byte_map[key])
+            if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+                self._write(bytes([key & 0x1f]))   # Ctrl+C -> 0x03, Ctrl+L -> 0x0c
                 return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
