@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QToolBar, QSpinBox, QLabel,
     QWidget, QSizePolicy, QFileDialog, QInputDialog, QColorDialog,
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
-    QVBoxLayout, QHBoxLayout, QPlainTextEdit,
+    QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame,
     QComboBox, QCheckBox, QFormLayout, QMessageBox,
 )
 
@@ -240,6 +240,12 @@ class MainWindow(QMainWindow):
         self._prog_titles = {}       # term -> program (OSC) title
         self._pre_tui_mode = {}      # term -> display mode to restore after TUI
         self._tab_colors = {}        # term -> tab colour name (for persistence)
+        self._syncing = False        # guard: programmatic chip sync vs user click
+        # toolbar chip buttons, populated by _build_toolbar; empty here so a
+        # _sync during _build_menu (which runs first) is a harmless no-op.
+        self._mode_buttons = {}
+        self._colors_buttons = {}
+        self._tui_buttons = {}
         self._build_menu()
         self._build_toolbar()
         self._build_security_indicator()
@@ -663,6 +669,10 @@ class MainWindow(QMainWindow):
             action.blockSignals(True)
             action.setChecked(value)
             action.blockSignals(False)
+        self._set_chip(self._colors_buttons,
+                       'on' if term.colors_enabled() else 'off')
+        self._set_chip(self._tui_buttons,
+                       'tui' if term.current_tui() else 'cli')
         self._update_tui_indicator()
         self._update_security_indicator()
         self._update_terminate_enabled()
@@ -724,6 +734,7 @@ class MainWindow(QMainWindow):
         action = self._mode_actions.get(mode)
         if action is not None and not action.isChecked():
             action.setChecked(True)
+        self._set_chip(self._mode_buttons, mode)
 
     def set_colors(self, enabled):
         if 'colors' in self._locked:
@@ -732,6 +743,7 @@ class MainWindow(QMainWindow):
         if term is not None:
             term.apply_colors(enabled)
         self.act_colors.setChecked(enabled)
+        self._set_chip(self._colors_buttons, 'on' if enabled else 'off')
         self._default_colors = bool(enabled)
         self._persist()
 
@@ -759,6 +771,7 @@ class MainWindow(QMainWindow):
             self._sync_mode_toggles(term.current_mode())
         self._default_tui = bool(enabled)
         self.act_tui.setChecked(enabled)
+        self._set_chip(self._tui_buttons, 'tui' if enabled else 'cli')
         self._update_tui_indicator()
         self._update_security_indicator()
         self._persist()
@@ -935,6 +948,15 @@ class MainWindow(QMainWindow):
                 for act in actions:
                     act.setEnabled(False)
                     act.setToolTip(act.toolTip() + note)
+        # disable the matching toolbar chip groups too, so a locked setting is
+        # visibly un-clickable in both the menu and the toolbar.
+        for key, buttons in (('unicode_mode', self._mode_buttons),
+                             ('colors', self._colors_buttons),
+                             ('tui', self._tui_buttons)):
+            if key in self._locked:
+                for btn in buttons.values():
+                    btn.setEnabled(False)
+                    btn.setToolTip(btn.toolTip() + note)
         if self._locked_violations:
             keys = ', '.join(self._locked_violations)
             msg = ('These settings are locked by the administrator; your home '
@@ -1405,6 +1427,64 @@ class MainWindow(QMainWindow):
         self._sync_chrome_to_tab()
         self._persist()
 
+    # A labelled, bordered group of mutually-exclusive chip buttons -- the
+    # visible, self-explaining form of a setting (e.g. "unicode: Strip Reveal
+    # Show"). Makes the setting's NAME and its options obvious to a new user,
+    # where a bare row of toggle icons did not. Returns (frame, {key: button}).
+    _CHIP_CSS = (
+        'QFrame#chip{border:1px solid palette(mid);border-radius:6px;'
+        'background:palette(base)}'
+        'QFrame#chip > QLabel{color:palette(mid);font-size:11px;'
+        'padding:0 3px 0 5px;background:transparent}'
+        'QFrame#chip QPushButton{border:none;background:transparent;'
+        'padding:2px 9px;border-radius:4px;color:palette(text)}'
+        'QFrame#chip QPushButton:hover{background:palette(midlight)}'
+    )
+
+    def _chip_group(self, caption, specs, on_select):
+        frame = QFrame(self)
+        frame.setObjectName('chip')
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(2, 1, 3, 1)
+        row.setSpacing(1)
+        row.addWidget(QLabel(caption, frame))
+        group = QButtonGroup(frame)
+        group.setExclusive(True)
+        buttons = {}
+        # Style the FRAME (so its border and every descendant chip is covered);
+        # per-chip checked colour is an object-name rule in the same sheet, so a
+        # mode chip keeps its safety colour code (Strip yellow, Reveal green,
+        # Show red).
+        css = self._CHIP_CSS
+        for key, label, colour, tip in specs:
+            btn = QPushButton(label, frame)
+            btn.setObjectName('chip_' + key)
+            btn.setCheckable(True)
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            checked = colour or '#3b7ddd'
+            css += ('QFrame#chip QPushButton#chip_%s:checked'
+                    '{background:%s;color:#fff;font-weight:600}' % (key, checked))
+            btn.toggled.connect(
+                lambda on, k=key: (on and not self._syncing) and on_select(k))
+            group.addButton(btn)
+            row.addWidget(btn)
+            buttons[key] = btn
+        frame.setStyleSheet(css)
+        return frame, buttons
+
+    def _set_chip(self, buttons, key):
+        """Programmatically select a chip WITHOUT firing its handler (guarded by
+        self._syncing), so reflecting state never loops back into a setter."""
+        btn = buttons.get(key)
+        if btn is None or btn.isChecked():
+            return
+        self._syncing = True
+        try:
+            btn.setChecked(True)
+        finally:
+            self._syncing = False
+
     def _build_toolbar(self):
         bar = QToolBar('Main', self)
         bar.setMovable(False)
@@ -1423,13 +1503,44 @@ class MainWindow(QMainWindow):
                              QSizePolicy.Policy.Preferred)
         bar.addWidget(spacer)
 
-        bar.addAction(self.act_strip)
-        bar.addAction(self.act_reveal)
-        bar.addAction(self.act_show)
-        bar.addAction(self.act_colors)
-        bar.addSeparator()
+        # unicode display mode: Strip (yellow, lossy) / Reveal (green, lossless) /
+        # Show (red, a glyph can deceive). Grouped and labelled so it is obvious
+        # these three are one unicode setting.
+        uni_frame, self._mode_buttons = self._chip_group('unicode:', (
+            ('strip', 'Strip', '#e5a50a', self.act_strip.toolTip()),
+            ('reveal', 'Reveal', '#1f8a54', self.act_reveal.toolTip()),
+            ('show', 'Show', '#d83933', self.act_show.toolTip()),
+        ), self.set_mode)
+        bar.addWidget(uni_frame)
 
-        bar.addAction(self.act_tui)
+        # rendering mode: CLI (line mode, the safe default) vs TUI (opt-in
+        # full-screen). TUI is the riskier choice, so its chip is yellow.
+        mode_frame, self._tui_buttons = self._chip_group('mode:', (
+            ('cli', 'CLI', None,
+             'Line mode: program output is reduced to safe display, the default.'),
+            ('tui', 'TUI', '#e5a50a', TUI_TOOLTIP),
+        ), lambda k: self.set_tui(k == 'tui'))
+        self._tui_frame = mode_frame
+        bar.addWidget(mode_frame)
+
+        # ANSI colours on/off.
+        col_frame, self._colors_buttons = self._chip_group('colours:', (
+            ('on', 'On', None, self.act_colors.toolTip()),
+            ('off', 'Off', None, 'Show program output without ANSI colours.'),
+        ), lambda k: self.set_colors(k == 'on'))
+        bar.addWidget(col_frame)
+
+        if not tui_available():
+            for btn in self._tui_buttons.values():
+                btn.setEnabled(False)
+            self._tui_buttons['tui'].setToolTip('TUI mode needs python3-pyte.')
+
+        # reflect the current defaults on the freshly-built chips
+        self._set_chip(self._mode_buttons, self._default_mode)
+        self._set_chip(self._colors_buttons,
+                       'on' if self._default_colors else 'off')
+        self._set_chip(self._tui_buttons, 'tui' if self._default_tui else 'cli')
+
         # yellow risk indicator, shown only while TUI mode is active. A toolbar
         # widget is shown/hidden through the QAction addWidget() returns.
         self.tui_dot = QLabel(bar)
