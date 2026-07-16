@@ -299,11 +299,20 @@ class MainWindow(QMainWindow):
         term.notified.connect(self._on_notify)
         index = self.tabs.addTab(term, term.cwd_basename() or 'shell')
         self.tabs.setCurrentIndex(index)
-        # auto-colour the new tab (cycled so it differs from its neighbour) unless
-        # one is already set (a restored or user-chosen colour wins).
+        # auto-colour the new tab so it differs from its neighbour, unless one is
+        # already set (a restored or user-chosen colour wins). Advance past a
+        # palette colour that matches the adjacent tab's actual colour, so the
+        # distinction holds even after a neighbour was recoloured or moved.
         if self._auto_tab_colors and term not in self._tab_colors:
+            prev = None
+            if index > 0:
+                prev = self._tab_colors.get(self.tabs.widget(index - 1))
             color = TAB_PALETTE[self._auto_color_idx % len(TAB_PALETTE)]
-            self._auto_color_idx += 1
+            for _ in range(len(TAB_PALETTE)):
+                color = TAB_PALETTE[self._auto_color_idx % len(TAB_PALETTE)]
+                self._auto_color_idx += 1
+                if color != prev:
+                    break
             self.set_tab_color(index, QColor(color))
         self._sync_chrome_to_tab()
         term.setFocus()
@@ -770,6 +779,8 @@ class MainWindow(QMainWindow):
         self._persist()
 
     def set_auto_tab_colors(self, enabled):
+        if 'auto_tab_colors' in self._locked:
+            return                        # admin-locked; not user-changeable
         self._auto_tab_colors = bool(enabled)
         self.act_auto_tab_colors.setChecked(enabled)
         self._persist()               # affects new tabs; existing keep their colour
@@ -993,6 +1004,7 @@ class MainWindow(QMainWindow):
             ('unicode_mode', list(self._mode_actions.values())),
             ('colors', [self.act_colors]),
             ('colored_markings', [self.act_markings]),
+            ('auto_tab_colors', [self.act_auto_tab_colors]),
             ('tui', [self.act_tui]),
             ('allow_title', [self.act_title]),
         ]

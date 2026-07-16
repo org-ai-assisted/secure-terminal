@@ -273,6 +273,11 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0):
                     elif num == 2:
                         cells = []
                         col = 0
+                # A cursor/erase op clears the pending autowrap (the implicit
+                # col == max_line "phantom" past the last column), so a following
+                # printable overwrites the last cell instead of wrapping a row.
+                if max_line and col >= max_line:
+                    col = max_line - 1
                 i = m.end()
                 continue
             m = _SGR_ONLY_RE.match(raw, i)

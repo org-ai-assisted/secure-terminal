@@ -917,11 +917,17 @@ class SecureTerminal(QPlainTextEdit):
         block = doc.findBlock(start)
         while block.isValid() and block.position() <= end:
             base = block.position()
-            seg_start = max(start, base) - base
-            seg_end = min(end, base + len(block.text())) - base
+            # extract each block's selected slice with a QTextCursor, whose
+            # positions are the same UTF-16 code units as start/end -- Python
+            # str slicing would count code points and mis-slice an astral char.
+            seg_start = max(start, base)
+            seg_end = min(end, base + block.length() - 1)   # exclude block sep
+            seg = QTextCursor(doc)
+            seg.setPosition(seg_start)
+            seg.setPosition(seg_end, QTextCursor.MoveMode.KeepAnchor)
             if parts and block.userState() != 1:      # 1 == wrap continuation
                 parts.append('\n')
-            parts.append(block.text()[seg_start:seg_end])
+            parts.append(seg.selectedText())
             block = block.next()
         data = QMimeData()
         data.setText(''.join(parts))
