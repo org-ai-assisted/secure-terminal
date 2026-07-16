@@ -90,7 +90,7 @@ from secure_terminal.sanitize import (
     colors_allowed, too_close, sanitize_paste,
     sanitize_paste_unicode,
     paste_findings, tui_cell, sanitize_title,
-    feed_line_edits, cells_to_runs, cells_display_col,
+    feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY,
     wants_full_screen, leaves_full_screen, describe_codepoint,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
@@ -197,6 +197,7 @@ class SecureTerminal(QPlainTextEdit):
 
         # optional ANSI colours (off by default); SGR parser state.
         self._colors = False
+        self._markings = True         # colour the '_' / badge by risk class (on)
         self._sgr_reset()
 
         # Scrollback limit in lines. Default to a bounded window (like every
@@ -566,6 +567,16 @@ class SecureTerminal(QPlainTextEdit):
     def _effective_colors(self):
         return self._colors and colors_allowed()
 
+    # -- coloured risk markings (the '_' / <U+XXXX> badge, by risk class) -------
+    def apply_markings(self, enabled):
+        if bool(enabled) == self._markings:
+            return
+        self._markings = bool(enabled)
+        self._rerender()      # re-colour (or un-colour) the existing markings
+
+    def markings_enabled(self):
+        return self._markings
+
     def _sgr_reset(self):
         # palette indexes (or None for default) + bold; folded by parse_sgr.
         self._sgr = {'fg': None, 'bg': None, 'bold': False}
@@ -592,11 +603,28 @@ class SecureTerminal(QPlainTextEdit):
             fmt.setFontWeight(QFont.Weight.Bold)
         return fmt
 
+    # Foreground colour of a neutralized/revealed marking, by risk class. Chosen
+    # to read on both the light and dark themes.
+    MARKING_COLORS = {
+        'bidi':      '#e5484d',       # red    -- reorders text (worst)
+        'invisible': '#f5a623',       # amber  -- zero-width / BOM / separators
+        'control':   '#3b9eff',       # blue   -- C0 / DEL / C1 controls
+        'nonascii':  '#a06cff',       # purple -- other non-ASCII (homoglyph)
+    }
+
     def _fmt_from_key(self, key):
         """QTextCharFormat for a cell's SGR key (a sorted-items tuple), or the
-        default format for None. Cached; the theme change clears the cache."""
+        default format for None. A (MARK_KEY, class) key colours a neutralized /
+        revealed marking by its risk class. Cached; a theme change clears it."""
         if key is None:
             return QTextCharFormat()
+        if isinstance(key, tuple) and len(key) == 2 and key[0] == MARK_KEY:
+            fmt = self._line_fmt_cache.get(key)
+            if fmt is None:
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor(self.MARKING_COLORS[key[1]]))
+                self._line_fmt_cache[key] = fmt
+            return fmt
         fmt = self._line_fmt_cache.get(key)
         if fmt is None:
             fmt = self._format_for(dict(key))
@@ -829,7 +857,7 @@ class SecureTerminal(QPlainTextEdit):
         of the logical cursor (a reveal badge is several columns wide)."""
         colors = self._effective_colors()
         runs, prefix = cells_to_runs(completed, self._line_cells,
-                                     self._mode, colors)
+                                     self._mode, colors, self._markings)
         cursor = self._out_cursor
         if cursor is None:
             cursor = self.textCursor()

@@ -194,6 +194,7 @@ class MainWindow(QMainWindow):
         # looks broken. Parsing is bounded (16 palette colours) and the renderer's
         # contrast guard keeps text readable. An explicit saved 'false' still wins.
         self._default_colors = cfg.get('colors', 'true') == 'true'
+        self._default_markings = cfg.get('colored_markings', 'true') == 'true'
         try:
             self._default_zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(cfg['zoom'])))
         except (KeyError, ValueError):
@@ -317,6 +318,7 @@ class MainWindow(QMainWindow):
         term.apply_zoom(self._default_zoom)
         term.apply_mode(self._default_mode)
         term.apply_colors(self._default_colors)
+        term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
         term.apply_allow_title(self._default_allow_title)
@@ -336,6 +338,7 @@ class MainWindow(QMainWindow):
             mode = self._default_mode
         term.apply_mode(mode)
         term.apply_colors(self._default_colors)
+        term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
         term.apply_allow_title(self._default_allow_title)
@@ -498,6 +501,7 @@ class MainWindow(QMainWindow):
         mode = info.get('mode')
         term.apply_mode(mode if mode in DISPLAY_MODES else self._default_mode)
         term.apply_colors(bool(info.get('colors')))
+        term.apply_markings(bool(info.get('markings', True)))
         try:
             term.apply_scrollback(int(info.get('scrollback', self._scrollback)))
         except (TypeError, ValueError):
@@ -664,6 +668,7 @@ class MainWindow(QMainWindow):
         # so a tab switch only DISPLAYS state, never mutates it.
         for action, value in (
                 (self.act_colors, term.colors_enabled()),
+                (self.act_markings, term.markings_enabled()),
                 (self.act_tui, term.current_tui()),
                 (self.act_title, term.allow_title_enabled())):
             action.blockSignals(True)
@@ -745,6 +750,14 @@ class MainWindow(QMainWindow):
         self.act_colors.setChecked(enabled)
         self._set_chip(self._colors_buttons, 'on' if enabled else 'off')
         self._default_colors = bool(enabled)
+        self._persist()
+
+    def set_markings(self, enabled):
+        term = self.current()
+        if term is not None:
+            term.apply_markings(enabled)
+        self.act_markings.setChecked(enabled)
+        self._default_markings = bool(enabled)
         self._persist()
 
     def set_tui(self, enabled):
@@ -986,6 +999,7 @@ class MainWindow(QMainWindow):
             'zoom': str(self._default_zoom),
             'unicode_mode': self._default_mode,
             'colors': 'true' if self._default_colors else 'false',
+            'colored_markings': 'true' if self._default_markings else 'false',
             'scrollback': str(self._scrollback),
             'paste_delay': str(self._paste_delay),
             'tui': 'true' if self._default_tui else 'false',
@@ -1165,6 +1179,17 @@ class MainWindow(QMainWindow):
             'is on.')
         self.act_colors.toggled.connect(self.set_colors)
         view_menu.addAction(self.act_colors)
+
+        self.act_markings = QAction('Colored &markings', self, checkable=True)
+        self.act_markings.setChecked(self._default_markings)
+        self.act_markings.setToolTip(
+            'Colour each neutralized or revealed character (the "_" and the '
+            '<U+XXXX> badge) by its risk class: red for bidi controls that '
+            'reorder text, amber for zero-width and invisible characters, blue '
+            'for control bytes, purple for other non-ASCII (homoglyph-prone). On '
+            'by default; independent of the ANSI Colors setting.')
+        self.act_markings.toggled.connect(self.set_markings)
+        view_menu.addAction(self.act_markings)
 
         self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', '#e5a50a'),
                                '&TUI mode', self, checkable=True)
@@ -1619,6 +1644,7 @@ class MainWindow(QMainWindow):
                 'zoom': term.current_zoom(),
                 'mode': term.current_mode(),
                 'colors': term.colors_enabled(),
+                'markings': term.markings_enabled(),
                 'tui': term.current_tui(),
                 'allow_title': term.allow_title_enabled(),
                 'scrollback': term.current_scrollback(),

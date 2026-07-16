@@ -306,7 +306,27 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0):
     return completed, cells, col, sgr
 
 
-def cells_to_runs(lines, current, mode, colors):
+# Risk class of a neutralized/revealed character, so its marking (the '_' or the
+# <U+XXXX> badge) can be coloured by WHY the character is dangerous, not just that
+# it is. Ordered worst-first.
+def marking_class(cp):
+    if (0x202A <= cp <= 0x202E or 0x2066 <= cp <= 0x2069
+            or cp in (0x200E, 0x200F, 0x061C)):
+        return 'bidi'                 # reorders text -- the worst deception
+    if (cp in (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF)
+            or 0x2028 <= cp <= 0x2029):
+        return 'invisible'            # zero-width / BOM / line-paragraph separator
+    if cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
+        return 'control'              # C0 / DEL / C1 control bytes
+    return 'nonascii'                 # any other non-ASCII (homoglyph-prone)
+
+
+# sentinel head of a run key that colours a marking by its risk class, kept
+# distinct from an SGR-state key (a sorted-items tuple) or None.
+MARK_KEY = '\x00mark'
+
+
+def cells_to_runs(lines, current, mode, colors, markings=True):
     r"""Render finished cell-lines plus the current cell-line to a coalesced list
     of (display_text, sgr_key) runs, with '\n' between the finished lines and
     before the current one. Each cell's char is rendered via render_output (so the
@@ -323,13 +343,23 @@ def cells_to_runs(lines, current, mode, colors):
         else:
             runs.append([[disp], key])
 
+    def emit(ch, key):
+        disp = render_output(ch, mode)
+        # a neutralized/revealed char (its display differs from the source) is a
+        # "marking"; colour it by risk class when colored markings are on --
+        # independent of the ANSI-colour toggle.
+        if markings and disp != ch:
+            add(disp, (MARK_KEY, marking_class(ord(ch))))
+        else:
+            add(disp, key if colors else None)
+
     for cellline in lines:
         for ch, key in cellline:
-            add(render_output(ch, mode), key if colors else None)
+            emit(ch, key)
         add('\n', None)
     prefix_len = sum(len(p) for parts, _ in runs for p in parts)
     for ch, key in current:
-        add(render_output(ch, mode), key if colors else None)
+        emit(ch, key)
     return [(''.join(parts), key) for parts, key in runs], prefix_len
 
 
