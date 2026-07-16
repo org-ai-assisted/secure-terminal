@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from secure_terminal import settings, session, ipc
+from secure_terminal.sanitize import sanitize_paste
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES, tui_available,
 )
@@ -211,6 +212,12 @@ class MainWindow(QMainWindow):
         self._persist_session = cfg.get('persist_session') != 'false'
         # optional opt-in command hook, configured only via a settings drop-in
         self._hook_config = _read_hook_config(cfg)
+        # remote control (the ctl inject-into-tab surface) is OFF unless an admin
+        # turned it on in a privileged directory (remote_control is privileged-
+        # only, so a home config cannot enable it).
+        self._remote_control = cfg.get('remote_control') == 'true'
+        self._tab_ids = {}            # term -> stable id (for `ctl --tab id:N`)
+        self._next_tab_id = 0
 
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
@@ -258,6 +265,8 @@ class MainWindow(QMainWindow):
 
     # -- tabs, each its own shell over its own pseudo-terminal -----------------
     def _add_tab(self, term):
+        self._tab_ids[term] = self._next_tab_id       # stable id for ctl matching
+        self._next_tab_id += 1
         term.zoom_step.connect(self._on_zoom_step)
         term.tab_step.connect(self._on_tab_step)
         term.tab_move.connect(self._on_tab_move)
@@ -377,11 +386,70 @@ class MainWindow(QMainWindow):
         if not isinstance(request, dict):
             return {'ok': False, 'error': 'malformed request'}
         op = request.get('op')
+        # 'open'/'ping' are the single-instance mechanism, always allowed. The
+        # remote-control ops (ctl-*) are the inject/list surface and are refused
+        # unless an admin enabled remote_control in a privileged directory.
         if op == 'ping':
             return {'ok': True, 'pid': os.getpid()}
         if op == 'open':
             return self._ipc_open(request)
+        if isinstance(op, str) and op.startswith('ctl-'):
+            if not self._remote_control:
+                return {'ok': False, 'error': 'remote control is disabled; an '
+                        'administrator must set remote_control=true in '
+                        '/etc/secure-terminal.d'}
+            return self._ipc_ctl(op, request)
         return {'ok': False, 'error': 'unknown op: %r' % (op,)}
+
+    def _find_tab(self, match):
+        """Resolve a `ctl --tab` matcher ('id:N', 'title:NAME', or a bare title)
+        to a terminal, or None. The first title match wins."""
+        if not isinstance(match, str):
+            return None
+        kind, _, value = match.partition(':')
+        if not value:
+            kind, value = 'title', match
+        for term, tid in self._tab_ids.items():
+            index = self.tabs.indexOf(term)
+            if index < 0:
+                continue
+            if kind == 'id' and str(tid) == value:
+                return term
+            if kind == 'title' and self.tabs.tabText(index) == value:
+                return term
+        return None
+
+    def _ipc_ctl(self, op, request):
+        if op == 'ctl-ls':
+            tabs = []
+            for term, tid in sorted(self._tab_ids.items(), key=lambda kv: kv[1]):
+                index = self.tabs.indexOf(term)
+                if index < 0:
+                    continue
+                tabs.append({'id': tid, 'title': self.tabs.tabText(index),
+                             'mode': term.current_mode(),
+                             'tui': term.tui_active()})
+            return {'ok': True, 'tabs': tabs}
+        if op in ('ctl-send-text', 'ctl-set-tab-title'):
+            term = self._find_tab(request.get('tab'))
+            if term is None:
+                return {'ok': False, 'error': 'no tab matched %r'
+                        % (request.get('tab'),)}
+            if op == 'ctl-send-text':
+                text = request.get('text')
+                if not isinstance(text, str):
+                    return {'ok': False, 'error': 'text must be a string'}
+                # route through the paste sanitizer: injected text can no more
+                # smuggle an escape/control than a paste can.
+                term._write(sanitize_paste(text).encode('utf-8'))
+                return {'ok': True}
+            title = request.get('title')
+            if not isinstance(title, str):
+                return {'ok': False, 'error': 'title must be a string'}
+            self._user_titles[term] = title
+            self._refresh_tab_label(term)
+            return {'ok': True}
+        return {'ok': False, 'error': 'unknown ctl op: %r' % (op,)}
 
     def _ipc_open(self, request):
         tabs = request.get('tabs')
@@ -440,6 +508,7 @@ class MainWindow(QMainWindow):
         self._user_titles.pop(term, None)
         self._prog_titles.pop(term, None)
         self._tab_colors.pop(term, None)
+        self._tab_ids.pop(term, None)
         self.tabs.removeTab(index)
         term.deleteLater()
         if self.tabs.count() == 0:
@@ -1604,8 +1673,57 @@ def _sanitize_tab_spec(spec):
     }
 
 
+def _ctl_main(argv):
+    """The `secure-terminal ctl ...` client: send a remote-control request to a
+    running instance and print the reply. Pure Python (no Qt). Remote control must
+    be enabled by an admin on the running instance, or it refuses."""
+    parser = argparse.ArgumentParser(
+        prog='secure-terminal ctl',
+        description='Remote-control a running secure-terminal instance. Requires '
+                    'remote_control=true set by an admin in /etc/secure-terminal.d.')
+    parser.add_argument('--instance-group', default='default',
+                        help='which running instance (default: "default")')
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('ls', help='list tabs (id and title)')
+    send = sub.add_parser('send-text', help='send text to a tab (as if typed, '
+                                            'sanitized)')
+    send.add_argument('--tab', required=True, metavar='MATCH',
+                      help='target tab: id:N or title:NAME')
+    send.add_argument('text', help="text to send (include a newline to submit)")
+    title = sub.add_parser('set-tab-title', help='rename a tab')
+    title.add_argument('--tab', required=True, metavar='MATCH')
+    title.add_argument('title')
+    args = parser.parse_args(argv)
+
+    request = {'op': 'ctl-' + args.cmd}
+    if args.cmd in ('send-text', 'set-tab-title'):
+        request['tab'] = args.tab
+    if args.cmd == 'send-text':
+        request['text'] = args.text
+    if args.cmd == 'set-tab-title':
+        request['title'] = args.title
+
+    reply = ipc.send_request(args.instance_group, request)
+    if reply is None:
+        sys.stderr.write('secure-terminal ctl: no running instance in group %r\n'
+                         % (args.instance_group,))
+        return 1
+    if not reply.get('ok'):
+        sys.stderr.write('secure-terminal ctl: ' + reply.get('error', 'failed')
+                         + '\n')
+        return 1
+    if args.cmd == 'ls':
+        for tab in reply.get('tabs', []):
+            sys.stdout.write('%s\t%s%s\n' % (
+                tab.get('id'), tab.get('title', ''),
+                '  [tui]' if tab.get('tui') else ''))
+    return 0
+
+
 def main():
     _quiet_font_warnings()
+    if sys.argv[1:2] == ['ctl']:
+        return _ctl_main(sys.argv[2:])
     launch = _parse_launch_args(sys.argv[1:])
 
     # Single instance by default: try to hand this launch to a running instance in

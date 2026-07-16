@@ -40,6 +40,11 @@ _APP = 'secure-terminal'
 # higher-numbered .conf that overrides even the app's choices.
 _USER_FILE = '50_user.conf'
 
+# Keys that are ALWAYS privileged: honored only from a system directory, never
+# from the user's home config (even without an explicit `lock=`). remote_control
+# is the injection surface, so only an admin may enable it.
+PRIVILEGED_ONLY = frozenset({'remote_control'})
+
 
 def _user_config_dir():
     base = os.environ.get('XDG_CONFIG_HOME') or os.path.join(
@@ -121,7 +126,7 @@ def load():
     honored from the privileged directories (a user cannot lock or unlock). Never
     raises."""
     system = {}
-    locked = set()
+    locked = set(PRIVILEGED_ONLY)          # always admin-only, no lock= needed
     for directory in _system_dirs():
         layer = _load_dir(directory)
         for key in layer.pop('lock', '').replace(',', ' ').split():
