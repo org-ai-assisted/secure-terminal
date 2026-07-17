@@ -1,0 +1,147 @@
+secure-terminal(1) -- a terminal where paste is safe by construction
+====================================================================
+
+<!--
+# Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+# See the file COPYING for copying conditions.
+-->
+
+## SYNOPSIS
+
+`secure-terminal` [OPTIONS] [`--` <PROGRAM> [<ARGS>...]]
+
+`secure-terminal` `-e` <STRING>
+
+`secure-terminal` `ctl` [`--instance-group` <NAME>] <COMMAND> [<ARGS>...]
+
+## DESCRIPTION
+
+secure-terminal is a small terminal for pasting commands into, and reading text
+out of, without worrying about invisible characters, bidi overrides or escape
+sequences. Its default display is printable ASCII only (everything else is
+neutralized) and it interprets no escape sequences from program output, so a
+pasted or printed lie cannot redraw or reorder what you see. Paste is sanitized
+to ASCII before it reaches the shell.
+
+Without `--`, `-e` or a reused instance, a shell (from `$SHELL`, else
+`/bin/bash`) is started. With `--` the remaining arguments are run as a real
+argv, with no shell reparse.
+
+## OPTIONS
+
+  * `--title` <TITLE>:
+    Set the initial tab title.
+
+  * `--tui`, `--no-tui`:
+    Start this tab in TUI mode (interpret escapes through a confined screen
+    model) or in the safe CLI mode. Overrides the configured default for this
+    tab only. TUI mode needs `python3-pyte`.
+
+  * `--mode` `strip`|`show`|`reveal`|`detail`:
+    Initial unicode display mode (see DISPLAY MODES).
+
+  * `-e`, `--command` <STRING>:
+    Run <STRING>, shell-split but without a shell. Prefer `--` <PROGRAM>
+    <ARGS> for a real argv.
+
+  * `--class` <CLASS>:
+    Set the window WM_CLASS / Wayland app-id, for window-manager rules.
+
+  * `--name` <NAME>:
+    Set the window WM_CLASS instance name (X11).
+
+  * `--new-instance`:
+    Force a fresh process instead of reusing a running instance.
+
+  * `--instance-group` <NAME>:
+    Which running instance to reuse (default: "default").
+
+  * `--version`:
+    Print the version and exit.
+
+  * `-h`, `--help`:
+    Print a usage summary and exit.
+
+  * `--` <PROGRAM> [<ARGS>...]:
+    Run <PROGRAM> directly as a real argv (no shell reparse). Repeat a leading
+    program per tab where supported.
+
+## DISPLAY MODES
+
+secure-terminal has two rendering modes, chosen per tab:
+
+  * CLI mode (default, safe):
+    A strict, line-oriented display. No escape sequence from program output is
+    interpreted; output is append-only, so a program can never reach back and
+    rewrite a line already shown.
+
+  * TUI mode (opt-in):
+    Escapes are interpreted inside an isolated in-memory screen model that has
+    no OS reach: it cannot set the window title or touch the system clipboard.
+    Every on-screen character is still ASCII/unicode-filtered and colours keep a
+    contrast guard. Use it to run full-screen programs (ssh, an editor, htop) and
+    for the shell's completion menus and progress displays.
+
+The unicode `--mode` controls how a non-ASCII byte in output is shown:
+
+  * `strip`:
+    Replace it with "_" (the safe default).
+
+  * `show`:
+    Render the glyph when printable (readable, but a look-alike can deceive).
+
+  * `reveal`:
+    Show a `<U+XXXX>` codepoint badge (hover for its name).
+
+  * `detail`:
+    Like reveal but with the codepoint's Unicode name inline, `<U+XXXX NAME>`.
+
+## CONFIGURATION
+
+Settings are `KEY=value` lines spread over `*.conf` drop-in files, read from
+these directories, lowest precedence first:
+
+    /usr/lib/secure-terminal.d/*.conf       built-in vendor defaults
+    /etc/secure-terminal.d/*.conf           system administrator
+    /usr/local/etc/secure-terminal.d/*.conf local administrator
+    ~/.config/secure-terminal.d/*.conf      user (highest precedence)
+
+The user's own choices are written to
+`~/.config/secure-terminal.d/50_user.conf`. A privileged directory may `lock` a
+key so the user cannot override it. The built-in defaults file documents every
+key. See also the app's View menu and the global Settings dialog.
+
+## REMOTE CONTROL
+
+`secure-terminal ctl` can list tabs, rename a tab, read a tab's rendered text
+(`dump-tab`) and send text into a tab (`send-text`, as if typed) over an
+owner-only socket. It is an injection/read surface and is OFF by default; it can
+only be enabled from a privileged configuration directory (`remote_control`).
+
+## FILES
+
+  * `~/.config/secure-terminal.d/*.conf`:
+    User configuration (see CONFIGURATION).
+
+  * `~/.local/state/secure-terminal/`:
+    Restored session: the tab list and each tab's scrollback.
+
+  * `/etc/apparmor.d/secure-terminal`:
+    AppArmor confinement profile.
+
+## SECURITY
+
+The safe-by-construction guarantees rest on the CLI mode: no escape parser,
+printable-ASCII-only display, ASCII-sanitized paste, and a memory-safe
+implementation. TUI mode is a deliberate, clearly-indicated, lower-guarantee
+mode; the confined screen model still cannot touch the title or clipboard and
+still filters every character. Only run programs you trust in TUI mode.
+
+## WWW
+
+https://secure-terminal.github.io
+
+## AUTHOR
+
+secure-terminal and this man page are AI-assisted; see
+https://github.com/org-ai-assisted .

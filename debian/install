@@ -2,6 +2,8 @@ usr/bin/secure-terminal usr/bin/
 usr/bin/secure-terminal-cli usr/bin/
 usr/lib/python3/dist-packages/secure_terminal usr/lib/python3/dist-packages/
 usr/share/applications/secure-terminal.desktop usr/share/applications/
+usr/share/icons/hicolor/scalable/apps/secure-terminal.svg usr/share/icons/hicolor/scalable/apps/
+usr/share/metainfo/secure-terminal.metainfo.xml usr/share/metainfo/
 usr/share/secure-terminal/hooks usr/share/secure-terminal/
 etc/apparmor.d/secure-terminal etc/apparmor.d/
 usr/lib/secure-terminal.d usr/lib/

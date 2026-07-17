@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+  See the file COPYING for copying conditions.
+  AI-Assisted.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- terminal body -->
+  <rect x="10" y="20" width="108" height="88" rx="12" ry="12" fill="#14161b" stroke="#3a3f4b" stroke-width="3"/>
+  <!-- title bar -->
+  <path d="M10 32 v-0 a12 12 0 0 1 12 -12 h84 a12 12 0 0 1 12 12 v0 z" fill="#20232b"/>
+  <circle cx="24" cy="26" r="3.5" fill="#e5484d"/>
+  <circle cx="36" cy="26" r="3.5" fill="#e5a50a"/>
+  <circle cx="48" cy="26" r="3.5" fill="#1f8a54"/>
+  <!-- prompt: a chevron and a blinking-style cursor block -->
+  <path d="M26 52 l16 12 -16 12" fill="none" stroke="#2ab0a0" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="52" y="70" width="26" height="8" rx="2" fill="#e6e6e6"/>
+  <!-- shield badge for "secure" -->
+  <g transform="translate(78,60)">
+    <path d="M20 2 L38 9 V26 C38 40 30 47 20 51 C10 47 2 40 2 26 V9 Z" fill="#1f8a54" stroke="#0f4d2f" stroke-width="2"/>
+    <path d="M11 27 l6 6 12 -14" fill="none" stroke="#ffffff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

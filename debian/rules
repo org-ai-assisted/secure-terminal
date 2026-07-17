@@ -18,6 +18,24 @@ execute_after_dh_install:
 	dpkg-parsechangelog -S Version \
 		> debian/secure-terminal/usr/share/secure-terminal/version
 
+## Generate the man page from its ronn source at build time (reproducible date),
+## the same way derivative-maker packages do, then let dh_installman install it.
+override_dh_installman:
+	mkdir --parents auto-generated-man-pages
+	ronn \
+		--date=2020-01-01 \
+		--manual="secure-terminal Manual" \
+		--organization="secure-terminal" \
+		-- \
+		<man/secure-terminal.1.ronn \
+		>auto-generated-man-pages/secure-terminal.1
+	dh_installman auto-generated-man-pages/secure-terminal.1
+
+## Remove the generated man page so the source tree stays pristine.
+override_dh_clean:
+	dh_clean
+	rm --recursive --force auto-generated-man-pages
+
 ## Register the AppArmor profile and reload it on install/upgrade (and handle
 ## removal), via debhelper's dh_apparmor.
 override_dh_installdeb:

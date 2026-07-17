@@ -8,3 +8,8 @@ debian/debhelper-build-stamp
 debian/files
 debian/*.substvars
 debian/secure-terminal/
+
+# generated man page (built from man/*.ronn)
+auto-generated-man-pages/
+debian/*.debhelper
+debian/*.debhelper.log

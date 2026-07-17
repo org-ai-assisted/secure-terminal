@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+  See the file COPYING for copying conditions.
+  AI-Assisted.
+-->
+<component type="desktop-application">
+  <id>io.github.secure_terminal.secure_terminal</id>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <name>secure-terminal</name>
+  <summary>A terminal where paste is safe by construction</summary>
+  <description>
+    <p>
+      secure-terminal is a small terminal for pasting commands into, and reading
+      text out of, without worrying about invisible characters, bidi overrides or
+      escape sequences. Its default display is printable ASCII only and it
+      interprets no escape sequences from program output, so a pasted or printed
+      lie cannot redraw or reorder what you see. Paste is sanitized to ASCII
+      before it reaches the shell.
+    </p>
+    <p>
+      An opt-in, clearly indicated TUI mode can run full-screen programs (ssh, an
+      editor, htop) and the shell's completion menus by interpreting escapes
+      inside an isolated screen model that still filters every character and
+      cannot touch the window title or system clipboard. The strict line mode
+      remains the safe-by-construction default.
+    </p>
+  </description>
+  <launchable type="desktop-id">secure-terminal.desktop</launchable>
+  <provides>
+    <binary>secure-terminal</binary>
+  </provides>
+  <categories>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+  <keywords>
+    <keyword>terminal</keyword>
+    <keyword>shell</keyword>
+    <keyword>ascii</keyword>
+    <keyword>safe</keyword>
+    <keyword>paste</keyword>
+  </keywords>
+  <url type="homepage">https://secure-terminal.github.io</url>
+  <url type="bugtracker">https://github.com/secure-terminal/secure-terminal/issues</url>
+  <url type="vcs-browser">https://github.com/secure-terminal/secure-terminal</url>
+  <developer id="org.whonix">
+    <name>ENCRYPTED SUPPORT LLC</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+</component>
