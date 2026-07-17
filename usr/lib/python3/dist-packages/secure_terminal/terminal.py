@@ -115,11 +115,6 @@ _RISK_LABELS = {
 # OSC 9 ";<text>" (BEL or ST terminated): the iTerm2-style desktop notification.
 _OSC9 = re.compile(rb'\x1b\]9;([^\x07\x1b]*)(?:\x07|\x1b\\)')
 
-# Cursor UP (CUU): a program redrawing lines ABOVE the cursor -- a completion menu,
-# a progress display. Line mode is one-dimensional (append-only), so it cannot
-# honour a move up, and such a redraw piles up; the tab is advised to use TUI mode.
-_CURSOR_UP = re.compile(r'\x1b\[[0-9]*A')
-
 
 def tui_available():
     return pyte is not None
@@ -294,12 +289,9 @@ class SecureTerminal(QPlainTextEdit):
         # is held here and prepended to the next chunk, so a split OSC/CSI never
         # leaks its remainder as literal text (see split_trailing_escape).
         self._esc_carry = ''
-        # emit osc_used at most once per tab (a shell sets an OSC title on every
-        # prompt, so per-OSC would spam); the window shows a dismissible notice.
-        self._osc_notice_shown = False
-        # advise TUI at most once per tab when a program redraws lines above the
-        # cursor (a completion menu, a progress display) that line mode cannot show.
-        self._redraw_hint_shown = False
+        # emitted whenever a program uses an OSC escape while in pure CLI mode,
+        # where it is stripped; the window de-duplicates to a once-per-tab notice
+        # (it knows the setting, so the terminal must not consume the state itself).
         # optional command hook (opt-in): config dict or None, plus the current
         # typed input line so it can be judged before Enter submits it.
         self._hook = None
@@ -815,18 +807,12 @@ class SecureTerminal(QPlainTextEdit):
         text = self._absorb_caret(text)         # drop a shell's duplicate ^C echo
         text = self._esc_carry + text
         text, self._esc_carry = split_trailing_escape(text)
-        # An OSC (ESC ]) is stripped in line mode; tell the user once per tab that a
-        # program tried a title/clipboard/hyperlink escape they cannot see.
-        if not self._osc_notice_shown and '\x1b]' in text:
-            self._osc_notice_shown = True
+        # An OSC (ESC ]) is stripped in PURE CLI mode; flag it so the window can
+        # notice the neutralized escape. Only in pure CLI mode: in TUI mode an OSC
+        # title/notification may be handled (allow_title), so a "was ignored" notice
+        # would contradict it. The window de-duplicates to once per tab.
+        if not self.tui_active() and '\x1b]' in text:
             self.osc_used.emit()
-        # A cursor-up redraw (completion menu, progress bar) cannot be shown in the
-        # one-dimensional line display; advise TUI mode once per tab.
-        if not self._redraw_hint_shown and _CURSOR_UP.search(text):
-            self._redraw_hint_shown = True
-            self._advise('This program redraws the screen (e.g. a completion menu '
-                         'or progress display), which the safe CLI mode cannot show '
-                         'correctly. Turn on TUI mode to see it.')
         self._raw += text
         if len(self._raw) > self._RAW_MAX:
             self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output

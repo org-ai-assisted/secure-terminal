@@ -264,7 +264,8 @@ class MainWindow(QMainWindow):
         self._prog_titles = {}       # term -> program (OSC) title
         self._pre_tui_mode = {}      # term -> display mode to restore after TUI
         self._tab_colors = {}        # term -> tab colour name (for persistence)
-        self._advisories = {}        # term -> its pending advisory (banner text)
+        self._advisories = {}        # term -> (kind, banner text); kind tui|osc
+        self._osc_notified = set()   # terms already shown the once-per-tab OSC notice
         self._syncing = False        # guard: programmatic chip sync vs user click
         # toolbar chip buttons, populated by _build_toolbar; empty here so a
         # _sync during _build_menu (which runs first) is a harmless no-op.
@@ -364,22 +365,26 @@ class MainWindow(QMainWindow):
         row.addWidget(close)
         return frame
 
-    def _on_advise(self, term, message):
+    def _on_advise(self, term, message, kind='tui'):
         """A terminal raised an advisory. It belongs to THAT tab, so remember it
-        per-tab and only show the banner while its tab is current -- otherwise the
-        hint (e.g. "switch to TUI mode") would hang over an unrelated terminal."""
-        self._advisories[term] = message
+        per-tab (with its kind) and only show the banner while its tab is current --
+        otherwise the hint would hang over an unrelated terminal. kind is 'tui' for
+        a full-screen hint (auto-dismissed when TUI is enabled) or 'osc'."""
+        self._advisories[term] = (kind, message)
         if term is self.current():
             self._refresh_banner()
 
     def _on_osc_used(self, term):
-        """A program used an OSC escape (title, clipboard, hyperlink) that line mode
-        strips. Surface a dismissible per-tab notice, unless the user turned the
-        notice off (it fires once per tab; a shell sets a title every prompt)."""
-        if self._osc_notice:
+        """A program used an OSC escape (title, clipboard, hyperlink) that pure CLI
+        mode strips. Surface a dismissible notice ONCE per tab, unless the user
+        turned it off. The terminal emits per OSC (a shell sets a title every
+        prompt); de-duplicate here so re-enabling the setting re-arms a tab that was
+        never actually shown the notice."""
+        if self._osc_notice and term not in self._osc_notified:
+            self._osc_notified.add(term)
             self._on_advise(term, 'An application used an OSC escape (window title, '
                             'clipboard or hyperlink). The safe CLI mode ignores it. '
-                            'Turn this notice off in View > Notify on OSC use.')
+                            'Turn this notice off in View > Notify on OSC use.', 'osc')
 
     def _dismiss_advisory(self):
         """The X button: clear the current tab's advisory and hide the banner."""
@@ -389,9 +394,9 @@ class MainWindow(QMainWindow):
     def _refresh_banner(self):
         """Show the current tab's pending advisory, or hide the banner if it has
         none. Called on every tab switch so the banner always matches the tab."""
-        message = self._advisories.get(self.current())
-        if message:
-            self._banner_label.setText(message)
+        entry = self._advisories.get(self.current())
+        if entry:
+            self._banner_label.setText(entry[1])
             self._banner.setVisible(True)
         else:
             self._banner.setVisible(False)
@@ -636,6 +641,7 @@ class MainWindow(QMainWindow):
         self._prog_titles.pop(term, None)
         self._tab_colors.pop(term, None)
         self._advisories.pop(term, None)
+        self._osc_notified.discard(term)
         self._tab_ids.pop(term, None)
         self.tabs.removeTab(index)
         term.deleteLater()
@@ -891,9 +897,11 @@ class MainWindow(QMainWindow):
             if enabled:
                 # Turning TUI on answers a "this program needs a full-screen
                 # interface -- turn on TUI mode" advisory, so that hint is no longer
-                # valid: clear this tab's banner.
-                self._advisories.pop(term, None)
-                self._refresh_banner()
+                # valid: clear it. Only the TUI hint -- an unrelated OSC notice on
+                # the same tab must stay.
+                if self._advisories.get(term, (None,))[0] == 'tui':
+                    self._advisories.pop(term, None)
+                    self._refresh_banner()
                 # Any non-'show' mode makes a TUI unreadable (box-drawing becomes
                 # '_' in strip, or a badge in reveal/detail that breaks the grid),
                 # so lean this TAB to 'show'. Do it on the term only -- NOT via
