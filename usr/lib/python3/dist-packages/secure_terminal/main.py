@@ -219,6 +219,9 @@ class MainWindow(QMainWindow):
             self._paste_delay = 3
         self._default_tui = cfg.get('tui') == 'true'
         self._default_allow_title = cfg.get('allow_title') == 'true'
+        # notice (a dismissible banner) when a program uses an OSC escape that line
+        # mode strips; on by default, a global toggle turns it off
+        self._osc_notice = cfg.get('osc_notice') != 'false'
         # session persistence is on unless explicitly disabled
         self._persist_session = cfg.get('persist_session') != 'false'
         # optional opt-in command hook, configured only via a settings drop-in
@@ -308,6 +311,7 @@ class MainWindow(QMainWindow):
             lambda title, t=term: self._on_tab_title(t, title))
         term.notified.connect(self._on_notify)
         term.advise_signal.connect(lambda msg, t=term: self._on_advise(t, msg))
+        term.osc_used.connect(lambda t=term: self._on_osc_used(t))
         index = self.tabs.addTab(term, term.cwd_basename() or 'shell')
         self.tabs.setCurrentIndex(index)
         # auto-colour the new tab so it differs from its neighbour, unless one is
@@ -367,6 +371,15 @@ class MainWindow(QMainWindow):
         self._advisories[term] = message
         if term is self.current():
             self._refresh_banner()
+
+    def _on_osc_used(self, term):
+        """A program used an OSC escape (title, clipboard, hyperlink) that line mode
+        strips. Surface a dismissible per-tab notice, unless the user turned the
+        notice off (it fires once per tab; a shell sets a title every prompt)."""
+        if self._osc_notice:
+            self._on_advise(term, 'An application used an OSC escape (window title, '
+                            'clipboard or hyperlink). The safe CLI mode ignores it. '
+                            'Turn this notice off in View > Notify on OSC use.')
 
     def _dismiss_advisory(self):
         """The X button: clear the current tab's advisory and hide the banner."""
@@ -852,6 +865,13 @@ class MainWindow(QMainWindow):
         self.act_auto_tab_colors.setChecked(enabled)
         self._persist()               # affects new tabs; existing keep their colour
 
+    def set_osc_notice(self, enabled):
+        if 'osc_notice' in self._locked:
+            return                        # admin-locked; not user-changeable
+        self._osc_notice = bool(enabled)
+        self.act_osc_notice.setChecked(enabled)
+        self._persist()
+
     def set_markings(self, enabled):
         if 'colored_markings' in self._locked:
             return                        # admin-locked; not user-changeable
@@ -1072,6 +1092,7 @@ class MainWindow(QMainWindow):
             ('colors', [self.act_colors]),
             ('colored_markings', [self.act_markings]),
             ('auto_tab_colors', [self.act_auto_tab_colors]),
+            ('osc_notice', [self.act_osc_notice]),
             ('tui', [self.act_tui]),
             ('allow_title', [self.act_title]),
         ]
@@ -1110,6 +1131,7 @@ class MainWindow(QMainWindow):
             'paste_delay': str(self._paste_delay),
             'tui': 'true' if self._default_tui else 'false',
             'allow_title': 'true' if self._default_allow_title else 'false',
+            'osc_notice': 'true' if self._osc_notice else 'false',
             'persist_session': 'true' if self._persist_session else 'false',
         }, locked=self._locked)
 
@@ -1306,6 +1328,15 @@ class MainWindow(QMainWindow):
             'on a tab (right-click) overrides the automatic one.')
         self.act_auto_tab_colors.toggled.connect(self.set_auto_tab_colors)
         view_menu.addAction(self.act_auto_tab_colors)
+
+        self.act_osc_notice = QAction('Notify on &OSC use', self, checkable=True)
+        self.act_osc_notice.setChecked(self._osc_notice)
+        self.act_osc_notice.setToolTip(
+            'Show a dismissible banner (once per tab) when a program uses an OSC '
+            'escape -- a window title, clipboard write or hyperlink -- which the '
+            'safe CLI mode ignores. On by default.')
+        self.act_osc_notice.toggled.connect(self.set_osc_notice)
+        view_menu.addAction(self.act_osc_notice)
 
         self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', '#e5a50a'),
                                '&TUI mode', self, checkable=True)
@@ -1526,6 +1557,10 @@ class MainWindow(QMainWindow):
         title.setChecked(self._default_allow_title)
         form.addRow('Allow program title / notifications', title)
 
+        osc = QCheckBox()
+        osc.setChecked(self._osc_notice)
+        form.addRow('Notify on OSC use', osc)
+
         scrollback = QComboBox()
         for label, lines in SCROLLBACK_CHOICES:
             scrollback.addItem(label, lines)
@@ -1559,6 +1594,7 @@ class MainWindow(QMainWindow):
             'theme': theme.currentData(), 'zoom': zoom.value(),
             'mode': mode.currentData(), 'colors': colors.isChecked(),
             'tui': tui.isChecked(), 'allow_title': title.isChecked(),
+            'osc_notice': osc.isChecked(),
             'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
             'persist': persist.isChecked(),
         })
@@ -1573,9 +1609,13 @@ class MainWindow(QMainWindow):
                 ('unicode_mode', 'mode', self._default_mode),
                 ('colors', 'colors', self._default_colors),
                 ('tui', 'tui', self._default_tui),
-                ('allow_title', 'allow_title', self._default_allow_title)):
+                ('allow_title', 'allow_title', self._default_allow_title),
+                ('osc_notice', 'osc_notice', self._osc_notice)):
             if key in self._locked:
                 opts[field] = current
+        if 'osc_notice' in opts:
+            self._osc_notice = opts['osc_notice']
+            self.act_osc_notice.setChecked(self._osc_notice)
         self._default_theme = opts['theme']
         self._default_zoom = opts['zoom']
         self._default_mode = opts['mode']

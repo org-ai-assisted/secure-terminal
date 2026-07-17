@@ -178,6 +178,10 @@ class SecureTerminal(QPlainTextEdit):
     # injected into the document: injected text is unfaithful -- it could be
     # selected and copied into a transcript as if a program printed it.
     advise_signal = pyqtSignal(str)
+    # a program emitted an OSC escape (window title, clipboard, hyperlink, ...)
+    # while in line mode, where it is stripped for safety. Emitted once per tab so
+    # the window can show a dismissible notice (a shell sets a title every prompt).
+    osc_used = pyqtSignal()
     # a program set the title / sent a notification (only when allowed)
     title_changed = pyqtSignal(str)
     notified = pyqtSignal(str)
@@ -281,6 +285,9 @@ class SecureTerminal(QPlainTextEdit):
         # is held here and prepended to the next chunk, so a split OSC/CSI never
         # leaks its remainder as literal text (see split_trailing_escape).
         self._esc_carry = ''
+        # emit osc_used at most once per tab (a shell sets an OSC title on every
+        # prompt, so per-OSC would spam); the window shows a dismissible notice.
+        self._osc_notice_shown = False
         # optional command hook (opt-in): config dict or None, plus the current
         # typed input line so it can be judged before Enter submits it.
         self._hook = None
@@ -788,6 +795,11 @@ class SecureTerminal(QPlainTextEdit):
         text = self._absorb_caret(text)         # drop a shell's duplicate ^C echo
         text = self._esc_carry + text
         text, self._esc_carry = split_trailing_escape(text)
+        # An OSC (ESC ]) is stripped in line mode; tell the user once per tab that a
+        # program tried a title/clipboard/hyperlink escape they cannot see.
+        if not self._osc_notice_shown and '\x1b]' in text:
+            self._osc_notice_shown = True
+            self.osc_used.emit()
         self._raw += text
         if len(self._raw) > self._RAW_MAX:
             self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output
