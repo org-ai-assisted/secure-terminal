@@ -124,6 +124,13 @@ _OSC_CLIP_MAX = 64 * 1024        # cap a clipboard payload; no unbounded writes
 # (the display text can differ from the target -- the phishing risk).
 _OSC8 = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)\x07(.*?)\x1b\]8;;\x07',
                    re.DOTALL)
+# OSC numeric code -> feature key, so a CLI-mode notice can name the exact type.
+_OSC_CODE_KEY = {}
+for _k, _lbl, _codes, *_rest in OSC_FEATURES:
+    for _c in _codes.replace(' ', '').split(','):
+        _OSC_CODE_KEY[int(_c)] = _k
+# OSC code embedded in text (str, in the CLI display path).
+_OSC_CODE_RE = re.compile(r'\x1b\](\d+)')
 
 # Alternate-screen enter/leave, as BYTES: pyte has no alt buffer, so the feed path
 # acts on these to snapshot/restore the primary screen at the exact boundary.
@@ -194,9 +201,10 @@ class SecureTerminal(QPlainTextEdit):
     # selected and copied into a transcript as if a program printed it.
     advise_signal = pyqtSignal(str)
     # a program emitted an OSC escape (window title, clipboard, hyperlink, ...)
-    # while in line mode, where it is stripped for safety. Emitted once per tab so
-    # the window can show a dismissible notice (a shell sets a title every prompt).
-    osc_used = pyqtSignal()
+    # while in line mode, where it is stripped for safety. Carries the FEATURE KEY
+    # (see OSC_FEATURES; 'osc_other' for an unrecognized code) so the window can
+    # notice each TYPE at most once per tab.
+    osc_used = pyqtSignal(str)
     # a program set the title / sent a notification (only when allowed)
     title_changed = pyqtSignal(str)
     notified = pyqtSignal(str)
@@ -954,9 +962,15 @@ class SecureTerminal(QPlainTextEdit):
         # usual victim) is never leaked as literal text.
         text = self._esc_carry + text
         text, self._esc_carry = split_trailing_escape(text)
-        # An OSC (ESC ]) is stripped in CLI mode; flag it so the window can notice.
+        # An OSC (ESC ]) is stripped in CLI mode; flag each distinct TYPE seen so
+        # the window can notice it at most once per tab (not once per any OSC).
         if '\x1b]' in text:
-            self.osc_used.emit()
+            emitted = set()
+            for m in _OSC_CODE_RE.finditer(text):
+                key = _OSC_CODE_KEY.get(int(m.group(1)), 'osc_other')
+                if key not in emitted:
+                    emitted.add(key)
+                    self.osc_used.emit(key)
         self._raw += text
         if len(self._raw) > self._RAW_MAX:
             self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output

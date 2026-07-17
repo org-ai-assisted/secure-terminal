@@ -243,6 +243,10 @@ class MainWindow(QMainWindow):
         # notice (a dismissible banner) when a program uses an OSC escape that line
         # mode strips; on by default, a global toggle turns it off
         self._osc_notice = cfg.get('osc_notice') != 'false'
+        # OSC types the user has muted individually (still neutralized, just no
+        # notice): a set of feature keys, comma-separated in config.
+        self._osc_notice_off = set(
+            k.strip() for k in cfg.get('osc_notice_off', '').split(',') if k.strip())
         # session persistence is on unless explicitly disabled
         self._persist_session = cfg.get('persist_session') != 'false'
         # optional opt-in command hook, configured only via a settings drop-in
@@ -282,12 +286,13 @@ class MainWindow(QMainWindow):
 
         self._theme_actions = {}
         self._osc_actions = {}       # osc feature key -> its checkable menu action
+        self._osc_notice_actions = {}  # osc feature key -> its notice-toggle action
         self._user_titles = {}       # term -> user-set tab name
         self._prog_titles = {}       # term -> program (OSC) title
         self._pre_tui_mode = {}      # term -> display mode to restore after TUI
         self._tab_colors = {}        # term -> tab colour name (for persistence)
         self._advisories = {}        # term -> (kind, banner text); kind tui|osc
-        self._osc_notified = set()   # terms already shown the once-per-tab OSC notice
+        self._osc_notified = set()   # (term, key) pairs already shown the OSC notice
         self._syncing = False        # guard: programmatic chip sync vs user click
         # toolbar chip buttons, populated by _build_toolbar; empty here so a
         # _sync during _build_menu (which runs first) is a harmless no-op.
@@ -335,7 +340,7 @@ class MainWindow(QMainWindow):
         term.notified.connect(self._on_notify)
         term.cwd_changed.connect(lambda path, t=term: self._on_cwd_changed(t, path))
         term.advise_signal.connect(lambda msg, t=term: self._on_advise(t, msg))
-        term.osc_used.connect(lambda t=term: self._on_osc_used(t))
+        term.osc_used.connect(lambda key, t=term: self._on_osc_used(t, key))
         index = self.tabs.addTab(term, term.cwd_basename() or 'shell')
         self.tabs.setCurrentIndex(index)
         # auto-colour the new tab so it differs from its neighbour, unless one is
@@ -397,17 +402,23 @@ class MainWindow(QMainWindow):
         if term is self.current():
             self._refresh_banner()
 
-    def _on_osc_used(self, term):
-        """A program used an OSC escape (title, clipboard, hyperlink) that pure CLI
-        mode strips. Surface a dismissible notice ONCE per tab, unless the user
-        turned it off. The terminal emits per OSC (a shell sets a title every
-        prompt); de-duplicate here so re-enabling the setting re-arms a tab that was
-        never actually shown the notice."""
-        if self._osc_notice and term not in self._osc_notified:
-            self._osc_notified.add(term)
-            self._on_advise(term, 'An application used an OSC escape (window title, '
-                            'clipboard or hyperlink). The safe CLI mode ignores it. '
-                            'Turn this notice off in View > Notify on OSC use.', 'osc')
+    def _on_osc_used(self, term, key):
+        """A program used an OSC escape of TYPE `key` that pure CLI mode strips.
+        Surface a dismissible notice at most once per TYPE per tab, unless notices
+        are off globally or for that type. De-duplicating here (not in the terminal)
+        means re-enabling a notice re-arms a tab that was never actually shown it."""
+        if not self._osc_notice or key in self._osc_notice_off:
+            return
+        if (term, key) in self._osc_notified:
+            return
+        self._osc_notified.add((term, key))
+        entry = OSC_FEATURE_BY_KEY.get(key)
+        label = entry[0].lower() if entry else 'an escape'
+        self._on_advise(term, 'An application used an OSC escape (' + label + '), '
+                        'which the safe CLI mode neutralized. Enable it under '
+                        'View > OSC features if you trust the source; turn this '
+                        'notice off (all or per type) in View > Notify on OSC use.',
+                        'osc')
 
     def _dismiss_advisory(self):
         """The X button: clear the current tab's advisory and hide the banner."""
@@ -671,7 +682,7 @@ class MainWindow(QMainWindow):
         self._prog_titles.pop(term, None)
         self._tab_colors.pop(term, None)
         self._advisories.pop(term, None)
-        self._osc_notified.discard(term)
+        self._osc_notified = {p for p in self._osc_notified if p[0] is not term}
         self._tab_ids.pop(term, None)
         self.tabs.removeTab(index)
         term.deleteLater()
@@ -910,6 +921,16 @@ class MainWindow(QMainWindow):
         self.act_osc_notice.setChecked(enabled)
         if not self._osc_notice:
             self._clear_advisories('osc')   # a switched-off notice must not linger
+        self._persist()
+
+    def set_osc_notice_type(self, key, notify):
+        """Mute or un-mute the OSC notice for one type (the feature is unaffected;
+        this only controls whether its neutralized use raises a banner)."""
+        if notify:
+            self._osc_notice_off.discard(key)
+        else:
+            self._osc_notice_off.add(key)
+            self._clear_advisories('osc')   # drop a showing notice for a muted type
         self._persist()
 
     def set_markings(self, enabled):
@@ -1249,6 +1270,7 @@ class MainWindow(QMainWindow):
             'tui': 'true' if self._default_tui else 'false',
             'allow_title': 'true' if self._default_allow_title else 'false',
             'osc_notice': 'true' if self._osc_notice else 'false',
+            'osc_notice_off': ','.join(sorted(self._osc_notice_off)),
             'persist_session': 'true' if self._persist_session else 'false',
             **{k: 'true' if v else 'false' for k, v in self._osc_defaults.items()},
         }, locked=self._locked)
@@ -1447,14 +1469,23 @@ class MainWindow(QMainWindow):
         self.act_auto_tab_colors.toggled.connect(self.set_auto_tab_colors)
         view_menu.addAction(self.act_auto_tab_colors)
 
-        self.act_osc_notice = QAction('Notify on &OSC use', self, checkable=True)
+        osc_notice_menu = view_menu.addMenu('Notify on &OSC use')
+        self.act_osc_notice = QAction('&All OSC notices', self, checkable=True)
         self.act_osc_notice.setChecked(self._osc_notice)
         self.act_osc_notice.setToolTip(
-            'Show a dismissible banner (once per tab) when a program uses an OSC '
-            'escape -- a window title, clipboard write or hyperlink -- which the '
-            'safe CLI mode ignores. On by default.')
+            'Show a dismissible banner (at most once per TYPE per tab) when a '
+            'program uses an OSC escape the safe CLI mode neutralized. On by '
+            'default. Untick a specific type below to mute just that one.')
         self.act_osc_notice.toggled.connect(self.set_osc_notice)
-        view_menu.addAction(self.act_osc_notice)
+        osc_notice_menu.addAction(self.act_osc_notice)
+        osc_notice_menu.addSeparator()
+        for key, label, codes, _d, _r, _h in OSC_FEATURES:
+            act = QAction(label + '  (OSC ' + codes + ')', self, checkable=True)
+            act.setChecked(key not in self._osc_notice_off)   # ticked == notify
+            act.setToolTip('Notify when untrusted output uses this OSC escape.')
+            act.toggled.connect(lambda on, k=key: self.set_osc_notice_type(k, on))
+            osc_notice_menu.addAction(act)
+            self._osc_notice_actions[key] = act
 
         self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', '#e5a50a'),
                                '&TUI mode', self, checkable=True)
