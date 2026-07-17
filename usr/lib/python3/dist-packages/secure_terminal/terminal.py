@@ -86,7 +86,7 @@ from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
                          QTextFormat, QGuiApplication)
 from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
-                             QHBoxLayout, QLabel, QPushButton)
+                             QHBoxLayout, QLabel, QPushButton, QApplication)
 
 # The pure, Qt-free sanitization core (also tested directly by dist-ai). Names
 # are re-exported here so terminal.py stays the single import point for the rest
@@ -98,7 +98,7 @@ from secure_terminal.sanitize import (
     paste_findings, tui_cell, sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL,
     wants_full_screen, leaves_full_screen, describe_codepoint, marking_class,
-    split_trailing_escape, feed_chunk_carry, OSC_FEATURES,
+    split_trailing_escape, feed_chunk_carry, has_bell, OSC_FEATURES,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 
@@ -301,6 +301,12 @@ class SecureTerminal(QPlainTextEdit):
         # the user enabled it AND only in TUI mode (line mode strips all escapes).
         # Off by default -- every one is a spoofing/exfiltration surface.
         self._osc = {key: False for key, *_rest in OSC_FEATURES}
+        # Bell (BEL, 0x07) policy: 'off' (neutralized silently, the safe default --
+        # BEL from untrusted output is a nuisance/attention-grab surface), 'audible'
+        # (a system beep) or 'visual' (a window/taskbar urgency flash). Rate-limited
+        # so a program spamming BEL cannot machine-gun it.
+        self._bell = 'off'
+        self._last_bell = 0.0
         self._last_title = ''
         self._reported_cwd = ''       # OSC 7 working directory, when osc_cwd is on
         # OSC 4/10/11/12 palette overrides (when osc_colors is on): 'fg'/'bg'/
@@ -520,6 +526,37 @@ class SecureTerminal(QPlainTextEdit):
 
     def any_osc_enabled(self):
         return any(self._osc.values())
+
+    # -- bell (BEL 0x07) -------------------------------------------------------
+    _BELL_MODES = ('off', 'audible', 'visual')
+
+    def apply_bell(self, mode):
+        """Set how a BEL from program output is signalled for this tab:
+        'off' (silent, the default), 'audible' (system beep) or 'visual' (a
+        window/taskbar urgency flash)."""
+        self._bell = mode if mode in self._BELL_MODES else 'off'
+
+    def bell_mode(self):
+        return self._bell
+
+    def _ring(self):
+        """Signal a bell per the tab's policy, rate-limited to at most once per
+        ~200ms so a BEL flood cannot machine-gun the beep/flash."""
+        if self._bell == 'off':
+            return
+        now = time.monotonic()
+        if now - self._last_bell < 0.2:
+            return
+        self._last_bell = now
+        app = QApplication.instance()
+        if app is None:
+            return
+        if self._bell == 'audible':
+            app.beep()
+        else:                       # 'visual': WM urgency hint on our window
+            win = self.window()
+            if win is not None:
+                app.alert(win, 0)
 
     # -- compatibility: "allow title/notifications" == the title + notify OSCs ---
     def apply_allow_title(self, enabled):
@@ -926,6 +963,11 @@ class SecureTerminal(QPlainTextEdit):
             self.shell_exited.emit()
             return
         text = self._decoder.decode(data)
+        # Ring the bell for a standalone BEL in the output (not an OSC terminator),
+        # if the tab opted in. Works in both modes; the BEL itself is still
+        # neutralized in the display -- ringing is the only added effect.
+        if self._bell != 'off' and has_bell(text):
+            self._ring()
         # Track whether a full-screen program holds the alternate screen. While it
         # does, keep the pyte screen fed even in line mode, so flipping to TUI mode
         # shows its current frame at once (no restart, the program keeps running).

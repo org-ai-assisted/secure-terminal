@@ -247,6 +247,11 @@ class MainWindow(QMainWindow):
         # notice): a set of feature keys, comma-separated in config.
         self._osc_notice_off = set(
             k.strip() for k in cfg.get('osc_notice_off', '').split(',') if k.strip())
+        # bell (BEL 0x07) policy: off (default, silent), audible (system beep) or
+        # visual (window/taskbar urgency flash). BEL from untrusted output is a
+        # nuisance surface, so silence is the safe default.
+        _bell = cfg.get('bell', 'off')
+        self._default_bell = _bell if _bell in ('off', 'audible', 'visual') else 'off'
         # session persistence is on unless explicitly disabled
         self._persist_session = cfg.get('persist_session') != 'false'
         # optional opt-in command hook, configured only via a settings drop-in
@@ -471,6 +476,7 @@ class MainWindow(QMainWindow):
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
+        term.apply_bell(self._default_bell)
         self._apply_osc_defaults(term)
         self._add_tab(term)
 
@@ -491,6 +497,7 @@ class MainWindow(QMainWindow):
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
+        term.apply_bell(self._default_bell)
         self._apply_osc_defaults(term)
         self._add_tab(term)
         if spec.get('title'):
@@ -658,6 +665,7 @@ class MainWindow(QMainWindow):
             term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
         term.apply_allow_title(bool(info.get('allow_title')))
+        term.apply_bell(info.get('bell', self._default_bell))
         index = self._add_tab(term)
         name = info.get('name')
         if isinstance(name, str) and name:
@@ -829,6 +837,10 @@ class MainWindow(QMainWindow):
             action.blockSignals(True)
             action.setChecked(value)
             action.blockSignals(False)
+        # the Bell radio uses `triggered` (fires only on a user click), so a
+        # programmatic setChecked here just reflects the current tab, no mutation
+        for mode, action in self._bell_actions.items():
+            action.setChecked(term.bell_mode() == mode)
         self._set_chip(self._colors_buttons,
                        'on' if term.colors_enabled() else 'off')
         self._set_chip(self._tui_buttons,
@@ -1185,6 +1197,20 @@ class MainWindow(QMainWindow):
         self._update_security_indicator()
         self._persist()
 
+    def set_bell(self, mode):
+        """Set the bell policy (off/audible/visual) on the current tab, remember it
+        as the default for new tabs, and persist it."""
+        if 'bell' in self._locked:
+            return
+        term = self.current()
+        if term is not None:
+            term.apply_bell(mode)
+        self._default_bell = mode
+        act = self._bell_actions.get(mode)
+        if act is not None:
+            act.setChecked(True)
+        self._persist()
+
     def _on_cwd_changed(self, term, path):
         # OSC 7 working directory (only when osc_cwd is enabled): show it as the
         # tab's tooltip (non-intrusive; the path is already sanitized).
@@ -1235,6 +1261,7 @@ class MainWindow(QMainWindow):
             ('osc_notice', [self.act_osc_notice]),
             ('tui', [self.act_tui]),
             ('allow_title', [self.act_title]),
+            ('bell', list(self._bell_actions.values())),
         ] + [(k, [self._osc_actions[k]]) for k in self._osc_actions]
         for key, actions in gated:
             if key in self._locked:
@@ -1271,6 +1298,7 @@ class MainWindow(QMainWindow):
             'paste_delay': str(self._paste_delay),
             'tui': 'true' if self._default_tui else 'false',
             'allow_title': 'true' if self._default_allow_title else 'false',
+            'bell': self._default_bell,
             'osc_notice': 'true' if self._osc_notice else 'false',
             'osc_notice_off': ','.join(sorted(self._osc_notice_off)),
             'persist_session': 'true' if self._persist_session else 'false',
@@ -1488,6 +1516,30 @@ class MainWindow(QMainWindow):
             act.toggled.connect(lambda on, k=key: self.set_osc_notice_type(k, on))
             osc_notice_menu.addAction(act)
             self._osc_notice_actions[key] = act
+
+        bell_menu = view_menu.addMenu('&Bell')
+        self._bell_group = QActionGroup(self)
+        self._bell_group.setExclusive(True)
+        self._bell_actions = {}
+        for label, mode, tip in (
+            ('&Off', 'off',
+             'A BEL from program output is silently neutralized (the safe '
+             'default). A bell rung by untrusted output is a nuisance and an '
+             'attention-grab surface, so it is off unless you ask for it.'),
+            ('&Audible', 'audible',
+             'A BEL rings a short system beep. Rate-limited, so a program '
+             'spamming BEL cannot machine-gun it.'),
+            ('&Visual', 'visual',
+             'A BEL flags the window for attention (a window-manager urgency '
+             'hint / taskbar flash) instead of a sound. Rate-limited.'),
+        ):
+            act = QAction(label, self, checkable=True)
+            act.setToolTip(tip)
+            act.setChecked(self._default_bell == mode)
+            act.triggered.connect(lambda _checked, m=mode: self.set_bell(m))
+            self._bell_group.addAction(act)
+            bell_menu.addAction(act)
+            self._bell_actions[mode] = act
 
         self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', '#e5a50a'),
                                '&TUI mode', self, checkable=True)
@@ -1801,6 +1853,7 @@ class MainWindow(QMainWindow):
                                      or self._osc_defaults.get('osc_notify'))
         self._scrollback = opts['scrollback']
         self._paste_delay = opts['paste_delay']
+        self._default_bell = opts.get('bell', self._default_bell)
         for index in range(self.tabs.count()):
             term = self.tabs.widget(index)
             term.apply_theme(opts['theme'])
@@ -1811,6 +1864,7 @@ class MainWindow(QMainWindow):
                 term.apply_osc(key, value)
             term.apply_scrollback(opts['scrollback'])
             term.apply_paste_delay(opts['paste_delay'])
+            term.apply_bell(self._default_bell)
         self.set_persist_session(opts['persist'])
         self._sync_chrome_to_tab()
         self._persist()
@@ -1985,6 +2039,7 @@ class MainWindow(QMainWindow):
                 'markings': term.markings_enabled(),
                 'tui': term.current_tui(),
                 'allow_title': term.allow_title_enabled(),
+                'bell': term.bell_mode(),
                 'scrollback': term.current_scrollback(),
                 'text': text,
             })
