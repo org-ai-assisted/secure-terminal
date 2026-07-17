@@ -93,7 +93,7 @@ from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
 # of the package (main.py, dialog.py).
 from secure_terminal.sanitize import (
     THEMES, BASE_POINT_SIZE, ANSI_PALETTE, DISPLAY_MODES,
-    colors_allowed, too_close, sanitize_paste,
+    colors_allowed, too_close, luminance, sanitize_paste,
     sanitize_paste_unicode,
     paste_findings, tui_cell, sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL,
@@ -290,6 +290,9 @@ class SecureTerminal(QPlainTextEdit):
         self._osc = {key: False for key, *_rest in OSC_FEATURES}
         self._last_title = ''
         self._reported_cwd = ''       # OSC 7 working directory, when osc_cwd is on
+        # OSC 4/10/11/12 palette overrides (when osc_colors is on): 'fg'/'bg'/
+        # 'cursor' -> hex, and int index -> hex for the 16-colour set.
+        self._osc_palette = {}
         # persistent output cursor for line mode (see _paint_line)
         self._out_cursor = None
         # the current (editable) line held as LOGICAL cells (source_char, sgr_key)
@@ -491,6 +494,9 @@ class SecureTerminal(QPlainTextEdit):
         """Enable/disable one OSC feature (see OSC_FEATURES) for this tab."""
         if key in self._osc:
             self._osc[key] = bool(enabled)
+            if key == 'osc_colors' and not enabled and self._osc_palette:
+                self._osc_palette.clear()
+                self.apply_theme(self._theme)  # restore the theme palette + repaint
 
     def osc_enabled(self, key):
         return self._osc.get(key, False)
@@ -596,7 +602,8 @@ class SecureTerminal(QPlainTextEdit):
             return QColor(default) if default is not None else None
         idx = _PYTE_COLOR.get(color)
         if idx is not None:
-            return QColor(ANSI_PALETTE[idx + 8 if bright else idx])
+            real = idx + 8 if bright else idx
+            return QColor(self._osc_palette.get(real, ANSI_PALETTE[real]))
         col = QColor('#' + color)          # 256/truecolor as a 6-hex string
         if col.isValid():
             return col
@@ -607,7 +614,9 @@ class SecureTerminal(QPlainTextEdit):
         fmt = self._fmt_cache.get(key)
         if fmt is not None:
             return fmt
-        base_bg, base_fg = THEMES.get(self._theme, THEMES['dark'])
+        theme_bg, theme_fg = THEMES.get(self._theme, THEMES['dark'])
+        base_bg = self._osc_palette.get('bg', theme_bg)   # OSC 11 default bg
+        base_fg = self._osc_palette.get('fg', theme_fg)   # OSC 10 default fg
         fg = self._pyte_qcolor(cell.fg, base_fg, bright=cell.bold)
         bg = self._pyte_qcolor(cell.bg, None)
         if cell.reverse:
@@ -616,8 +625,13 @@ class SecureTerminal(QPlainTextEdit):
         if fg is None:
             fg = QColor(base_fg)
         eff_bg = bg if bg is not None else QColor(base_bg)
-        if too_close(_rgb(fg), _rgb(eff_bg)):   # same contrast guard as colours
-            fg = QColor(base_fg)
+        if too_close(_rgb(fg), _rgb(eff_bg)):
+            # force a readable foreground for the ACTUAL background, so a program
+            # cannot hide text by setting fg == bg -- even by moving the default
+            # colours together via OSC 10/11 (the fallback must NOT be a
+            # program-set colour, or the guard could be defeated).
+            fg = QColor('#000000') if luminance(_rgb(eff_bg)) > 127 \
+                else QColor('#e6e6e6')
             if bg is not None and too_close(_rgb(fg), _rgb(bg)):
                 bg = None
         fmt = QTextCharFormat()
@@ -1033,8 +1047,49 @@ class SecureTerminal(QPlainTextEdit):
                 self._osc_clipboard(params)
             elif code == 7 and self._osc['osc_cwd']:
                 self._osc_cwd(params)
+            elif code in (4, 10, 11, 12) and self._osc['osc_colors']:
+                self._osc_color(code, params)
             elif code == 1337 and self._osc['osc_iterm2']:
                 self._osc_iterm2(params)
+
+    def _parse_osc_color(self, spec):
+        """An OSC colour spec ('rgb:RR/GG/BB', '#RRGGBB', or a name) -> '#rrggbb',
+        or None. Only well-formed colours are accepted (never a raw string)."""
+        s = spec.decode('ascii', 'ignore').strip().lower()
+        m = re.match(r'rgb:([0-9a-f]{1,4})/([0-9a-f]{1,4})/([0-9a-f]{1,4})$', s)
+        if m:
+            return '#' + ''.join((g * 2)[:2] for g in m.groups())
+        if re.match(r'#[0-9a-f]{6}$', s):
+            return s
+        col = QColor(s)
+        return col.name() if col.isValid() else None
+
+    def _osc_color(self, code, params):
+        """OSC 4/10/11/12: override a palette index or the default fg/bg/cursor
+        colour. The contrast guard in _pyte_format still applies, so a program
+        still cannot paint text the same colour as the background to hide it."""
+        if code == 4:
+            parts = params.split(b';', 1)
+            if len(parts) != 2 or not parts[0].isdigit():
+                return
+            idx = int(parts[0])
+            col = self._parse_osc_color(parts[1])
+            if col is not None and 0 <= idx < 16:      # only the set we render
+                self._osc_palette[idx] = col
+        else:
+            col = self._parse_osc_color(params)
+            if col is None:
+                return
+            role = {10: 'fg', 11: 'bg', 12: 'cursor'}[code]
+            self._osc_palette[role] = col
+            if role in ('fg', 'bg'):       # make the default colour actually show
+                pal = self.palette()
+                pal.setColor(QPalette.ColorRole.Base if role == 'bg'
+                             else QPalette.ColorRole.Text, QColor(col))
+                self.setPalette(pal)
+        self._fmt_cache.clear()                        # re-resolve cell colours
+        if self._grid_mode():
+            self._render_tui()
 
     def _osc_clipboard(self, params):
         """OSC 52: <selection>;<base64|'?'>. WRITE only; a read query ('?') is
