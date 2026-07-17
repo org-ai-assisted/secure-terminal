@@ -141,31 +141,37 @@ def split_trailing_escape(text, cap=4096):
 #
 # Fields: key, label, codes (human), default (always False = neutralized),
 # risk ('low' | 'medium' | 'high'; drives the security lamp), hint (laymen).
+#
+# The hints describe the risk from UNTRUSTED OUTPUT: bytes you did not author
+# reaching the terminal (a file you view, a program's output, a server banner)
+# can carry these escapes, so a passive action like viewing a log triggers the
+# side-effect. This is NOT about a program you deliberately run -- secure-terminal
+# does not sandbox programs; see the threat-model note in the security lamp.
 OSC_FEATURES = (
     ('osc_title', 'Window / tab title', '0, 2', False, 'medium',
-     'Lets a program rename the window or tab. A spoofed title can mislead you, '
-     'and on terminals that answer a "report title" query it can inject '
-     'keystrokes.'),
+     'Untrusted output can rename the window or tab; a spoofed title can mislead '
+     'you, and a "report title" query can put text onto your input line.'),
     ('osc_notify', 'Desktop notifications', '9', False, 'medium',
-     'Lets a program raise a desktop notification. The text can be faked, e.g. '
-     '"your session expired, run this command".'),
+     'Untrusted output can raise a desktop notification whose text is faked '
+     '(for example a bogus "your session expired" prompt).'),
     ('osc_hyperlink', 'Hyperlinks', '8', False, 'medium',
-     'A program can make links whose visible text differs from the real target '
-     '(classic phishing). When enabled, the true target is surfaced next to the '
-     'text so you can see where a link really points.'),
+     'Untrusted output can present a link whose visible text differs from where '
+     'it really points (phishing). When enabled, the true target is surfaced next '
+     'to the text so you can see where a link really goes.'),
     ('osc_clipboard', 'System clipboard', '52', False, 'high',
-     'Lets a program WRITE your system clipboard (so your next paste runs its '
-     'command) or read it back to itself. The most dangerous terminal escape.'),
+     'Untrusted output could silently overwrite your system clipboard, so a later '
+     'paste inserts text you did not copy, or read your clipboard back to itself. '
+     'The most dangerous terminal escape.'),
     ('osc_colors', 'Palette / colours', '4, 10, 11, 12', False, 'medium',
-     'Lets a program change the terminal colours -- for example paint text the '
-     'same colour as the background to hide it, or leave your palette altered '
+     'Untrusted output can change the terminal colours -- for example paint text '
+     'the same colour as the background to hide it, or leave your palette altered '
      'after it exits.'),
     ('osc_cwd', 'Working-directory report', '7', False, 'low',
-     'Lets a program report its working directory. Minor: it discloses a path '
-     'and some shells act on it.'),
+     'Untrusted output can set the tab\'s reported directory. Minor: it discloses '
+     'a path and some shells act on it.'),
     ('osc_iterm2', 'iTerm2 extensions', '1337', False, 'high',
-     'Lets a program use iTerm2 proprietary escapes (file upload / download, set '
-     'variables) -- a very large surface.'),
+     'Untrusted output could use iTerm2 proprietary escapes (file upload / '
+     'download, set variables) -- a very large surface.'),
 )
 
 # key -> (label, codes, default, risk, hint), for quick lookup.

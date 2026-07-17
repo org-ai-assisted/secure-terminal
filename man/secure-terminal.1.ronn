@@ -131,11 +131,23 @@ only be enabled from a privileged configuration directory (`remote_control`).
 
 ## SECURITY
 
+secure-terminal does not sandbox the programs you run; if you choose to run
+something harmful it runs, as in any terminal. What it protects is VIEWING
+untrusted data: a crafted file, a program's output, a login banner or a filename
+can carry escape sequences that, on a normal terminal, act rather than merely
+display -- quietly changing your clipboard (so a later paste inserts text you
+never copied), drawing a link whose text lies about its target, or putting text
+onto your input line. secure-terminal removes those escapes so reading untrusted
+output is safe, and sanitizes paste so untrusted text cannot smuggle a hidden
+command into the shell.
+
 The safe-by-construction guarantees rest on the CLI mode: no escape parser,
 printable-ASCII-only display, ASCII-sanitized paste, and a memory-safe
-implementation. TUI mode is a deliberate, clearly-indicated, lower-guarantee
-mode; the confined screen model still cannot touch the title or clipboard and
-still filters every character. Only run programs you trust in TUI mode.
+implementation. TUI mode is a deliberate, clearly-indicated, lower-guarantee mode;
+the confined screen model still filters every character, and each OSC feature
+(title, clipboard, hyperlink, colours, ...) is neutralized unless you enable it
+(see `View > OSC features`), at your own risk. Only run programs you trust in TUI
+mode.
 
 ## WWW
 

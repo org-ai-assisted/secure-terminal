@@ -41,6 +41,19 @@ TUI_TOOLTIP = (
     'program CAN draw a misleading interface within its screen, so only run '
     'programs you trust. The default CLI mode remains safe by construction.')
 
+# Plain-language threat model for the OSC controls, shown in the security lamp so
+# a lay user does not over-trust the feature. Safe example only (no destructive
+# commands): the point is that a passive action can trigger a real side-effect.
+_OSC_THREAT_MODEL = (
+    'Threat model: secure-terminal does NOT make the programs you run safer -- if '
+    'you choose to run something harmful it still runs, as in any terminal. What '
+    'it guards is VIEWING untrusted output: a crafted file you open, a program\'s '
+    'output, an SSH login banner or even a filename can carry these escapes, so a '
+    'harmless-looking action (reading a log) would otherwise cause a real '
+    'side-effect -- for example quietly changing your clipboard so a later paste '
+    'inserts text you never copied. Keeping these off means untrusted output can '
+    'only be read, never act.')
+
 ZOOM_MIN = 25
 ZOOM_MAX = 400
 
@@ -974,10 +987,11 @@ class MainWindow(QMainWindow):
         if not enabled:
             return ('#1f8a54', 'OSC off',
                     'OSC: all neutralized (green).\n\n'
-                    'Every way a program can reach OUT of the terminal (set the '
-                    'window title, write your clipboard, make hyperlinks, change '
-                    'colours, ...) is turned off. Enable individual ones under '
-                    'View > OSC features, at your own risk.')
+                    'Every way OUTPUT can reach out of the terminal (set the window '
+                    'title, write your clipboard, make hyperlinks, change colours, '
+                    '...) is turned off, so viewing untrusted output cannot trigger '
+                    'those side-effects. Enable individual ones under View > OSC '
+                    'features, at your own risk.\n\n' + _OSC_THREAT_MODEL)
         risks = [OSC_FEATURE_BY_KEY[k][3] for k in enabled]
         labels = ', '.join(OSC_FEATURE_BY_KEY[k][0] for k in enabled)
         if 'high' in risks:
@@ -988,9 +1002,10 @@ class MainWindow(QMainWindow):
                 'OSC: enabled features (%s).\n\n' % ('high risk' if 'high' in risks
                                                      else 'elevated') +
                 'You have enabled: ' + labels + '.\n\n'
-                'A program can now use these to act on your system beyond drawing '
-                'its own screen. Turn them off under View > OSC features to return '
-                'to green.')
+                'Untrusted output can now trigger these side-effects (not only a '
+                'program you chose to run -- any output, including a file you view '
+                'or a server banner). Turn them off under View > OSC features to '
+                'return to green.\n\n' + _OSC_THREAT_MODEL)
 
     def _display_level(self):
         """The display (unicode) risk axis as (colour, short, detail). Show

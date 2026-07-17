@@ -10,6 +10,26 @@ else, so a pasted or printed lie has nothing to hide in.
 This is the problem [output lies](https://output-lies.github.io) documents,
 removed at the source.
 
+## Threat model (what this does, and does not, protect)
+
+secure-terminal does **not** sandbox the programs you run. If you choose to run
+something harmful, it runs, exactly as in any terminal; nothing at the terminal
+layer can change that.
+
+What it guards is **viewing untrusted data**. The danger in a normal terminal is
+that bytes you did not author, and did not choose to execute, can *act* rather than
+merely *display*: a crafted file you open, a program's output, an SSH login banner,
+a filename in a listing or a commit message can carry escape sequences. On a normal
+terminal, merely reading such output can quietly change your clipboard (so a later
+paste inserts text you never copied), draw a link whose visible text lies about its
+destination, put text onto your input line, or paint text invisibly. A passive,
+low-suspicion action causes a side-effect you never intended, without you running
+anything.
+
+secure-terminal removes those escapes so that reading untrusted output is safe, and
+sanitizes paste so untrusted text cannot smuggle a hidden command into your shell.
+It does nothing about the programs you deliberately run.
+
 ## How it stays safe
 
 - **ASCII-only display.** Program output is passed through a sanitizer: ANSI/OSC
