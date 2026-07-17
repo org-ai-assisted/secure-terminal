@@ -37,13 +37,18 @@ _SAFE = frozenset(_HONORED | set(range(0x20, 0x7F)))
 
 def TestOneInput(data):
     fdp = atheris.FuzzedDataProvider(data)
+    max_line = fdp.ConsumeIntInRange(0, 256)   # 0 = unbounded; >0 = width bound
     text = fdp.ConsumeUnicodeNoSurrogates(2 ** 18)
 
-    comp, cells, col, sgr, _wraps = feed_line_edits([], 0, {}, text)
+    comp, cells, col, sgr, _wraps = feed_line_edits([], 0, {}, text, max_line)
     if not 0 <= col <= len(cells):
         raise RuntimeError(
             "feed_line_edits cursor {0} out of [0,{1}]: input={2!r}".format(
                 col, len(cells), text))
+    if max_line and (col > max_line or len(cells) > max_line):
+        raise RuntimeError(
+            "feed_line_edits exceeded width {0}: col={1} len={2} input={3!r}".format(
+                max_line, col, len(cells), text))
     for ch, _key in cells:
         if ch == '\x1b':
             raise RuntimeError(
@@ -64,7 +69,7 @@ def TestOneInput(data):
             "cells_display_col negative: input={0!r}".format(text))
 
     ## Feeding the resulting state again must not raise.
-    feed_line_edits(cells, col, sgr, text)
+    feed_line_edits(cells, col, sgr, text, max_line)
 
 
 def main():
