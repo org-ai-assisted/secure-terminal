@@ -100,10 +100,12 @@ ANSI_RE = re.compile(
     r'\x1b\[[0-?]*[ -/]*[@-~]'
     r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?'
     # DCS (ESC P), SOS (ESC X), PM (ESC ^), APC (ESC _): a string sequence whose
-    # BODY runs to a BEL or ST terminator. Consume the whole body -- matching only
-    # the two-byte opener (the generic arm below) would leak the body as text, so a
-    # cat'd DECRQSS/XTGETTCAP/APC payload ("\x1bP$qm\x1b\\") would show "$qm".
-    r'|\x1b[PX^_][^\x07\x1b]*(?:\x07|\x1b\\)?'
+    # BODY runs to an ST (ESC \) terminator. Unlike OSC, BEL does NOT terminate
+    # these -- a BEL byte is part of the (often binary) body -- so the body is
+    # "anything but ESC" up to the ST. Consume the whole body: matching only the
+    # two-byte opener (the generic arm below) would leak the body as text, so a
+    # cat'd DECRQSS/XTGETTCAP/Sixel/APC payload ("\x1bP$qm\x1b\\") would show "$qm".
+    r'|\x1b[PX^_][^\x1b]*(?:\x1b\\)?'
     r'|\x1b[@-Z\\-_]'
 )
 
@@ -120,7 +122,7 @@ SGR_RE = re.compile(r'\x1b\[([0-9;]*)m')
 _TRAILING_ESCAPE = re.compile(
     r'\x1b(?:'
     r'\][^\x07\x1b]*'        # OSC: ESC ] ... still awaiting its BEL or ST
-    r'|[PX^_][^\x07\x1b]*'   # DCS/SOS/PM/APC: ESC P/X/^/_ ... awaiting BEL or ST
+    r'|[PX^_][^\x1b]*'       # DCS/SOS/PM/APC: ESC P/X/^/_ ... awaiting ST (BEL is body)
     r'|\[[0-?]*[ -/]*'       # CSI: ESC [ params/intermediates, no final byte yet
     r'|[ -/]*'               # ESC + intermediate bytes, awaiting a final (charsets)
     r')?$'
@@ -145,6 +147,56 @@ def split_trailing_escape(text, cap=4096):
     if m and m.group() and len(m.group()) <= cap:
         return text[:m.start()], m.group()
     return text, ''
+
+
+# A string sequence -- OSC (ESC ]), DCS (ESC P), SOS (ESC X), PM (ESC ^), APC
+# (ESC _) -- can be arbitrarily long (a Sixel image is a large DCS) and can split
+# across read() chunks. Holding an unbounded carry would let hostile output
+# balloon memory; but simply DROPPING an over-cap carry leaks the sequence's
+# continuation (the later chunks carry no introducer) as visible text. So once an
+# incomplete string sequence outgrows the carry cap we switch to a DISCARD state:
+# subsequent bytes are swallowed until the terminator, then rendering resumes.
+# This keeps "strip every escape" true for a sequence of ANY length in O(1) memory.
+_STRING_INTRO = ']PX^_'                 # 2nd byte of ESC-<x> string introducers
+_STRING_TERMINATOR = {
+    ']': re.compile(r'\x07|\x1b\\'),    # OSC ends on BEL or ST
+    'P': re.compile(r'\x1b\\'),         # DCS ends on ST only (BEL is body)
+    'X': re.compile(r'\x1b\\'),         # SOS
+    '^': re.compile(r'\x1b\\'),         # PM
+    '_': re.compile(r'\x1b\\'),         # APC
+}
+
+
+def feed_chunk_carry(text, carry, drop, cap=4096):
+    """CLI-mode incremental escape handling across read() chunks. Given the new
+    `text`, the short `carry` held from the previous chunk (str), and `drop` (the
+    introducer byte of an over-long string sequence being discarded, or ''),
+    return (renderable_text, new_carry, new_drop). Guarantees every escape --
+    including an arbitrarily long, chunk-split string sequence -- is fully removed
+    with O(1) memory: an incomplete string sequence past `cap` switches to a
+    discard state that swallows bytes until its terminator (handling a terminator
+    itself split across the boundary via a one-byte ESC carry)."""
+    text = carry + text
+    carry = ''
+    if drop:
+        m = _STRING_TERMINATOR[drop].search(text)
+        if not m:
+            # still inside the sequence; a lone trailing ESC may be a split ST
+            return '', ('\x1b' if text.endswith('\x1b') else ''), drop
+        text = text[m.end():]
+        drop = ''
+    m = _TRAILING_ESCAPE.search(text)
+    if m and m.group():
+        g = m.group()
+        if len(g) >= 2 and g[1] in _STRING_INTRO and len(g) > cap:
+            drop = g[1]                 # too long to hold -> swallow to terminator
+            text = text[:m.start()]
+        elif len(g) <= cap:
+            carry = g                   # short incomplete escape -> hold for next chunk
+            text = text[:m.start()]
+        # else: an over-cap NON-string tail (a pathological unterminated CSI, which
+        # a real program never emits) is let through, bounded -- as before.
+    return text, carry, drop
 
 
 # --- OSC features -------------------------------------------------------------

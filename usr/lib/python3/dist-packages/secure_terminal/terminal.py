@@ -98,7 +98,7 @@ from secure_terminal.sanitize import (
     paste_findings, tui_cell, sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL,
     wants_full_screen, leaves_full_screen, describe_codepoint, marking_class,
-    split_trailing_escape, OSC_FEATURES,
+    split_trailing_escape, feed_chunk_carry, OSC_FEATURES,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 
@@ -328,8 +328,12 @@ class SecureTerminal(QPlainTextEdit):
         self._pending_caret = []
         # An escape sequence split across two os.read() chunks: its incomplete tail
         # is held here and prepended to the next chunk, so a split OSC/CSI never
-        # leaks its remainder as literal text (see split_trailing_escape).
+        # leaks its remainder as literal text (see feed_chunk_carry).
         self._esc_carry = ''
+        # When an over-long string sequence (OSC/DCS/Sixel/APC) outgrows the carry
+        # cap, this holds its introducer byte and the feed discards bytes until the
+        # terminator, so a huge chunk-split escape is stripped in O(1) memory.
+        self._esc_drop = ''
         # emitted whenever a program uses an OSC escape while in pure CLI mode,
         # where it is stripped; the window de-duplicates to a once-per-tab notice
         # (it knows the setting, so the terminal must not consume the state itself).
@@ -970,9 +974,11 @@ class SecureTerminal(QPlainTextEdit):
         # CLI line mode: display through the escape-stripping pipeline. Prepend any
         # escape tail held back from the previous chunk and hold back a new
         # incomplete tail, so a sequence split across reads (a long OSC title is the
-        # usual victim) is never leaked as literal text.
-        text = self._esc_carry + text
-        text, self._esc_carry = split_trailing_escape(text)
+        # usual victim) is never leaked as literal text. An over-long string
+        # sequence (a Sixel image is the worst case) switches to a discard state so
+        # it is stripped whatever its length, without buffering it unbounded.
+        text, self._esc_carry, self._esc_drop = feed_chunk_carry(
+            text, self._esc_carry, self._esc_drop)
         # An OSC (ESC ]) is stripped in CLI mode; flag each distinct TYPE seen so
         # the window can notice it at most once per tab (not once per any OSC).
         if '\x1b]' in text:
@@ -1449,6 +1455,15 @@ class SecureTerminal(QPlainTextEdit):
                 if key in (Qt.Key.Key_C, Qt.Key.Key_U):
                     self._line_buffer = ''    # SIGINT / kill-line discards the line
                     self._line_dirty = False
+                return
+            # The rest of the Ctrl+@..Ctrl+_ range (Ctrl+[ -> 0x1b ESC, Ctrl+] ->
+            # 0x1d, Ctrl+^ -> 0x1e, Ctrl+_ / Ctrl+/ -> 0x1f readline-undo, Ctrl+Space
+            # / Ctrl+@ -> 0x00 set-mark): forward the control byte Qt already
+            # computed for the layout, so the whole range is faithful without a
+            # hard-coded keymap. Enter/Tab/Backspace keep their dedicated handling.
+            ctl = event.text()
+            if len(ctl) == 1 and ord(ctl) < 0x20 and ctl not in '\b\t\n\r':
+                self._write(ctl.encode('latin-1'))
                 return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
