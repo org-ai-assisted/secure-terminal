@@ -105,6 +105,32 @@ ANSI_RE = re.compile(
 # colours are enabled. Everything else is still stripped.
 SGR_RE = re.compile(r'\x1b\[([0-9;]*)m')
 
+# An escape sequence can be split across two os.read() chunks. The line renderer
+# is stateless per chunk, so a split OSC/CSI would leak its TAIL as literal text:
+# a long OSC title (which a shell sets on every prompt) is the usual victim -- its
+# head is stripped, then the next chunk's remainder ("...] (cd ~) [pts/11]\x07")
+# renders as text, BEL and all. This matches an INCOMPLETE escape at end-of-text
+# so the caller can hold it back and prepend it to the next chunk.
+_TRAILING_ESCAPE = re.compile(
+    r'\x1b(?:'
+    r'\][^\x07\x1b]*'        # OSC: ESC ] ... still awaiting its BEL or ST
+    r'|\[[0-?]*[ -/]*'       # CSI: ESC [ params/intermediates, no final byte yet
+    r'|[ -/]*'               # ESC + intermediate bytes, awaiting a final (charsets)
+    r')?$'
+)
+
+
+def split_trailing_escape(text, cap=4096):
+    """Split off an INCOMPLETE escape sequence at the end of `text`, if any, so a
+    caller feeding one read()-chunk at a time can carry it to the next chunk rather
+    than leak its tail. Returns (complete_text, carry). A carry longer than `cap`
+    is NOT held (a genuine split sequence is short; an unterminated flood -- or a
+    program that simply never terminates its OSC -- is let through, bounded)."""
+    m = _TRAILING_ESCAPE.search(text)
+    if m and m.group() and len(m.group()) <= cap:
+        return text[:m.start()], m.group()
+    return text, ''
+
 
 def colors_allowed():
     """False only when NO_COLOR is set (per no-color.org: presence, any value),
@@ -259,11 +285,21 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0):
                 num = int(m.group(1)) if m.group(1) else None
                 op = m.group(2)
                 if op == 'C':
-                    col = min(len(cells), col + (num or 1))
+                    # cursor forward: like a real VT, moving past end-of-line
+                    # leaves BLANKS in the gap (a right-prompt jumps here, e.g.
+                    # "\x1b[43C[pts/N]"). Pad up to the target column, bounded by
+                    # the width, instead of collapsing the gap onto the last cell.
+                    col = col + (num or 1)
+                    col = min(col, max_line - 1) if max_line else min(col, len(cells))
+                    while len(cells) < col:
+                        cells.append((' ', tuple(sorted(sgr.items()))))
                 elif op == 'D':
                     col = max(0, col - (num or 1))
                 elif op == 'G':
-                    col = max(0, min(len(cells), (num or 1) - 1))
+                    col = max(0, (num or 1) - 1)          # absolute column (1-based)
+                    col = min(col, max_line - 1) if max_line else min(col, len(cells))
+                    while len(cells) < col:
+                        cells.append((' ', tuple(sorted(sgr.items()))))
                 else:                                   # K: erase in line
                     if num in (None, 0):
                         del cells[col:]                 # cursor -> end of line

@@ -95,6 +95,7 @@ from secure_terminal.sanitize import (
     paste_findings, tui_cell, sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL,
     wants_full_screen, leaves_full_screen, describe_codepoint, marking_class,
+    split_trailing_escape,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 
@@ -276,6 +277,10 @@ class SecureTerminal(QPlainTextEdit):
         # Local caret echoes (^C, ^\) awaiting possible de-duplication against the
         # shell's own echo: [(text, deadline_monotonic), ...]. See _echo_caret.
         self._pending_caret = []
+        # An escape sequence split across two os.read() chunks: its incomplete tail
+        # is held here and prepended to the next chunk, so a split OSC/CSI never
+        # leaks its remainder as literal text (see split_trailing_escape).
+        self._esc_carry = ''
         # optional command hook (opt-in): config dict or None, plus the current
         # typed input line so it can be judged before Enter submits it.
         self._hook = None
@@ -776,8 +781,13 @@ class SecureTerminal(QPlainTextEdit):
             return
 
         # line mode: retain the raw output (for a mode re-render) and display it
-        # through the escape-stripping pipeline.
+        # through the escape-stripping pipeline. Prepend any escape tail held back
+        # from the previous chunk and hold back a new incomplete tail, so a
+        # sequence split across reads (a long OSC title is the usual victim) is
+        # never leaked as literal text.
         text = self._absorb_caret(text)         # drop a shell's duplicate ^C echo
+        text = self._esc_carry + text
+        text, self._esc_carry = split_trailing_escape(text)
         self._raw += text
         if len(self._raw) > self._RAW_MAX:
             self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output
