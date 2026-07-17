@@ -132,6 +132,45 @@ def split_trailing_escape(text, cap=4096):
     return text, ''
 
 
+# --- OSC features -------------------------------------------------------------
+# Every OSC (Operating System Command) capability a program may try. Each is
+# NEUTRALIZED by default (secure by construction) and can be individually enabled
+# at the user's own risk. This registry is the single source of truth for the
+# config keys, the settings/menu UI, the security lamp and the layman
+# attack-surface hints, so the list never drifts across those places.
+#
+# Fields: key, label, codes (human), default (always False = neutralized),
+# risk ('low' | 'medium' | 'high'; drives the security lamp), hint (laymen).
+OSC_FEATURES = (
+    ('osc_title', 'Window / tab title', '0, 2', False, 'medium',
+     'Lets a program rename the window or tab. A spoofed title can mislead you, '
+     'and on terminals that answer a "report title" query it can inject '
+     'keystrokes.'),
+    ('osc_notify', 'Desktop notifications', '9', False, 'medium',
+     'Lets a program raise a desktop notification. The text can be faked, e.g. '
+     '"your session expired, run this command".'),
+    ('osc_hyperlink', 'Clickable hyperlinks', '8', False, 'medium',
+     'Lets a program make clickable links whose visible text can differ from the '
+     'real target -- classic phishing.'),
+    ('osc_clipboard', 'System clipboard', '52', False, 'high',
+     'Lets a program WRITE your system clipboard (so your next paste runs its '
+     'command) or read it back to itself. The most dangerous terminal escape.'),
+    ('osc_colors', 'Palette / colours', '4, 10, 11, 12', False, 'medium',
+     'Lets a program change the terminal colours -- for example paint text the '
+     'same colour as the background to hide it, or leave your palette altered '
+     'after it exits.'),
+    ('osc_cwd', 'Working-directory report', '7', False, 'low',
+     'Lets a program report its working directory. Minor: it discloses a path '
+     'and some shells act on it.'),
+    ('osc_iterm2', 'iTerm2 extensions', '1337', False, 'high',
+     'Lets a program use iTerm2 proprietary escapes (file upload / download, set '
+     'variables) -- a very large surface.'),
+)
+
+# key -> (label, codes, default, risk, hint), for quick lookup.
+OSC_FEATURE_BY_KEY = {f[0]: f[1:] for f in OSC_FEATURES}
+
+
 def colors_allowed():
     """False only when NO_COLOR is set (per no-color.org: presence, any value),
     a legitimate user-wide opt-out. Colours are opt-in per tab anyway. The
