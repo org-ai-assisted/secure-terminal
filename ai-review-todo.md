@@ -14,18 +14,17 @@ reviewer if a detached run comes back empty.
 
 ## Open
 
-- **TUI emulator (fixes commit)** -- `0c55f9d^..0c55f9d`
-  - Files: `usr/lib/python3/dist-packages/secure_terminal/terminal.py`
-  - The FIRST review of the emulator (`6e3534b`) completed and found 5 real
-    bugs, all fixed + regression-tested. The confirmatory pass on the fixes
-    (`0c55f9d`) never completed (codex timeout). Re-run to confirm the fixes.
+(none)
 
-- **OSC granular handlers + UI** -- `3d2f267^..23eb186`
-  - Files: `terminal.py`, `main.py`, `sanitize.py`
-  - Security-sensitive: clipboard (OSC 52) write, palette (OSC 4/10/11/12)
-    contrast guard, hyperlink (OSC 8) surfacing, the per-feature dispatcher.
-  - Self-review already caught + fixed a DoS (OSC 4 palette-flood re-render).
-    A clean external review is still wanted.
+## Done
+
+- **TUI emulator (fixes commit)** -- `0c55f9d^..0c55f9d`: reviewed 2026-07-17.
+  Found 2 more issues (alternate-screen transition DoS; uncapped restored-history
+  seed), both fixed + regression-tested in `560dda6`.
+- **OSC granular handlers + UI** -- `3d2f267^..23eb186`: reviewed 2026-07-17.
+  Found 6 issues (legacy allow_title default clobber + lock bypass, OSC split
+  across PTY reads, per-tab OSC state not persisted, OSC 7 path not sanitized,
+  OSC 8 ST terminator), all fixed + regression-tested in `560dda6`.
 
 ## Note
 
