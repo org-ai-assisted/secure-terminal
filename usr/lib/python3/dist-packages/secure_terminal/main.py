@@ -391,6 +391,13 @@ class MainWindow(QMainWindow):
         self._advisories.pop(self.current(), None)
         self._refresh_banner()
 
+    def _clear_advisories(self, kind):
+        """Drop every tab's advisory of a given kind (e.g. all 'osc' notices once
+        OSC handling is enabled, or the notice is switched off) and refresh."""
+        for term in [t for t, entry in self._advisories.items() if entry[0] == kind]:
+            self._advisories.pop(term, None)
+        self._refresh_banner()
+
     def _refresh_banner(self):
         """Show the current tab's pending advisory, or hide the banner if it has
         none. Called on every tab switch so the banner always matches the tab."""
@@ -876,6 +883,8 @@ class MainWindow(QMainWindow):
             return                        # admin-locked; not user-changeable
         self._osc_notice = bool(enabled)
         self.act_osc_notice.setChecked(enabled)
+        if not self._osc_notice:
+            self._clear_advisories('osc')   # a switched-off notice must not linger
         self._persist()
 
     def set_markings(self, enabled):
@@ -1050,6 +1059,10 @@ class MainWindow(QMainWindow):
             term.apply_allow_title(enabled)
         self._default_allow_title = bool(enabled)
         self.act_title.setChecked(enabled)
+        if enabled:
+            # letting titles/notifications through answers the OSC "was ignored"
+            # notice, so it is no longer valid.
+            self._clear_advisories('osc')
         self._persist()
 
     def _on_tab_title(self, term, title):
