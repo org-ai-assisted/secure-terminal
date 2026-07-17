@@ -147,6 +147,31 @@ def tui_available():
     return pyte is not None
 
 
+# Directories a bell sound file may live in. Restricting to these keeps the
+# AppArmor profile enforceable (it grants read only here), so a user cannot point
+# the bell at an arbitrary path the sandbox would then have to be widened for.
+BELL_SOUND_DIRS = (
+    '/usr/share/sounds',
+    '/usr/share/secure-terminal/sounds',
+    os.path.join(os.path.expanduser('~'), '.local/share/sounds'),
+)
+
+
+def sound_file_allowed(path):
+    """True if `path` is a real file inside one of BELL_SOUND_DIRS (symlinks
+    resolved), so a bell sound cannot escape the AppArmor-granted directories."""
+    if not path:
+        return False
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return False
+    if not os.path.isfile(real):
+        return False
+    return any(real == base or real.startswith(base + os.sep)
+               for base in (os.path.realpath(p) for p in BELL_SOUND_DIRS))
+
+
 def _rgb(color):
     return (color.red(), color.green(), color.blue())
 
@@ -215,6 +240,9 @@ class SecureTerminal(QPlainTextEdit):
     notified = pyqtSignal(str)
     # a program reported its working directory via OSC 7 (only when osc_cwd is on)
     cwd_changed = pyqtSignal(str)
+    # a bell fired with the 'tray' channel enabled; the window shows a passive
+    # system-tray popup (the terminal has no tray icon of its own). Carries a label.
+    bell_tray = pyqtSignal(str)
 
     def __init__(self, parent=None, command=None, tui=False, history=''):
         super().__init__(parent)
@@ -310,11 +338,14 @@ class SecureTerminal(QPlainTextEdit):
         # the user enabled it AND only in TUI mode (line mode strips all escapes).
         # Off by default -- every one is a spoofing/exfiltration surface.
         self._osc = {key: False for key, *_rest in OSC_FEATURES}
-        # Bell (BEL, 0x07) policy: 'off' (neutralized silently, the safe default --
-        # BEL from untrusted output is a nuisance/attention-grab surface), 'audible'
-        # (a system beep) or 'visual' (a window/taskbar urgency flash). Rate-limited
-        # so a program spamming BEL cannot machine-gun it.
-        self._bell = 'off'
+        # Bell (BEL, 0x07): a set of independent notification channels (audible /
+        # visual / tray). Empty = silent, the safe default -- BEL from untrusted
+        # output is a nuisance/attention-grab surface. Rate-limited so a program
+        # spamming BEL cannot machine-gun it. An optional sound file replaces the
+        # system beep for the audible channel (restricted to allowed folders).
+        self._bell_channels = set()
+        self._bell_sound = ''
+        self._sound_effect = None
         self._last_bell = 0.0
         self._seeding = False         # True while replaying _raw into pyte (no bell)
         self._last_title = ''
@@ -555,21 +586,46 @@ class SecureTerminal(QPlainTextEdit):
         return any(self._osc.values())
 
     # -- bell (BEL 0x07) -------------------------------------------------------
-    _BELL_MODES = ('off', 'audible', 'visual')
+    # Notification channels are INDEPENDENT (not mutually exclusive): a bell may
+    # ring any combination. Empty set = silent (the safe default).
+    #   audible  a system beep, or a chosen sound file (see apply_bell_sound)
+    #   visual   a window-manager urgency hint / taskbar flash
+    #   tray     a passive system-tray popup (dispatched by the window)
+    BELL_CHANNELS = ('audible', 'visual', 'tray')
 
-    def apply_bell(self, mode):
-        """Set how a BEL from program output is signalled for this tab:
-        'off' (silent, the default), 'audible' (system beep) or 'visual' (a
-        window/taskbar urgency flash)."""
-        self._bell = mode if mode in self._BELL_MODES else 'off'
+    @classmethod
+    def _parse_bell(cls, spec):
+        """Normalise a bell spec (a comma-separated string, an iterable, or the
+        legacy 'off'/'audible'/'visual') to a set of valid channels."""
+        if isinstance(spec, str):
+            spec = spec.split(',')
+        return {c.strip() for c in spec if c and c.strip() in cls.BELL_CHANNELS}
 
-    def bell_mode(self):
-        return self._bell
+    def apply_bell(self, spec):
+        """Set the enabled notification channels for this tab (see BELL_CHANNELS)."""
+        self._bell_channels = self._parse_bell(spec)
+
+    def bell_channels(self):
+        return set(self._bell_channels)
+
+    def bell_spec(self):
+        """The channel set as a stable comma-separated string, for config/session."""
+        return ','.join(sorted(self._bell_channels))
+
+    def bell_enabled(self, channel):
+        return channel in self._bell_channels
+
+    def apply_bell_sound(self, path):
+        """Set the audible-channel sound file. Accepted only if it resolves inside
+        an allowed sound directory (so the AppArmor profile stays enforceable); an
+        empty or disallowed path falls back to the plain system beep."""
+        self._bell_sound = path if sound_file_allowed(path) else ''
+        self._sound_effect = None       # rebuilt lazily on next ring
 
     def _ring(self):
-        """Signal a bell per the tab's policy, rate-limited to at most once per
-        ~200ms so a BEL flood cannot machine-gun the beep/flash."""
-        if self._bell == 'off':
+        """Fire every enabled notification channel, rate-limited to at most once per
+        ~200ms so a BEL flood cannot machine-gun the beep/flash/popup."""
+        if not self._bell_channels:
             return
         now = time.monotonic()
         if now - self._last_bell < 0.2:
@@ -578,12 +634,32 @@ class SecureTerminal(QPlainTextEdit):
         app = QApplication.instance()
         if app is None:
             return
-        if self._bell == 'audible':
-            app.beep()
-        else:                       # 'visual': WM urgency hint on our window
+        if 'audible' in self._bell_channels:
+            if not self._play_sound():
+                app.beep()              # no/failed sound file -> system beep
+        if 'visual' in self._bell_channels:
             win = self.window()
             if win is not None:
-                app.alert(win, 0)
+                app.alert(win, 0)       # WM urgency hint on our window
+        if 'tray' in self._bell_channels:
+            self.bell_tray.emit(self._last_title or 'secure-terminal')
+
+    def _play_sound(self):
+        """Play the configured sound file via QtMultimedia if one is set and the
+        module is available. Returns True if playback was started."""
+        if not self._bell_sound:
+            return False
+        try:
+            if self._sound_effect is None:
+                from PyQt6.QtMultimedia import QSoundEffect
+                from PyQt6.QtCore import QUrl
+                eff = QSoundEffect(self)
+                eff.setSource(QUrl.fromLocalFile(self._bell_sound))
+                self._sound_effect = eff
+            self._sound_effect.play()
+            return True
+        except Exception:               # noqa: BLE001 -- QtMultimedia optional
+            return False
 
     # -- compatibility: "allow title/notifications" == the title + notify OSCs ---
     def apply_allow_title(self, enabled):
@@ -1063,7 +1139,7 @@ class SecureTerminal(QPlainTextEdit):
         # feed_chunk_carry has rejoined a split sequence, so has_bell() -- which
         # strips complete OSC/DCS sequences before looking for a BEL -- never
         # false-fires on a shell's BEL-terminated title, split across reads or not.
-        if self._bell != 'off' and has_bell(text):
+        if self._bell_channels and has_bell(text):
             self._ring()
         # An OSC (ESC ]) is stripped in CLI mode; flag each distinct TYPE seen so
         # the window can notice it at most once per tab (not once per any OSC).

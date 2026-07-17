@@ -30,6 +30,7 @@ from secure_terminal import settings, session, ipc
 from secure_terminal.sanitize import sanitize_paste, OSC_FEATURES, OSC_FEATURE_BY_KEY
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES, tui_available,
+    sound_file_allowed, BELL_SOUND_DIRS,
 )
 
 TUI_TOOLTIP = (
@@ -260,8 +261,12 @@ class MainWindow(QMainWindow):
         # bell (BEL 0x07) policy: off (default, silent), audible (system beep) or
         # visual (window/taskbar urgency flash). BEL from untrusted output is a
         # nuisance surface, so silence is the safe default.
-        _bell = cfg.get('bell', 'off')
-        self._default_bell = _bell if _bell in ('off', 'audible', 'visual') else 'off'
+        # bell notification channels (comma-separated: audible, visual, tray;
+        # empty = silent). Legacy single 'audible'/'visual' still parse. An optional
+        # sound file (restricted to allowed dirs) replaces the beep for 'audible'.
+        self._default_bell = SecureTerminal._parse_bell(cfg.get('bell', ''))
+        self._default_bell_sound = cfg.get('bell_sound', '')
+        self._tray = None             # shared system-tray icon, created on first use
         # user overrides for window keyboard shortcuts: "ident=Seq ident=Seq ...".
         # Only overrides (bindings differing from the built-in default) are stored;
         # _bind() applies them as each action is created, and the Keyboard
@@ -497,6 +502,8 @@ class MainWindow(QMainWindow):
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
         term.apply_bell(self._default_bell)
+        term.apply_bell_sound(self._default_bell_sound)
+        self._connect_bell_tray(term)
         self._apply_osc_defaults(term)
         self._add_tab(term)
 
@@ -518,6 +525,8 @@ class MainWindow(QMainWindow):
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
         term.apply_bell(self._default_bell)
+        term.apply_bell_sound(self._default_bell_sound)
+        self._connect_bell_tray(term)
         self._apply_osc_defaults(term)
         self._add_tab(term)
         if spec.get('title'):
@@ -699,6 +708,8 @@ class MainWindow(QMainWindow):
         # an admin-locked bell must win over whatever the saved session carried
         term.apply_bell(self._default_bell if 'bell' in self._locked
                         else info.get('bell', self._default_bell))
+        term.apply_bell_sound(self._default_bell_sound)
+        self._connect_bell_tray(term)
         index = self._add_tab(term)
         name = info.get('name')
         if isinstance(name, str) and name:
@@ -870,10 +881,10 @@ class MainWindow(QMainWindow):
             action.blockSignals(True)
             action.setChecked(value)
             action.blockSignals(False)
-        # the Bell radio uses `triggered` (fires only on a user click), so a
+        # the Bell channels use `triggered` (fires only on a user click), so a
         # programmatic setChecked here just reflects the current tab, no mutation
-        for mode, action in self._bell_actions.items():
-            action.setChecked(term.bell_mode() == mode)
+        for channel, action in self._bell_actions.items():
+            action.setChecked(term.bell_enabled(channel))
         self._set_chip(self._colors_buttons,
                        'on' if term.colors_enabled() else 'off')
         self._set_chip(self._tui_buttons,
@@ -1234,19 +1245,81 @@ class MainWindow(QMainWindow):
         self._update_security_indicator()
         self._persist()
 
-    def set_bell(self, mode):
-        """Set the bell policy (off/audible/visual) on the current tab, remember it
-        as the default for new tabs, and persist it."""
+    def set_bell_channel(self, channel, enabled):
+        """Enable/disable one notification channel (audible/visual/tray) on the
+        current tab, remember it as the default for new tabs, and persist. The
+        channels are independent -- any combination may be on."""
         if 'bell' in self._locked:
             return
+        if enabled:
+            self._default_bell.add(channel)
+        else:
+            self._default_bell.discard(channel)
         term = self.current()
         if term is not None:
-            term.apply_bell(mode)
-        self._default_bell = mode
-        act = self._bell_actions.get(mode)
-        if act is not None:
-            act.setChecked(True)
+            term.apply_bell(self._default_bell)
+        if channel in self._bell_actions:
+            self._bell_actions[channel].setChecked(enabled)
         self._persist()
+
+    def set_bell_sound(self, path):
+        """Set the audible-channel sound file (accepted only inside an allowed
+        directory), apply it to every tab, and persist."""
+        if 'bell' in self._locked:
+            return
+        self._default_bell_sound = path if sound_file_allowed(path) else ''
+        for i in range(self.tabs.count()):
+            self.tabs.widget(i).apply_bell_sound(self._default_bell_sound)
+        if hasattr(self, 'act_bell_sound'):
+            self.act_bell_sound.setText(self._bell_sound_label())
+        self._persist()
+
+    def _bell_sound_label(self):
+        if self._default_bell_sound:
+            return 'Sound file: ' + os.path.basename(self._default_bell_sound) + '...'
+        return 'Sound file (beep)...'
+
+    def _pick_bell_sound(self):
+        if 'bell' in self._locked:
+            return
+        start = next((d for d in BELL_SOUND_DIRS if os.path.isdir(d)),
+                     BELL_SOUND_DIRS[0])
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Choose bell sound', start, 'Sound files (*.wav *.ogg)')
+        if not path:
+            return
+        if not sound_file_allowed(path):
+            QMessageBox.warning(
+                self, 'Sound file not allowed',
+                'The bell sound must be a file inside an allowed folder:\n\n  '
+                + '\n  '.join(BELL_SOUND_DIRS)
+                + '\n\nCopy the file into one of these and try again.')
+            return
+        self.set_bell_sound(path)
+
+    def _tray_icon(self):
+        """The shared system-tray icon, created lazily on first use (a bell with
+        the 'tray' channel enabled). Returns None if the platform has no tray."""
+        if self._tray is None:
+            from PyQt6.QtWidgets import QSystemTrayIcon
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                return None
+            self._tray = QSystemTrayIcon(self.windowIcon(), self)
+            self._tray.setToolTip('secure-terminal')
+            self._tray.show()
+        return self._tray
+
+    def _connect_bell_tray(self, term):
+        term.bell_tray.connect(lambda label: self._on_bell_tray(term, label))
+
+    def _on_bell_tray(self, term, label):
+        from PyQt6.QtWidgets import QSystemTrayIcon
+        tray = self._tray_icon()
+        if tray is None:
+            return
+        name = self._user_titles.get(term) or label or 'secure-terminal'
+        tray.showMessage('secure-terminal', 'Bell: ' + name,
+                         QSystemTrayIcon.MessageIcon.Information, 3000)
 
     def _on_cwd_changed(self, term, path):
         # OSC 7 working directory (only when osc_cwd is enabled): show it as the
@@ -1298,7 +1371,7 @@ class MainWindow(QMainWindow):
             ('osc_notice', [self.act_osc_notice]),
             ('tui', [self.act_tui]),
             ('allow_title', [self.act_title]),
-            ('bell', list(self._bell_actions.values())),
+            ('bell', list(self._bell_actions.values()) + [self.act_bell_sound]),
         ] + [(k, [self._osc_actions[k]]) for k in self._osc_actions]
         # a legacy allow_title lock also greys the granular title + notify controls
         if 'allow_title' in self._locked:
@@ -1339,7 +1412,8 @@ class MainWindow(QMainWindow):
             'paste_delay': str(self._paste_delay),
             'tui': 'true' if self._default_tui else 'false',
             'allow_title': 'true' if self._default_allow_title else 'false',
-            'bell': self._default_bell,
+            'bell': ','.join(sorted(self._default_bell)),
+            'bell_sound': self._default_bell_sound,
             'keybindings': ' '.join('%s=%s' % (i, self._keybindings[i])
                                     for i in sorted(self._keybindings)),
             'osc_notice': 'true' if self._osc_notice else 'false',
@@ -1561,28 +1635,36 @@ class MainWindow(QMainWindow):
             self._osc_notice_actions[key] = act
 
         bell_menu = view_menu.addMenu('&Bell')
-        self._bell_group = QActionGroup(self)
-        self._bell_group.setExclusive(True)
+        # Independent channels (not mutually exclusive): a BEL may ring any
+        # combination. None ticked = silent, the safe default (a bell rung by
+        # untrusted output is a nuisance/attention-grab surface).
         self._bell_actions = {}
-        for label, mode, tip in (
-            ('&Off', 'off',
-             'A BEL from program output is silently neutralized (the safe '
-             'default). A bell rung by untrusted output is a nuisance and an '
-             'attention-grab surface, so it is off unless you ask for it.'),
+        for label, channel, tip in (
             ('&Audible', 'audible',
-             'A BEL rings a short system beep. Rate-limited, so a program '
-             'spamming BEL cannot machine-gun it.'),
+             'Ring a short system beep (or a chosen sound file). Rate-limited, so '
+             'a program spamming BEL cannot machine-gun it.'),
             ('&Visual', 'visual',
-             'A BEL flags the window for attention (a window-manager urgency '
-             'hint / taskbar flash) instead of a sound. Rate-limited.'),
+             'Flag the window for attention (a window-manager urgency hint / '
+             'taskbar flash). Rate-limited.'),
+            ('&Tray popup', 'tray',
+             'Show a passive system-tray popup. A subtle, non-focus-stealing '
+             'notification. Rate-limited.'),
         ):
             act = QAction(label, self, checkable=True)
             act.setToolTip(tip)
-            act.setChecked(self._default_bell == mode)
-            act.triggered.connect(lambda _checked, m=mode: self.set_bell(m))
-            self._bell_group.addAction(act)
+            act.setChecked(channel in self._default_bell)
+            act.triggered.connect(
+                lambda checked, c=channel: self.set_bell_channel(c, checked))
             bell_menu.addAction(act)
-            self._bell_actions[mode] = act
+            self._bell_actions[channel] = act
+        bell_menu.addSeparator()
+        self.act_bell_sound = QAction(self._bell_sound_label(), self)
+        self.act_bell_sound.setToolTip(
+            'Choose the sound file for the audible bell. Restricted to the allowed '
+            'sound folders (' + ', '.join(BELL_SOUND_DIRS) + ') so the AppArmor '
+            'profile stays enforceable. Clear it to use the plain system beep.')
+        self.act_bell_sound.triggered.connect(self._pick_bell_sound)
+        bell_menu.addAction(self.act_bell_sound)
 
         self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', '#e5a50a'),
                                '&TUI mode', self, checkable=True)
@@ -2235,7 +2317,7 @@ class MainWindow(QMainWindow):
                 'tui': term.current_tui(),
                 'allow_title': term.allow_title_enabled(),
                 'osc': {_f[0]: term.osc_enabled(_f[0]) for _f in OSC_FEATURES},
-                'bell': term.bell_mode(),
+                'bell': term.bell_spec(),
                 'scrollback': term.current_scrollback(),
                 'text': text,
             })
