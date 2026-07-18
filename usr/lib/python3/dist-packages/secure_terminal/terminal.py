@@ -2305,6 +2305,17 @@ class SecureTerminal(QPlainTextEdit):
         self._char_popup = dlg          # keep a reference so it is not GC'd
         dlg.show()
 
+    def reset_caret(self):
+        """Snap the visible caret back to the output cursor (where typed input
+        goes), clearing any selection. Used after a search moves the caret to a
+        match, so closing the find bar returns the caret to where you can type."""
+        if self._out_cursor is not None:
+            self.setTextCursor(self._out_cursor)
+        else:
+            tc = self.textCursor()
+            tc.movePosition(QTextCursor.MoveOperation.End)
+            self.setTextCursor(tc)
+
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         # A terminal caret is not click-positionable: typed input always goes to
@@ -2314,12 +2325,7 @@ class SecureTerminal(QPlainTextEdit):
         # type). Keep a drag-selection for copy; otherwise snap the caret back.
         if self.textCursor().hasSelection():
             return
-        if self._out_cursor is not None:
-            self.setTextCursor(self._out_cursor)
-        else:
-            tc = self.textCursor()
-            tc.movePosition(QTextCursor.MoveOperation.End)
-            self.setTextCursor(tc)
+        self.reset_caret()
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
     def insertFromMimeData(self, source):

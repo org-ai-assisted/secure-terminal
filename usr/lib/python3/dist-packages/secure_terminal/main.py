@@ -16,6 +16,7 @@ from PyQt6.QtCore import QTimer, Qt, QUrl, QRect, qInstallMessageHandler
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QIcon, QColor, QPixmap,
     QPainter, QBrush, QFont, QDesktopServices,
+    QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QToolBar, QSpinBox, QLabel,
@@ -23,6 +24,7 @@ from PyQt6.QtWidgets import (
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QKeySequenceEdit,
+    QTextEdit,
 )
 
 from PyQt6.QtNetwork import QLocalServer
@@ -209,6 +211,63 @@ def _dot_icon(color):
     return QIcon(pixmap)
 
 
+class FindBar(QWidget):
+    """A dismissible find bar shown below the tabs. It searches only the
+    already-neutralized display text of the terminal (never raw bytes), so a
+    search can surface nothing a program did not already render. The bar drives
+    the search; the window owns the tabs and does the actual finding."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+        self.setObjectName('findbar')
+        self.setVisible(False)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 4, 8, 4)
+        row.setSpacing(6)
+        self.input = QLineEdit(self)
+        self.input.setPlaceholderText('Find in scrollback')
+        self.input.setClearButtonEnabled(True)
+        self.input.textChanged.connect(lambda _t: window._find_update())
+        self.input.returnPressed.connect(lambda: window._find_step(False))
+        self.count = QLabel('', self)
+        self.count.setStyleSheet('color: palette(mid)')
+        prev_btn = QPushButton('Prev', self)
+        prev_btn.setToolTip('Previous match (Shift+Enter)')
+        prev_btn.clicked.connect(lambda: window._find_step(True))
+        next_btn = QPushButton('Next', self)
+        next_btn.setToolTip('Next match (Enter)')
+        next_btn.clicked.connect(lambda: window._find_step(False))
+        self.case = QCheckBox('Case', self)
+        self.case.setToolTip('Case sensitive')
+        self.case.toggled.connect(lambda _c: window._find_update())
+        self.all_tabs = QCheckBox('All tabs', self)
+        self.all_tabs.setToolTip('Search every tab, not just this one')
+        self.all_tabs.toggled.connect(lambda _c: window._find_update())
+        close_btn = QPushButton('x', self)
+        close_btn.setToolTip('Close (Esc)')
+        close_btn.setFixedWidth(24)
+        close_btn.clicked.connect(window.hide_find)
+        row.addWidget(QLabel('Find:', self))
+        row.addWidget(self.input, 1)
+        row.addWidget(self.count)
+        row.addWidget(prev_btn)
+        row.addWidget(next_btn)
+        row.addWidget(self.case)
+        row.addWidget(self.all_tabs)
+        row.addWidget(close_btn)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._window.hide_find()
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            backward = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self._window._find_step(backward)
+            return
+        super().keyPressEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, launch=None):
         super().__init__()
@@ -352,7 +411,9 @@ class MainWindow(QMainWindow):
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(0)
         self._banner = self._make_banner()
+        self._find_bar = FindBar(self)
         col.addWidget(self.tabs)
+        col.addWidget(self._find_bar)
         col.addWidget(self._banner)
         self.setCentralWidget(central)
 
@@ -859,6 +920,149 @@ class MainWindow(QMainWindow):
         # the colour swatch also carries the tab's number, so refresh every tab
         # (a colour change does not move tabs, but this keeps one code path).
         self._renumber_tabs()
+
+    # -- find in scrollback: per-tab and across all tabs ----------------------
+    _FIND_FMT = None
+
+    def _find_format(self):
+        if MainWindow._FIND_FMT is None:
+            fmt = QTextCharFormat()
+            fmt.setBackground(QColor('#ffd54a'))     # amber highlight
+            fmt.setForeground(QColor('#1a1a1a'))     # readable on amber
+            MainWindow._FIND_FMT = fmt
+        return MainWindow._FIND_FMT
+
+    def show_find(self):
+        term = self.current()
+        if term is None:
+            return
+        # seed with the current selection, if any, for a quick "find this"
+        sel = term.textCursor().selectedText()
+        if sel and '\u2029' not in sel:      # not a multi-line selection (Qt joins rows with U+2029)
+            self._find_bar.input.setText(sel)
+        self._find_bar.setVisible(True)
+        self._find_bar.input.setFocus()
+        self._find_bar.input.selectAll()
+        self._find_update()
+
+    def hide_find(self):
+        self._find_bar.setVisible(False)
+        for i in range(self.tabs.count()):
+            self.tabs.widget(i).setExtraSelections([])
+        term = self.current()
+        if term is not None:
+            term.reset_caret()
+            term.setFocus()
+
+    def _find_flags(self):
+        flags = QTextDocument.FindFlag(0)
+        if self._find_bar.case.isChecked():
+            flags |= QTextDocument.FindFlag.FindCaseSensitively
+        return flags
+
+    def _highlight_matches(self, term, query, flags):
+        """Highlight every match of `query` in `term`; return the match count."""
+        if not query:
+            term.setExtraSelections([])
+            return 0
+        selections = []
+        doc = term.document()
+        cursor = QTextCursor(doc)
+        fmt = self._find_format()
+        while True:
+            cursor = doc.find(query, cursor, flags)
+            if cursor.isNull():
+                break
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = cursor
+            sel.format = fmt
+            selections.append(sel)
+        term.setExtraSelections(selections)
+        return len(selections)
+
+    def _find_update(self):
+        """Re-run after the query, case or scope changed: highlight matches and
+        move to the first one from the top of the current tab."""
+        query = self._find_bar.input.text()
+        flags = self._find_flags()
+        all_tabs = self._find_bar.all_tabs.isChecked()
+        term = self.current()
+        total = 0
+        if all_tabs:
+            tabs_hit = 0
+            for i in range(self.tabs.count()):
+                n = self._highlight_matches(self.tabs.widget(i), query, flags)
+                total += n
+                tabs_hit += 1 if n else 0
+            if query:
+                self._find_bar.count.setText(
+                    '%d in %d tab%s' % (total, tabs_hit,
+                                        '' if tabs_hit == 1 else 's')
+                    if total else 'no matches')
+            else:
+                self._find_bar.count.setText('')
+        else:
+            for i in range(self.tabs.count()):
+                if self.tabs.widget(i) is not term:
+                    self.tabs.widget(i).setExtraSelections([])
+            total = self._highlight_matches(term, query, flags)
+            if not query:
+                self._find_bar.count.setText('')
+            elif total == 0:
+                self._find_bar.count.setText('no matches')
+            else:
+                self._find_bar.count.setText(
+                    '%d match%s' % (total, '' if total == 1 else 'es'))
+        # jump to the first match from the top of the current tab
+        if query and term is not None:
+            cursor = term.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            term.setTextCursor(cursor)
+            self._find_step(False, from_update=True)
+
+    def _find_step(self, backward, from_update=False):
+        """Move to the next (or previous) match. In all-tabs mode, roll over into
+        the neighbouring tab that has a match when the current tab is exhausted."""
+        query = self._find_bar.input.text()
+        if not query:
+            return
+        flags = self._find_flags()
+        if backward:
+            flags |= QTextDocument.FindFlag.FindBackward
+        term = self.current()
+        if term is not None and term.find(query, flags):
+            term.ensureCursorVisible()
+            return
+        if not self._find_bar.all_tabs.isChecked():
+            # wrap within this tab
+            if term is None:
+                return
+            cursor = term.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End if backward
+                                else QTextCursor.MoveOperation.Start)
+            term.setTextCursor(cursor)
+            if term.find(query, flags):
+                term.ensureCursorVisible()
+            return
+        if from_update:
+            return                        # the first-match seed found nothing here
+        # all-tabs: hop to the next/prev tab that has a match
+        count = self.tabs.count()
+        start = self.tabs.currentIndex()
+        order = range(1, count + 1)
+        for off in order:
+            idx = (start + (-off if backward else off)) % count
+            other = self.tabs.widget(idx)
+            cursor = other.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End if backward
+                                else QTextCursor.MoveOperation.Start)
+            other.setTextCursor(cursor)
+            if other.find(query, flags):
+                self.tabs.setCurrentIndex(idx)
+                other.ensureCursorVisible()
+                other.setFocus()
+                self._find_bar.input.setFocus()
+                return
 
     def _number_icon(self, n, color):
         """The tab's position number drawn inside its colour swatch (a neutral
@@ -1806,6 +2010,13 @@ class MainWindow(QMainWindow):
         self._bind(self.act_select_all, 'select_all', 'Ctrl+Shift+A')
         self.act_select_all.triggered.connect(self.select_all)
         edit_menu.addAction(self.act_select_all)
+        edit_menu.addSeparator()
+        self.act_find = QAction(QIcon.fromTheme('edit-find'), '&Find...', self)
+        # Ctrl+Shift+F, not Ctrl+F: a bare Ctrl+<letter> is forwarded to the
+        # running program (^F), so the search shortcut uses the Shift variant.
+        self._bind(self.act_find, 'find', 'Ctrl+Shift+F')
+        self.act_find.triggered.connect(self.show_find)
+        edit_menu.addAction(self.act_find)
 
         view_menu = bar.addMenu('&View')
         act_zin = QAction(QIcon.fromTheme('zoom-in'), 'Zoom &In', self)
