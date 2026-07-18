@@ -23,5 +23,7 @@ secure-terminal|secure-terminal safe CLI (escape-stripping, line-local rendering
 	il@, il1@, dl@, dl1@, ich@, ich1@, dch@, dch1@, ech@, smir@, rmir@, rep@,
 	smkx@, rmkx@, is2@, rs1@, rs2@, hts@, tbc@,
 	hs@, tsl@, fsl@, dsl@,
-	u6@, u7@, u8@, u9@, RV@, XM@, xm@, kmous@, Ms@, Se@, Ss@,
+	u6@, u7@, u8@, u9@, RV@, XR@, XM@, xm@, kmous@, Ms@, Se@, Ss@,
+	civis@, cnorm@, cvvis@, flash@, initc@, initp@, oc@,
+	mc0@, mc4@, mc5@, mc5i@, smglp@, smglr@, smgrp@, smgl@, smgr@, sitm@, ritm@,
 	use=xterm-16color,

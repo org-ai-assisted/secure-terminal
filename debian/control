@@ -2,7 +2,8 @@ Source: secure-terminal
 Section: utils
 Priority: optional
 Maintainer: ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
-Build-Depends: debhelper-compat (= 13), dh-apparmor, ncurses-bin, python3, ronn
+Build-Depends: debhelper-compat (= 13), dh-apparmor, ncurses-bin, ncurses-term,
+ python3, ronn
 Standards-Version: 4.6.2
 Homepage: https://secure-terminal.github.io
 Vcs-Browser: https://github.com/secure-terminal/secure-terminal
