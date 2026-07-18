@@ -12,10 +12,11 @@ import shlex
 import argparse
 import json
 
-from PyQt6.QtCore import QTimer, Qt, QUrl, QRect, qInstallMessageHandler
+from PyQt6.QtCore import (
+    QTimer, Qt, QUrl, QRect, QPoint, QObject, QEvent, qInstallMessageHandler)
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QIcon, QColor, QPixmap,
-    QPainter, QBrush, QFont, QDesktopServices,
+    QPainter, QBrush, QFont, QDesktopServices, QCursor,
     QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PyQt6.QtWidgets import (
@@ -209,6 +210,86 @@ def _dot_icon(color):
     painter.drawEllipse(1, 1, 12, 12)
     painter.end()
     return QIcon(pixmap)
+
+
+class InfoTip(QLabel):
+    """A persistent, selectable, zoom-aware replacement for the plain tooltip.
+    Unlike QToolTip you can move the pointer INTO it to select and copy the text,
+    and its font follows the current zoom, so a long risk explanation is readable
+    and quotable. It hides on Esc, or when the pointer leaves both it and the
+    widget it describes (polled, so no fragile enter/leave bookkeeping)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # a non-activating tool window: shows without stealing focus from the
+        # terminal, stays on top, and (unlike a QToolTip) accepts mouse events so
+        # its text can be selected. Parented to the window for clean teardown.
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+                            | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
+                                     | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        self.setWordWrap(True)
+        self.setMargin(7)
+        self.setMaximumWidth(460)
+        self.setStyleSheet('QLabel{background:#fdf6d8;color:#1a1a1a;'
+                           'border:1px solid #b9a24a;border-radius:5px}')
+        self._source = None
+        self._poll = QTimer(self)
+        self._poll.setInterval(150)
+        self._poll.timeout.connect(self._check_pointer)
+
+    def show_for(self, widget, text, global_pos, zoom):
+        self._source = widget
+        self.setText(text)
+        font = QFont()
+        base = font.pointSizeF() if font.pointSizeF() > 0 else 10.0
+        font.setPointSizeF(base * max(50, min(400, zoom)) / 100.0)
+        self.setFont(font)
+        self.adjustSize()
+        self.move(global_pos + QPoint(12, 18))
+        self.show()
+        self._poll.start()
+
+    def _check_pointer(self):
+        pos = QCursor.pos()
+        over_tip = self.isVisible() and self.geometry().contains(pos)
+        over_src = False
+        if self._source is not None:
+            try:
+                top_left = self._source.mapToGlobal(QPoint(0, 0))
+                over_src = QRect(top_left, self._source.size()).contains(pos)
+            except RuntimeError:                       # the source was destroyed
+                self._source = None
+        if not over_tip and not over_src:
+            self.hide()
+            self._poll.stop()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.hide()
+            self._poll.stop()
+            return
+        super().keyPressEvent(event)
+
+
+class _ToolTipFilter(QObject):
+    """Application event filter that renders every tooltip as an interactive,
+    zoom-aware InfoTip instead of the plain QToolTip."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+        self._tip = InfoTip(window)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.ToolTip and isinstance(obj, QWidget):
+            text = obj.toolTip()
+            if text:
+                self._tip.show_for(obj, text, event.globalPos(),
+                                   self._window.current_zoom_percent())
+                return True                            # suppress the plain tooltip
+        return super().eventFilter(obj, event)
 
 
 class FindBar(QWidget):
@@ -416,6 +497,11 @@ class MainWindow(QMainWindow):
         col.addWidget(self._find_bar)
         col.addWidget(self._banner)
         self.setCentralWidget(central)
+        # render tooltips as interactive, zoom-aware popups (selectable + copyable)
+        self._tip_filter = _ToolTipFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._tip_filter)
 
         self._theme_actions = {}
         self._osc_actions = {}       # osc feature key -> its checkable menu action
@@ -1139,6 +1225,14 @@ class MainWindow(QMainWindow):
 
     def current(self):
         return self.tabs.currentWidget()
+
+    def current_zoom_percent(self):
+        """The active tab's zoom (percent), so tooltip text scales with it. Falls
+        back to the window default when there is no tab yet."""
+        term = self.current()
+        if term is not None:
+            return term.current_zoom()
+        return getattr(self, '_default_zoom', 100)
 
     # -- copy / paste route through the current tab (paste stays sanitized) ----
     def copy_selection(self):
