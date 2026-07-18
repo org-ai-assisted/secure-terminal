@@ -2281,8 +2281,18 @@ class SecureTerminal(QPlainTextEdit):
             | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         col.addWidget(info)
         esc = '\\u%04x' % cp if cp <= 0xFFFF else '\\U%08x' % cp
+        note = QLabel(
+            'Copy places the safe <code>%s</code> escape on the clipboard, not the '
+            'raw character: copying an invisible, bidi or homoglyph character as-is '
+            'is the exact hazard this terminal guards against.' % esc, dlg)
+        note.setTextFormat(Qt.TextFormat.RichText)
+        note.setWordWrap(True)
+        note.setStyleSheet('color: palette(mid); font-size: 11px;')
+        col.addWidget(note)
         row = QHBoxLayout()
         copy = QPushButton('Copy ' + esc, dlg)
+        copy.setToolTip('Copies the %s escape (a safe ASCII representation), '
+                        'never the raw character.' % esc)
         copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(esc))
         close = QPushButton('Close', dlg)
         close.setDefault(True)

@@ -95,6 +95,28 @@ def _read_version(paths=None):
 # Shown in the About dialog.
 APP_VERSION = _read_version()
 
+
+def _app_icon():
+    """The secure-terminal application icon. Prefer the installed hicolor theme
+    icon; fall back to the shipped SVG by path so the About dialog and window
+    icon still show it from a source checkout, before `update-icon-caches` has
+    run, or on a bare-bones desktop with no icon theme. Returns a null QIcon if
+    nothing is found -- callers treat that as "no logo", never an error."""
+    themed = QIcon.fromTheme('secure-terminal')
+    if not themed.isNull():
+        return themed
+    base = os.path.abspath(__file__)
+    for _ in range(6):            # .../dist-packages/secure_terminal/main.py -> repo root
+        base = os.path.dirname(base)
+    rel = os.path.join('usr', 'share', 'icons', 'hicolor', 'scalable',
+                       'apps', 'secure-terminal.svg')
+    for path in ('/usr/share/icons/hicolor/scalable/apps/secure-terminal.svg',
+                 os.path.join(base, rel)):
+        if os.path.exists(path):
+            return QIcon(path)
+    return QIcon()
+
+
 # cap on a `ctl dump-tab` reply so it stays under the IPC frame limit.
 _DUMP_MAX = 512 * 1024
 
@@ -2205,8 +2227,15 @@ class MainWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle('About secure-terminal')
         layout = QVBoxLayout(dialog)
+        icon = _app_icon()
+        if not icon.isNull():
+            logo = QLabel()
+            logo.setPixmap(icon.pixmap(64, 64))
+            logo.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            layout.addWidget(logo)
         title = QLabel('secure-terminal ' + APP_VERSION)
         title.setStyleSheet('font-weight:bold; font-size:16px;')
+        title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(title)
         body = QLabel(
             'A terminal where paste is safe by construction.<br><br>'
@@ -2998,6 +3027,9 @@ def main():
         qt_argv += ['-name', launch.wm_name]     # Qt X11 resource/instance name
     app = QApplication(qt_argv)
     app.setApplicationName('secure-terminal')
+    _icon = _app_icon()
+    if not _icon.isNull():
+        app.setWindowIcon(_icon)
     if launch.wm_class:
         # Wayland app-id and, on Qt6/XCB, the WM_CLASS class part.
         app.setDesktopFileName(launch.wm_class)
