@@ -57,6 +57,12 @@ profile secure-terminal /usr/bin/secure-terminal {
   # so a second launch reuses the running instance.
   owner /run/user/[0-9]*/secure-terminal/ rw,
   owner /run/user/[0-9]*/secure-terminal/*.sock rwkl,
+
+  # --test-canary positive control (for security-test harnesses): a fixed,
+  # owner-only marker under the predefined runtime subtree. Confined to exactly
+  # this folder -- the canary action can write nowhere else.
+  owner /run/user/[0-9]*/secure-terminal/canary/ rw,
+  owner /run/user/[0-9]*/secure-terminal/canary/* rwk,
   unix (create, bind, listen, shutdown, getattr, setattr) type=stream,
   unix (accept, connect, send, receive) type=stream
         peer=(label=@{profile_name}),

@@ -2555,6 +2555,11 @@ def _launch_parser(with_globals):
         p.add_argument('--instance-group', dest='instance_group',
                        metavar='NAME', default='default',
                        help='which running instance to reuse (default: "default")')
+        # Handled by an early headless dispatch in main() (before Qt); listed here
+        # only so --help documents it. See CANARY_TOKEN / _test_canary.
+        p.add_argument('--test-canary', action='store_true',
+                       help='fire the safe EICAR-style test canary and exit '
+                            '(positive control for security-test harnesses)')
     p.add_argument('--title', help='initial tab title')
     p.add_argument('--tui', action='store_true', default=None,
                    help='start this tab in TUI mode')
@@ -2692,10 +2697,79 @@ def _ctl_main(argv):
     return 0
 
 
+# EICAR-style positive control for adversarial security-test harnesses.
+#
+# secure-terminal is secure by construction: nothing on the output path can write
+# to the pty, so an attack payload fed as output can never inject a command. An
+# adversarial corpus test therefore EXPECTS the canary to never fire against us.
+# That creates a dangerous failure mode -- if the harness itself is broken (never
+# feeds the payload, watches the wrong marker, cannot write its temp dir), EVERY
+# payload silently "passes" and a genuinely vulnerable terminal would look just as
+# clean as we do. A green run would then mean nothing.
+#
+# `--test-canary` closes that gap: it makes secure-terminal DELIBERATELY perform
+# the exact safe action a successful injection would (drop a marker file + emit a
+# token), so the harness can confirm end to end that it can actually SEE a fired
+# canary. The harness must run this positive control first and FAIL LOUD if the
+# canary is not observed, before trusting any "not vulnerable" verdict.
+#
+# Two properties keep the control itself harmless and confinable:
+#  - The action is benign -- a fixed ASCII token, never a real command -- so it
+#    cannot hurt a tester.
+#  - The marker goes to a single PREDEFINED, owner-only location
+#    (<runtime>/secure-terminal/canary/canary), NOT an arbitrary caller-supplied
+#    path, so the write can never be aimed elsewhere and the AppArmor profile
+#    grants write to exactly that subtree and nothing else.
+# The token is a stable protocol constant shared with the harness.
+CANARY_TOKEN = 'SECURE-TERMINAL-TEST-CANARY-POSITIVE-CONTROL-V1'
+
+
+def canary_marker_path():
+    """The single PREDEFINED path the --test-canary positive control writes:
+    <runtime>/secure-terminal/canary/canary. Fixed (never a caller-supplied path)
+    so the action cannot be aimed elsewhere, owner-only, and confinable -- the
+    AppArmor profile grants write to exactly this subtree. Reuses the same runtime
+    base as the single-instance IPC socket, so (like the socket) it follows
+    XDG_RUNTIME_DIR; the profile authorizes the standard /run/user/<uid> location,
+    which is what an enforcing host uses. Test harnesses run in CI without the
+    profile enforcing, so they may redirect the runtime dir freely."""
+    return os.path.join(ipc.socket_dir(), 'canary', 'canary')
+
+
+def _test_canary():
+    """Perform the safe canary action and exit (see CANARY_TOKEN). Writes the fixed
+    token to the predefined, owner-only marker and echoes it on stdout. Headless:
+    no Qt, no shell, no window. Fails LOUD (exit 1) if the marker cannot be written,
+    so a harness can tell a real machinery fault from a clean run."""
+    marker = canary_marker_path()
+    try:
+        os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
+        with open(marker, 'w', encoding='ascii') as handle:
+            handle.write(CANARY_TOKEN + '\n')
+    except OSError as exc:
+        sys.stderr.write('secure-terminal: --test-canary: cannot write the canary '
+                         'marker %s: %s\n' % (marker, exc))
+        return 1
+    sys.stdout.write(CANARY_TOKEN + '\n')
+    sys.stdout.flush()
+    return 0
+
+
 def main():
     _quiet_font_warnings()
     if sys.argv[1:2] == ['ctl']:
         return _ctl_main(sys.argv[2:])
+    # Headless positive control for security-test harnesses; handled before Qt so
+    # it needs no display. It is a global option, so fire whenever --test-canary
+    # appears anywhere among the global args (before any child-command '--'), not
+    # only as the very first token -- a wrapper may prefix another global such as
+    # --new-instance. A '--test-canary' after '--' belongs to the child command
+    # and is left alone. See CANARY_TOKEN.
+    _head = sys.argv[1:]
+    if '--' in _head:
+        _head = _head[:_head.index('--')]
+    if '--test-canary' in _head:
+        return _test_canary()
     launch = _parse_launch_args(sys.argv[1:])
 
     # Single instance by default: try to hand this launch to a running instance in
