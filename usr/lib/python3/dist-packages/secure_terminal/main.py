@@ -271,6 +271,10 @@ class MainWindow(QMainWindow):
         # sound file (restricted to allowed dirs) replaces the beep for 'audible'.
         self._default_bell = SecureTerminal._parse_bell(cfg.get('bell', ''))
         self._default_bell_sound = cfg.get('bell_sound', '')
+        # system tray: opt-in, OFF by default. When on, a tray icon offers a few
+        # fixed, safe actions (Show/Hide, New Tab, Quit) and the 'tray' bell
+        # channel works; when off, no tray icon is ever created.
+        self._systray = cfg.get('systray') == 'true'
         self._tray = None             # shared system-tray icon, created on first use
         # user overrides for window keyboard shortcuts: "ident=Seq ident=Seq ...".
         # Only overrides (bindings differing from the built-in default) are stored;
@@ -1324,28 +1328,114 @@ class MainWindow(QMainWindow):
         self.set_bell_sound(path)
 
     def _tray_icon(self):
-        """The shared system-tray icon, created lazily on first use (a bell with
-        the 'tray' channel enabled). Returns None if the platform has no tray."""
+        """The shared system-tray icon. Created lazily on first use, but ONLY when
+        the tray is enabled in settings (opt-in, default off). Returns None if the
+        tray is disabled or the platform has no tray."""
+        if not self._systray:
+            return None
         if self._tray is None:
             from PyQt6.QtWidgets import QSystemTrayIcon
             if not QSystemTrayIcon.isSystemTrayAvailable():
                 return None
             self._tray = QSystemTrayIcon(self.windowIcon(), self)
-            self._tray.setToolTip('secure-terminal')
+            self._tray.setToolTip('secure-terminal')   # a fixed string, never output
+            self._tray.setContextMenu(self._build_tray_menu())
+            self._tray.activated.connect(self._on_tray_activated)
             self._tray.show()
         return self._tray
+
+    def _build_tray_menu(self):
+        """The tray context menu: SAFE, fixed actions only. Nothing here is derived
+        from program output -- a tray surface is out-of-grid and trusted-looking, so
+        untrusted text on it could phish. Show/Hide, New Tab, Quit."""
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.addAction('Show / Hide window').triggered.connect(
+            self._toggle_window_visibility)
+        menu.addAction('New Tab').triggered.connect(
+            lambda: (self._restore_window(), self.new_tab()))
+        menu.addSeparator()
+        menu.addAction('Quit').triggered.connect(self.close)
+        return menu
+
+    def _on_tray_activated(self, reason):
+        from PyQt6.QtWidgets import QSystemTrayIcon
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._toggle_window_visibility()
+
+    def _toggle_window_visibility(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self._restore_window()
+
+    def _restore_window(self):
+        # Clear only the minimized bit, preserving maximized / full-screen state --
+        # showNormal() would shrink a maximized or full-screen window on restore.
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _connect_bell_tray(self, term):
         term.bell_tray.connect(lambda label: self._on_bell_tray(term, label))
 
-    def _on_bell_tray(self, term, label):
+    def _on_bell_tray(self, term, _label):
         from PyQt6.QtWidgets import QSystemTrayIcon
         tray = self._tray_icon()
         if tray is None:
             return
-        name = self._user_titles.get(term) or label or 'secure-terminal'
-        tray.showMessage('secure-terminal', 'Bell: ' + name,
+        # Only TRUSTED text in the notification: the user-set tab name, else a
+        # generic locator. NEVER the program-set title (_label) -- untrusted output
+        # must not reach this out-of-grid, trusted-looking surface (the whole threat
+        # model is "output lies"; a "Bell: <arbitrary text>" popup is a phish vector).
+        name = self._user_titles.get(term)
+        if not name:
+            index = self.tabs.indexOf(term)
+            name = 'tab %d' % (index + 1) if index != -1 else 'a background tab'
+        tray.showMessage('secure-terminal', 'Bell in ' + name,
                          QSystemTrayIcon.MessageIcon.Information, 3000)
+
+    def set_systray(self, enabled):
+        """Enable/disable the opt-in system-tray icon (default off). Turning it off
+        removes any existing icon; the 'tray' bell channel follows suit."""
+        if 'systray' in self._locked:
+            return
+        enabled = bool(enabled)
+        if enabled:
+            from PyQt6.QtWidgets import QSystemTrayIcon
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                # Don't present the feature as active where the desktop has no tray:
+                # the icon can't show and popups would be silently discarded.
+                self._systray = False
+                self.act_systray.setChecked(False)
+                self._update_bell_tray_action()
+                self.statusBar().showMessage(
+                    'No system tray is available on this desktop.', 8000)
+                return
+        self._systray = enabled
+        self.act_systray.setChecked(enabled)
+        if not enabled and self._tray is not None:
+            self._tray.hide()
+            self._tray = None
+        elif enabled:
+            self._tray_icon()          # create now, so the effect is immediate
+        self._update_bell_tray_action()
+        self._persist()
+
+    def _update_bell_tray_action(self):
+        """The 'Tray popup' bell channel needs the tray enabled; grey it out (with a
+        hint) when the tray is off, so it is never a silent dead setting. An admin
+        'bell' lock, if present, already governs it and wins."""
+        act = self._bell_actions.get('tray')
+        if act is None or 'bell' in self._locked:
+            return
+        act.setEnabled(self._systray)
+        tip = self._bell_tray_base_tip
+        if not self._systray:
+            tip += ('\n\nEnable the system tray (View > System tray icon) to use '
+                    'this channel.')
+        act.setToolTip(tip)
 
     def _on_cwd_changed(self, term, path):
         # OSC 7 working directory (only when osc_cwd is enabled): show it as the
@@ -1453,6 +1543,7 @@ class MainWindow(QMainWindow):
             ('bell', list(self._bell_actions.values())
              + [self.act_bell_sound, self.act_bell_sound_clear]),
             ('bell_sound', [self.act_bell_sound, self.act_bell_sound_clear]),
+            ('systray', [self.act_systray]),
         ] + [(k, [self._osc_actions[k]]) for k in self._osc_actions]
         # a legacy allow_title lock also greys the granular title + notify controls
         if 'allow_title' in self._locked:
@@ -1496,6 +1587,7 @@ class MainWindow(QMainWindow):
             'allow_title': 'true' if self._default_allow_title else 'false',
             'bell': ','.join(sorted(self._default_bell)),
             'bell_sound': self._default_bell_sound,
+            'systray': 'true' if self._systray else 'false',
             'keybindings': ' '.join('%s=%s' % (i, self._keybindings[i])
                                     for i in sorted(self._keybindings)),
             'osc_notice': 'true' if self._osc_notice else 'false',
@@ -1739,6 +1831,9 @@ class MainWindow(QMainWindow):
                 lambda checked, c=channel: self.set_bell_channel(c, checked))
             bell_menu.addAction(act)
             self._bell_actions[channel] = act
+        # base tooltip for the tray channel, so _update_bell_tray_action can append
+        # / remove the "needs the tray enabled" hint without mangling the text.
+        self._bell_tray_base_tip = self._bell_actions['tray'].toolTip()
         bell_menu.addSeparator()
         self.act_bell_sound = QAction(self._bell_sound_label(), self)
         self.act_bell_sound.setToolTip(
@@ -1776,6 +1871,21 @@ class MainWindow(QMainWindow):
             'xterm-256color entry.')
         self.act_cli_terminfo.toggled.connect(self.set_cli_terminfo)
         view_menu.addAction(self.act_cli_terminfo)
+
+        self.act_systray = QAction('S&ystem tray icon', self, checkable=True)
+        self.act_systray.setChecked(self._systray)
+        self.act_systray.setToolTip(
+            'Show a system-tray icon with a few fixed actions (Show/Hide window, '
+            'New Tab, Quit) and enable the Tray-popup bell channel. Off by default. '
+            'The tray shows only fixed text -- never a program-set title or other '
+            'output -- so untrusted output cannot deceive you through it.')
+        self.act_systray.toggled.connect(self.set_systray)
+        view_menu.addAction(self.act_systray)
+        # reflect the tray state onto the 'Tray popup' bell channel (grey it out when
+        # the tray is off) now that both actions exist.
+        self._update_bell_tray_action()
+        if self._systray:
+            self._tray_icon()          # show the icon at startup when enabled
 
         # act_title stays as a compatibility action (the combined title+notify
         # toggle used by the settings dialog / session), but is NOT shown in the
