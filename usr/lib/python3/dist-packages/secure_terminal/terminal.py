@@ -83,6 +83,25 @@ try:
 except ImportError:                      # TUI mode is unavailable without pyte
     pyte = None
 
+if pyte is not None:
+    class _SafeHistoryScreen(pyte.HistoryScreen):
+        """pyte 0.8.0's HistoryScreen.select_graphic_rendition() takes only
+        *attrs, but pyte's stream dispatches a private ("?"-prefixed) CSI with
+        private=True, so a private-marked SGR raises TypeError and _feed_bytes
+        drops the whole frame. Programs like vim, htop and tmux emit such
+        sequences, which showed up as dropped frames in that render. A private
+        SGR is not a standard colour operation, so ignore it (as upstream pyte
+        later did) instead of crashing; every other private CSI (set/reset mode)
+        already accepts private=. Nothing here weakens the cell filter: this only
+        governs how pyte parses, never what is allowed onto the screen."""
+
+        def select_graphic_rendition(self, *attrs, private=False, **kwargs):
+            if private:
+                return
+            super().select_graphic_rendition(*attrs)
+else:
+    _SafeHistoryScreen = None
+
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData)
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
@@ -812,7 +831,7 @@ class SecureTerminal(QPlainTextEdit):
 
     def _make_screen(self):
         cols, rows = self._tui_grid_size()
-        self._screen = pyte.HistoryScreen(cols, rows,
+        self._screen = _SafeHistoryScreen(cols, rows,
                                           history=self._history_size(), ratio=0.5)
         self._stream = pyte.ByteStream(self._screen)
         # Route pyte's BEL to the tab's bell policy. pyte tracks OSC state across
