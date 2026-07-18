@@ -142,6 +142,12 @@ _OSC_CODE_RE = re.compile(r'\x1b\](\d+)')
 # acts on these to snapshot/restore the primary screen at the exact boundary.
 _ALT_ENTER_BYTES = (b'\x1b[?1049h', b'\x1b[?1047h', b'\x1b[?47h')
 _ALT_LEAVE_BYTES = (b'\x1b[?1049l', b'\x1b[?1047l', b'\x1b[?47l')
+# Synchronized output (DECSET private mode 2026): a program brackets a screen
+# update so the terminal shows the completed frame, never a half-drawn one. It is
+# a SET-mode with no reply -- purely a rendering hint -- so it is safe to honour
+# unconditionally; a watchdog bounds an update that is never closed.
+_SYNC_BEGIN = '\x1b[?2026h'
+_SYNC_END = '\x1b[?2026l'
 
 
 def tui_available():
@@ -447,6 +453,12 @@ class SecureTerminal(QPlainTextEdit):
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._render_tui)
+        # synchronized output (DECSET 2026): while True, hold the paint (pyte is
+        # still fed) so a frame is shown whole. Watchdog bounds an unclosed update.
+        self._sync_update = False
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setSingleShot(True)
+        self._sync_timer.timeout.connect(self._end_sync_update)
 
         # restored scrollback from a previous session, shown as history above
         # the fresh shell (line mode; a TUI tab repaints over it on first draw).
@@ -870,6 +882,16 @@ class SecureTerminal(QPlainTextEdit):
         self._fmt_cache[key] = fmt
         return fmt
 
+    def _end_sync_update(self):
+        """End a synchronized-output hold (its ESC[?2026l arrived, or the watchdog
+        fired) and paint the completed frame at once."""
+        if not self._sync_update:
+            return
+        self._sync_update = False
+        self._sync_timer.stop()
+        if self._grid_mode():
+            self._render_tui()
+
     def _render_tui(self):
         """Repaint the TUI view: the scrolling history ABOVE the live pyte grid.
         A scrolled-off history line never changes, so it is appended to the
@@ -1170,6 +1192,16 @@ class SecureTerminal(QPlainTextEdit):
             if not self._alt_screen:
                 self._tui_hint_shown = False   # a later full-screen app re-advises
 
+        # Synchronized output (DECSET 2026): enter/leave the paint-hold, resolved by
+        # the LAST marker in the chunk. pyte is still fed below; only the paint is
+        # deferred, so a program's frame is shown whole.
+        if _SYNC_BEGIN in text or _SYNC_END in text:
+            if text.rfind(_SYNC_BEGIN) > text.rfind(_SYNC_END):
+                self._sync_update = True
+                self._sync_timer.start(150)    # bound an update that never closes
+            else:
+                self._end_sync_update()
+
         # Feed pyte ONLY in TUI mode -- never in the safe CLI mode, so the escape
         # interpreter is kept out of the default path. On CLI->TUI the screen is
         # rebuilt from the retained raw output (see _seed_grid), so no CLI-period
@@ -1193,7 +1225,9 @@ class SecureTerminal(QPlainTextEdit):
             self._raw += text
             if len(self._raw) > self._RAW_MAX:
                 self._raw = self._raw[-self._RAW_MAX:]
-            if not self._render_timer.isActive():
+            # hold the paint during a synchronized update (the model keeps updating);
+            # _end_sync_update renders the completed frame.
+            if not self._sync_update and not self._render_timer.isActive():
                 self._render_timer.start(16)     # coalesce bursts into ~60fps
             return
 
@@ -1359,10 +1393,70 @@ class SecureTerminal(QPlainTextEdit):
                 self._osc_clipboard(params)
             elif code == 7 and self._osc['osc_cwd']:
                 self._osc_cwd(params)
-            elif code in (4, 10, 11, 12) and self._osc['osc_colors']:
+            elif code in (4, 10, 11):
+                if params.rstrip().endswith(b'?'):
+                    self._osc_color_query(code, params)   # gated write-back reply
+                elif self._osc['osc_colors']:
+                    self._osc_color(code, params)
+            elif code == 12 and self._osc['osc_colors']:
                 self._osc_color(code, params)
             elif code == 1337 and self._osc['osc_iterm2']:
                 self._osc_iterm2(params)
+
+    def _in_raw_mode(self):
+        """True if the pty line discipline is in RAW mode (ICANON off) -- a
+        full-screen program is reading input directly, so a query reply is consumed
+        by it, not injected onto a cooked-mode shell command line (the reflection-
+        oracle vector). This is the gate that lets us answer a colour query safely."""
+        if self._fd is None:
+            return False
+        try:
+            attr = termios.tcgetattr(self._fd)
+        except (termios.error, OSError):
+            return False
+        return not (attr[3] & termios.ICANON)     # attr[3] == lflag
+
+    def _osc_color_value(self, code, params):
+        """The terminal's OWN colour for an OSC 4/10/11 query, as an xterm
+        'rgb:RRRR/GGGG/BBBB' string, or None. Non-secret (our theme/palette)."""
+        theme_bg, theme_fg = THEMES.get(self._theme, THEMES['dark'])
+        if code == 11:
+            col = self._osc_palette.get('bg', theme_bg)
+        elif code == 10:
+            col = self._osc_palette.get('fg', theme_fg)
+        elif code == 4:
+            try:
+                idx = int(params.split(b';', 1)[0])
+            except (ValueError, IndexError):
+                return None
+            if not 0 <= idx < len(ANSI_PALETTE):
+                return None
+            col = self._osc_palette.get(idx, ANSI_PALETTE[idx])
+        else:
+            return None
+        colour = QColor(col)
+        if not colour.isValid():
+            return None
+        return 'rgb:%04x/%04x/%04x' % (colour.red() * 257, colour.green() * 257,
+                                       colour.blue() * 257)
+
+    def _osc_color_query(self, code, params):
+        """Answer an OSC 4/10/11 colour QUERY (';?') with the terminal's own colour
+        -- the ONE write-back to the pty we allow, and only when BOTH: the user
+        enabled osc_color_query AND the pty is in raw mode (so the reply is consumed
+        by the running program, never injected at a shell prompt). The reply is the
+        terminal's non-secret colour and carries no attacker-influenced content."""
+        if not self._osc.get('osc_color_query') or not self._in_raw_mode():
+            return
+        value = self._osc_color_value(code, params)
+        if value is None:
+            return
+        if code == 4:
+            idx = int(params.split(b';', 1)[0])
+            reply = '\x1b]4;%d;%s\x07' % (idx, value)
+        else:
+            reply = '\x1b]%d;%s\x07' % (code, value)
+        self._write(reply.encode('ascii'))
 
     def _parse_osc_color(self, spec):
         """An OSC colour spec ('rgb:RR/GG/BB', '#RRGGBB', or a name) -> '#rrggbb',

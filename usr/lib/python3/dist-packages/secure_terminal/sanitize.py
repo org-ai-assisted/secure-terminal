@@ -236,6 +236,12 @@ OSC_FEATURES = (
     ('osc_cwd', 'Working-directory report', '7', False, 'low',
      'Untrusted output can set the tab\'s reported directory. Minor: it discloses '
      'a path and some shells act on it.'),
+    ('osc_color_query', 'Colour query reply', '10, 11, 4', False, 'medium',
+     'Lets programs read the terminal\'s own background / foreground colour '
+     '(editors use it to match a dark or light theme). This is the one case the '
+     'terminal writes a reply back, so to stay safe it answers ONLY while a '
+     'full-screen program is running -- never at a shell prompt, where a reply '
+     'could be injected as input -- and only the non-secret colour.'),
     ('osc_iterm2', 'iTerm2 extensions', '1337', False, 'high',
      'Untrusted output could use iTerm2 proprietary escapes (file upload / '
      'download, set variables) -- a very large surface.'),
