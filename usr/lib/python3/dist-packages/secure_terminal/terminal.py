@@ -117,7 +117,7 @@ from secure_terminal.sanitize import (
     colors_allowed, too_close, luminance, sanitize_paste,
     sanitize_paste_unicode,
     paste_findings, tui_cell, sanitize_title,
-    feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL,
+    feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL, STRIP_BOX,
     wants_full_screen, leaves_full_screen, describe_codepoint, marking_class,
     split_trailing_escape, feed_chunk_carry, has_bell, OSC_FEATURES,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
@@ -1754,6 +1754,20 @@ class SecureTerminal(QPlainTextEdit):
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
 
+    def _export_ascii(self, text):
+        """Map the display box (STRIP_BOX) back to ASCII '_' for any text that
+        LEAVES the widget (copy, save transcript, command hook, session restore),
+        so everything you copy or save is pure ASCII. The box is only ever a
+        placeholder in strip mode (Show/Detail can hold a real box glyph), so map
+        only there."""
+        return text.replace(STRIP_BOX, '_') if self._mode == 'strip' else text
+
+    def toPlainText(self):
+        # Overrides QPlainTextEdit.toPlainText so every external text getter
+        # (save transcript, _hook_transcript, session cap) yields ASCII, not the
+        # display box. Qt's own rendering does not go through this method.
+        return self._export_ascii(super().toPlainText())
+
     def createMimeDataFromSelection(self):
         """On copy, join soft-autowrapped rows (blocks _paint_line marked with
         userState 1) so a line that wrapped at the terminal width copies as one
@@ -1780,7 +1794,7 @@ class SecureTerminal(QPlainTextEdit):
             parts.append(seg.selectedText())
             block = block.next()
         data = QMimeData()
-        data.setText(''.join(parts))
+        data.setText(self._export_ascii(''.join(parts)))
         return data
 
     def _write(self, data):

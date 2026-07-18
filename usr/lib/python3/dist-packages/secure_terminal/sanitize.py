@@ -80,6 +80,14 @@ ANSI_PALETTE = [
 #               a homoglyph reads as its identity, not just a number.
 DISPLAY_MODES = ('strip', 'show', 'reveal', 'detail')
 
+# The GUI DISPLAYS a neutralized byte as this box (U+25A1 WHITE SQUARE) instead of
+# a bare '_', so it is easy to spot and read; the widget maps it back to ASCII '_'
+# on copy and on any text export, so everything you copy or save stays pure ASCII.
+# render_output() itself (used by the CLI wrapper, which writes straight to an
+# outer terminal and has no copy layer) still emits '_'. Encoded as an escape so
+# this source file stays ASCII-only.
+STRIP_BOX = '\u25a1'
+
 
 def _detail_badge(cp):
     """A verbose reveal badge: <U+XXXX NAME>, all printable ASCII (Unicode names
@@ -528,6 +536,12 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
 
     def emit(ch, key):
         disp = render_output(ch, mode)
+        if mode == 'strip' and disp == '_' and disp != ch:
+            # Strip mode neutralizes EVERY non-ASCII byte to the placeholder, so
+            # the box is unambiguously a placeholder here (Show/Detail can hold a
+            # real box glyph, so leave those as '_'); the widget maps it back to
+            # '_' on export in strip mode only.
+            disp = STRIP_BOX
         # a neutralized/revealed char (its display differs from the source) is a
         # "marking": tag it with a COLOUR SOURCE -- its risk class when colored
         # markings are on; otherwise the program's own SGR key, so allowed ANSI
