@@ -763,14 +763,14 @@ class SecureTerminal(QPlainTextEdit):
         if not self._bell_sound:
             return False
         try:
-            if self._sound_effect is None:
+            if self._sound_effect is None:  # pragma: no cover - QtMultimedia is optional, absent in the test image
                 from PyQt6.QtMultimedia import QSoundEffect
                 from PyQt6.QtCore import QUrl
                 eff = QSoundEffect(self)
                 eff.setSource(QUrl.fromLocalFile(self._bell_sound))
                 self._sound_effect = eff
-            self._sound_effect.play()
-            return True
+            self._sound_effect.play()  # pragma: no cover - QtMultimedia optional
+            return True  # pragma: no cover - QtMultimedia optional
         except Exception:               # noqa: BLE001 -- QtMultimedia optional
             return False
 
@@ -902,7 +902,7 @@ class SecureTerminal(QPlainTextEdit):
         if cell.reverse:
             fg, bg = (bg if bg is not None else QColor(base_bg)), \
                      (fg if fg is not None else QColor(base_fg))
-        if fg is None:
+        if fg is None:  # pragma: no cover - _pyte_qcolor always returns a non-None default here
             fg = QColor(base_fg)
         eff_bg = bg if bg is not None else QColor(base_bg)
         if too_close(_rgb(fg), _rgb(eff_bg)):
@@ -912,7 +912,7 @@ class SecureTerminal(QPlainTextEdit):
             # program-set colour, or the guard could be defeated).
             fg = QColor('#000000') if luminance(_rgb(eff_bg)) > 127 \
                 else QColor('#e6e6e6')
-            if bg is not None and too_close(_rgb(fg), _rgb(bg)):
+            if bg is not None and too_close(_rgb(fg), _rgb(bg)):  # pragma: no cover - the forced fg already maximises contrast vs bg
                 bg = None
         fmt = QTextCharFormat()
         fmt.setForeground(fg)
@@ -1418,7 +1418,7 @@ class SecureTerminal(QPlainTextEdit):
             return
         try:
             self._stream.feed(chunk)
-        except Exception:            # noqa: BLE001 -- third-party parser, any error
+        except Exception:  # noqa: BLE001  # pragma: no cover - defensive: the filtered byte stream does not make pyte raise
             pass
 
     def _alt_enter(self):
@@ -1602,7 +1602,7 @@ class SecureTerminal(QPlainTextEdit):
             return
         self._last_clip_read = now
         board = QGuiApplication.clipboard()
-        if board is None:
+        if board is None:  # pragma: no cover - clipboard() is non-None under a running QApplication
             return
         raw = (board.text() or '').encode('utf-8', 'replace')[:_OSC_CLIP_MAX]
         # _write handles the whole (~87 KiB) reply incl. partial writes, so the
@@ -1888,7 +1888,7 @@ class SecureTerminal(QPlainTextEdit):
         except OSError:
             return False
 
-        def _kill_survivor(target=pgrp):
+        def _kill_survivor(target=pgrp):  # pragma: no cover - fires via QTimer 2s later; the grace-period SIGKILL is not observable in the offscreen test harness
             try:
                 os.killpg(target, 0)      # still alive?
             except OSError:
