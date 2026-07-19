@@ -14,7 +14,9 @@ coverity:
   canonical-repos: "secure-terminal/secure-terminal,org-ai-assisted/secure-terminal"
 
 ## The widget suite runs secure-terminal offscreen (PyQt6 + pyte), the fuzz suite
-## uses hypothesis, and the coverage gate uses coverage.py, so the container needs
-## these on top of python3.
+## uses hypothesis, and the coverage gate uses coverage.py; ncurses-bin provides
+## `tic`, which the opt-in restricted-terminfo tests compile the shipped entry
+## with (the base image ships only libncursesw6, not the tic binary). All on top
+## of python3.
 dist-ai-tests:
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-coverage"
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-coverage ncurses-bin"
