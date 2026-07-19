@@ -6,10 +6,11 @@
 ## https://github.com/org-ai-assisted/developer-meta-files/blob/master/agents/github-actions-consumer-templates.md
 
 coverity:
-  ## scan.coverity.com project name. The URL renders the slash as a dash for
-  ## display ('/projects/secure-terminal-secure-terminal') but the API
-  ## form-parameter requires the actual slash.
-  project-name:    "secure-terminal/secure-terminal"
+  ## scan.coverity.com project name -- the slash-free name the project is
+  ## actually registered under (org-ai-assisted-secure-terminal); the token in
+  ## COVERITY_SCAN_TOKEN is scoped to it. An earlier "secure-terminal/secure-terminal"
+  ## did not match the registration and 401'd on the build-tool download.
+  project-name:    "org-ai-assisted-secure-terminal"
   canonical-repos: "secure-terminal/secure-terminal,org-ai-assisted/secure-terminal"
 
 ## The widget suite runs secure-terminal offscreen (PyQt6 + pyte), the fuzz suite
