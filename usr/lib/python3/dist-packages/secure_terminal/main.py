@@ -183,7 +183,7 @@ def _read_hook_config(cfg):
         argv = shlex.split(raw)
     except ValueError:
         return None
-    if not argv:
+    if not argv:  # pragma: no cover - a non-empty non-whitespace command always yields a token
         return None
     try:
         timeout = int(cfg.get('command_hook_timeout') or 10)
@@ -761,7 +761,7 @@ class MainWindow(QMainWindow):
         self._server = QLocalServer(self)
         self._server.setSocketOptions(
             QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
-        if not self._server.listen(path):
+        if not self._server.listen(path):  # pragma: no cover - a fresh same-UID socket path listens; a listen failure is a rare OS-level fault
             self._server = None
             return
         self._server.newConnection.connect(self._on_instance_connection)
@@ -3405,5 +3405,5 @@ def main():
     return app.exec()
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover - module entry guard
     sys.exit(main())
