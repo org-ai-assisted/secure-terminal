@@ -728,7 +728,10 @@ def parse_sgr(param_str, state):
     (a 16-colour palette index int, a '#rrggbb' string for 256-colour / truecolor,
     or None) and 'bold' (bool). Pure so the colour logic can be tested without Qt;
     terminal.py turns the resulting state into a format."""
-    nums = [int(p) if p.isdigit() else 0
+    # str.isdigit() is True for non-ASCII digits (superscripts, other scripts)
+    # that int() rejects; require ASCII so a hostile parameter cannot crash the
+    # parser (production feeds ASCII via SGR_RE, so this changes nothing there).
+    nums = [int(p) if (p.isascii() and p.isdigit()) else 0
             for p in (param_str.split(';') if param_str else ['0'])]
     i = 0
     while i < len(nums):
