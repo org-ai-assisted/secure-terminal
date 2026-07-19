@@ -13,13 +13,14 @@ Rules-Requires-Root: no
 Package: secure-terminal
 Architecture: all
 Depends: ${misc:Depends},
+ apparmor,
+ ncurses-bin,
+ ncurses-term,
  python3,
  python3-pyqt6,
+ python3-pyqt6.qtmultimedia,
  python3-pyte,
  qt6-svg-plugins
-Recommends: apparmor,
- ncurses-bin,
- python3-pyqt6.qtmultimedia
 Description: a terminal where paste is safe by construction
  secure-terminal is a small, line-oriented terminal for pasting commands into,
  and reading text out of, without worrying about invisible characters, bidi

@@ -758,20 +758,21 @@ class SecureTerminal(QPlainTextEdit):
             self.bell_tray.emit(self._last_title or 'secure-terminal')
 
     def _play_sound(self):
-        """Play the configured sound file via QtMultimedia if one is set and the
-        module is available. Returns True if playback was started."""
+        """Play the configured sound file via QtMultimedia (a hard dependency).
+        Returns True if playback was started, False if there is no sound set or
+        playback fails (a bad/unsupported file, no audio device)."""
         if not self._bell_sound:
             return False
         try:
-            if self._sound_effect is None:  # pragma: no cover - QtMultimedia is optional, absent in the test image
+            if self._sound_effect is None:
                 from PyQt6.QtMultimedia import QSoundEffect
                 from PyQt6.QtCore import QUrl
                 eff = QSoundEffect(self)
                 eff.setSource(QUrl.fromLocalFile(self._bell_sound))
                 self._sound_effect = eff
-            self._sound_effect.play()  # pragma: no cover - QtMultimedia optional
-            return True  # pragma: no cover - QtMultimedia optional
-        except Exception:               # noqa: BLE001 -- QtMultimedia optional
+            self._sound_effect.play()
+            return True
+        except Exception:               # noqa: BLE001 -- contain any playback error
             return False
 
     # -- compatibility: "allow title/notifications" == the title + notify OSCs ---
