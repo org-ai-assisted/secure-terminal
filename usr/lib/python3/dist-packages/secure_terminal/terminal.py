@@ -1087,6 +1087,28 @@ class SecureTerminal(QPlainTextEdit):
         # palette indexes (or None for default) + bold; folded by parse_sgr.
         self._sgr = {'fg': None, 'bg': None, 'bold': False}
 
+    # Bracketed-paste enable (DECSET 2004): a shell's line editor emits this
+    # immediately before each prompt (bash readline, zsh zle, fish, ... all on by
+    # default), so it marks where a command's output ends and the next prompt
+    # begins -- even when both land in one read.
+    _PROMPT_START = '\x1b[?2004h'
+
+    def _reset_leftover_sgr(self, text):
+        """Guard the shell prompt against a finished command's leftover colour.
+
+        A program can set an SGR colour and exit without resetting it; a normal
+        terminal then leaves it "stuck", bleeding into the shell's next prompt
+        (here readable, contrast-guarded, but still the attacker's colour). Inject
+        an SGR reset at each prompt-start marker so the prompt renders in the
+        default palette; the program's own colour, before the marker, is untouched.
+        The reset is a no-op when nothing is stuck, and a colour the prompt itself
+        (a coloured PS1) sets after the marker still applies. Injected into the
+        retained raw too, so a mode re-render stays consistent. Shells that do not
+        enable bracketed paste simply keep the old (stuck-but-readable) behaviour."""
+        if self._PROMPT_START in text:
+            return text.replace(self._PROMPT_START, '\x1b[0m' + self._PROMPT_START)
+        return text
+
     def _sgr_qcolor(self, val, default):
         """A parse_sgr colour value -> QColor: a 16-colour palette INDEX (int,
         honouring an OSC 4 override), a '#rrggbb' 256-colour / truecolor string, or
@@ -1361,6 +1383,10 @@ class SecureTerminal(QPlainTextEdit):
         # generic OSC) -- else padding an OSC past the cap would evade the notice.
         if self._esc_drop == ']' and drop_before != ']':
             self.osc_used.emit('osc_other')
+        # Reset a finished command's leftover colour before it reaches the shell's
+        # next prompt. Injected into the retained raw too, so a later mode
+        # re-render reproduces the clean prompt rather than re-sticking the colour.
+        text = self._reset_leftover_sgr(text)
         self._raw += text
         if len(self._raw) > self._RAW_MAX:
             self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output
