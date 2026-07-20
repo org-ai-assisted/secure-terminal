@@ -118,7 +118,7 @@ from secure_terminal.sanitize import (
     sanitize_paste_unicode,
     paste_findings, tui_cell, sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL, STRIP_BOX,
-    wants_full_screen, leaves_full_screen, describe_codepoint, marking_class,
+    wants_full_screen, leaves_full_screen, describe_codepoint, marking_class, PROMPT_START,
     split_trailing_escape, feed_chunk_carry, has_bell, OSC_FEATURES,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
@@ -1087,12 +1087,6 @@ class SecureTerminal(QPlainTextEdit):
         # palette indexes (or None for default) + bold; folded by parse_sgr.
         self._sgr = {'fg': None, 'bg': None, 'bold': False}
 
-    # Bracketed-paste enable (DECSET 2004): a shell's line editor emits this
-    # immediately before each prompt (bash readline, zsh zle, fish, ... all on by
-    # default), so it marks where a command's output ends and the next prompt
-    # begins -- even when both land in one read.
-    _PROMPT_START = '\x1b[?2004h'
-
     def _reset_leftover_sgr(self, text):
         """Guard the shell prompt against a finished command's leftover colour.
 
@@ -1105,8 +1099,8 @@ class SecureTerminal(QPlainTextEdit):
         (a coloured PS1) sets after the marker still applies. Injected into the
         retained raw too, so a mode re-render stays consistent. Shells that do not
         enable bracketed paste simply keep the old (stuck-but-readable) behaviour."""
-        if self._PROMPT_START in text:
-            return text.replace(self._PROMPT_START, '\x1b[0m' + self._PROMPT_START)
+        if PROMPT_START in text:
+            return text.replace(PROMPT_START, '\x1b[0m' + PROMPT_START)
         return text
 
     def _sgr_qcolor(self, val, default):

@@ -390,6 +390,12 @@ def apply_line_edits(line, col, text, max_line=0):
 _LINE_CSI_RE = re.compile(r'\x1b\[([0-9]*)([CDGK])')
 _SGR_ONLY_RE = re.compile(r'\x1b\[([0-9;]*)m')
 
+# Bracketed-paste enable (DECSET 2004): a shell's line editor emits it right
+# before each prompt (bash readline, zsh zle, fish, ...). We use it as the
+# prompt-start marker -- to end a command's un-terminated last line so the prompt
+# starts fresh (below), and, in terminal.py, to reset a leftover colour.
+PROMPT_START = '\x1b[?2004h'
+
 
 def feed_line_edits(cells, col, sgr, raw, max_line=0):
     """Advance the current line's LOGICAL cell buffer by one raw output chunk.
@@ -454,6 +460,18 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0):
                 sgr = dict(sgr)
                 parse_sgr(m.group(1), sgr)
                 i = m.end()
+                continue
+            if raw.startswith(PROMPT_START, i):
+                # A shell prompt is starting. If the finished command left the
+                # cursor mid-line (output with no trailing newline, e.g.
+                # `head -c N /dev/urandom`), end that line so the prompt starts
+                # fresh instead of gluing onto it -- a nicety over stock bash, and
+                # a no-op at column 0 (e.g. zsh's PROMPT_SP already did it).
+                if col != 0:
+                    completed.append(cells)
+                    wraps.append(False)
+                    cells, col = [], 0
+                i += len(PROMPT_START)
                 continue
             m = ANSI_RE.match(raw, i)
             if m:                                       # any other escape: strip
