@@ -353,6 +353,12 @@ class MainWindow(QMainWindow):
     def __init__(self, launch=None):
         super().__init__()
         self.setWindowTitle('secure-terminal')
+        # Set the icon on the WINDOW too, not only the QApplication default: some
+        # window managers read _NET_WM_ICON off the individual window for the title
+        # bar / taskbar, so app.setWindowIcon() alone can leave a generic icon.
+        _icon = _app_icon()
+        if not _icon.isNull():
+            self.setWindowIcon(_icon)
         self.resize(820, 520)
         self._launch = launch
 
