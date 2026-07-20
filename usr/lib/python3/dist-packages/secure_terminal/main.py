@@ -456,6 +456,8 @@ class MainWindow(QMainWindow):
         self._shortcuts = {}          # ident -> (action, default_seq_str, label)
         # session persistence is on unless explicitly disabled
         self._persist_session = cfg.get('persist_session') != 'false'
+        # confirm before closing a tab/window that still runs a foreground program
+        self._confirm_close = cfg.get('confirm_close') != 'false'
         # optional opt-in command hook, configured only via a settings drop-in
         self._hook_config = _read_hook_config(cfg)
         # remote control (the ctl inject-into-tab surface) is OFF unless an admin
@@ -943,6 +945,11 @@ class MainWindow(QMainWindow):
     def close_tab(self, index):
         term = self.tabs.widget(index)
         if term is None:
+            return
+        if not self._confirm_running_close(
+                'Close tab?',
+                'A program is still running in this tab. Close it anyway?',
+                [term]):
             return
         term.shutdown()
         self._user_titles.pop(term, None)
@@ -2019,6 +2026,7 @@ class MainWindow(QMainWindow):
                                           else 'false'),
             'osc_notice_off': ','.join(sorted(self._osc_notice_off)),
             'persist_session': 'true' if self._persist_session else 'false',
+            'confirm_close': 'true' if self._confirm_close else 'false',
             **{k: 'true' if v else 'false' for k, v in self._osc_defaults.items()},
         }, locked=self._locked)
 
@@ -2077,6 +2085,16 @@ class MainWindow(QMainWindow):
             'starts under the restored history. Stored under ~/.local/state.')
         self.act_persist.toggled.connect(self.set_persist_session)
         file_menu.addAction(self.act_persist)
+
+        self.act_confirm_close = QAction('&Confirm close if a program is running',
+                                         self, checkable=True)
+        self.act_confirm_close.setChecked(self._confirm_close)
+        self.act_confirm_close.setToolTip(
+            'Ask before closing a tab -- or the whole window -- while a program '
+            'other than the shell is still running in it, so a long job or an '
+            'editor is not lost to a stray click. On by default.')
+        self.act_confirm_close.toggled.connect(self.set_confirm_close)
+        file_menu.addAction(self.act_confirm_close)
 
         act_clear_session = QAction('&Clear Saved Session', self)
         act_clear_session.triggered.connect(self.clear_saved_session)
@@ -2990,6 +3008,26 @@ class MainWindow(QMainWindow):
         self.act_persist.setChecked(enabled)
         if not enabled:
             session.clear()
+
+    def set_confirm_close(self, enabled):
+        self._confirm_close = bool(enabled)
+        self.act_confirm_close.setChecked(enabled)
+
+    def _confirm_running_close(self, title, question, terms):
+        """True if it is OK to proceed with a close. When the confirm-on-close
+        setting is on and any terminal in `terms` still runs a foreground program
+        (something other than its shell), ask first; return False if the user
+        declines. A no-op (returns True) when the setting is off or nothing is
+        running, so the normal close path is untouched."""
+        if not self._confirm_close:
+            return True
+        if not any(t is not None and t.has_foreground_program() for t in terms):
+            return True
+        reply = QMessageBox.question(
+            self, title, question,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return reply == QMessageBox.StandardButton.Yes
         self._persist()
 
     def clear_saved_session(self):
@@ -3038,6 +3076,15 @@ class MainWindow(QMainWindow):
 
     # -- lifecycle ------------------------------------------------------------
     def closeEvent(self, event):
+        running = sum(1 for i in range(self.tabs.count())
+                      if self.tabs.widget(i).has_foreground_program())
+        if running and not self._confirm_running_close(
+                'Quit?',
+                ('A program is still running in %d tab%s. Quit anyway?'
+                 % (running, '' if running == 1 else 's')),
+                [self.tabs.widget(i) for i in range(self.tabs.count())]):
+            event.ignore()
+            return
         if self._persist_session:
             session.save(self._session_tabs())
         else:
