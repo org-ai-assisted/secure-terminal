@@ -1500,8 +1500,8 @@ class MainWindow(QMainWindow):
     def _display_level(self):
         """The display (unicode) risk axis as (colour, short, detail). Show
         renders deceptive glyphs (red). Reveal is safe AND lossless -- the exact
-        <U+XXXX> codepoint is shown (green). Strip is safe but LOSSY -- non-ASCII
-        collapses to a single "_" that is easy to overlook (yellow)."""
+        <U+XXXX> codepoint is shown (green). Strip is safe too -- non-ASCII becomes
+        a coloured box, hard to miss (green); lossy, but nothing deceptive."""
         term = self.current()
         mode = term.current_mode() if term is not None else 'strip'
         if mode == 'show':
@@ -1530,13 +1530,13 @@ class MainWindow(QMainWindow):
                     'identity, not just a number (the annotation unicode-show '
                     'prints). Escape sequences are removed and pasting is '
                     'sanitized.')
-        return ('#e5a50a', 'Strip',
-                'Display: STRIP (yellow).\n\n'
-                'Non-ASCII output becomes "_": safe -- nothing deceptive is drawn '
-                '-- but lossy. A single "_" is easy to overlook (far less visible '
-                'than a revealed <U+XXXX> badge), so you may not notice that '
-                'hidden characters were there at all. Switch to Reveal to see the '
-                'exact codepoints. Escape sequences are removed and pasting is '
+        return ('#1f8a54', 'Strip',
+                'Display: STRIP (green, safe).\n\n'
+                'Non-ASCII output becomes a coloured box -- one per character, '
+                'coloured by risk class -- so nothing deceptive is drawn and a '
+                'neutralized character is hard to miss. Still lossy: you see that '
+                'something was stripped, not which codepoint; switch to Reveal for '
+                'the exact <U+XXXX>. Escape sequences are removed and pasting is '
                 'sanitized either way.')
 
     def _mode_level(self):
@@ -2150,19 +2150,18 @@ class MainWindow(QMainWindow):
 
         # Mutually-exclusive display modes as a colour-coded segmented control.
         # Ordered Strip, Reveal, Detail, Show so Strip and Show are never
-        # adjacent. Reveal and Detail are green (safe AND lossless -- the exact
-        # codepoint is shown, Detail also names it); Strip is yellow (safe but
-        # lossy -- non-ASCII collapses to a "_" that is easy to overlook); Show is
-        # red (a rendered glyph can deceive).
+        # adjacent. Strip, Reveal and Detail are green (all safe): Strip replaces
+        # non-ASCII with a coloured box, hard to miss though lossy; Reveal/Detail
+        # show the exact codepoint. Show is red (a rendered glyph can deceive).
         mode_menu = view_menu.addMenu('&Unicode')
         self._mode_group = QActionGroup(self)
         self._mode_group.setExclusive(True)
         self._mode_actions = {}
         for label, key, colour, tip in (
-            ('&Strip', 'strip', '#e5a50a',
-             'Non-ASCII output becomes "_": safe, but lossy -- a single "_" is '
-             'easy to overlook, so you may not notice hidden characters were '
-             'there. Reveal is more informative.'),
+            ('&Strip', 'strip', '#1f8a54',
+             'Non-ASCII output becomes a coloured box (by risk class): safe and '
+             'hard to miss, though lossy -- you see that something was stripped, '
+             'not which codepoint. Reveal shows the exact <U+XXXX>.'),
             ('&Reveal', 'reveal', '#1f8a54',
              'Show every non-ASCII character as a <U+XXXX> badge: safe and '
              'lossless, you see the exact codepoint, nothing can pose as a '
@@ -2907,7 +2906,7 @@ class MainWindow(QMainWindow):
         # Show (red, a glyph can deceive). Grouped and labelled so it is obvious
         # these three are one unicode setting.
         uni_frame, self._mode_buttons = self._chip_group('unicode:', (
-            ('strip', 'Strip', '#e5a50a', self.act_strip.toolTip()),
+            ('strip', 'Strip', '#1f8a54', self.act_strip.toolTip()),
             ('reveal', 'Reveal', '#1f8a54', self.act_reveal.toolTip()),
             ('detail', 'Detail', '#1f8a54', self.act_detail.toolTip()),
             ('show', 'Show', '#d83933', self.act_show.toolTip()),
