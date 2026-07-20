@@ -2222,11 +2222,14 @@ class MainWindow(QMainWindow):
         self.act_markings = QAction('Colored &markings', self, checkable=True)
         self.act_markings.setChecked(self._default_markings)
         self.act_markings.setToolTip(
-            'Colour each neutralized or revealed character (the "_" and the '
-            '<U+XXXX> badge) by its risk class: red for bidi controls that '
-            'reorder text, amber for zero-width and invisible characters, blue '
-            'for control bytes, purple for other non-ASCII (homoglyph-prone). On '
-            'by default; independent of the ANSI Colors setting.')
+            'Colour each neutralized or revealed character -- the box placeholder '
+            'and the <U+XXXX> badge -- by its risk class: red for bidi controls '
+            'that reorder text, amber for zero-width and invisible characters, '
+            'blue for control bytes, purple for other non-ASCII (homoglyph-prone). '
+            'The colour comes from the risk class, never from the program, so '
+            'output cannot recolour a marking to blend in, and the contrast guard '
+            'keeps it readable, so it cannot be hidden. On by default; independent '
+            'of the ANSI Colors setting.')
         self.act_markings.toggled.connect(self.set_markings)
         view_menu.addAction(self.act_markings)
 
