@@ -20,6 +20,8 @@ Depends: ${misc:Depends},
  python3-pyqt6.qtmultimedia,
  python3-pyte,
  qt6-svg-plugins
+Recommends: fonts-hack,
+ fonts-dejavu-core
 Description: safe-by-construction terminal for untrusted paste and output
  secure-terminal is a small, line-oriented terminal for pasting commands into,
  and reading text out of, without worrying about invisible characters, bidi

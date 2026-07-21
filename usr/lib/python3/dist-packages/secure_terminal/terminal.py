@@ -126,6 +126,14 @@ from secure_terminal.sanitize import (
 # Custom char-format property carrying a marked cell's SOURCE code point, so the
 # widget can describe the real character on hover/click regardless of how it is
 # displayed (the strip "_", a reveal/detail badge, a control shown as "_").
+# The default terminal font. Hack is a monospace face DESIGNED to disambiguate
+# confusable glyphs (dotted zero distinct from O, tailed l, serifed 1 and I,
+# rn kept apart from m) and -- crucially for a terminal that promises "what you
+# see is the exact bytes" -- it ships NO ligature tables, so it can never merge
+# characters (e.g. != into one glyph). Packaged in Debian as fonts-hack; an
+# uninstalled family falls back to DejaVu Sans Mono, then the generic monospace.
+DEFAULT_FONT_FAMILY = 'Hack'
+
 _CP_PROP = QTextFormat.Property.UserProperty + 1
 
 # Human-readable gloss for each risk class (marking_class), for the click popup.
@@ -335,12 +343,10 @@ class SecureTerminal(QPlainTextEdit):
         self.setFrameStyle(0)
 
         self._base_point_size = BASE_POINT_SIZE
-        font = QFont('monospace')
-        font.setStyleHint(QFont.StyleHint.Monospace)
-        font.setPointSize(self._base_point_size)
-        self.setFont(font)
-
         self._zoom = 100
+        self._font_family = DEFAULT_FONT_FAMILY
+        self._apply_font(sync=False)
+
         self._theme = 'dark'
         self.apply_theme(self._theme)
 
@@ -541,16 +547,42 @@ class SecureTerminal(QPlainTextEdit):
         if self._grid_mode():         # repaint the grid ONLY while it owns the
             self._render_timer.start(16)   # screen; line-TUI keeps its scrollback
 
-    def apply_zoom(self, percent):
-        percent = max(10, min(1000, int(percent)))
-        self._zoom = percent
-        size = max(1, round(self._base_point_size * percent / 100.0))
-        font = self.font()
+    def _apply_font(self, sync=True):
+        """Build the terminal font from the chosen family and current zoom. A hard
+        monospace fallback chain (DejaVu, then the generic monospace) means an
+        uninstalled family degrades to a fixed-pitch face, never a proportional one
+        (which would break the grid and the confusable spacing). OpenType ligature
+        and contextual-alternate features are turned off where the Qt build allows
+        it -- ligatures HIDE characters, a deception vector for a WYSIWYG terminal;
+        the default family (Hack) ships no ligature tables anyway."""
+        size = max(1, round(self._base_point_size * self._zoom / 100.0))
+        font = QFont()
+        font.setFamilies([self._font_family or DEFAULT_FONT_FAMILY,
+                          'DejaVu Sans Mono', 'monospace'])
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFixedPitch(True)
+        for _tag in ('liga', 'clig', 'calt', 'dlig'):
+            try:
+                font.setFeature(_tag, 0)
+            except (AttributeError, TypeError, ValueError):
+                pass                 # per-feature control needs Qt >= 6.7; skip
         font.setPointSize(size)
         self.setFont(font)
-        self._sync_tui_size()          # font change resizes the grid
-        if self._grid_mode():
-            self._render_timer.start(16)   # repaint at the new glyph size
+        if sync:
+            self._sync_tui_size()          # a font change resizes the grid
+            if self._grid_mode():
+                self._render_timer.start(16)   # repaint at the new glyph size
+
+    def apply_zoom(self, percent):
+        self._zoom = max(10, min(1000, int(percent)))
+        self._apply_font()
+
+    def set_font_family(self, family):
+        self._font_family = (family or '').strip() or DEFAULT_FONT_FAMILY
+        self._apply_font()
+
+    def current_font_family(self):
+        return self._font_family
 
     def current_zoom(self):
         return self._zoom

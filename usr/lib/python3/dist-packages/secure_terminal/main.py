@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QKeySequenceEdit,
-    QTextEdit,
+    QTextEdit, QFontDialog,
 )
 
 from PyQt6.QtNetwork import QLocalServer
@@ -34,7 +34,7 @@ from secure_terminal.sanitize import (
     sanitize_paste, OSC_FEATURES, OSC_FEATURE_BY_KEY, luminance)
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES, tui_available,
-    sound_file_allowed, BELL_SOUND_DIRS,
+    sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
 )
 
 TUI_TOOLTIP = (
@@ -377,6 +377,10 @@ class MainWindow(QMainWindow):
             else 'dark'
         self._default_mode = cfg.get('unicode_mode') \
             if cfg.get('unicode_mode') in DISPLAY_MODES else 'detail'
+        # Default terminal font family (global). Hack disambiguates confusables and
+        # has no ligature tables; an uninstalled family falls back in the widget.
+        self._default_font_family = (cfg.get('font_family') or '').strip() \
+            or DEFAULT_FONT_FAMILY
         # Colours on by default: with a capable TERM the shell prompt, ls, git
         # and friends emit SGR colour, and a terminal that silently dropped it
         # looks broken. Parsing is bounded (16 palette colours) and the renderer's
@@ -697,6 +701,7 @@ class MainWindow(QMainWindow):
                               cli_terminfo=self._default_cli_terminfo)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
+        term.set_font_family(self._default_font_family)
         term.apply_mode(self._default_mode)
         term.apply_colors(self._default_colors)
         term.apply_markings(self._default_markings)
@@ -730,6 +735,7 @@ class MainWindow(QMainWindow):
                               cli_terminfo=cli_terminfo)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
+        term.set_font_family(spec.get('font_family') or self._default_font_family)
         mode = spec.get('mode')
         if mode not in DISPLAY_MODES or 'unicode_mode' in self._locked:
             mode = self._default_mode
@@ -907,6 +913,7 @@ class MainWindow(QMainWindow):
             term.apply_zoom(int(info.get('zoom', self._default_zoom)))
         except (TypeError, ValueError):
             term.apply_zoom(self._default_zoom)
+        term.set_font_family(info.get('font_family') or self._default_font_family)
         mode = info.get('mode')
         term.apply_mode(mode if mode in DISPLAY_MODES else self._default_mode)
         term.apply_colors(bool(info.get('colors')))
@@ -1359,6 +1366,37 @@ class MainWindow(QMainWindow):
         self._update_security_indicator()
         self._default_mode = mode
         self._persist()
+
+    def set_font_family(self, family):
+        """Set the current tab's font family and make it the default for new tabs
+        (existing tabs keep their own, mirroring how mode/theme are sticky). An
+        empty or admin-locked value is ignored; the widget falls back on a family
+        that is not installed."""
+        if 'font_family' in self._locked:
+            return                        # admin-locked; not user-changeable
+        family = (family or '').strip() or DEFAULT_FONT_FAMILY
+        term = self.current()
+        if term is not None:
+            term.set_font_family(family)
+        self._default_font_family = family
+        self._persist()
+
+    def choose_font(self):
+        """Per-tab font picker: a monospaced-only font dialog seeded with the
+        current tab's family. Only the family is taken (size is the zoom control);
+        a proportional pick is prevented by the dialog's monospaced filter and, as
+        a backstop, the widget's fixed-pitch fallback chain."""
+        term = self.current()
+        if term is None:
+            return
+        current = QFont(term.current_font_family())
+        try:
+            opts = QFontDialog.FontDialogOption.MonospacedFonts
+        except AttributeError:
+            opts = QFontDialog.FontDialogOption(0)
+        font, ok = QFontDialog.getFont(current, self, 'Terminal font', opts)
+        if ok:
+            self.set_font_family(font.family())
 
     def _sync_mode_toggles(self, mode):
         """Check the button for the active display mode in the exclusive group.
@@ -2014,6 +2052,7 @@ class MainWindow(QMainWindow):
             'theme': self._default_theme,
             'zoom': str(self._default_zoom),
             'unicode_mode': self._default_mode,
+            'font_family': self._default_font_family,
             'colors': 'true' if self._default_colors else 'false',
             'colored_markings': 'true' if self._default_markings else 'false',
             'auto_tab_colors': 'true' if self._auto_tab_colors else 'false',
@@ -2210,6 +2249,15 @@ class MainWindow(QMainWindow):
         self.act_detail = self._mode_actions['detail']
         self.act_show = self._mode_actions['show']
         self._sync_mode_toggles(self._default_mode)
+
+        self.act_font = QAction('&Font...', self)
+        self.act_font.setToolTip(
+            'Choose the terminal font for this tab, and the default for new tabs. '
+            'The default, Hack, is designed to disambiguate look-alike glyphs '
+            '(dotted zero, distinct 1/l/I) and ships no ligatures, which could '
+            'otherwise hide characters.')
+        self.act_font.triggered.connect(self.choose_font)
+        view_menu.addAction(self.act_font)
 
         view_menu.addSeparator()
         self.act_colors = QAction(
@@ -3004,6 +3052,7 @@ class MainWindow(QMainWindow):
                 'theme': term.current_theme(),
                 'zoom': term.current_zoom(),
                 'mode': term.current_mode(),
+                'font_family': term.current_font_family(),
                 'colors': term.colors_enabled(),
                 'markings': term.markings_enabled(),
                 'tui': term.current_tui(),
@@ -3459,6 +3508,24 @@ def main():
     if not launch.new_instance:
         window.start_instance_server(launch.instance_group)
     window.show()
+
+    # On ANY quit -- a SIGTERM/SIGHUP from the launching terminal (via
+    # _install_signal_quit -> app.quit()), an explicit app.quit(), or the last
+    # window closing -- detach every tab's pty notifier, close its fd and hang up
+    # its child WHILE the Qt event loop is still up. Without this, a
+    # SIGTERM->app.quit() leaves app.exec() and the pty QSocketNotifiers are then
+    # destroyed uncontrolled during interpreter teardown, which segfaults under
+    # XCB. shutdown() is idempotent, so a normal window close (whose closeEvent
+    # already shut its tabs down) re-running here is harmless.
+    def _shutdown_all_tabs():
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, MainWindow):
+                for i in range(widget.tabs.count()):
+                    try:
+                        widget.tabs.widget(i).shutdown()
+                    except Exception:      # pylint: disable=broad-except
+                        pass               # best-effort teardown; never block quit
+    app.aboutToQuit.connect(_shutdown_all_tabs)
 
     return app.exec()
 
