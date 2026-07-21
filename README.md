@@ -74,9 +74,14 @@ The safety model above does not cost you the usual conveniences:
   in the top right (Up/Down keys or type a value). `Ctrl+0` resets to 100%.
 - **Themes.** White-on-black and black-on-white, under **View -> Theme**. Plain,
   high-contrast, no syntax coloring.
-- **Unicode display mode** (top bar, per tab, default **Strip**). Strip replaces
-  non-ASCII with `_` (safe). Show renders legitimate unicode as glyphs so you can
-  read a log, while still neutralizing the invisible, bidi and homoglyph classes.
+- **Unicode display mode** (top bar, per tab, default **Box**). Box replaces every
+  non-ASCII character with a coloured box, one per character, tinted by risk class
+  (a bidi override, a zero-width character and a plain foreign letter get different
+  colours); safe, lossy, and hard to miss. A saved transcript maps the box back to
+  a plain ASCII `_`. Show renders legitimate unicode as glyphs so you can read a
+  log, but still tints each one by risk class -- a homoglyph confusable with ASCII
+  wears a louder colour than honest foreign text, and the invisible, bidi and
+  control classes (which have no visible glyph) still show as a coloured placeholder.
   Reveal shows every non-ASCII character as a `<U+XXXX>` badge to inspect exactly
   what is there. Escapes are stripped in every mode.
 - **Save transcript** (File menu, `Ctrl+Shift+S`). Writes the current tab's

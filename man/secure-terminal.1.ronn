@@ -82,13 +82,18 @@ secure-terminal has two rendering modes, chosen per tab:
     contrast guard. Use it to run full-screen programs (ssh, an editor, htop) and
     for the shell's completion menus and progress displays.
 
-The unicode `--mode` controls how a non-ASCII byte in output is shown:
+The unicode `--mode` controls how a non-ASCII byte in output is shown (the top-bar
+label for `strip` is "Box"):
 
   * `strip`:
-    Replace it with "_" (the safe default).
+    Replace it with a coloured box, one per character, tinted by risk class (the
+    safe default). A saved transcript maps the box back to a plain ASCII "_".
 
   * `show`:
-    Render the glyph when printable (readable, but a look-alike can deceive).
+    Render the glyph when printable, tinted by risk class so a look-alike stands
+    out (a homoglyph confusable with ASCII wears a louder colour than honest
+    foreign text). Non-printable classes (invisible, bidi, control) have no glyph,
+    so they still show as a coloured placeholder.
 
   * `reveal`:
     Show a `<U+XXXX>` codepoint badge (hover for its name).

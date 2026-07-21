@@ -510,9 +510,43 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0):
     return completed, cells, col, sgr, wraps
 
 
-# Risk class of a neutralized/revealed character, so its marking (the '_' or the
-# <U+XXXX> badge) can be coloured by WHY the character is dangerous, not just that
-# it is. Ordered worst-first.
+# Non-ASCII code points that are CONFUSABLE with a printable ASCII character --
+# the true homoglyphs (Cyrillic a, Greek omicron, ...), as distinct from merely
+# foreign but non-deceptive non-ASCII (CJK, emoji, an accented e). Built once from
+# the Unicode confusables data shipped by python3-confusable-homoglyphs (a hard
+# dependency); if the package is somehow absent the set is empty and such a
+# character just stays in the generic 'nonascii' class -- never a crash.
+_ASCII_CONFUSABLES = None
+
+
+def _ascii_confusables():
+    global _ASCII_CONFUSABLES
+    if _ASCII_CONFUSABLES is None:
+        found = set()
+        try:
+            import json
+            from confusable_homoglyphs import confusables as _cf
+            data_path = os.path.join(os.path.dirname(_cf.__file__),
+                                     'confusables.json')
+            with open(data_path, encoding='utf-8') as handle:
+                data = json.load(handle)
+            for source, alternatives in data.items():
+                if len(source) != 1 or ord(source) <= 0x7F:
+                    continue          # only NON-ASCII sources can pose as ASCII
+                for alt in alternatives:
+                    glyph = alt.get('c', '')
+                    if len(glyph) == 1 and 0x20 <= ord(glyph) <= 0x7E:
+                        found.add(ord(source))
+                        break
+        except Exception:             # pylint: disable=broad-except
+            pass                      # no data -> no refinement; stays 'nonascii'
+        _ASCII_CONFUSABLES = frozenset(found)
+    return _ASCII_CONFUSABLES
+
+
+# Risk class of a neutralized/revealed character, so its marking (the box, the '_'
+# or the <U+XXXX> badge) can be coloured by WHY the character is dangerous, not
+# just that it is. Ordered worst-first.
 def marking_class(cp):
     if (0x202A <= cp <= 0x202E or 0x2066 <= cp <= 0x2069
             or cp in (0x200E, 0x200F, 0x061C)):
@@ -522,7 +556,9 @@ def marking_class(cp):
         return 'invisible'            # zero-width / BOM / line-paragraph separator
     if cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
         return 'control'              # C0 / DEL / C1 control bytes
-    return 'nonascii'                 # any other non-ASCII (homoglyph-prone)
+    if cp > 0x7F and cp in _ascii_confusables():
+        return 'confusable'           # a homoglyph: a non-ASCII look-alike of ASCII
+    return 'nonascii'                 # other non-ASCII (foreign, but not a look-alike)
 
 
 # sentinel head of a run key that colours a marking by its risk class, kept
@@ -577,7 +613,13 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
         # no other trace). Past _RUN_CAP runs (a flood) stop tagging so the runs
         # re-coalesce and the UI cannot wedge; distinct codepoints no longer merge,
         # but the cap still bounds it.
-        if disp != ch and len(runs) < _RUN_CAP:
+        # In SHOW mode a printable non-ASCII glyph is shown as itself (disp == ch),
+        # so it would otherwise render unmarked -- tag it too, so it keeps its glyph
+        # but wears its risk colour (a homoglyph in 'confusable' colour cannot pose
+        # as ASCII; legitimate foreign text just wears the milder 'nonascii').
+        shown_nonascii = (mode == 'show' and disp == ch
+                          and len(ch) == 1 and ord(ch) > 0x7F)
+        if (disp != ch or shown_nonascii) and len(runs) < _RUN_CAP:
             if markings:
                 color = marking_class(ord(ch))
             elif colors:

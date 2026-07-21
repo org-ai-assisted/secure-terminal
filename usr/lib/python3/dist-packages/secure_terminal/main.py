@@ -404,6 +404,8 @@ class MainWindow(QMainWindow):
             self._paste_delay = max(0, min(60, int(cfg['paste_delay'])))
         except (KeyError, ValueError):
             self._paste_delay = 3
+        self._paste_warn = cfg.get('paste_warn') \
+            if cfg.get('paste_warn') in ('always', 'unicode', 'never') else 'unicode'
         self._default_tui = cfg.get('tui') == 'true'
         # opt-in: advertise the restricted `secure-terminal` terminfo (CLI-mode)
         # instead of xterm-256color for new tabs. Off by default (xterm-256color
@@ -707,6 +709,7 @@ class MainWindow(QMainWindow):
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
+        term.apply_paste_warn(self._paste_warn)
         term.apply_bell(self._default_bell)
         term.apply_bell_sound(self._default_bell_sound)
         self._connect_bell_tray(term)
@@ -744,6 +747,7 @@ class MainWindow(QMainWindow):
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
+        term.apply_paste_warn(self._paste_warn)
         bell = self._default_bell
         if spec.get('bell') is not None and 'bell' not in self._locked:
             bell = SecureTerminal._parse_bell(spec['bell'])
@@ -923,6 +927,7 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
+        term.apply_paste_warn(self._paste_warn)
         # restore the full per-feature OSC map when present; fall back to the legacy
         # allow_title boolean for sessions saved before the granular controls (which
         # collapsed hyperlink/clipboard/colour/cwd/iTerm2 into title+notify).
@@ -1558,13 +1563,14 @@ class MainWindow(QMainWindow):
         if mode == 'show':
             return ('#d83933', 'Show',
                     'Display: SHOW (red).\n\n'
-                    'Non-ASCII output is drawn as its glyph, so a look-alike '
-                    '(homoglyph) can pose as an ASCII character and text can read '
-                    'as something it is not. The invisible, bidi and control '
-                    'classes are still neutralized and pasting is still sanitized, '
-                    'but a rendered glyph can deceive the eye. This is the highest '
-                    'risk, above TUI mode, because the deception is in what you '
-                    'read.\n\nSwitch to Box or Reveal to remove it.')
+                    'Non-ASCII output is drawn as its glyph. With colour markings on '
+                    '(the default) each glyph is tinted by its risk class -- a '
+                    'homoglyph in rose -- so a look-alike is flagged rather than '
+                    'posing cleanly as ASCII; but you still have to NOTICE the '
+                    'colour, so this stays the highest risk, above TUI mode. The '
+                    'invisible, bidi and control classes are neutralized to a box '
+                    'and pasting is still sanitized.\n\nSwitch to Box or Reveal to '
+                    'remove the risk entirely.')
         if mode == 'reveal':
             return ('#1f8a54', 'Reveal',
                     'Display: REVEAL (green, safe).\n\n'
@@ -1984,6 +1990,20 @@ class MainWindow(QMainWindow):
             self.tabs.widget(i).apply_paste_delay(seconds)
         self._persist()
 
+    def set_paste_warn(self, mode):
+        """When to show the paste-warning dialog: always / unicode (default) /
+        never. Applies to every tab and becomes the default for new ones."""
+        if mode not in ('always', 'unicode', 'never') or 'paste_warn' in self._locked:
+            return
+        self._paste_warn = mode
+        for i in range(self.tabs.count()):
+            self.tabs.widget(i).apply_paste_warn(mode)
+        if hasattr(self, '_paste_warn_actions'):
+            act = self._paste_warn_actions.get(mode)
+            if act is not None and not act.isChecked():
+                act.setChecked(True)
+        self._persist()
+
     def save_transcript(self):
         term = self.current()
         if term is None:
@@ -2060,6 +2080,7 @@ class MainWindow(QMainWindow):
             'auto_tab_colors': 'true' if self._auto_tab_colors else 'false',
             'scrollback': str(self._scrollback),
             'paste_delay': str(self._paste_delay),
+            'paste_warn': self._paste_warn,
             'tui': 'true' if self._default_tui else 'false',
             'cli_terminfo': 'true' if self._default_cli_terminfo else 'false',
             'allow_title': 'true' if self._default_allow_title else 'false',
@@ -2239,9 +2260,11 @@ class MainWindow(QMainWindow):
              'official Unicode name inline (what unicode-show annotates), so a '
              'homoglyph reads as its identity, not just a number.'),
             ('S&how', 'show', '#d83933',
-             'Render non-ASCII output as its glyph. Least safe: a look-alike '
-             '(homoglyph) can pose as an ASCII character. The invisible, bidi and '
-             'control classes are still neutralized.'),
+             'Render printable non-ASCII output as its glyph -- and, with colour '
+             'markings on, tint each by its risk class (a homoglyph in rose), so a '
+             'look-alike is flagged instead of blending in as ASCII. Still the least '
+             'safe mode: you have to NOTICE the colour. The invisible, bidi and '
+             'control classes are neutralized to a box either way.'),
         ):
             act = QAction(_dot_icon(colour), label, self, checkable=True)
             act.setToolTip(tip)
@@ -2460,6 +2483,27 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _checked, n=secs: self.set_paste_delay(n))
             pd_group.addAction(act)
             pd_menu.addAction(act)
+
+        pw_menu = view_menu.addMenu('Paste &warning')
+        pw_group = QActionGroup(self)
+        pw_group.setExclusive(True)
+        self._paste_warn_actions = {}
+        for label, key, tip in (
+            ('&Always', 'always', 'Show the paste-warning dialog on every paste.'),
+            ('If &unicode', 'unicode',
+             'Show it only when the paste carries unicode or control characters '
+             '(the default). Plain-ASCII pastes go straight through.'),
+            ('&Never', 'never',
+             'Never prompt. The paste is still sanitized (escapes and hidden '
+             'bytes removed) before it reaches the shell.'),
+        ):
+            act = QAction(label, self, checkable=True)
+            act.setToolTip(tip)
+            act.setChecked(key == self._paste_warn)
+            act.triggered.connect(lambda _checked, k=key: self.set_paste_warn(k))
+            pw_group.addAction(act)
+            pw_menu.addAction(act)
+            self._paste_warn_actions[key] = act
 
         tabs_menu = bar.addMenu('Ta&bs')
         act_next_tab = QAction('&Next Tab', self)

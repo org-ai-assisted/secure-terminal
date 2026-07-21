@@ -138,10 +138,11 @@ _CP_PROP = QTextFormat.Property.UserProperty + 1
 
 # Human-readable gloss for each risk class (marking_class), for the click popup.
 _RISK_LABELS = {
-    'bidi':      'bidirectional control -- can reorder text (the worst deception)',
-    'invisible': 'invisible -- zero-width, BOM or line/paragraph separator',
-    'control':   'control character -- C0, DEL or C1',
-    'nonascii':  'other non-ASCII -- can be a look-alike (homoglyph)',
+    'bidi':       'bidirectional control -- can reorder text (the worst deception)',
+    'confusable': 'a look-alike of an ASCII character (homoglyph), e.g. Cyrillic a for Latin a',
+    'invisible':  'invisible -- zero-width, BOM or line/paragraph separator',
+    'control':    'control character -- C0, DEL or C1',
+    'nonascii':   'other non-ASCII -- foreign text, not an ASCII look-alike',
 }
 
 # Any numeric-code OSC: ESC ] <code> ; <params> (BEL | ST). The dispatcher acts on
@@ -394,6 +395,7 @@ class SecureTerminal(QPlainTextEdit):
 
         # seconds the paste-warning "Allow" button stays disabled.
         self._paste_delay = 3
+        self._paste_warn = 'unicode'   # always | unicode (default) | never
 
         # TUI mode: interpret escapes through a pyte screen so full-screen
         # programs (ssh, vim, htop, tmux) work. Off by default; the strict, no-parser
@@ -548,17 +550,16 @@ class SecureTerminal(QPlainTextEdit):
             self._render_timer.start(16)   # screen; line-TUI keeps its scrollback
 
     def _apply_font(self, sync=True):
-        """Build the terminal font from the chosen family and current zoom. A hard
-        monospace fallback chain (DejaVu, then the generic monospace) means an
-        uninstalled family degrades to a fixed-pitch face, never a proportional one
-        (which would break the grid and the confusable spacing). OpenType ligature
-        and contextual-alternate features are turned off where the Qt build allows
-        it -- ligatures HIDE characters, a deception vector for a WYSIWYG terminal;
-        the default family (Hack) ships no ligature tables anyway."""
+        """Build the terminal font from the chosen family and current zoom. The
+        default family (Hack) is a hard package dependency, so no fallback chain is
+        needed; the Monospace style hint still steers Qt's own substitution toward
+        a fixed-pitch face if a user picks a family that is not installed. OpenType
+        ligature and contextual-alternate features are turned off where the Qt build
+        allows it -- ligatures HIDE characters, a deception vector for a WYSIWYG
+        terminal; the default family (Hack) ships no ligature tables anyway."""
         size = max(1, round(self._base_point_size * self._zoom / 100.0))
         font = QFont()
-        font.setFamilies([self._font_family or DEFAULT_FONT_FAMILY,
-                          'DejaVu Sans Mono', 'monospace'])
+        font.setFamily(self._font_family or DEFAULT_FONT_FAMILY)
         font.setStyleHint(QFont.StyleHint.Monospace)
         font.setFixedPitch(True)
         for _tag in ('liga', 'clig', 'calt', 'dlig'):
@@ -634,6 +635,12 @@ class SecureTerminal(QPlainTextEdit):
 
     def current_paste_delay(self):
         return self._paste_delay
+
+    def apply_paste_warn(self, mode):
+        self._paste_warn = mode if mode in ('always', 'unicode', 'never') else 'unicode'
+
+    def current_paste_warn(self):
+        return self._paste_warn
 
     # -- TUI mode -------------------------------------------------------------
     def apply_tui(self, enabled):
@@ -1170,10 +1177,11 @@ class SecureTerminal(QPlainTextEdit):
     # Foreground colour of a neutralized/revealed marking, by risk class. Chosen
     # to read on both the light and dark themes.
     MARKING_COLORS = {
-        'bidi':      '#e5484d',       # red    -- reorders text (worst)
-        'invisible': '#f5a623',       # amber  -- zero-width / BOM / separators
-        'control':   '#3b9eff',       # blue   -- C0 / DEL / C1 controls
-        'nonascii':  '#a06cff',       # purple -- other non-ASCII (homoglyph)
+        'bidi':       '#e5484d',      # red    -- reorders text (worst)
+        'confusable': '#ff5c8a',      # rose   -- a homoglyph: poses as an ASCII char
+        'invisible':  '#f5a623',      # amber  -- zero-width / BOM / separators
+        'control':    '#3b9eff',      # blue   -- C0 / DEL / C1 controls
+        'nonascii':   '#a06cff',      # purple -- other non-ASCII (foreign, not a look-alike)
     }
 
     def _fmt_from_key(self, key):
@@ -2391,11 +2399,15 @@ class SecureTerminal(QPlainTextEdit):
     # -- paste: warn on, then sanitize, anything unusual ----------------------
     def insertFromMimeData(self, source):
         raw = source.text()
-        # A plain-ASCII paste goes straight through; only warn when the clipboard
-        # carries unicode or control characters -- the case worth a second look.
+        # When to show the paste-warning dialog, per the paste_warn setting:
+        #   'always'  -- every paste (even plain ASCII);
+        #   'unicode' -- only when the clipboard carries unicode or control
+        #                characters, the case worth a second look (the default);
+        #   'never'   -- never prompt; the paste is still sanitized silently.
         has_unicode, has_control = paste_findings(raw)
         action = 'stripped'
-        if has_unicode or has_control:
+        warn = self._paste_warn
+        if warn == 'always' or (warn == 'unicode' and (has_unicode or has_control)):
             from secure_terminal.dialog import PasteWarningDialog
             action = PasteWarningDialog.confirm(raw, self._paste_delay, self)
             if action == 'reject':
