@@ -2087,6 +2087,8 @@ class MainWindow(QMainWindow):
              + [self.act_bell_sound, self.act_bell_sound_clear]),
             ('bell_sound', [self.act_bell_sound, self.act_bell_sound_clear]),
             ('systray', [self.act_systray]),
+            ('paste_warn', list(self._paste_warn_actions.values())),
+            ('copy_warn', list(self._copy_warn_actions.values())),
         ] + [(k, [self._osc_actions[k]]) for k in self._osc_actions]
         # a legacy allow_title lock also greys the granular title + notify controls
         if 'allow_title' in self._locked:
@@ -3359,8 +3361,9 @@ def _launch_parser(with_globals):
                    help='initial unicode display mode')
     p.add_argument('-e', '--command', dest='cmd_string', metavar='STRING',
                    help='run STRING (shell-split, no shell); prefer -- for a real argv')
-    # per-tab overrides of the window defaults (an admin lock still wins). Each
-    # defaults to None -> use the window default.
+    # per-tab overrides of the window defaults (an admin lock still wins). None is
+    # the "not passed" sentinel that inherits the window default, so the store_true
+    # / store_false pairs deliberately default to None rather than False.
     p.add_argument('--colors', action='store_true', default=None,
                    help='enable ANSI colours for this tab')
     p.add_argument('--no-colors', dest='colors', action='store_false',

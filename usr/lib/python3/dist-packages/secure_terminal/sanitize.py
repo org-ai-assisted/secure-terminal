@@ -697,6 +697,32 @@ def cells_display_col(cells, col, mode):
     return sum(len(render_output(c, mode)) for c, _ in cells[:col])
 
 
+# Unicode Default_Ignorable_Code_Point ranges that str.isprintable() does NOT
+# already exclude (it drops the Cf/Cc/Cn classes, but keeps these): the combining
+# grapheme joiner, variation selectors, Mongolian free variation selectors, and
+# the Hangul fillers. Each is invisible on its own, so "keep printable unicode"
+# must still drop it -- while ORDINARY combining marks (an accent on a base letter)
+# are not default-ignorable and are kept, so legitimate decomposed text survives.
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x034F, 0x034F),      # COMBINING GRAPHEME JOINER
+    (0x115F, 0x1160),      # HANGUL CHOSEONG/JUNGSEONG FILLER
+    (0x17B4, 0x17B5),      # KHMER INHERENT VOWELS
+    (0x180B, 0x180F),      # MONGOLIAN free variation selectors + vowel separator
+    (0x3164, 0x3164),      # HANGUL FILLER
+    (0xFE00, 0xFE0F),      # variation selectors 1-16
+    (0xFFA0, 0xFFA0),      # HALFWIDTH HANGUL FILLER
+    (0x1D173, 0x1D17A),    # musical symbol begin/end (Cf, belt and braces)
+    (0xE0100, 0xE01EF),    # variation selectors supplement 17-256
+)
+
+
+def is_default_ignorable(ch):
+    """True for an invisible-on-its-own default-ignorable character that
+    str.isprintable() nonetheless keeps (see _DEFAULT_IGNORABLE_RANGES)."""
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE_RANGES)
+
+
 def sanitize_paste(text):
     """Strip a pasted string to printable ASCII; newlines become carriage
     returns (what the shell expects for a submitted line)."""
@@ -716,14 +742,15 @@ def sanitize_paste_unicode(text):
     CJK) instead of dropping it, for a deliberate "paste with unicode". The
     deceptive and injection classes are still removed: control characters, bidi
     overrides, zero-width and other invisibles are all non-printable, so
-    str.isprintable() excludes them, and a paste can never smuggle a hidden
+    str.isprintable() excludes them (plus the default-ignorable characters it
+    keeps, e.g. variation selectors), and a paste can never smuggle a hidden
     newline or an escape sequence this way either. Newlines still become the
     carriage return the shell expects for a submitted line."""
     out = []
     for ch in text:
         if ch == '\n' or ch == '\r':
             out.append('\r')
-        elif ch == '\t' or ch.isprintable():
+        elif ch == '\t' or (ch.isprintable() and not is_default_ignorable(ch)):
             out.append(ch)
         # control, bidi, zero-width, other invisibles -> dropped
     return ''.join(out)
@@ -732,11 +759,15 @@ def sanitize_paste_unicode(text):
 def sanitize_clipboard_unicode(text):
     """Text safe to place on the SYSTEM clipboard: printable characters plus tab
     and newline. Control, bidi, zero-width and other invisibles (the "output lies"
-    hazard) are all non-printable, so str.isprintable() drops them and none can
-    ride the clipboard into another application. Unlike sanitize_paste_unicode,
-    printable non-ASCII (accents, CJK) is KEPT and newlines are PRESERVED as
-    newlines -- clipboard text is multi-line content, not a shell submission."""
-    return ''.join(ch for ch in text if ch.isprintable() or ch in '\n\t')
+    hazard) are all non-printable, so str.isprintable() drops them; the
+    default-ignorable characters it keeps (variation selectors, the combining
+    grapheme joiner, ...) are dropped too, so none can ride the clipboard into
+    another application. Unlike sanitize_paste_unicode, printable non-ASCII
+    (accents, CJK) is KEPT and newlines are PRESERVED as newlines -- clipboard text
+    is multi-line content, not a shell submission."""
+    return ''.join(ch for ch in text
+                   if (ch.isprintable() and not is_default_ignorable(ch))
+                   or ch in '\n\t')
 
 
 def sanitize_clipboard(text):

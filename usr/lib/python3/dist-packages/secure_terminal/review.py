@@ -49,7 +49,8 @@ _PANE_RENDER = (
 _KINDS = {
     'paste': {
         'summary': 'This paste hides %s.',
-        'summary_empty': 'This paste contains hidden characters.',
+        # shown in "always" mode for a clean paste: no hidden characters to name.
+        'summary_empty': 'Review this paste before it reaches the shell.',
         'reject': 'Reject',
         'reject_tip': 'Do not paste (Enter or Esc)',
         'stripped': 'Paste stripped',
@@ -62,7 +63,7 @@ _KINDS = {
     },
     'copy': {
         'summary': 'This copy would carry %s onto the clipboard.',
-        'summary_empty': 'This copy would carry hidden characters onto the clipboard.',
+        'summary_empty': 'Review this copy before it reaches the clipboard.',
         'reject': "Don't copy",
         'reject_tip': 'Do not copy (Enter or Esc)',
         'stripped': 'Copy stripped',

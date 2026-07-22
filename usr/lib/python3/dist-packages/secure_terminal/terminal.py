@@ -1998,6 +1998,25 @@ class SecureTerminal(QPlainTextEdit):
         if board is not None:
             board.setText(text)
 
+    def _reviewed_context_menu(self, pos):
+        """The standard context menu, but with Copy/Cut rerouted through our
+        reviewed copy(): their default targets are Qt's NON-virtual C++ copy()
+        slot, which bypasses the copy() override and would put a raw (Show-mode)
+        selection straight on the clipboard. (Paste goes through insertFromMimeData,
+        which IS virtual and already reviewed.)"""
+        menu = self.createStandardContextMenu(pos)
+        for act in menu.actions():
+            if act.objectName() in ('edit-copy', 'edit-cut'):
+                try:
+                    act.triggered.disconnect()
+                except TypeError:
+                    pass
+                act.triggered.connect(lambda _checked=False: self.copy())
+        return menu
+
+    def contextMenuEvent(self, event):
+        self._reviewed_context_menu(event.pos()).exec(event.globalPos())
+
     def _write(self, data):
         """Write ALL of `data` to the pty. The single point where anything reaches
         the child's input (keystrokes, paste, the one gated clipboard reply), so it
