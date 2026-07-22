@@ -51,7 +51,9 @@ It does nothing about the programs you deliberately run.
   character wears its risk-class colour and stays click-to-inspect. While the
   paste is held, terminal input is suspended and both send buttons are
   countdown-gated (configurable; Enter or Esc rejects), so a stray key cannot
-  wave a hostile paste through. A plain-ASCII paste is not interrupted.
+  wave a hostile paste through. In the default mode a plain-ASCII paste is not
+  interrupted; the warning is configurable to always, only-on-unicode (the
+  default), or never.
 - **Tiny input allowlist.** You type printable ASCII plus a small set of control
   keys that the pseudo-terminal turns into signals:
 

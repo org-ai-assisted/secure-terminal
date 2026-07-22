@@ -565,10 +565,16 @@ class SecureTerminal(QPlainTextEdit):
         preview carries the same risk-class colouring and the same click-to-inspect
         popup as the terminal itself. Preview instances only."""
         self.clear()
-        self._raw = ''
+        # Retain `text` as the raw source (not ''), so a later apply_mode /
+        # apply_markings / apply_colors re-renders the preview instead of blanking
+        # it, and reset the per-line state (cursor + SGR) so a previous preview's
+        # unfinished formatting cannot bleed into this one.
+        self._raw = text
+        self._out_cursor = None
         self._line_cells = []
         self._line_col = 0
         self._line_fmt_cache = {}
+        self._sgr_reset()
         self._mode = mode if mode in DISPLAY_MODES else 'detail'
         self._markings = bool(markings)
         self._feed_line(text)
@@ -1482,7 +1488,8 @@ class SecureTerminal(QPlainTextEdit):
         # a silent surprise. Skipped when a full-screen or repainting program is on
         # (its own TUI advisory covers it, and there its clear is part of drawing).
         elif (not self._clear_notice_shown and wants_clear(text)
-                and not entered and not wants_screen_repaint(text)):
+                and not self._alt_screen and not entered
+                and not wants_screen_repaint(text)):
             self._clear_notice_shown = True
             self._advise('A program tried to clear the screen. The safe CLI mode '
                          'keeps output append-only, so nothing can erase what you '

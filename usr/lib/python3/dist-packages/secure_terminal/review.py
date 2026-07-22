@@ -109,6 +109,9 @@ class PasteReviewBar(QWidget):
         `delay` seconds. Focus lands on Reject so Enter/Esc reject and no keystroke
         can reach the shell."""
         self._term = term
+        # Each review opens collapsed: a prior review's expanded Detail must not
+        # reveal the next paste's previews without an explicit toggle.
+        self._detail_btn.setChecked(False)
         findings = classify_paste(raw)
         parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
                  for label, n in findings]
@@ -144,12 +147,17 @@ class PasteReviewBar(QWidget):
 
     # -- internals ------------------------------------------------------------
     def _choose(self, action):
+        # Single-shot: clear _term before dispatching so a second click (a
+        # double-click, or Esc right after) is a no-op, independent of when the
+        # resolved signal hides the bar.
         term = self._term
+        if term is None:
+            return
+        self._term = None
         self._countdown.stop()
-        if term is not None:
-            # dispatch emits paste_review_resolved, which the window routes back to
-            # hide_review -- so the bar always closes, however the choice was made.
-            term.dispatch_pending_paste(action)
+        # dispatch emits paste_review_resolved, which the window routes back to
+        # hide_review -- so the bar always closes, however the choice was made.
+        term.dispatch_pending_paste(action)
 
     def _toggle_detail(self, on):
         self._panes_host.setVisible(bool(on))
