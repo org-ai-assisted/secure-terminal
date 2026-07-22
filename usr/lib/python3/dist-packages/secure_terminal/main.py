@@ -933,8 +933,10 @@ class MainWindow(QMainWindow):
         """Recreate a tab from saved session state: its settings, name, colour
         and scrollback history, under a fresh shell."""
         history = info.get('text') if isinstance(info.get('text'), str) else ''
+        cwd = info.get('cwd')
         term = SecureTerminal(tui=bool(info.get('tui')), history=history,
-                              cli_terminfo=self._default_cli_terminfo)
+                              cli_terminfo=self._default_cli_terminfo,
+                              cwd=cwd if isinstance(cwd, str) and cwd else None)
         theme = info.get('theme')
         term.apply_theme(theme if theme in THEMES else self._default_theme)
         try:
@@ -3231,6 +3233,7 @@ class MainWindow(QMainWindow):
                 'osc': {_f[0]: term.osc_enabled(_f[0]) for _f in OSC_FEATURES},
                 'bell': term.bell_spec(),
                 'scrollback': term.current_scrollback(),
+                'cwd': term.shell_cwd(),      # restore the tab in the same directory
                 'text': text,
             })
         return tabs

@@ -344,8 +344,11 @@ class SecureTerminal(QPlainTextEdit):
     clipboard_read_requested = pyqtSignal()
 
     def __init__(self, parent=None, command=None, tui=False, history='',
-                 cli_terminfo=False, preview=False):
+                 cli_terminfo=False, preview=False, cwd=None):
         super().__init__(parent)
+        # working directory to start the shell in (restored session tab); None ->
+        # inherit the app's cwd.
+        self._cwd = cwd if isinstance(cwd, str) and cwd else None
         # A preview instance renders text through the SAME pipeline (risk-class
         # colouring, the inspect popup, the contrast guard, theme and font) but runs
         # NO child: it spawns no pty and accepts no keyboard input, so the paste
@@ -1353,6 +1356,13 @@ class SecureTerminal(QPlainTextEdit):
                 argv = shlex.split(command) if command else []
             if not argv:
                 argv = [os.environ.get('SHELL') or '/bin/bash']
+            if self._cwd:
+                # restore a session tab's working directory; a vanished dir falls
+                # back to the inherited cwd rather than failing the spawn.
+                try:
+                    os.chdir(self._cwd)
+                except OSError:
+                    pass
             try:
                 os.execvp(argv[0], argv)
             except OSError:
@@ -2127,6 +2137,17 @@ class SecureTerminal(QPlainTextEdit):
         if path == home:
             return '~'
         return os.path.basename(path.rstrip('/')) or '/'
+
+    def shell_cwd(self):
+        """The SHELL's full working directory (where the prompt sits), for saving a
+        session tab so it restores in the same place. Always the shell pid (not the
+        foreground pgrp): that is the canonical prompt location. '' if unreadable."""
+        if self._pid is None:
+            return ''
+        try:
+            return os.readlink('/proc/%d/cwd' % self._pid)
+        except OSError:
+            return ''
 
     def has_foreground_program(self):
         """True when a program other than the shell holds the foreground, i.e.
