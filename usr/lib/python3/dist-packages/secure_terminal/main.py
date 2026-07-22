@@ -213,6 +213,17 @@ def _dot_icon(color):
     return QIcon(pixmap)
 
 
+def _select_labels(widget):
+    """Make every QLabel under `widget` selectable, so a dialog's descriptive
+    text can be marked and copied by hand, not just its input fields. Preserves
+    any flags a label already has (e.g. link handling)."""
+    for label in widget.findChildren(QLabel):
+        label.setTextInteractionFlags(
+            label.textInteractionFlags()
+            | Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+
+
 class InfoTip(QLabel):
     """A persistent, selectable, zoom-aware replacement for the plain tooltip.
     Unlike QToolTip you can move the pointer INTO it to select and copy the text,
@@ -1690,6 +1701,7 @@ class MainWindow(QMainWindow):
         close.clicked.connect(dialog.accept)
         buttons.addWidget(close)
         layout.addLayout(buttons)
+        _select_labels(dialog)
         dialog.exec()
 
     def set_allow_title(self, enabled):
@@ -2006,6 +2018,7 @@ class MainWindow(QMainWindow):
         countdown = QTimer(dialog)
         countdown.timeout.connect(_tick)
         countdown.start(1000)
+        _select_labels(dialog)
         dialog.exec()
         term.grant_clipboard_read(result['decision'])
 
@@ -2771,6 +2784,7 @@ class MainWindow(QMainWindow):
         save.clicked.connect(_do_save)
         buttons.addWidget(save)
         layout.addLayout(buttons)
+        _select_labels(dialog)
         dialog.exec()
 
     def show_about(self):
@@ -2811,6 +2825,7 @@ class MainWindow(QMainWindow):
         close.clicked.connect(dialog.accept)
         buttons.addWidget(close)
         layout.addLayout(buttons)
+        _select_labels(dialog)
         dialog.exec()
 
     _COMMAND_HELP = (
@@ -2946,6 +2961,7 @@ class MainWindow(QMainWindow):
         buttons.addWidget(apply_all)
         form.addRow(buttons)
 
+        _select_labels(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._apply_global({
@@ -3255,6 +3271,7 @@ class MainWindow(QMainWindow):
         close = QPushButton('Close')
         close.clicked.connect(dialog.accept)
         grid.addWidget(close, len(rows) + 1, 3)
+        _select_labels(dialog)
         dialog.exec()
 
     # -- lifecycle ------------------------------------------------------------
