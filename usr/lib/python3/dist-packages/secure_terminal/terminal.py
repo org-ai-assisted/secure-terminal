@@ -1067,10 +1067,22 @@ class SecureTerminal(QPlainTextEdit):
                 self._alt_view = False
             self._delete_grid()
             self._append_scrollback(screen)
-            self._append_grid(screen)
+            # Trim trailing blank grid rows BELOW the cursor so the document ends at
+            # the prompt/last output; without this the full grid pads ~screen.lines
+            # empty rows below it and you can scroll down into empty space.
+            last = screen.cursor.y
+            for y in range(screen.lines):
+                if any(cell.data.strip() for cell in screen.buffer[y].values()):
+                    last = y
+            self._append_grid(screen, last_row=max(last, screen.cursor.y))
         self.setUpdatesEnabled(True)
         if at_bottom:
             self._place_grid_cursor(screen)
+            if bar is not None:
+                # Follow the tail: setTextCursor alone does not reliably scroll the
+                # viewport (the CLI path adds an explicit ensureCursorVisible for the
+                # same reason), so pin the view to the newest line when at the bottom.
+                bar.setValue(bar.maximum())
         elif bar is not None:
             bar.setValue(min(prev_scroll, bar.maximum()))
         self.viewport().update()
@@ -1129,21 +1141,27 @@ class SecureTerminal(QPlainTextEdit):
                 have = True
         self._top_ids = {id(r) for r in current}
 
-    def _append_grid(self, screen):
-        """Append the live grid (screen.lines rows) at the end of the document."""
+    def _append_grid(self, screen, last_row=None):
+        """Append the live grid at the end of the document. last_row (the last row
+        that carries content or holds the cursor) trims the trailing BLANK grid rows
+        below the cursor in the primary/line-TUI view -- otherwise the full
+        screen.lines grid pads the document with empty, scrollable rows below the
+        last output, so you can scroll into empty space. A full-screen alt-screen
+        program passes None and keeps all rows (it owns the whole fixed canvas)."""
         cur = self.textCursor()
         cur.movePosition(QTextCursor.MoveOperation.End)
         have = self.document().characterCount() > 1
-        for y in range(screen.lines):
+        rows = screen.lines if last_row is None else last_row + 1
+        for y in range(rows):
             if have:
                 cur.insertText('\n')
             self._insert_grid_row(cur, screen.buffer[y], screen.columns)
             have = True
-        # Actual block count, not screen.lines: if the scrollback block cap is
-        # smaller than the grid (a tiny /scrollback on a tall display), Qt prunes
-        # blocks as they are inserted, and a stale _grid_rows would make the next
-        # _delete_grid compute a negative start and wipe the whole document.
-        self._grid_rows = min(screen.lines, self.document().blockCount())
+        # Actual block count, not rows: if the scrollback block cap is smaller than
+        # the grid (a tiny /scrollback on a tall display), Qt prunes blocks as they
+        # are inserted, and a stale _grid_rows would make the next _delete_grid
+        # compute a negative start and wipe the whole document.
+        self._grid_rows = min(rows, self.document().blockCount())
 
     def _place_grid_cursor(self, screen):
         if screen.cursor.hidden:
