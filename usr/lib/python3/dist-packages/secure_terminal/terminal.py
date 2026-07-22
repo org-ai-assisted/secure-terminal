@@ -1734,9 +1734,13 @@ class SecureTerminal(QPlainTextEdit):
         self._write(b'\x1b]52;c;' + base64.b64encode(raw) + b'\x07')
 
     def _osc_clipboard(self, params):
-        """OSC 52 WRITE: <selection>;<base64>. The decoded text is stripped of
-        control/escape bytes before it reaches the clipboard, and bounded in size.
-        (A read query is handled separately in _handle_osc, gated per tab.)"""
+        """OSC 52 WRITE: <selection>;<base64>. The decoded text is filtered to
+        PRINTABLE characters (plus tab and newline) before it reaches the system
+        clipboard, and bounded in size -- so a program cannot smuggle a bidi
+        override, a zero-width / invisible character or a C0/C1 control onto the
+        clipboard (the same hazard the paste path drops), which a later paste into
+        any application would otherwise carry. (A read query is handled separately
+        in _handle_osc, gated per tab.)"""
         parts = params.split(b';', 1)
         if len(parts) != 2:
             return
@@ -1747,8 +1751,7 @@ class SecureTerminal(QPlainTextEdit):
             text = base64.b64decode(payload, validate=True).decode('utf-8', 'replace')
         except (ValueError, base64.binascii.Error):
             return
-        text = ''.join(ch for ch in text
-                       if ch in '\n\t' or 0x20 <= ord(ch) and ch != '\x7f')
+        text = ''.join(ch for ch in text if ch.isprintable() or ch in '\n\t')
         QGuiApplication.clipboard().setText(text)
 
     def _osc_cwd(self, params):

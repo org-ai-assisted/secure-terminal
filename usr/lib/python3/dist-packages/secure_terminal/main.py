@@ -3161,7 +3161,6 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         return reply == QMessageBox.StandardButton.Yes
-        self._persist()
 
     def clear_saved_session(self):
         session.clear()
