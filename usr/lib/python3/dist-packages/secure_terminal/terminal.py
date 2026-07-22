@@ -1101,9 +1101,13 @@ class SecureTerminal(QPlainTextEdit):
         first = doc.blockCount() - self._grid_rows
         cur = QTextCursor(doc.findBlockByNumber(max(0, first)))
         cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
-        if first > 0:                     # also eat the newline before the grid
-            cur.movePosition(QTextCursor.MoveOperation.PreviousCharacter,
-                             QTextCursor.MoveMode.KeepAnchor)
+        if first > 0:                     # also eat the newline before the grid:
+            # move the WHOLE cursor (anchor too) back over it, so the End
+            # selection below starts before the newline. With KeepAnchor the
+            # anchor stayed at the block start and the newline was never
+            # selected, leaving scrollback's last row with a trailing newline --
+            # a spurious empty block that double-spaced every scrolled row.
+            cur.movePosition(QTextCursor.MoveOperation.PreviousCharacter)
         cur.movePosition(QTextCursor.MoveOperation.End,
                          QTextCursor.MoveMode.KeepAnchor)
         cur.removeSelectedText()
