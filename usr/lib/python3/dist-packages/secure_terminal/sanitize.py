@@ -536,6 +536,9 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0):
                 # partial command line), so flushing would push the prompt onto
                 # its own line and drop the cursor below it -- the bug this guard
                 # prevents. Tell them apart by whether prompt text still follows.
+                # (If a read splits the bash marker from its prompt into separate
+                # chunks, the flush is skipped -- harmless: the prompt then just
+                # follows stock-bash behaviour, gluing to any leftover output.)
                 j = i + len(PROMPT_START)
                 if col != 0 and _printable_follows(raw, j):
                     completed.append(cells)

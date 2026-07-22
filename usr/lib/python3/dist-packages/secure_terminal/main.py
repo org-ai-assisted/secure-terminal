@@ -2059,10 +2059,11 @@ class MainWindow(QMainWindow):
             'Text files (*.txt);;All files (*)')
         if not path:
             return
-        # transcript_text() is pure ASCII AND lossless (Box mode names each
-        # neutralized byte inline rather than collapsing it to '_'), so the saved
-        # file is safe to open anywhere -- unlike a normal terminal's raw log --
-        # and still records exactly which characters were there.
+        # transcript_text() is lossless -- Box mode names each neutralized
+        # character inline (<U+XXXX NAME>) rather than collapsing it to '_' -- and
+        # pure ASCII except the real glyphs Show mode keeps. So the saved file is
+        # safe to open anywhere (unlike a normal terminal's raw log) and still
+        # records exactly which characters were there.
         try:
             with open(path, 'w', encoding='utf-8') as handle:
                 handle.write(term.transcript_text())

@@ -1904,8 +1904,8 @@ class SecureTerminal(QPlainTextEdit):
     def _export_ascii(self, text):
         """Map the display box (BOX) back to ASCII '_' for any text that LEAVES the
         widget (copy, command hook, session restore -- a saved transcript instead
-        uses transcript_text, which stays lossless), so everything you copy or save
-        is pure ASCII. Map only in Box mode, where every non-ASCII
+        uses transcript_text, which stays lossless), so text leaving in Box mode is
+        pure ASCII. Map only in Box mode, where every non-ASCII
         byte is a placeholder. Show mode also draws a box for no-glyph characters
         (invisible / bidi / control), but there a box may equally be a real U+25A1
         the program printed -- both copy safely as the box itself -- and Show mode is
@@ -1920,18 +1920,39 @@ class SecureTerminal(QPlainTextEdit):
         return self._export_ascii(super().toPlainText())
 
     def transcript_text(self):
-        """The scrollback for SAVING: pure ASCII, and lossless. In Box mode the
-        display collapses every neutralized byte to an inert box, which toPlainText
-        would save as a bare '_' -- losing which codepoint it was. A saved
-        transcript is a record, so in line-mode Box re-render the retained raw
-        output in Detail instead, naming each non-ASCII byte inline
-        (<U+XXXX NAME>): still pure ASCII, but nothing is lost. Reveal/Detail
-        already export their <U+XXXX> badges and Show keeps the glyph the user
-        opted into, so those -- and TUI mode, whose transcript is the rendered
-        grid -- use the on-screen text as-is."""
-        if self._mode == 'box' and not self._tui and self._raw:
-            return render_output(self._raw, 'detail')
-        return self.toPlainText()
+        """The scrollback for SAVING: lossless, and pure ASCII except the real
+        glyphs Show mode keeps. In Box mode the display collapses every neutralized
+        byte to an inert box, which toPlainText saves as a bare '_' -- losing which
+        codepoint it was. A saved transcript is a record, so walk the RENDERED
+        document (line edits, wraps and scrollback already applied -- unlike the
+        capped raw stream) and expand each box to its source codepoint named inline
+        (<U+XXXX NAME>, the Detail rendering). Non-box display passes through
+        unchanged: Reveal/Detail already carry <U+XXXX> badges, and Show keeps the
+        glyph you opted into. Works the same in CLI and TUI (both render a
+        document)."""
+        doc = self.document()
+        out = []
+        block = doc.begin()
+        first = True
+        while block.isValid():
+            if not first:                       # blocks are newline-separated,
+                out.append('\n')                # exactly like toPlainText
+            first = False
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    text = frag.text()
+                    if BOX in text:
+                        cp = frag.charFormat().property(_CP_PROP)
+                        # a neutralized run carries its source codepoint; name it.
+                        # A box without one (should not happen) still exports '_'.
+                        text = (text.replace(BOX, render_output(chr(cp), 'detail'))
+                                if cp is not None else text.replace(BOX, '_'))
+                    out.append(text)
+                it += 1
+            block = block.next()
+        return ''.join(out)
 
     def _selection_text(self):
         """The current selection as it would leave the widget: soft-autowrapped
