@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QKeySequenceEdit,
-    QTextEdit, QFontDialog,
+    QTextEdit, QFontDialog, QGroupBox,
 )
 
 from PyQt6.QtNetwork import QLocalServer
@@ -2888,67 +2888,90 @@ class MainWindow(QMainWindow):
         default for new ones."""
         dialog = QDialog(self)
         dialog.setWindowTitle('Global settings')
-        form = QFormLayout(dialog)
+        outer = QVBoxLayout(dialog)
+        outer.setSpacing(12)
 
+        # Grouped sections instead of one long flat list: each QGroupBox holds a
+        # right-aligned form so related settings read as a unit.
+        def _section(title):
+            box = QGroupBox(title)
+            sub = QFormLayout(box)
+            sub.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+            sub.setContentsMargins(12, 8, 12, 10)
+            sub.setSpacing(8)
+            outer.addWidget(box)
+            return sub
+
+        appearance = _section('Appearance')
         theme = QComboBox()
         for label, key in THEME_LABELS:
             theme.addItem(label, key)
         theme.setCurrentIndex(theme.findData(self._default_theme))
-        form.addRow('Theme', theme)
+        appearance.addRow('Theme', theme)
 
         zoom = QSpinBox()
         zoom.setRange(ZOOM_MIN, ZOOM_MAX)
         zoom.setSingleStep(ZOOM_STEP)
         zoom.setSuffix('%')
         zoom.setValue(self._default_zoom)
-        form.addRow('Zoom', zoom)
-
-        mode = QComboBox()
-        for label, key in (('Box (safe)', 'box'), ('Reveal unicode', 'reveal'),
-                           ('Detail (named)', 'detail'), ('Show unicode', 'show')):
-            mode.addItem(label, key)
-        mode.setCurrentIndex(mode.findData(self._default_mode))
-        form.addRow('Unicode', mode)
-
-        colors = QCheckBox()
-        colors.setChecked(self._default_colors)
-        form.addRow('Colors', colors)
-
-        tui = QCheckBox()
-        tui.setChecked(self._default_tui)
-        tui.setEnabled(tui_available())
-        form.addRow('TUI mode (new tabs)', tui)
-
-        # granular OSC feature toggles: each off by default, its risk in the label
-        # and its layman attack-surface hint as the tooltip.
-        osc_checks = {}
-        _risk_tag = {'low': '', 'medium': '  [medium risk]', 'high': '  [HIGH risk]'}
-        for _key, _label, _codes, _dflt, _risk, _hint in OSC_FEATURES:
-            _cb = QCheckBox()
-            _cb.setChecked(self._osc_defaults.get(_key, False))
-            _cb.setToolTip(_hint)
-            form.addRow('OSC ' + _label + _risk_tag[_risk], _cb)
-            osc_checks[_key] = _cb
-
-        osc = QCheckBox()
-        osc.setChecked(self._osc_notice)
-        form.addRow('Notify on OSC use', osc)
+        appearance.addRow('Zoom', zoom)
 
         scrollback = QComboBox()
         for label, lines in SCROLLBACK_CHOICES:
             scrollback.addItem(label, lines)
         scrollback.setCurrentIndex(scrollback.findData(self._scrollback))
-        form.addRow('Scrollback', scrollback)
+        appearance.addRow('Scrollback', scrollback)
 
+        rendering = _section('Text rendering')
+        mode = QComboBox()
+        for label, key in (('Box (safe)', 'box'), ('Reveal unicode', 'reveal'),
+                           ('Detail (named)', 'detail'), ('Show unicode', 'show')):
+            mode.addItem(label, key)
+        mode.setCurrentIndex(mode.findData(self._default_mode))
+        rendering.addRow('Unicode', mode)
+
+        colors = QCheckBox()
+        colors.setChecked(self._default_colors)
+        rendering.addRow('Colours', colors)
+
+        tui = QCheckBox()
+        tui.setChecked(self._default_tui)
+        tui.setEnabled(tui_available())
+        rendering.addRow('TUI mode (new tabs)', tui)
+
+        # granular OSC feature toggles: each off by default, its risk coloured in
+        # the label and its layman attack-surface hint as the tooltip.
+        osc_section = _section('OSC escape features (all off by default)')
+        osc_checks = {}
+        _risk_html = {
+            'low': '',
+            'medium': ' <span style="color:#b06f00">[medium risk]</span>',
+            'high': ' <span style="color:#d83933">[HIGH risk]</span>',
+        }
+        for _key, _label, _codes, _dflt, _risk, _hint in OSC_FEATURES:
+            _cb = QCheckBox()
+            _cb.setChecked(self._osc_defaults.get(_key, False))
+            _cb.setToolTip(_hint)
+            _lbl = QLabel('OSC ' + _label + _risk_html[_risk])
+            _lbl.setTextFormat(Qt.TextFormat.RichText)
+            _lbl.setToolTip(_hint)
+            osc_section.addRow(_lbl, _cb)
+            osc_checks[_key] = _cb
+
+        osc = QCheckBox()
+        osc.setChecked(self._osc_notice)
+        osc_section.addRow('Notify on OSC use', osc)
+
+        session_box = _section('Paste and session')
         pdelay = QComboBox()
         for label, secs in PASTE_DELAY_CHOICES:
             pdelay.addItem(label, secs)
         pdelay.setCurrentIndex(pdelay.findData(self._paste_delay))
-        form.addRow('Paste delay', pdelay)
+        session_box.addRow('Paste delay', pdelay)
 
         persist = QCheckBox()
         persist.setChecked(self._persist_session)
-        form.addRow('Restore session on start', persist)
+        session_box.addRow('Restore session on start', persist)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -2959,7 +2982,7 @@ class MainWindow(QMainWindow):
         apply_all.clicked.connect(dialog.accept)
         buttons.addWidget(cancel)
         buttons.addWidget(apply_all)
-        form.addRow(buttons)
+        outer.addLayout(buttons)
 
         _select_labels(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
