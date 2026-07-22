@@ -374,7 +374,7 @@ class SecureTerminal(QPlainTextEdit):
 
         # display mode for non-ASCII output, and an incremental UTF-8 decoder so
         # a multi-byte character split across two os.read() chunks still decodes.
-        self._mode = 'box'
+        self._mode = 'detail'
         self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
         # Retain the raw decoded output (line mode) so a display-mode change can
         # re-render the WHOLE buffer, not just new output. Bounded so a flood

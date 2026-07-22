@@ -32,9 +32,10 @@ Description: safe-by-construction terminal for untrusted paste and output
  It is written in a memory-safe language, so the parser handling hostile bytes
  cannot be turned into a memory-corruption exploit.
  .
- Input forwards printable ASCII plus a tiny allowlist of control keys that the
- pseudo-terminal turns into signals: Ctrl+C (SIGINT), Ctrl+Z (SIGTSTP),
- Ctrl+\\ (SIGQUIT) and Ctrl+D (EOF). An opt-in, clearly-flagged TUI mode can run
+ Input is forwarded as bytes, not interpreted: printable ASCII, the control keys a
+ shell's line editor uses (the Ctrl+A-Ctrl+Z range), and the arrow/Home/End/Delete
+ line-edit keys. The pseudo-terminal turns the signal keys into signals: Ctrl+C
+ (SIGINT), Ctrl+Z (SIGTSTP), Ctrl+\\ (SIGQUIT) and Ctrl+D (EOF). An opt-in, clearly-flagged TUI mode can run
  full-screen programs such as ssh, vim, htop or tmux by interpreting escapes
  inside an isolated screen model that still filters every character and cannot
  touch the title or clipboard; the strict line mode remains the

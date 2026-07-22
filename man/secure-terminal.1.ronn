@@ -83,11 +83,11 @@ secure-terminal has two rendering modes, chosen per tab:
     for the shell's completion menus and progress displays.
 
 The unicode `--mode` controls how a non-ASCII byte in output is shown (the top-bar
-label for `box` is "Box"):
+label for `detail` is "Detail"):
 
   * `box`:
-    Replace it with a coloured box, one per character, tinted by risk class (the
-    safe default). A saved transcript maps the box back to a plain ASCII "_".
+    Replace it with a coloured box, one per character, tinted by risk class. A
+    saved transcript maps the box back to a plain ASCII "_".
 
   * `show`:
     Render the glyph when printable, tinted by risk class so a look-alike stands
@@ -99,7 +99,8 @@ label for `box` is "Box"):
     Show a `<U+XXXX>` codepoint badge (hover for its name).
 
   * `detail`:
-    Like reveal but with the codepoint's Unicode name inline, `<U+XXXX NAME>`.
+    Like reveal but with the codepoint's Unicode name inline, `<U+XXXX NAME>`, so
+    a homoglyph reads as its identity rather than a bare number (the safe default).
 
 ## CONFIGURATION
 

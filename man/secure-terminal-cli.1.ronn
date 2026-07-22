@@ -27,12 +27,14 @@ run; if you choose to run something harmful, it runs, exactly as in any terminal
 ## OPTIONS
 
   * `--mode` <MODE>:
-    How to show non-ASCII output. `box` (the safe default) replaces non-ASCII
-    with `_` (the command-line wrapper writes to an outer terminal, so it has no
-    colour to tint the box with); `show` renders legitimate printable glyphs,
-    including homoglyphs that the outer terminal cannot tell from ASCII, while
-    still neutralizing the invisible, bidi and control classes to `_`; `reveal`
-    shows every non-ASCII character as a `<U+XXXX>` badge.
+    How to show non-ASCII output. `detail` (the safe default) names every
+    non-ASCII character inline as `<U+XXXX NAME>`, so a look-alike reads as its
+    identity; `box` replaces non-ASCII with `_` (the command-line wrapper writes
+    to an outer terminal, so it has no colour to tint the box with); `show`
+    renders legitimate printable glyphs, including homoglyphs that the outer
+    terminal cannot tell from ASCII, while still neutralizing the invisible, bidi
+    and control classes to `_`; `reveal` shows every non-ASCII character as a
+    `<U+XXXX>` badge.
 
   * <COMMAND> [<ARGS>...]:
     The command to run. With no command, your login shell is started.

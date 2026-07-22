@@ -1590,7 +1590,7 @@ class MainWindow(QMainWindow):
         <U+XXXX> codepoint is shown (green). Box is safe too -- non-ASCII becomes
         a coloured box, hard to miss (green); lossy, but nothing deceptive."""
         term = self.current()
-        mode = term.current_mode() if term is not None else 'box'
+        mode = term.current_mode() if term is not None else 'detail'
         if mode == 'show':
             return ('#d83933', 'Show',
                     'Display: SHOW (red).\n\n'

@@ -69,7 +69,7 @@ ANSI_PALETTE = [
 ]
 
 # How non-ASCII / unsafe content in program OUTPUT is shown:
-#   'box'    -- replace with a box placeholder (default, safe), as sanitize-string
+#   'box'    -- replace with a box placeholder (safe), as sanitize-string
 #               / stcat do; the GUI draws it as a box glyph, coloured by risk class.
 #   'show'   -- render a non-ASCII character as its glyph when it is printable
 #               (str.isprintable() excludes the invisible, bidi and format
@@ -78,7 +78,7 @@ ANSI_PALETTE = [
 #   'reveal' -- replace with a visible <U+XXXX> codepoint badge, to inspect.
 #   'detail' -- like reveal but verbose: <U+XXXX NAME>, the codepoint plus its
 #               official Unicode name inline (what `unicode-show` annotates), so
-#               a homoglyph reads as its identity, not just a number.
+#               a homoglyph reads as its identity, not just a number (default, safe).
 DISPLAY_MODES = ('box', 'show', 'reveal', 'detail')
 
 # The GUI DISPLAYS a neutralized byte as this box (U+25A1 WHITE SQUARE) instead of
@@ -286,7 +286,7 @@ def too_close(a, b):
     return abs(luminance(a) - luminance(b)) < 30
 
 
-def render_output(text, mode='box'):
+def render_output(text, mode='detail'):
     """Turn decoded child output into safe display text under one display mode.
     Escape sequences are always removed (there is no ANSI parser). Printable
     ASCII, tab and newline, and the two interactive cursor controls backspace
@@ -378,7 +378,7 @@ def wants_clear(text):
     return _CLEAR_SCREEN.search(text) is not None
 
 
-def sanitize_bytes(data, mode='box'):
+def sanitize_bytes(data, mode='detail'):
     """Convenience wrapper: decode raw bytes 1:1 (latin-1) and render. Used by
     tests and any all-ASCII path; the live output stream uses an incremental
     UTF-8 decoder so multi-byte characters survive read boundaries."""

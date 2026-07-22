@@ -88,7 +88,10 @@ The safety model above does not cost you the usual conveniences:
   in the top right (Up/Down keys or type a value). `Ctrl+0` resets to 100%.
 - **Themes.** White-on-black and black-on-white, under **View -> Theme**. Plain,
   high-contrast, no syntax coloring.
-- **Unicode display mode** (top bar, per tab, default **Box**). Box replaces every
+- **Unicode display mode** (top bar, per tab, default **Detail**). Detail names
+  every non-ASCII character inline as `<U+XXXX NAME>` (the codepoint plus its
+  official Unicode name, what `unicode-show` annotates), so a homoglyph reads as its
+  identity rather than a bare number. Box replaces every
   non-ASCII character with a coloured box, one per character, tinted by risk class
   (a bidi override, a zero-width character and a plain foreign letter get different
   colours); safe, lossy, and hard to miss. A saved transcript maps the box back to

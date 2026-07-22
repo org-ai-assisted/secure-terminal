@@ -6,8 +6,8 @@ source of truth for behaviour.
 
 ## Display modes
 
-- Modes: `box` (default), `show`, `reveal`, `detail`. Internal key is `box`
-  (was `strip`; renamed pre-release, no back-compat).
+- Modes: `box`, `show`, `reveal`, `detail` (default). The `box` key was `strip`
+  (renamed pre-release, no back-compat).
 - **Box**: every non-ASCII byte becomes a box glyph, coloured by risk class. A
   saved transcript / copy maps the box back to ASCII `_`.
 - **Show**: a printable non-ASCII glyph is rendered as itself but TINTED by risk
