@@ -109,3 +109,17 @@ source of truth for behaviour.
 - zsh interactive completion (menu-select) is inherently a TUI-class feature
   (cursor-addressed in-place repaint); the shipped `secure-terminal` terminfo
   cancels those caps so line mode degrades to a plain appended list.
+
+## Screenshots (generators already exist - do not hand-roll)
+
+The Pages site's screenshots come from two committed generators; regenerate via
+them rather than painting shots.
+
+- **Review-bar shots** (`shots/paste-warning.png`, `shots/copy-warning.png`):
+  headless Qt grab of the real ReviewBar. Regenerate with dist-ai's
+  `secure-terminal-shots` (drives `paste-warning-shot.py <out.png> [paste|copy]`).
+- **Terminal-comparison shots** (`comparison/shots/*.png`): real Debian terminals
+  under nested labwc, from terminal-poc-corpus `comparison/capture.sh`
+  (`ST_REPO=<checkout>`; needs an X server, so run it in the sandbox).
+
+See also the site's `shots/README.md`.
