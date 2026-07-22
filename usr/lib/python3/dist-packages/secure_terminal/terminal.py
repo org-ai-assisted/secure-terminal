@@ -59,7 +59,7 @@ Even in TUI mode every cell is still character-filtered and pyte only builds a
 screen model, so program output cannot drive it to set the title or touch the
 clipboard the way a real terminal's escape handling can (the programs you run
 still have your normal user access). The window flags TUI mode with a visible
-risk indicator; the strict line mode remains the safe-by-construction default.
+risk indicator; the strict line mode remains the safe-by-design default.
 """
 
 import os
@@ -118,6 +118,7 @@ from secure_terminal.sanitize import (
     sanitize_paste_unicode, sanitize_clipboard, sanitize_clipboard_unicode,
     paste_findings, tui_cell, sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL, BOX,
+    render_output,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     describe_codepoint, marking_class, PROMPT_START,
     split_trailing_escape, feed_chunk_carry, has_bell, OSC_FEATURES,
@@ -1902,8 +1903,9 @@ class SecureTerminal(QPlainTextEdit):
 
     def _export_ascii(self, text):
         """Map the display box (BOX) back to ASCII '_' for any text that LEAVES the
-        widget (copy, save transcript, command hook, session restore), so everything
-        you copy or save is pure ASCII. Map only in Box mode, where every non-ASCII
+        widget (copy, command hook, session restore -- a saved transcript instead
+        uses transcript_text, which stays lossless), so everything you copy or save
+        is pure ASCII. Map only in Box mode, where every non-ASCII
         byte is a placeholder. Show mode also draws a box for no-glyph characters
         (invisible / bidi / control), but there a box may equally be a real U+25A1
         the program printed -- both copy safely as the box itself -- and Show mode is
@@ -1916,6 +1918,20 @@ class SecureTerminal(QPlainTextEdit):
         # (save transcript, _hook_transcript, session cap) yields ASCII, not the
         # display box. Qt's own rendering does not go through this method.
         return self._export_ascii(super().toPlainText())
+
+    def transcript_text(self):
+        """The scrollback for SAVING: pure ASCII, and lossless. In Box mode the
+        display collapses every neutralized byte to an inert box, which toPlainText
+        would save as a bare '_' -- losing which codepoint it was. A saved
+        transcript is a record, so in line-mode Box re-render the retained raw
+        output in Detail instead, naming each non-ASCII byte inline
+        (<U+XXXX NAME>): still pure ASCII, but nothing is lost. Reveal/Detail
+        already export their <U+XXXX> badges and Show keeps the glyph the user
+        opted into, so those -- and TUI mode, whose transcript is the rendered
+        grid -- use the on-screen text as-is."""
+        if self._mode == 'box' and not self._tui and self._raw:
+            return render_output(self._raw, 'detail')
+        return self.toPlainText()
 
     def _selection_text(self):
         """The current selection as it would leave the widget: soft-autowrapped

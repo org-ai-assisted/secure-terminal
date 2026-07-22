@@ -1,6 +1,6 @@
 # secure-terminal
 
-A terminal where paste is safe by construction.
+A terminal where paste is safe by design.
 
 Paste a command copied from the web, or read text a program printed, without
 worrying about invisible characters, bidi overrides or escape sequences.
@@ -94,8 +94,9 @@ The safety model above does not cost you the usual conveniences:
   identity rather than a bare number. Box replaces every
   non-ASCII character with a coloured box, one per character, tinted by risk class
   (a bidi override, a zero-width character and a plain foreign letter get different
-  colours); safe, lossy, and hard to miss. A saved transcript maps the box back to
-  a plain ASCII `_`. Show renders legitimate unicode as glyphs so you can read a
+  colours); safe and hard to miss. The on-screen box is lossy, but a saved
+  transcript names each byte inline (`<U+XXXX NAME>`) so the record is not; a
+  copied box still maps to a plain ASCII `_`. Show renders legitimate unicode as glyphs so you can read a
   log, but still tints each one by risk class -- a homoglyph confusable with ASCII
   wears a louder colour than honest foreign text, and the invisible, bidi and
   control classes (which have no visible glyph) still show as a coloured placeholder.
@@ -160,7 +161,7 @@ completion menu, a progress bar, or a full-screen program on the alternate scree
 What you give up: because the cursor can be positioned, a program can draw a
 *misleading interface* (a fake prompt, say) or overwrite a line you already read,
 so only run programs you trust. This is "restricted-emulator safe," not "safe by
-construction."
+design."
 
 **Security comparison with the default mode.** The line (CLI) mode, and
 everything the project's guarantees rest on, is **unchanged**: it never interprets

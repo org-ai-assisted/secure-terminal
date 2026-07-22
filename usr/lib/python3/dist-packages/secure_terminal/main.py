@@ -45,7 +45,7 @@ TUI_TOOLTIP = (
     'clipboard cannot be touched, and every character is still '
     'ASCII/unicode-filtered, so invisible or homoglyph text cannot hide. But a '
     'program CAN draw a misleading interface within its screen, so only run '
-    'programs you trust. The default CLI mode remains safe by construction.')
+    'programs you trust. The default CLI mode remains safe by design.')
 
 # Plain-language threat model for the OSC controls, shown in the security lamp so
 # a lay user does not over-trust the feature. Safe example only (no destructive
@@ -2059,11 +2059,13 @@ class MainWindow(QMainWindow):
             'Text files (*.txt);;All files (*)')
         if not path:
             return
-        # The buffer is already sanitized plain ASCII, so the saved file is safe
-        # to open anywhere -- unlike a normal terminal's raw log.
+        # transcript_text() is pure ASCII AND lossless (Box mode names each
+        # neutralized byte inline rather than collapsing it to '_'), so the saved
+        # file is safe to open anywhere -- unlike a normal terminal's raw log --
+        # and still records exactly which characters were there.
         try:
             with open(path, 'w', encoding='utf-8') as handle:
-                handle.write(term.toPlainText())
+                handle.write(term.transcript_text())
         except OSError:
             pass            # a failed save (bad path, no space) is not fatal
 
@@ -2785,7 +2787,7 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(title)
         body = QLabel(
-            'A terminal where paste is safe by construction.<br><br>'
+            'A terminal where paste is safe by design.<br><br>'
             'There is no escape parser, so every escape sequence in program '
             'output is removed and a printed or pasted lie cannot redraw, '
             'reorder or hide what you see -- and merely viewing a file cannot run '
@@ -3517,7 +3519,7 @@ def _ctl_main(argv):
 
 # EICAR-style positive control for adversarial security-test harnesses.
 #
-# secure-terminal is secure by construction: nothing on the output path can write
+# secure-terminal is secure by design: nothing on the output path can write
 # to the pty, so an attack payload fed as output can never inject a command. An
 # adversarial corpus test therefore EXPECTS the canary to never fire against us.
 # That creates a dangerous failure mode -- if the harness itself is broken (never

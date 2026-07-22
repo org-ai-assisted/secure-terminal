@@ -2,7 +2,7 @@
 Type=Application
 Name=secure-terminal
 GenericName=Terminal
-Comment=A terminal where paste is safe by construction
+Comment=A terminal where paste is safe by design
 Exec=secure-terminal
 Icon=secure-terminal
 Terminal=false

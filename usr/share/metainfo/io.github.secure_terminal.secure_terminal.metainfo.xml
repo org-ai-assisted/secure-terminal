@@ -9,7 +9,7 @@
   <metadata_license>FSFAP</metadata_license>
   <project_license>AGPL-3.0-or-later</project_license>
   <name>secure-terminal</name>
-  <summary>A terminal where paste is safe by construction</summary>
+  <summary>A terminal where paste is safe by design</summary>
   <description>
     <p>
       secure-terminal is a small terminal for pasting commands into, and reading
@@ -24,7 +24,7 @@
       editor, htop) and the shell's completion menus by interpreting escapes
       inside an isolated screen model that still filters every character and
       cannot touch the window title or system clipboard. The strict line mode
-      remains the safe-by-construction default.
+      remains the safe-by-design default.
     </p>
   </description>
   <launchable type="desktop-id">secure-terminal.desktop</launchable>

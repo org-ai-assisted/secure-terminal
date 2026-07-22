@@ -1,4 +1,4 @@
-secure-terminal(1) -- a terminal where paste is safe by construction
+secure-terminal(1) -- a terminal where paste is safe by design
 ====================================================================
 
 <!--
@@ -86,8 +86,9 @@ The unicode `--mode` controls how a non-ASCII byte in output is shown (the top-b
 label for `detail` is "Detail"):
 
   * `box`:
-    Replace it with a coloured box, one per character, tinted by risk class. A
-    saved transcript maps the box back to a plain ASCII "_".
+    Replace it with a coloured box, one per character, tinted by risk class. On
+    copy the box maps to a plain ASCII "_"; a saved transcript instead names each
+    such byte inline (`<U+XXXX NAME>`), so the record stays lossless.
 
   * `show`:
     Render the glyph when printable, tinted by risk class so a look-alike stands
@@ -147,7 +148,7 @@ onto your input line. secure-terminal removes those escapes so reading untrusted
 output is safe, and sanitizes paste so untrusted text cannot smuggle a hidden
 command into the shell.
 
-The safe-by-construction guarantees rest on the CLI mode: no escape parser,
+The safe-by-design guarantees rest on the CLI mode: no escape parser,
 printable-ASCII-only display, ASCII-sanitized paste, and a memory-safe
 implementation. TUI mode is a deliberate, clearly-indicated, lower-guarantee mode;
 the confined screen model still filters every character, and each OSC feature

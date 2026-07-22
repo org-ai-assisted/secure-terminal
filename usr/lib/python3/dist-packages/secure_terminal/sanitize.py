@@ -210,7 +210,7 @@ def feed_chunk_carry(text, carry, drop, cap=4096):
 
 # --- OSC features -------------------------------------------------------------
 # Every OSC (Operating System Command) capability a program may try. Each is
-# NEUTRALIZED by default (secure by construction) and can be individually enabled
+# NEUTRALIZED by default (secure by design) and can be individually enabled
 # at the user's own risk. This registry is the single source of truth for the
 # config keys, the settings/menu UI, the security lamp and the layman
 # attack-surface hints, so the list never drifts across those places.
