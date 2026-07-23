@@ -23,4 +23,7 @@ coverity:
 ## ncurses-term -- absent from trixie-slim, so tic could not resolve it and the
 ## compile silently fell back to xterm-256color. All on top of python3.
 dist-ai-tests:
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs ncurses-bin ncurses-term"
+  ## vim/htop/nano/tmux back the full-screen-program E2E (start it in TUI mode,
+  ## confirm it renders a frame in the pyte grid, send its quit key, confirm a clean
+  ## exit) -- the widget suite SKIPs a program that is absent, so add them to gate it.
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs ncurses-bin ncurses-term vim htop nano tmux"
