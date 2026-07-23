@@ -50,8 +50,9 @@ Design (see https://secure-terminal.github.io):
 
 This is a deliberately minimal, line-oriented terminal by default: no escape
 parser at all -- every escape sequence in the output is stripped in the renderer
-(safety does not rest on TERM, which is a normal xterm-256color, but on that
-unconditional stripping). An opt-in TUI mode (apply_tui) instead interprets
+(safety does not rest on TERM -- CLI mode advertises the restricted
+`secure-terminal` entry, TUI mode xterm-256color -- but on that unconditional
+stripping). An opt-in TUI mode (apply_tui) instead interprets
 escapes through a pyte screen model so full-screen programs (ssh, vim, htop,
 tmux) work; mode is only a rendering choice over the same byte stream, so it
 switches without restarting the shell and a running program survives the switch.
@@ -218,7 +219,7 @@ def _terminfo_source():
 
 def cli_terminfo_dir():
     """Return a terminfo directory containing the compiled `secure-terminal` entry
-    (for the opt-in custom TERM), compiling the shipped source into the user cache
+    (CLI mode's restricted TERM), compiling the shipped source into the user cache
     on demand when it is not already compiled, or None if it cannot be produced
     (caller then falls back to xterm-256color). Pure lookup + at most one `tic`."""
     src = _terminfo_source()
