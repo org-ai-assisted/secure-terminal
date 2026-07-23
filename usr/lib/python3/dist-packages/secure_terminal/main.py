@@ -584,7 +584,7 @@ class MainWindow(QMainWindow):
         self._update_terminate_enabled()
 
     # -- tabs, each its own shell over its own pseudo-terminal -----------------
-    def _add_tab(self, term):
+    def _add_tab(self, term, activate=True):
         self._tab_ids[term] = self._next_tab_id       # stable id for ctl matching
         self._next_tab_id += 1
         term.zoom_step.connect(self._on_zoom_step)
@@ -608,7 +608,12 @@ class MainWindow(QMainWindow):
         term.paste_review_resolved.connect(
             lambda t=term: self._hide_paste_review(t))
         index = self.tabs.addTab(term, term.cwd_basename() or 'shell')
-        self.tabs.setCurrentIndex(index)
+        # Background-restored session tabs are added WITHOUT switching to them: each
+        # setCurrentIndex would show that tab for an instant, so a multi-tab restore
+        # flashed the view through every tab (and left the LAST one focused). Only
+        # the foreground tab activates; the rest load quietly behind it.
+        if activate:
+            self.tabs.setCurrentIndex(index)
         # auto-colour the new tab so it differs from its neighbour, unless one is
         # already set (a restored or user-chosen colour wins). Advance past a
         # palette colour that matches the adjacent tab's actual colour, so the
@@ -951,13 +956,14 @@ class MainWindow(QMainWindow):
         Any remainder is finished in closeEvent so no tab is dropped from the save."""
         if not self._deferred_restore:
             return
-        self._restore_tab(self._deferred_restore.pop(0))
+        self._restore_tab(self._deferred_restore.pop(0), activate=False)
         if self._deferred_restore:
             QTimer.singleShot(0, self._restore_next_deferred)
 
-    def _restore_tab(self, info):
+    def _restore_tab(self, info, activate=True):
         """Recreate a tab from saved session state: its settings, name, colour
-        and scrollback history, under a fresh shell."""
+        and scrollback history, under a fresh shell. `activate` False adds it as a
+        background tab (a deferred multi-tab restore, so the view does not flash)."""
         history = info.get('text') if isinstance(info.get('text'), str) else ''
         cwd = info.get('cwd')
         mode = info.get('mode')
@@ -1001,7 +1007,7 @@ class MainWindow(QMainWindow):
                         else info.get('bell', self._default_bell))
         term.apply_bell_sound(self._default_bell_sound)
         self._connect_bell_tray(term)
-        index = self._add_tab(term)
+        index = self._add_tab(term, activate=activate)
         name = info.get('name')
         if isinstance(name, str) and name:
             self._user_titles[term] = name
@@ -3402,7 +3408,7 @@ class MainWindow(QMainWindow):
         # re-created is not dropped from the saved session (its log would otherwise
         # be pruned by session.save).
         while self._deferred_restore:
-            self._restore_tab(self._deferred_restore.pop(0))
+            self._restore_tab(self._deferred_restore.pop(0), activate=False)
         running = sum(1 for i in range(self.tabs.count())
                       if self.tabs.widget(i).has_foreground_program())
         if running and not self._confirm_running_close(
