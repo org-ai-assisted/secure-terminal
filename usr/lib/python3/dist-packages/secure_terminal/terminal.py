@@ -718,7 +718,9 @@ class SecureTerminal(QPlainTextEdit):
         re-export cannot reach the shell -- sending it would type `export TERM=...`
         into that program. So the switch is REFUSED with a clear message. Returns
         True if the mode changed (or was already set), False if it was refused."""
-        enabled = bool(enabled) and tui_available()
+        if bool(enabled) and not tui_available():
+            return False              # TUI requested but pyte missing: not applied
+        enabled = bool(enabled)
         if enabled == self._tui:
             return True
         if not self._preview and self._pid is not None and self.has_foreground_program():
@@ -733,9 +735,12 @@ class SecureTerminal(QPlainTextEdit):
         self._esc_carry = ''
         self._esc_drop = ''
         self._osc_carry = b''
-        # re-advertise the mode's terminfo to the running shell (no restart); guarded
-        # above so this only ever goes to a shell at a prompt, never to a program.
-        if not self._preview and self._pid is not None:
+        # re-advertise the mode's terminfo to the running shell (no restart). ONLY
+        # for the default login shell (self._command is None): a tab launched with
+        # `-- PROGRAM` runs that program as _pid, which has_foreground_program cannot
+        # tell apart from a bare shell, so injecting `export TERM=...` would type it
+        # into that program. Skipping keeps the switch a rendering-only change there.
+        if not self._preview and self._pid is not None and self._command is None:
             self._reexport_term()
         self._sync_display()
         return True

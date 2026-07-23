@@ -1547,8 +1547,14 @@ class MainWindow(QMainWindow):
                 # refused -- a program is running, so the shell's terminfo cannot be
                 # switched under it (apply_tui already advised why). Revert the
                 # toggle to the mode still in effect and do NOT change the default.
+                # Block signals across the revert: setChecked would otherwise emit
+                # `toggled` and re-enter set_tui(actual), whose success path persists
+                # `actual` as the global _default_tui -- exactly the change we are
+                # refusing (visible when this tab's mode differs from the default).
                 actual = term.current_tui()
+                _blocked = self.act_tui.blockSignals(True)
                 self.act_tui.setChecked(actual)
+                self.act_tui.blockSignals(_blocked)
                 self._set_chip(self._tui_buttons, 'tui' if actual else 'cli')
                 self._update_tui_indicator()
                 return
@@ -2984,7 +2990,8 @@ class MainWindow(QMainWindow):
         zoom.setSuffix('%')
         zoom.setValue(self._default_zoom)
         _tip_row(appearance, 'Zoom', zoom,
-                 'Default text size for new tabs, as a percent of the base font.')
+                 'Text size as a percent of the base font. Applies to every open '
+                 'tab and to new ones.')
 
         scrollback = QComboBox()
         for label, lines in SCROLLBACK_CHOICES:
