@@ -2951,25 +2951,41 @@ class MainWindow(QMainWindow):
             outer.addWidget(box)
             return sub
 
+        # Every settings row carries an explanation. A trailing "(i)" marker (and a
+        # help cursor) makes it VISIBLE that hovering shows one; the tip is set on
+        # BOTH the label and the field, and the app-wide InfoTip filter renders it
+        # as selectable/copyable text (not a plain QToolTip).
+        def _tip_row(form, label_text, widget, tip):
+            lbl = QLabel('%s <span style="color:#5b9bd5">(i)</span>' % label_text)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setToolTip(tip)
+            lbl.setCursor(Qt.CursorShape.WhatsThisCursor)
+            widget.setToolTip(tip)
+            form.addRow(lbl, widget)
+
         appearance = _section('Appearance')
         theme = QComboBox()
         for label, key in THEME_LABELS:
             theme.addItem(label, key)
         theme.setCurrentIndex(theme.findData(self._default_theme))
-        appearance.addRow('Theme', theme)
+        _tip_row(appearance, 'Theme', theme,
+                 'Colour theme for the terminal background and text. Applies to '
+                 'every open tab and to new ones.')
 
         zoom = QSpinBox()
         zoom.setRange(ZOOM_MIN, ZOOM_MAX)
         zoom.setSingleStep(ZOOM_STEP)
         zoom.setSuffix('%')
         zoom.setValue(self._default_zoom)
-        appearance.addRow('Zoom', zoom)
+        _tip_row(appearance, 'Zoom', zoom,
+                 'Default text size for new tabs, as a percent of the base font.')
 
         scrollback = QComboBox()
         for label, lines in SCROLLBACK_CHOICES:
             scrollback.addItem(label, lines)
         scrollback.setCurrentIndex(scrollback.findData(self._scrollback))
-        appearance.addRow('Scrollback', scrollback)
+        _tip_row(appearance, 'Scrollback', scrollback,
+                 'How many lines of past output each tab keeps for scrolling back.')
 
         rendering = _section('Text rendering')
         mode = QComboBox()
@@ -2977,16 +2993,23 @@ class MainWindow(QMainWindow):
                            ('Detail (named)', 'detail'), ('Show unicode', 'show')):
             mode.addItem(label, key)
         mode.setCurrentIndex(mode.findData(self._default_mode))
-        rendering.addRow('Unicode', mode)
+        _tip_row(rendering, 'Unicode', mode,
+                 'How non-ASCII characters are shown: Box (a safe placeholder), '
+                 'Reveal (the codepoint), Detail (the named codepoint), or Show '
+                 '(the real glyph, tinted by risk class).')
 
         colors = QCheckBox()
         colors.setChecked(self._default_colors)
-        rendering.addRow('Colours', colors)
+        _tip_row(rendering, 'Colours', colors,
+                 "Honour a program's ANSI colour escapes. Off shows plain text; "
+                 'risk-class markings still apply either way.')
 
         tui = QCheckBox()
         tui.setChecked(self._default_tui)
         tui.setEnabled(tui_available())
-        rendering.addRow('TUI mode (new tabs)', tui)
+        _tip_row(rendering, 'TUI mode (new tabs)', tui,
+                 'Start new tabs in TUI mode (for full-screen programs like vim or '
+                 'htop) instead of the safe line mode. Needs python3-pyte.')
 
         # granular OSC feature toggles: each off by default, its risk coloured in
         # the label and its layman attack-surface hint as the tooltip.
@@ -3001,15 +3024,19 @@ class MainWindow(QMainWindow):
             _cb = QCheckBox()
             _cb.setChecked(self._osc_defaults.get(_key, False))
             _cb.setToolTip(_hint)
-            _lbl = QLabel('OSC ' + _label + _risk_html[_risk])
+            _lbl = QLabel('OSC ' + _label + _risk_html[_risk]
+                          + ' <span style="color:#5b9bd5">(i)</span>')
             _lbl.setTextFormat(Qt.TextFormat.RichText)
             _lbl.setToolTip(_hint)
+            _lbl.setCursor(Qt.CursorShape.WhatsThisCursor)
             osc_section.addRow(_lbl, _cb)
             osc_checks[_key] = _cb
 
         osc = QCheckBox()
         osc.setChecked(self._osc_notice)
-        osc_section.addRow('Notify on OSC use', osc)
+        _tip_row(osc_section, 'Notify on OSC use', osc,
+                 'Show a one-time notice when a program uses an OSC escape you '
+                 'have not enabled, so a silent attempt does not go unseen.')
 
         session_box = _section('Paste and session')
         pdelay = QComboBox()
@@ -3025,11 +3052,15 @@ class MainWindow(QMainWindow):
                            self._paste_delay)
             pidx = pdelay.count() - 1
         pdelay.setCurrentIndex(pidx)
-        session_box.addRow('Paste delay', pdelay)
+        _tip_row(session_box, 'Paste delay', pdelay,
+                 'How long a pasted multi-line block is held for review before it '
+                 'can run, so a hidden command cannot execute the instant you paste.')
 
         persist = QCheckBox()
         persist.setChecked(self._persist_session)
-        session_box.addRow('Restore session on start', persist)
+        _tip_row(session_box, 'Restore session on start', persist,
+                 "Reopen the previous session's tabs and their scrollback (and "
+                 'window size) when secure-terminal starts.')
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
