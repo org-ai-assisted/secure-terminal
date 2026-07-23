@@ -285,6 +285,26 @@ class InfoTip(QLabel):
         super().keyPressEvent(event)
 
 
+class _InfoLabel(QLabel):
+    """A settings-row label whose trailing "(i)" marker is a real CLICK target:
+    a click shows the persistent, copyable InfoTip at once -- reliable and
+    re-openable, unlike a hover tooltip that only fires on a fresh mouse-rest (so
+    re-hovering the same spot does nothing). Hover still works (the tooltip is set
+    too); the pointing-hand cursor advertises that the marker is clickable."""
+
+    def __init__(self, html, tip, window):
+        super().__init__(html)
+        self._tip_text = tip
+        self._window = window
+        self.setTextFormat(Qt.TextFormat.RichText)
+        self.setToolTip(tip)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        self._window.show_info_tip(self, self._tip_text)
+        super().mousePressEvent(event)
+
+
 class _ToolTipFilter(QObject):
     """Application event filter that renders every tooltip as an interactive,
     zoom-aware InfoTip instead of the plain QToolTip."""
@@ -551,6 +571,7 @@ class MainWindow(QMainWindow):
         # Tabs still awaiting a deferred session restore (see below). Completed
         # before the session is saved on quit, so no tab is ever dropped.
         self._deferred_restore = []
+        self._pending_restore = {}       # placeholder widget -> saved tab info
         # Launch-CLI tabs take precedence over a restored session: opening
         # `secure-terminal --title x -- htop` should give you exactly that.
         if launch is not None and launch.tabs:
@@ -558,25 +579,27 @@ class MainWindow(QMainWindow):
                 self._open_launch_tab(spec)
         else:
             # Restore the previous session. Rendering a large scrollback is the
-            # dominant startup cost, so restore only the FIRST tab synchronously
-            # (the window opens with content); defer the rest to one-per-event-loop-
-            # turn AFTER the window is shown, so a big multi-tab session no longer
-            # blocks the first paint for seconds.
+            # dominant startup cost, so draw the whole tab BAR up front (cheap
+            # placeholder pages) and fill CONTENT in lazily: the active tab's shell
+            # + scrollback now (the window opens usable), the rest one per event-loop
+            # turn AFTER the window is shown. The bar no longer grows one tab at a
+            # time and the first paint is never blocked by a big multi-tab session.
             restored = [i for i in (session.load() if self._persist_session else [])
                         if isinstance(i, dict)]
-            # Restore the tab that was focused last time FIRST, so it -- not tab 0 --
-            # is the one shown the instant the window opens (no first-tab flash). The
-            # rest are inserted at their saved positions AROUND it in the background,
-            # one per event-loop turn, so a big multi-tab session does not block the
-            # first paint and the active tab stays current throughout.
+            # The tab focused last time is restored FIRST (real content), so it -- not
+            # tab 0 -- is what shows the instant the window opens (no first-tab flash);
+            # it stays current as the placeholders around it swap in their real shells.
             active = session.load_active() if self._persist_session else None
             if not (isinstance(active, int) and 0 <= active < len(restored)):
                 active = 0
             self._deferred_restore = []
             if restored:
-                self._restore_tab(restored[active], activate=True)
-                self._deferred_restore = [(i, restored[i]) for i in range(len(restored))
-                                          if i != active]
+                for _i, _info in enumerate(restored):
+                    if _i == active:
+                        self._restore_tab(_info, activate=True, at=_i)
+                    else:
+                        self._deferred_restore.append(
+                            self._add_placeholder_tab(_info, at=_i))
             if self._deferred_restore:
                 QTimer.singleShot(0, self._restore_next_deferred)
         if self.tabs.count() == 0:
@@ -967,16 +990,50 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         return {'ok': True, 'opened': opened}
 
+    def _add_placeholder_tab(self, info, at):
+        """Insert a lightweight placeholder page for a not-yet-restored session tab,
+        carrying its saved label, so the whole tab bar is drawn at once instead of
+        growing one tab at a time. _swap_placeholder replaces it with the real shell
+        + scrollback lazily. A bare QWidget (no pty, no signals) holds the position
+        and renders instantly."""
+        ph = QWidget()
+        self._pending_restore[ph] = info
+        label = info.get('title') or 'shell'
+        self.tabs.insertTab(min(at, self.tabs.count()), ph, label)
+        self._renumber_tabs()
+        return ph
+
+    def _swap_placeholder(self, ph):
+        """Replace a restore placeholder with its real tab (shell + scrollback) at
+        the same bar position, keeping the active tab current and unflashed. Removing
+        or inserting a tab BELOW the active one shifts the current INDEX (the active
+        widget is unchanged), which would emit a spurious currentChanged and flash the
+        view -- so block the tab signals across the swap and restore the current tab."""
+        info = self._pending_restore.pop(ph, None)
+        idx = self.tabs.indexOf(ph)
+        if info is None or idx < 0:
+            return
+        current = self.tabs.currentWidget()
+        blocked = self.tabs.blockSignals(True)
+        try:
+            self.tabs.removeTab(idx)
+            ph.deleteLater()
+            self._restore_tab(info, activate=False, at=idx)
+            if current is not None:
+                ci = self.tabs.indexOf(current)
+                if ci >= 0:
+                    self.tabs.setCurrentIndex(ci)
+        finally:
+            self.tabs.blockSignals(blocked)
+
     def _restore_next_deferred(self):
-        """Restore one more deferred session tab, then yield to the event loop
-        before the next -- so a large session's tabs and scrollback render
-        progressively after the window is already up, not before the first paint.
+        """Swap one more placeholder for its real tab, then yield to the event loop
+        before the next -- so a large session's shells and scrollback fill in
+        progressively behind the already-drawn bar, never before the first paint.
         Any remainder is finished in closeEvent so no tab is dropped from the save."""
         if not self._deferred_restore:
             return
-        idx, info = self._deferred_restore.pop(0)
-        # insert at the saved position (clamped); the active tab stays current.
-        self._restore_tab(info, activate=False, at=idx)
+        self._swap_placeholder(self._deferred_restore.pop(0))
         if self._deferred_restore:
             QTimer.singleShot(0, self._restore_next_deferred)
 
@@ -1140,8 +1197,8 @@ class MainWindow(QMainWindow):
 
     def hide_find(self):
         self._find_bar.setVisible(False)
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).setExtraSelections([])
+        for t in self._real_terms():
+            t.setExtraSelections([])
         term = self.current()
         if term is not None:
             term.reset_caret()
@@ -1200,8 +1257,8 @@ class MainWindow(QMainWindow):
         total = 0
         if all_tabs:
             tabs_hit = 0
-            for i in range(self.tabs.count()):
-                n = self._highlight_matches(self.tabs.widget(i), query, flags)
+            for t in self._real_terms():
+                n = self._highlight_matches(t, query, flags)
                 total += n
                 tabs_hit += 1 if n else 0
             if query:
@@ -1212,9 +1269,9 @@ class MainWindow(QMainWindow):
             else:
                 self._find_bar.count.setText('')
         else:
-            for i in range(self.tabs.count()):
-                if self.tabs.widget(i) is not term:
-                    self.tabs.widget(i).setExtraSelections([])
+            for t in self._real_terms():
+                if t is not term:
+                    t.setExtraSelections([])
             total = self._highlight_matches(term, query, flags)
             if not query:
                 self._find_bar.count.setText('')
@@ -1350,6 +1407,21 @@ class MainWindow(QMainWindow):
     def current(self):
         return self.tabs.currentWidget()
 
+    def _real_terms(self):
+        """The fully-restored terminal tabs, skipping any restore placeholder still
+        awaiting its shell -- so a bulk operation over all tabs never calls a
+        SecureTerminal method on a placeholder (a bare QWidget)."""
+        return [w for i in range(self.tabs.count())
+                if isinstance((w := self.tabs.widget(i)), SecureTerminal)]
+
+    def show_info_tip(self, anchor, text):
+        """Show the shared copyable InfoTip for a settings row on demand (a click on
+        its "(i)" marker), anchored just under the label -- reliable and re-openable
+        without waiting on a hover delay."""
+        self._tip_filter._tip.show_for(
+            anchor, text, anchor.mapToGlobal(QPoint(0, anchor.height())),
+            self.current_zoom_percent())
+
     def current_zoom_percent(self):
         """The active tab's zoom (percent), so tooltip text scales with it. Falls
         back to the window default when there is no tab yet."""
@@ -1384,8 +1456,8 @@ class MainWindow(QMainWindow):
     # -- keep the toolbar/menu showing the CURRENT tab's theme and zoom -------
     def _sync_chrome_to_tab(self, *_args):
         term = self.current()
-        if term is None:
-            return
+        if not isinstance(term, SecureTerminal):
+            return                          # a restore placeholder is transiently current
         self._refresh_banner()          # the banner follows the current tab
         self.zoom_box.blockSignals(True)
         self.zoom_box.setValue(term.current_zoom())
@@ -1806,8 +1878,8 @@ class MainWindow(QMainWindow):
             return
         self._osc_clipboard_read_always = bool(on)
         self.act_clip_read_always.setChecked(bool(on))
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).set_clipboard_read_always(bool(on))
+        for t in self._real_terms():
+            t.set_clipboard_read_always(bool(on))
         self._persist()
 
     def set_osc(self, key, enabled):
@@ -1864,8 +1936,8 @@ class MainWindow(QMainWindow):
         if self._bell_sound_locked():
             return
         self._default_bell_sound = path if sound_file_allowed(path) else ''
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).apply_bell_sound(self._default_bell_sound)
+        for t in self._real_terms():
+            t.apply_bell_sound(self._default_bell_sound)
         if hasattr(self, 'act_bell_sound'):
             self.act_bell_sound.setText(self._bell_sound_label())
         self._persist()
@@ -2100,14 +2172,14 @@ class MainWindow(QMainWindow):
 
     def set_scrollback(self, lines):
         self._scrollback = int(lines)
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).apply_scrollback(lines)
+        for t in self._real_terms():
+            t.apply_scrollback(lines)
         self._persist()
 
     def set_paste_delay(self, seconds):
         self._paste_delay = int(seconds)
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).apply_paste_delay(seconds)
+        for t in self._real_terms():
+            t.apply_paste_delay(seconds)
         self._persist()
 
     def set_paste_warn(self, mode):
@@ -2116,8 +2188,8 @@ class MainWindow(QMainWindow):
         if mode not in ('always', 'unicode', 'never') or 'paste_warn' in self._locked:
             return
         self._paste_warn = mode
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).apply_paste_warn(mode)
+        for t in self._real_terms():
+            t.apply_paste_warn(mode)
         if hasattr(self, '_paste_warn_actions'):
             act = self._paste_warn_actions.get(mode)
             if act is not None and not act.isChecked():
@@ -2131,8 +2203,8 @@ class MainWindow(QMainWindow):
         if mode not in ('always', 'unicode', 'never') or 'copy_warn' in self._locked:
             return
         self._copy_warn = mode
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).apply_copy_warn(mode)
+        for t in self._real_terms():
+            t.apply_copy_warn(mode)
         if hasattr(self, '_copy_warn_actions'):
             act = self._copy_warn_actions.get(mode)
             if act is not None and not act.isChecked():
@@ -2983,15 +3055,13 @@ class MainWindow(QMainWindow):
             outer.addWidget(box)
             return sub
 
-        # Every settings row carries an explanation. A trailing "(i)" marker (and a
-        # help cursor) makes it VISIBLE that hovering shows one; the tip is set on
-        # BOTH the label and the field, and the app-wide InfoTip filter renders it
-        # as selectable/copyable text (not a plain QToolTip).
+        # Every settings row carries an explanation. A trailing "(i)" marker makes
+        # it VISIBLE that help is there; the marker is a click target (reliable and
+        # re-openable) that shows the selectable/copyable InfoTip, and the tip is set
+        # on BOTH the label and the field so a plain hover surfaces it too.
         def _tip_row(form, label_text, widget, tip):
-            lbl = QLabel('%s <span style="color:#5b9bd5">(i)</span>' % label_text)
-            lbl.setTextFormat(Qt.TextFormat.RichText)
-            lbl.setToolTip(tip)
-            lbl.setCursor(Qt.CursorShape.WhatsThisCursor)
+            lbl = _InfoLabel(
+                '%s <span style="color:#5b9bd5">(i)</span>' % label_text, tip, self)
             widget.setToolTip(tip)
             form.addRow(lbl, widget)
 
@@ -3057,11 +3127,9 @@ class MainWindow(QMainWindow):
             _cb = QCheckBox()
             _cb.setChecked(self._osc_defaults.get(_key, False))
             _cb.setToolTip(_hint)
-            _lbl = QLabel('OSC ' + _label + _risk_html[_risk]
-                          + ' <span style="color:#5b9bd5">(i)</span>')
-            _lbl.setTextFormat(Qt.TextFormat.RichText)
-            _lbl.setToolTip(_hint)
-            _lbl.setCursor(Qt.CursorShape.WhatsThisCursor)
+            _lbl = _InfoLabel(
+                'OSC ' + _label + _risk_html[_risk]
+                + ' <span style="color:#5b9bd5">(i)</span>', _hint, self)
             osc_section.addRow(_lbl, _cb)
             osc_checks[_key] = _cb
 
@@ -3435,8 +3503,7 @@ class MainWindow(QMainWindow):
         # re-created is not dropped from the saved session (its log would otherwise
         # be pruned by session.save).
         while self._deferred_restore:
-            _idx, _info = self._deferred_restore.pop(0)
-            self._restore_tab(_info, activate=False, at=_idx)
+            self._swap_placeholder(self._deferred_restore.pop(0))
         running = sum(1 for i in range(self.tabs.count())
                       if self.tabs.widget(i).has_foreground_program())
         if running and not self._confirm_running_close(
