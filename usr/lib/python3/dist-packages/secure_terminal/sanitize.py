@@ -362,6 +362,23 @@ def wants_screen_repaint(text):
     return _NEEDS_SCREEN_REPAINT.search(text) is not None
 
 
+# A curses program under the RESTRICTED CLI terminfo cannot address the cursor or
+# use the alternate screen (cup/cuu/smcup are cancelled), so it cannot emit the
+# motion wants_screen_repaint looks for. It falls back to erasing each line with EL
+# and reprinting -- nano clears the screen with a burst of them. A shell prompt
+# uses at most one or two EL, so a burst is the tell that a full-screen app is
+# running which line mode cannot lay out.
+_EL_RE = re.compile(r'\x1b\[[012]?K')
+
+
+def wants_line_clears(text, threshold=4):
+    """True when `text` erases many lines (EL) at once -- the signature of a curses
+    app redrawing under a terminal that cannot address the cursor (so the
+    cursor-motion test in wants_screen_repaint misses it, e.g. nano under the
+    restricted CLI entry). The threshold keeps a shell's one/two-EL prompt out."""
+    return len(_EL_RE.findall(text)) >= threshold
+
+
 # A whole-screen clear or a full terminal reset: erase-display of the ENTIRE
 # screen (ED2) or the scrollback (ED3), or RIS (ESC c). Line mode is append-only
 # and tamper-evident -- nothing may erase what was already shown -- so it drops

@@ -121,6 +121,7 @@ from secure_terminal.sanitize import (
     feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL, BOX,
     render_output,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
+    wants_line_clears,
     describe_codepoint, marking_class, PROMPT_START,
     split_trailing_escape, feed_chunk_carry, has_bell, OSC_FEATURES,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
@@ -723,7 +724,12 @@ class SecureTerminal(QPlainTextEdit):
         enabled = bool(enabled)
         if enabled == self._tui:
             return True
-        if not self._preview and self._pid is not None and self.has_foreground_program():
+        # Refuse only for the default login shell running a foreground child: the
+        # re-export below would type `export TERM=...` into that child. A `-- PROGRAM`
+        # tab (self._command set) skips the re-export entirely, so its switch is a
+        # safe rendering-only change even though has_foreground_program() is True.
+        if (not self._preview and self._pid is not None
+                and self._command is None and self.has_foreground_program()):
             self._advise('Switch between CLI and TUI mode at a shell prompt: a '
                          'program is running now and owns the terminal, so its '
                          'terminfo cannot be changed under it. Quit the program '
@@ -1561,7 +1567,9 @@ class SecureTerminal(QPlainTextEdit):
         # leaves garbage. Point the user at TUI mode once per such program. The
         # repaint case (zsh/readline menu-select especially) uses no alternate
         # screen, so wants_full_screen alone misses it.
-        if not self._tui_hint_shown and (entered or wants_screen_repaint(text)):
+        if not self._tui_hint_shown and (
+                entered or wants_screen_repaint(text)
+                or (wants_line_clears(text) and self.has_foreground_program())):
             self._tui_hint_shown = True
             self._advise('This program is drawing in place -- a full-screen '
                          'interface, or a completion menu or progress display that '
@@ -2191,17 +2199,20 @@ class SecureTerminal(QPlainTextEdit):
             return ''
 
     def has_foreground_program(self):
-        """True when a program other than the shell holds the foreground, i.e.
-        there is something for Terminate to act on."""
+        """True when a program holds the foreground, i.e. there is something for
+        Terminate to act on. The direct child (_pid) in the foreground means the
+        shell is at its bare prompt for a LOGIN-shell tab (nothing to terminate) --
+        but for a `-- PROGRAM` tab _pid IS that program (nano, htop), so it is
+        exactly the foreground program to terminate."""
         pgrp = self._foreground_pgrp()
         if pgrp is None:
             return False
         try:
-            shell_pgrp = os.getpgid(self._pid) if self._pid is not None else None
+            child_pgrp = os.getpgid(self._pid) if self._pid is not None else None
         except ProcessLookupError:
-            return False                  # shell already gone (auto-reaped)
-        if shell_pgrp is not None and pgrp == shell_pgrp:
-            return False
+            return False                  # child already gone (auto-reaped)
+        if child_pgrp is not None and pgrp == child_pgrp:
+            return self._command is not None   # a launched program, not a shell prompt
         return True
 
     def terminate_foreground(self):
@@ -2213,8 +2224,15 @@ class SecureTerminal(QPlainTextEdit):
         pgrp = self._foreground_pgrp()
         if pgrp is None:
             return False
-        # Only the shell is running (nothing to terminate).
-        if self._pid is not None and pgrp == os.getpgid(self._pid):
+        # Never signal our OWN process group: the panic button must not kill
+        # secure-terminal itself. A child always runs in its own pty session, so a
+        # match here means the foreground pgrp was misresolved -- refuse it.
+        if pgrp == os.getpgrp():
+            return False
+        # The direct child is in the foreground: a bare LOGIN-shell prompt (nothing
+        # to terminate), but for a `-- PROGRAM` tab that child IS the program to kill.
+        if (self._pid is not None and pgrp == os.getpgid(self._pid)
+                and self._command is None):
             return False
         try:
             os.killpg(pgrp, signal.SIGTERM)
