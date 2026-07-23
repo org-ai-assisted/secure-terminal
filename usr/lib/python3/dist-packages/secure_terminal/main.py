@@ -1532,7 +1532,15 @@ class MainWindow(QMainWindow):
             return                        # admin-locked; not user-changeable
         term = self.current()
         if term is not None:
-            term.apply_tui(enabled)
+            if not term.apply_tui(enabled):
+                # refused -- a program is running, so the shell's terminfo cannot be
+                # switched under it (apply_tui already advised why). Revert the
+                # toggle to the mode still in effect and do NOT change the default.
+                actual = term.current_tui()
+                self.act_tui.setChecked(actual)
+                self._set_chip(self._tui_buttons, 'tui' if actual else 'cli')
+                self._update_tui_indicator()
+                return
             if enabled:
                 # Turning TUI on answers a "this program needs a full-screen
                 # interface -- turn on TUI mode" advisory, so that hint is no longer

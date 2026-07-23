@@ -703,26 +703,48 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- TUI mode -------------------------------------------------------------
     def apply_tui(self, enabled):
-        """Turn TUI mode on/off without restarting the shell. Mode is only a
-        rendering choice over the same byte stream, so a running program (htop,
-        an ssh session) keeps running across the switch. A no-op when unchanged or
-        pyte is missing.
+        """Switch between CLI (line) and TUI (grid) mode. The rendering changes over
+        the SAME running shell -- history is kept, nothing restarts. In addition,
+        when the shell is at a prompt its TERM is re-exported to match the new mode
+        (CLI -> restricted `secure-terminal`, so a program lists completions instead
+        of drawing an in-place menu line mode cannot show; TUI -> xterm-256color, so
+        full-screen programs work). The shell re-reads terminfo live, so no restart
+        and no lost shell state.
 
-        Enabling TUI does NOT blank the scrolling history: the fixed pyte grid
-        only takes over the screen while a full-screen program is actually on the
-        alternate screen (_grid_mode). With just a shell, TUI stays in line
-        display with the scrollback intact, so toggling CLI<->TUI back and forth
-        never loses history."""
+        If a program (or a nested shell) is running it OWNS the terminal, so the
+        re-export cannot reach the shell -- sending it would type `export TERM=...`
+        into that program. So the switch is REFUSED with a clear message. Returns
+        True if the mode changed (or was already set), False if it was refused."""
         enabled = bool(enabled) and tui_available()
         if enabled == self._tui:
-            return
+            return True
+        if not self._preview and self._pid is not None and self.has_foreground_program():
+            self._advise('Switch between CLI and TUI mode at a shell prompt: a '
+                         'program is running now and owns the terminal, so its '
+                         'terminfo cannot be changed under it. Quit the program '
+                         'first, or open a new tab in the other mode.')
+            return False
         self._tui = enabled
         # switching modes abandons any half-parsed CLI escape state; a stale carry
         # or discard would corrupt the first bytes rendered after switching back.
         self._esc_carry = ''
         self._esc_drop = ''
         self._osc_carry = b''
+        # re-advertise the mode's terminfo to the running shell (no restart); guarded
+        # above so this only ever goes to a shell at a prompt, never to a program.
+        if not self._preview and self._pid is not None:
+            self._reexport_term()
         self._sync_display()
+        return True
+
+    def _reexport_term(self):
+        """Tell the running shell to re-export TERM for the current mode, so it and
+        the programs it launches advertise what the mode can render -- without a
+        restart (the shell re-reads terminfo live). Sent as a plain, VISIBLE command
+        so the switch is transparent: you see exactly the `export TERM=...` that
+        reconfigured the shell, rather than a hidden change."""
+        term, _ = self._child_term()
+        self._write(('export TERM=%s\n' % term).encode())
 
     def _grid_mode(self):
         """True whenever TUI mode is on: the pyte grid owns the screen (with its
@@ -1304,18 +1326,24 @@ class SecureTerminal(QPlainTextEdit):
         super().wheelEvent(event)
 
     def _child_term(self):
-        """Decide the child's TERM and terminfo dir BEFORE the fork (so no tic runs
-        in the post-fork child). Default xterm-256color -- a capable, universal
-        entry so TUI mode's full-screen programs and ssh work, and safety does not
-        rest on TERM (line mode strips every escape in the renderer regardless).
-        With the opt-in cli_terminfo flag, advertise the restricted `secure-terminal`
-        entry so CLI-mode programs emit only what we render and never probe -- but
-        only if it resolves (else fall back, e.g. a checkout with no tic)."""
-        if self._cli_terminfo:
-            tdir = cli_terminfo_dir()
-            if tdir:
-                return 'secure-terminal', tdir
-        return 'xterm-256color', None
+        """The child's TERM and terminfo dir for the CURRENT mode, decided BEFORE
+        the fork (so no tic runs in the post-fork child). The shell is told, over
+        the normal terminfo protocol, exactly what the mode can show:
+
+        - CLI mode -> the restricted `secure-terminal` entry: no cursor addressing,
+          no alternate screen. A program then LISTS completions plainly and never
+          draws an in-place menu or full screen that line mode would strip into
+          garbage. Falls back to xterm-256color if the entry does not resolve.
+        - TUI mode -> xterm-256color, so full-screen programs (and ssh) work.
+
+        The terminfo DIR is returned in BOTH modes (so TERMINFO_DIRS always resolves
+        both entries), which lets a mode switch re-export TERM into the running shell
+        without a restart (see apply_tui). Safety never rests on TERM -- line mode
+        strips every escape regardless."""
+        tdir = cli_terminfo_dir()
+        if not self._tui and tdir:
+            return 'secure-terminal', tdir
+        return 'xterm-256color', tdir
 
     # -- child process over a pseudo-terminal ---------------------------------
     def _start(self, command):
