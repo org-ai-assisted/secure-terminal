@@ -420,11 +420,6 @@ class MainWindow(QMainWindow):
         self._copy_warn = cfg.get('copy_warn') \
             if cfg.get('copy_warn') in ('always', 'unicode', 'never') else 'unicode'
         self._default_tui = cfg.get('tui') == 'true'
-        # opt-in: advertise the restricted `secure-terminal` terminfo (CLI-mode)
-        # instead of xterm-256color for new tabs. Off by default (xterm-256color
-        # keeps ssh + TUI working); TERM is fixed at shell start, so this applies
-        # to NEW tabs only.
-        self._default_cli_terminfo = cfg.get('cli_terminfo') == 'true'
         self._default_allow_title = cfg.get('allow_title') == 'true'
         # granular per-OSC-feature defaults (each off = neutralized).
         self._osc_defaults = {}
@@ -730,8 +725,7 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentIndex(index)
 
     def new_tab(self, command=None):
-        term = SecureTerminal(tui=self._default_tui, command=command or None,
-                              cli_terminfo=self._default_cli_terminfo)
+        term = SecureTerminal(tui=self._default_tui, command=command or None)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(self._default_font_family)
@@ -756,18 +750,16 @@ class MainWindow(QMainWindow):
 
     def _open_launch_tab(self, spec):
         """Open a tab from a parsed launch spec. Besides --title/--tui/--mode/command,
-        a tab may override the window defaults for colours, cli-terminfo, bell and
-        individual OSC features. Admin locks still win: a locked setting is NEVER
-        overridable from the command line."""
+        a tab may override the window defaults for colours, bell and individual OSC
+        features. Admin locks still win: a locked setting is NEVER overridable from
+        the command line."""
         def _tab(key, default):
             val = spec.get(key)
             return default if val is None or key in self._locked else val
 
         tui = self._default_tui if (spec.get('tui') is None
                                     or 'tui' in self._locked) else spec['tui']
-        cli_terminfo = _tab('cli_terminfo', self._default_cli_terminfo)
-        term = SecureTerminal(tui=tui, command=spec.get('command') or None,
-                              cli_terminfo=cli_terminfo)
+        term = SecureTerminal(tui=tui, command=spec.get('command') or None)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(spec.get('font_family') or self._default_font_family)
@@ -959,7 +951,6 @@ class MainWindow(QMainWindow):
         history = info.get('text') if isinstance(info.get('text'), str) else ''
         cwd = info.get('cwd')
         term = SecureTerminal(tui=bool(info.get('tui')), history=history,
-                              cli_terminfo=self._default_cli_terminfo,
                               cwd=cwd if isinstance(cwd, str) and cwd else None)
         theme = info.get('theme')
         term.apply_theme(theme if theme in THEMES else self._default_theme)
@@ -1572,15 +1563,6 @@ class MainWindow(QMainWindow):
         self._update_security_indicator()
         self._persist()
 
-    def set_cli_terminfo(self, enabled):
-        """Set the restricted-terminfo default for new tabs. TERM is fixed when a
-        shell starts, so this cannot change a running tab -- only new ones."""
-        if 'cli_terminfo' in self._locked:
-            return
-        self._default_cli_terminfo = bool(enabled)
-        self.act_cli_terminfo.setChecked(bool(enabled))
-        self._persist()
-
     def _update_tui_indicator(self):
         term = self.current()
         active = term is not None and term.tui_active()
@@ -2131,7 +2113,6 @@ class MainWindow(QMainWindow):
             ('osc_notice', [self.act_osc_notice]),
             ('osc_clipboard_read_always', [self.act_clip_read_always]),
             ('tui', [self.act_tui]),
-            ('cli_terminfo', [self.act_cli_terminfo]),
             ('allow_title', [self.act_title]),
             ('bell', list(self._bell_actions.values())
              + [self.act_bell_sound, self.act_bell_sound_clear]),
@@ -2181,7 +2162,6 @@ class MainWindow(QMainWindow):
             'paste_warn': self._paste_warn,
             'copy_warn': self._copy_warn,
             'tui': 'true' if self._default_tui else 'false',
-            'cli_terminfo': 'true' if self._default_cli_terminfo else 'false',
             'allow_title': 'true' if self._default_allow_title else 'false',
             'bell': ','.join(sorted(self._default_bell)),
             'bell_sound': self._default_bell_sound,
@@ -2491,20 +2471,6 @@ class MainWindow(QMainWindow):
             self.act_tui.setText('TUI mode (needs python3-pyte)')
         self.act_tui.toggled.connect(self.set_tui)
         view_menu.addAction(self.act_tui)
-
-        self.act_cli_terminfo = QAction('&Restricted terminfo (CLI)', self,
-                                        checkable=True)
-        self.act_cli_terminfo.setChecked(self._default_cli_terminfo)
-        self.act_cli_terminfo.setToolTip(
-            'Advertise the restricted "secure-terminal" terminfo instead of '
-            'xterm-256color, so CLI-mode programs emit only what this terminal '
-            'renders and never probe it (no cursor addressing, alternate screen, '
-            'or capability queries). Off by default. TERM is fixed when a shell '
-            'starts, so this applies to NEW tabs; keep it off if you ssh or use '
-            'TUI mode, since a remote host / full-screen program needs the fuller '
-            'xterm-256color entry.')
-        self.act_cli_terminfo.toggled.connect(self.set_cli_terminfo)
-        view_menu.addAction(self.act_cli_terminfo)
 
         self.act_systray = QAction('S&ystem tray icon', self, checkable=True)
         self.act_systray.setChecked(self._systray)
@@ -3460,11 +3426,6 @@ def _launch_parser(with_globals):
                    help='enable ANSI colours for this tab')
     p.add_argument('--no-colors', dest='colors', action='store_false',
                    help='disable ANSI colours for this tab')
-    p.add_argument('--cli-terminfo', dest='cli_terminfo', action='store_true',
-                   default=None,
-                   help='advertise the restricted terminfo for this tab')
-    p.add_argument('--no-cli-terminfo', dest='cli_terminfo', action='store_false',
-                   help='advertise xterm-256color for this tab')
     p.add_argument('--bell', metavar='CHANNELS',
                    help='bell channels for this tab, e.g. "audible,visual" (empty = silent)')
     p.add_argument('--osc', dest='osc', metavar='FEATURE', action='append',
@@ -3507,7 +3468,7 @@ def _parse_launch_args(argv):
         launch.tabs.append({
             'title': namespace.title, 'tui': namespace.tui,
             'mode': namespace.mode, 'command': namespace.cmd_string,
-            'colors': namespace.colors, 'cli_terminfo': namespace.cli_terminfo,
+            'colors': namespace.colors,
             'bell': namespace.bell, 'osc': namespace.osc})
     if command is not None:
         launch.tabs[-1]['command'] = command
@@ -3515,7 +3476,7 @@ def _parse_launch_args(argv):
     def _empty(spec):
         return not any(spec.get(k) is not None
                        for k in ('title', 'tui', 'mode', 'command',
-                                 'colors', 'cli_terminfo', 'bell', 'osc'))
+                                 'colors', 'bell', 'osc'))
 
     # A leading '--tab' means the first tab IS that group; drop the empty
     # placeholder for tokens before it (its globals were already read).
@@ -3537,7 +3498,7 @@ def _sanitize_tab_spec(spec):
     """Type-validate a tab spec received over IPC (owner-only, but defensive)."""
     title, tui = spec.get('title'), spec.get('tui')
     mode, command = spec.get('mode'), spec.get('command')
-    colors, cli_terminfo = spec.get('colors'), spec.get('cli_terminfo')
+    colors = spec.get('colors')
     bell, osc = spec.get('bell'), spec.get('osc')
     return {
         'title': title if isinstance(title, str) else None,
@@ -3545,7 +3506,6 @@ def _sanitize_tab_spec(spec):
         'mode': mode if mode in DISPLAY_MODES else None,
         'command': command if isinstance(command, (str, list)) else None,
         'colors': colors if isinstance(colors, bool) else None,
-        'cli_terminfo': cli_terminfo if isinstance(cli_terminfo, bool) else None,
         'bell': bell if isinstance(bell, str) else None,
         'osc': [f for f in osc if isinstance(f, str)] if isinstance(osc, list) else None,
     }

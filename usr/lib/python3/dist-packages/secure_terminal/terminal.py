@@ -344,7 +344,7 @@ class SecureTerminal(QPlainTextEdit):
     clipboard_read_requested = pyqtSignal()
 
     def __init__(self, parent=None, command=None, tui=False, history='',
-                 cli_terminfo=False, preview=False, cwd=None):
+                 preview=False, cwd=None):
         super().__init__(parent)
         # working directory to start the shell in (restored session tab); None ->
         # inherit the app's cwd.
@@ -550,10 +550,6 @@ class SecureTerminal(QPlainTextEdit):
             self._raw = restored[-self._RAW_MAX:]   # so a mode toggle re-renders it too
             self._append(restored)
 
-        # opt-in: advertise the restricted `secure-terminal` terminfo instead of
-        # xterm-256color, so CLI-mode programs emit only what we render and never
-        # probe. Off by default (xterm-256color keeps ssh/TUI working).
-        self._cli_terminfo = bool(cli_terminfo)
         self._notifier = None
         self._fd = None
         self._pid = None
