@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QKeySequenceEdit,
-    QTextEdit, QFontDialog, QGroupBox,
+    QTextEdit, QFontDialog, QGroupBox, QToolButton,
 )
 
 from secure_terminal import settings, session, ipc
@@ -724,8 +724,13 @@ class MainWindow(QMainWindow):
         if 0 <= index < self.tabs.count():
             self.tabs.setCurrentIndex(index)
 
-    def new_tab(self, command=None):
-        term = SecureTerminal(tui=self._default_tui, command=command or None)
+    def new_tab(self, command=None, tui=None):
+        # tui=None -> the window default; True/False forces the mode for this tab
+        # so New Tab can offer CLI vs TUI at creation. TUI needs pyte.
+        if tui is None:
+            tui = self._default_tui
+        tui = bool(tui) and tui_available()
+        term = SecureTerminal(tui=tui, command=command or None)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(self._default_font_family)
@@ -2187,6 +2192,27 @@ class MainWindow(QMainWindow):
         self.act_new.triggered.connect(lambda: self.new_tab())
         file_menu.addAction(self.act_new)
 
+        # explicit-mode variants so a tab's CLI/TUI mode is chosen at creation
+        # (the plain New Tab uses the window default). Grouped under act_new on
+        # the toolbar as a dropdown.
+        # unbound by default (Ctrl+Shift+C/V/T are taken); rebindable in the
+        # Keyboard Shortcuts dialog.
+        self.act_new_cli = QAction('New Tab (&CLI)', self)
+        self._bind(self.act_new_cli, 'new_tab_cli', '')
+        self.act_new_cli.setToolTip(
+            'Open a tab in CLI (line) mode -- append-only, escapes stripped.')
+        self.act_new_cli.triggered.connect(lambda: self.new_tab(tui=False))
+        file_menu.addAction(self.act_new_cli)
+
+        self.act_new_tui = QAction('New Tab (T&UI)', self)
+        self._bind(self.act_new_tui, 'new_tab_tui', '')
+        self.act_new_tui.setEnabled(tui_available())
+        self.act_new_tui.setToolTip(
+            TUI_TOOLTIP if tui_available()
+            else 'TUI mode needs python3-pyte.')
+        self.act_new_tui.triggered.connect(lambda: self.new_tab(tui=True))
+        file_menu.addAction(self.act_new_tui)
+
         self.act_new_cmd = QAction('New Tab &Running...', self)
         self._bind(self.act_new_cmd, 'new_command_tab', 'Ctrl+Shift+R')
         self.act_new_cmd.setToolTip(
@@ -3140,6 +3166,15 @@ class MainWindow(QMainWindow):
         self.addToolBar(bar)
 
         bar.addAction(self.act_new)
+        # dropdown arrow on the New Tab button offers CLI vs TUI; the main button
+        # still opens a default-mode tab.
+        _new_btn = bar.widgetForAction(self.act_new)
+        if isinstance(_new_btn, QToolButton):
+            _new_menu = QMenu(_new_btn)
+            _new_menu.addAction(self.act_new_cli)
+            _new_menu.addAction(self.act_new_tui)
+            _new_btn.setMenu(_new_menu)
+            _new_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         bar.addSeparator()
         bar.addAction(self.act_copy)
         bar.addAction(self.act_paste)
