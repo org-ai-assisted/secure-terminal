@@ -960,8 +960,16 @@ class MainWindow(QMainWindow):
         and scrollback history, under a fresh shell."""
         history = info.get('text') if isinstance(info.get('text'), str) else ''
         cwd = info.get('cwd')
+        mode = info.get('mode')
+        # pass the saved display settings to the ctor so the restored scrollback is
+        # rendered ONCE in its final mode/colours/markings -- constructing in the
+        # default then apply_*-ing the saved values re-rendered the whole history up
+        # to three times, flickering the mode and jumping the scrollbar (#78).
         term = SecureTerminal(tui=bool(info.get('tui')), history=history,
-                              cwd=cwd if isinstance(cwd, str) and cwd else None)
+                              cwd=cwd if isinstance(cwd, str) and cwd else None,
+                              mode=mode if mode in DISPLAY_MODES else self._default_mode,
+                              colors=bool(info.get('colors')),
+                              markings=bool(info.get('markings', True)))
         theme = info.get('theme')
         term.apply_theme(theme if theme in THEMES else self._default_theme)
         try:
@@ -969,10 +977,6 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             term.apply_zoom(self._default_zoom)
         term.set_font_family(info.get('font_family') or self._default_font_family)
-        mode = info.get('mode')
-        term.apply_mode(mode if mode in DISPLAY_MODES else self._default_mode)
-        term.apply_colors(bool(info.get('colors')))
-        term.apply_markings(bool(info.get('markings', True)))
         try:
             term.apply_scrollback(int(info.get('scrollback', self._scrollback)))
         except (TypeError, ValueError):

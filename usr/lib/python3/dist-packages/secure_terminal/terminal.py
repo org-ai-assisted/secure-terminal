@@ -345,7 +345,8 @@ class SecureTerminal(QPlainTextEdit):
     clipboard_read_requested = pyqtSignal()
 
     def __init__(self, parent=None, command=None, tui=False, history='',
-                 preview=False, cwd=None):
+                 preview=False, cwd=None, mode='detail', colors=False,
+                 markings=True):
         super().__init__(parent)
         # working directory to start the shell in (restored session tab); None ->
         # inherit the app's cwd.
@@ -379,7 +380,11 @@ class SecureTerminal(QPlainTextEdit):
 
         # display mode for non-ASCII output, and an incremental UTF-8 decoder so
         # a multi-byte character split across two os.read() chunks still decodes.
-        self._mode = 'detail'
+        # Set from the ctor (a restored tab passes its saved mode) BEFORE any
+        # history is rendered below, so restored scrollback is drawn ONCE in its
+        # final mode -- never first in the default then re-rendered (the flicker +
+        # scrollbar jumps of restoring into the wrong mode).
+        self._mode = mode if mode in DISPLAY_MODES else 'detail'
         self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
         # Retain the raw decoded output (line mode) so a display-mode change can
         # re-render the WHOLE buffer, not just new output. Bounded so a flood
@@ -396,9 +401,10 @@ class SecureTerminal(QPlainTextEdit):
         # far more than a screenful, so what you can see is always re-rendered.
         self._RERENDER_TAIL = 131072
 
-        # optional ANSI colours (off by default); SGR parser state.
-        self._colors = False
-        self._markings = True         # colour the '_' / badge by risk class (on)
+        # optional ANSI colours (off by default); SGR parser state. Also set from
+        # the ctor before the history render, for the same render-once reason.
+        self._colors = bool(colors)
+        self._markings = bool(markings)   # colour the '_' / badge by risk class
         self._sgr_reset()
 
         # Scrollback limit in lines. Default to a bounded window (like every
