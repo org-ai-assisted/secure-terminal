@@ -1994,7 +1994,11 @@ class SecureTerminal(QPlainTextEdit):
         for entry in list(self._pending_caret):
             token = entry[0]
             idx = text.find(token)
-            if 0 <= idx <= 2:                 # only near the very start of output
+            # Only absorb a caret that leads the chunk: at the start, or preceded by
+            # nothing but CR/LF/whitespace (a shell may emit "\r\n^C"). A printable
+            # char before it means this is real output that merely contains "^C"
+            # (e.g. "a^C-note"), which must NOT be corrupted.
+            if 0 <= idx <= 2 and not text[:idx].strip():
                 text = text[:idx] + text[idx + len(token):]
                 self._pending_caret.remove(entry)
         return text
