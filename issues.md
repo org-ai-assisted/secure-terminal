@@ -38,3 +38,26 @@ entry in the LOCAL system terminfo db does not help remote hosts.
   fingerprint-neutral, but drops all colour and in-line editing. See the
   compatibility page's terminfo comparison.
 - Worth reconsidering `dumb` for CLI mode if ssh-in-CLI is a common workflow.
+
+## 3. CLI-mode redraw garble on completion / wrapped lines
+
+An interactive shell's line editor (zsh's zle) redraws the prompt line with
+optimised, cursor-RELATIVE sequences: differential rewrites (`CSI nD`/`CSI nC` +
+`CSI K`), and partial-line reprints after a completion listing. These assume the
+terminal can move the cursor UP to a previous row -- a capability the restricted
+`secure-terminal` entry deliberately cancels (`cuu@`). With no cursor-up, zle
+falls back to redraws that operate on the current DISPLAY row; when the prompt +
+input WRAP past the terminal width, the CLI line renderer (which models one
+logical line) and zle's wrapped-row cursor math diverge, and the line garbles.
+
+- Symptom: `ls a<Tab>` cycling long candidates can render e.g.
+  `aiuto-generated-dan-pages` or corrupt the prompt to `-terminal% ...`.
+- Only bites when the prompt+input is long enough to wrap; short lines are fine.
+- Root cause is structural: faithfully replaying a full terminal's cursor-relative
+  redraws in a line-oriented renderer under a no-cursor-up terminfo. `dumb` (even
+  fewer caps) does not obviously fix it -- zle still cannot move up.
+- Options: (a) a substantial CLI-renderer investment to track display-row cursor
+  position across wraps; (b) report a very wide width to the shell so its line
+  never wraps (display trade-off); (c) reconsider the CLI terminfo/mode approach.
+  This is the strongest of the accumulating signals that the custom restricted
+  entry, while elegant, is fragile against real interactive redraws.
