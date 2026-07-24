@@ -64,6 +64,15 @@ _OSC_THREAT_MODEL = (
 ZOOM_MIN = 25
 ZOOM_MAX = 400
 
+# UI (chrome) scale: enlarges the settings dialog and the other dialogs for
+# readability/accessibility, independent of the terminal-content zoom. A percent of
+# the base dialog font; the base point size is captured once (below) so re-scaling
+# never compounds.
+UI_SCALE_MIN = 75
+UI_SCALE_MAX = 300
+UI_SCALE_STEP = 25
+_UI_BASE_POINT = None            # the un-scaled dialog font point size, captured once
+
 # Cycled to auto-colour new tabs so a tab differs from its neighbour; distinct,
 # theme-readable hues. A user-set tab colour overrides the auto one.
 TAB_PALETTE = ('#e5484d', '#e5a50a', '#1f8a54', '#3b9eff',
@@ -214,10 +223,20 @@ def _dot_icon(color):
     return QIcon(pixmap)
 
 
-def _select_labels(widget):
-    """Make every QLabel under `widget` selectable, so a dialog's descriptive
-    text can be marked and copied by hand, not just its input fields. Preserves
-    any flags a label already has (e.g. link handling)."""
+def _select_labels(widget, scale=100):
+    """Prepare a dialog: make every QLabel under `widget` selectable (so its
+    descriptive text can be marked and copied, not just its input fields), and
+    scale the whole dialog's font to `scale` percent so the chrome is enlargeable
+    for readability. The base point size is captured once, so re-scaling a fresh
+    dialog never compounds. Preserves any flags a label already has."""
+    if scale != 100:
+        global _UI_BASE_POINT
+        font = widget.font()
+        if _UI_BASE_POINT is None:
+            _base = font.pointSizeF()
+            _UI_BASE_POINT = _base if _base > 0 else 10.0
+        font.setPointSizeF(_UI_BASE_POINT * scale / 100.0)
+        widget.setFont(font)
     for label in widget.findChildren(QLabel):
         label.setTextInteractionFlags(
             label.textInteractionFlags()
@@ -421,6 +440,11 @@ class MainWindow(QMainWindow):
                                           min(FONT_SIZE_MAX, int(cfg['font_size'])))
         except (KeyError, ValueError, TypeError):
             self._default_font_size = BASE_POINT_SIZE
+        # UI (chrome/dialog) scale percent -- enlarges settings + other dialogs.
+        try:
+            self._ui_scale = max(UI_SCALE_MIN, min(UI_SCALE_MAX, int(cfg['ui_scale'])))
+        except (KeyError, ValueError, TypeError):
+            self._ui_scale = 100
         # Colours on by default: with a capable TERM the shell prompt, ls, git
         # and friends emit SGR colour, and a terminal that silently dropped it
         # looks broken. Parsing is bounded (16 palette colours) and the renderer's
@@ -1894,7 +1918,7 @@ class MainWindow(QMainWindow):
         close.clicked.connect(dialog.accept)
         buttons.addWidget(close)
         layout.addLayout(buttons)
-        _select_labels(dialog)
+        _select_labels(dialog, self._ui_scale)
         dialog.exec()
 
     def set_allow_title(self, enabled):
@@ -2225,7 +2249,7 @@ class MainWindow(QMainWindow):
         countdown = QTimer(dialog)
         countdown.timeout.connect(_tick)
         countdown.start(1000)
-        _select_labels(dialog)
+        _select_labels(dialog, self._ui_scale)
         dialog.exec()
         term.grant_clipboard_read(result['decision'])
 
@@ -2346,6 +2370,7 @@ class MainWindow(QMainWindow):
             'unicode_mode': self._default_mode,
             'font_family': self._default_font_family,
             'font_size': str(self._default_font_size),
+            'ui_scale': str(self._ui_scale),
             'colors': 'true' if self._default_colors else 'false',
             'colored_markings': 'true' if self._default_markings else 'false',
             'auto_tab_colors': 'true' if self._auto_tab_colors else 'false',
@@ -2999,7 +3024,7 @@ class MainWindow(QMainWindow):
         save.clicked.connect(_do_save)
         buttons.addWidget(save)
         layout.addLayout(buttons)
-        _select_labels(dialog)
+        _select_labels(dialog, self._ui_scale)
         dialog.exec()
 
     def show_about(self):
@@ -3040,7 +3065,7 @@ class MainWindow(QMainWindow):
         close.clicked.connect(dialog.accept)
         buttons.addWidget(close)
         layout.addLayout(buttons)
-        _select_labels(dialog)
+        _select_labels(dialog, self._ui_scale)
         dialog.exec()
 
     _COMMAND_HELP = (
@@ -3156,6 +3181,16 @@ class MainWindow(QMainWindow):
         _tip_row(appearance, 'Font size', font_size,
                  'Base font size in points; the zoom below scales this. Applies to '
                  'every open tab and to new ones.')
+
+        ui_scale = QSpinBox()
+        ui_scale.setRange(UI_SCALE_MIN, UI_SCALE_MAX)
+        ui_scale.setSingleStep(UI_SCALE_STEP)
+        ui_scale.setSuffix('%')
+        ui_scale.setValue(self._ui_scale)
+        _tip_row(appearance, 'Menu size', ui_scale,
+                 'Enlarge this and the other dialogs for readability, independent '
+                 'of the terminal text zoom above. Takes effect the next time a '
+                 'dialog is opened.')
 
         zoom = QSpinBox()
         zoom.setRange(ZOOM_MIN, ZOOM_MAX)
@@ -3282,13 +3317,14 @@ class MainWindow(QMainWindow):
         buttons.addWidget(apply_all)
         outer.addLayout(buttons)
 
-        _select_labels(dialog)
+        _select_labels(dialog, self._ui_scale)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._apply_global({
             'theme': theme.currentData(), 'zoom': zoom.value(),
             'font_family': font_family.currentFont().family(),
             'font_size': font_size.value(),
+            'ui_scale': ui_scale.value(),
             'mode': mode.currentData(), 'colors': colors.isChecked(),
             'tui': tui.isChecked(),
             'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
@@ -3324,6 +3360,7 @@ class MainWindow(QMainWindow):
         self._default_zoom = opts['zoom']
         self._default_font_family = opts.get('font_family', self._default_font_family)
         self._default_font_size = opts.get('font_size', self._default_font_size)
+        self._ui_scale = opts.get('ui_scale', self._ui_scale)
         self._default_mode = opts['mode']
         self._default_colors = opts['colors']
         self._default_tui = opts['tui']
@@ -3613,7 +3650,7 @@ class MainWindow(QMainWindow):
         close = QPushButton('Close')
         close.clicked.connect(dialog.accept)
         grid.addWidget(close, len(rows) + 1, 3)
-        _select_labels(dialog)
+        _select_labels(dialog, self._ui_scale)
         dialog.exec()
 
     # -- lifecycle ------------------------------------------------------------
