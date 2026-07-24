@@ -3115,12 +3115,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         body = QLabel(
             'A terminal where paste is safe by design.<br><br>'
-            'There is no escape parser, so every escape sequence in program '
-            'output is removed and a printed or pasted lie cannot redraw, '
-            'reorder or hide what you see -- and merely viewing a file cannot run '
-            'code. Non-ASCII characters are stripped, revealed or shown as you '
-            'choose. Pasting is sanitized and warned on. It is written in a '
-            'memory-safe language.<br><br>'
+            'In CLI mode there is no escape parser, so every escape '
+            'sequence in program output is removed and a printed or pasted lie '
+            'cannot redraw, reorder or hide what you see -- and merely viewing a '
+            'file cannot run code. (The opt-in TUI mode interprets escapes in an '
+            'isolated grid to run full-screen programs.) Non-ASCII characters are '
+            'stripped, revealed or shown as you choose. Pasting is sanitized and '
+            'warned on. It is written in a memory-safe language.<br><br>'
             '<a href="https://secure-terminal.github.io">secure-terminal.github.io</a>'
             '<br><a href="https://output-lies.github.io">output-lies.github.io</a>'
             ' &ndash; the problem it removes<br><br>'
@@ -3309,7 +3310,7 @@ class MainWindow(QMainWindow):
         tui.setEnabled(tui_available())
         _tip_row(rendering, 'TUI mode (new tabs)', tui,
                  'Start new tabs in TUI mode (for full-screen programs like vim or '
-                 'htop) instead of the default CLI mode. CLI mode is APPEND-ONLY and '
+                 'htop) instead of CLI mode. CLI mode is APPEND-ONLY and '
                  'tamper-evident -- output can only be added, never moved or erased, '
                  'so a hostile program cannot rewrite what you already saw. TUI mode '
                  'interprets cursor/screen escapes inside an isolated grid so full-'
