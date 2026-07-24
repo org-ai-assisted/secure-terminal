@@ -2875,15 +2875,19 @@ class SecureTerminal(QPlainTextEdit):
                 else sanitize_paste(raw))
         if not safe:
             return
-        # A paste that leaves PENDING line-mode text (line mode, and not fully
-        # submitted by a trailing CR) inserts characters _line_buffer never saw, so
-        # the hook would judge a stale line on the next Enter -- mark it dirty so it
-        # fails safe (asks). A fully-submitting paste (approved via review) or a
-        # TUI-mode paste leaves no pending line, so it must NOT set the flag and
-        # poison the next fresh command.
-        if self._hook is not None and not self.tui_active() \
-                and safe and not safe.endswith('\r'):
-            self._line_dirty = True
+        # Keep the hook's view of the line honest across a paste (line mode only; a
+        # TUI paste does not touch the line-mode command).
+        if self._hook is not None and not self.tui_active() and safe:
+            if safe.endswith('\r'):
+                # The paste submitted the line (approved via review). Reset like
+                # Enter, so a typed prefix cannot linger and make the hook judge
+                # "prefix + next command" on the following prompt.
+                self._line_buffer = ''
+                self._line_dirty = False
+            else:
+                # Pending text _line_buffer never saw -> the hook must fail safe
+                # (ask) on the next Enter rather than judge a stale line.
+                self._line_dirty = True
         data = safe.encode('utf-8')
         # Bracketed paste when the TUI program asked for it (DEC mode 2004), so a
         # multi-line paste is delivered as data, not interpreted as keystrokes.
