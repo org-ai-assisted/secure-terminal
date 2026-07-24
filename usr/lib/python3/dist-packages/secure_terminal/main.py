@@ -3244,6 +3244,27 @@ class MainWindow(QMainWindow):
                  'How long a pasted multi-line block is held for review before it '
                  'can run, so a hidden command cannot execute the instant you paste.')
 
+        _WARN_CHOICES = (('Always review', 'always'),
+                         ('Only unicode / control', 'unicode'),
+                         ('Never review', 'never'))
+        paste_warn = QComboBox()
+        for _wl, _wv in _WARN_CHOICES:
+            paste_warn.addItem(_wl, _wv)
+        paste_warn.setCurrentIndex(paste_warn.findData(self._paste_warn))
+        _tip_row(session_box, 'Paste review', paste_warn,
+                 'When to hold a paste for review before it reaches the shell: '
+                 'Always, Only when it carries unicode/control characters (the '
+                 'default -- the case worth a second look), or Never. A command '
+                 'hook still reviews an auto-submitting paste whatever this is set to.')
+        copy_warn = QComboBox()
+        for _wl, _wv in _WARN_CHOICES:
+            copy_warn.addItem(_wl, _wv)
+        copy_warn.setCurrentIndex(copy_warn.findData(self._copy_warn))
+        _tip_row(session_box, 'Copy review', copy_warn,
+                 'When to confirm before the selection is copied to the clipboard: '
+                 'Always, Only when it carries unicode/control characters (the '
+                 'default), or Never.')
+
         persist = QCheckBox()
         persist.setChecked(self._persist_session)
         _tip_row(session_box, 'Restore session on start', persist,
@@ -3273,6 +3294,7 @@ class MainWindow(QMainWindow):
             'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
             'osc_notice': osc.isChecked(),
             'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
+            'paste_warn': paste_warn.currentData(), 'copy_warn': copy_warn.currentData(),
             'persist': persist.isChecked(),
         })
 
@@ -3313,6 +3335,8 @@ class MainWindow(QMainWindow):
                                      or self._osc_defaults.get('osc_notify'))
         self._scrollback = opts['scrollback']
         self._paste_delay = opts['paste_delay']
+        self._paste_warn = opts.get('paste_warn', self._paste_warn)
+        self._copy_warn = opts.get('copy_warn', self._copy_warn)
         for term in self._real_terms():
             term.apply_theme(opts['theme'])
             term.apply_zoom(opts['zoom'])
@@ -3324,6 +3348,8 @@ class MainWindow(QMainWindow):
                 term.apply_osc(key, value)
             term.apply_scrollback(opts['scrollback'])
             term.apply_paste_delay(opts['paste_delay'])
+            term.apply_paste_warn(self._paste_warn)
+            term.apply_copy_warn(self._copy_warn)
             # NB: bell is intentionally NOT applied here. This global-settings
             # dialog has no bell field, so touching it would silently reset each
             # tab's per-tab bell choice; the bell is managed via the View menu only.
