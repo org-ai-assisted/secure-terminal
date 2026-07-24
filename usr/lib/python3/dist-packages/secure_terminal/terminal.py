@@ -382,6 +382,11 @@ class SecureTerminal(QPlainTextEdit):
     # As paste_review_requested, but for text leaving via COPY (the same review bar
     # and preview, configured separately). (raw text, countdown seconds).
     copy_review_requested = pyqtSignal(str, int)
+    # Risky text (unicode / control / multi-line) crossed the boundary UNREVIEWED
+    # because the user set review to 'never': the content is NOT stripped (that would
+    # break deliberately pasting/copying real unicode), but the window lights a red
+    # risk lamp so the unreviewed crossing is visible rather than silent.
+    unreviewed_risk = pyqtSignal()
     # a program emitted an OSC escape (window title, clipboard, hyperlink, ...)
     # while in line mode, where it is stripped for safety. Carries the FEATURE KEY
     # (see OSC_FEATURES; 'osc_other' for an unrecognized code) so the window can
@@ -2186,6 +2191,11 @@ class SecureTerminal(QPlainTextEdit):
             # gate the paste review needs does not apply (delay 0).
             self.copy_review_requested.emit(text, 0)
             return
+        # Review off ('never'): the selection already keeps its unicode (a deliberate
+        # copy is not stripped); if it was risky, it reaches the clipboard unreviewed,
+        # so light the risk lamp.
+        if warn == 'never' and (has_unicode or has_control):
+            self.unreviewed_risk.emit()
         self._set_clipboard(sanitize_clipboard_unicode(text))
 
     def dispatch_pending_copy(self, action):
@@ -2874,9 +2884,15 @@ class SecureTerminal(QPlainTextEdit):
             self._review_active = True
             self.paste_review_requested.emit(raw, int(self._paste_delay))
             return
-        # No review needed ('never', or a clean paste in 'unicode' mode): sanitize
-        # to ASCII and send straight through, as before.
-        self._dispatch_paste(raw, 'stripped')
+        # Not held. With review OFF ('never'), do NOT strip to ASCII -- that would
+        # make deliberately pasting real unicode (CJK, emoji, an accented path)
+        # impossible; keep printable unicode instead (control/bidi/invisible are
+        # still neutralized, since those are injection, not content, and a hidden
+        # newline could auto-run). If the content was risky, it crosses UNREVIEWED,
+        # so light the risk lamp -- visible, not silent.
+        if warn == 'never' and risky:
+            self.unreviewed_risk.emit()
+        self._dispatch_paste(raw, 'unicode' if warn == 'never' else 'stripped')
 
     def dispatch_pending_paste(self, action):
         """Resolve a held paste review: 'stripped' or 'unicode' sends it (sanitized

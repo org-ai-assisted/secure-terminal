@@ -472,6 +472,9 @@ class MainWindow(QMainWindow):
             if cfg.get('paste_warn') in ('always', 'unicode', 'never') else 'unicode'
         self._copy_warn = cfg.get('copy_warn') \
             if cfg.get('copy_warn') in ('always', 'unicode', 'never') else 'unicode'
+        # Set when risky text has crossed the boundary UNREVIEWED (review off); lights
+        # the red review lamp until acknowledged (the security-details dialog clears it).
+        self._unreviewed_risk = False
         self._default_tui = cfg.get('tui') == 'true'
         self._default_allow_title = cfg.get('allow_title') == 'true'
         # granular per-OSC-feature defaults (each off = neutralized).
@@ -666,6 +669,7 @@ class MainWindow(QMainWindow):
             lambda t=term: self._on_clipboard_read_requested(t))
         term.advise_signal.connect(lambda msg, t=term: self._on_advise(t, msg))
         term.osc_used.connect(lambda key, t=term: self._on_osc_used(t, key))
+        term.unreviewed_risk.connect(self._on_unreviewed_risk)
         term.paste_review_requested.connect(
             lambda raw, delay, t=term: self._show_review(t, raw, delay, 'paste'))
         term.copy_review_requested.connect(
@@ -764,6 +768,16 @@ class MainWindow(QMainWindow):
                         'View > OSC features if you trust the source; turn this '
                         'notice off (all or per type) in View > Notify on OSC use.',
                         'osc')
+
+    def _on_unreviewed_risk(self):
+        """Risky text crossed the boundary with review off: light the red review
+        lamp and a brief status hint, so the unreviewed crossing is visible."""
+        if not self._unreviewed_risk:
+            self._unreviewed_risk = True
+            self._update_security_indicator()
+        self.statusBar().showMessage(
+            'Risky text crossed unreviewed (review is off) -- see the red review '
+            'lamp; click it for details.', 6000)
 
     def _dismiss_advisory(self):
         """The X button: clear the current tab's advisory and hide the banner."""
@@ -1774,7 +1788,8 @@ class MainWindow(QMainWindow):
         self.sec_display = QPushButton(self)
         self.sec_mode = QPushButton(self)
         self.sec_osc = QPushButton(self)
-        for lamp in (self.sec_display, self.sec_mode, self.sec_osc):
+        self.sec_review = QPushButton(self)
+        for lamp in (self.sec_display, self.sec_mode, self.sec_osc, self.sec_review):
             lamp.setFlat(True)
             lamp.setCursor(Qt.CursorShape.PointingHandCursor)
             lamp.clicked.connect(self._show_security_details)
@@ -1888,11 +1903,38 @@ class MainWindow(QMainWindow):
                 'unicode setting (Box / Reveal / Show); none of those re-enable '
                 'escapes, so none can be used to deceive you into running code.')
 
+    def _review_level(self):
+        """The paste/copy REVIEW axis. Green when both directions are reviewed;
+        yellow when a direction's review is off ('never'), so risky text can cross
+        unseen; red once risky text HAS actually crossed unreviewed (cleared when
+        you open this Security level dialog)."""
+        paste_w, copy_w = self._paste_warn, self._copy_warn
+        term = self.current()
+        if term is not None:
+            paste_w, copy_w = term.current_paste_warn(), term.current_copy_warn()
+        off = [name for name, warn in (('paste', paste_w), ('copy', copy_w))
+               if warn == 'never']
+        common = ('Review holds risky text (unicode, control or multi-line) crossing '
+                  'the boundary until you confirm it. When a direction is set to '
+                  "'never' the text is NOT stripped -- so you can still paste/copy "
+                  'real unicode -- but nothing checks it, so this lamp turns red the '
+                  'moment risky text actually crosses, to keep the risk visible.\n\n'
+                  'Set the levels under View or Global settings > Paste/Copy review.')
+        if self._unreviewed_risk:
+            return ('#e5484d', 'review!',
+                    'Review: risky text has crossed UNREVIEWED (red).\n\n' + common)
+        if off:
+            return ('#e5a50a', 'review off',
+                    'Review: %s review is off (yellow).\n\n' % ' + '.join(off) + common)
+        return ('#1f8a54', 'review on',
+                'Review: paste and copy are both reviewed (green).\n\n' + common)
+
     def _update_security_indicator(self):
         for lamp, level, axis in (
                 (self.sec_display, self._display_level(), 'Display'),
                 (self.sec_mode, self._mode_level(), 'Mode'),
-                (self.sec_osc, self._osc_level(), 'OSC')):
+                (self.sec_osc, self._osc_level(), 'OSC'),
+                (self.sec_review, self._review_level(), 'Review')):
             colour, short, _detail = level
             lamp.setIcon(_dot_icon(colour))
             lamp.setText(' ' + short)
@@ -1900,7 +1942,12 @@ class MainWindow(QMainWindow):
 
     def _show_security_details(self):
         detail = (self._display_level()[2] + '\n\n' + self._mode_level()[2]
-                  + '\n\n' + self._osc_level()[2])
+                  + '\n\n' + self._osc_level()[2] + '\n\n' + self._review_level()[2])
+        # Opening the details acknowledges the unreviewed-risk warning: clear the red
+        # lamp back to its config colour (green/yellow).
+        if self._unreviewed_risk:
+            self._unreviewed_risk = False
+            self._update_security_indicator()
         dialog = QDialog(self)
         dialog.setWindowTitle('Security level')
         layout = QVBoxLayout(dialog)
@@ -2277,6 +2324,7 @@ class MainWindow(QMainWindow):
             act = self._paste_warn_actions.get(mode)
             if act is not None and not act.isChecked():
                 act.setChecked(True)
+        self._update_security_indicator()          # review lamp reflects the level
         self._persist()
 
     def set_copy_warn(self, mode):
@@ -2292,6 +2340,7 @@ class MainWindow(QMainWindow):
             act = self._copy_warn_actions.get(mode)
             if act is not None and not act.isChecked():
                 act.setChecked(True)
+        self._update_security_indicator()          # review lamp reflects the level
         self._persist()
 
     def save_transcript(self):
