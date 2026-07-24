@@ -2839,6 +2839,11 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
     def insertFromMimeData(self, source):
+        if self._review_active:
+            # A copy or paste is already held for review: ignore a second paste
+            # rather than clobber the pending one (input is otherwise suspended
+            # during a review; copy() guards the same way). Re-paste after choosing.
+            return
         raw = source.text()
         # When to review the paste, per the paste_warn setting:
         #   'always'  -- every paste (even plain ASCII);
