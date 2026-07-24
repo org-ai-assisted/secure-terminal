@@ -41,12 +41,11 @@ from secure_terminal.review import ReviewBar
 
 TUI_TOOLTIP = (
     'TUI mode runs full-screen programs (ssh, vim, htop, tmux) by '
-    'interpreting the terminal escape sequences the strict default mode refuses. '
-    'It stays confined to an isolated screen model: the window title and system '
-    'clipboard cannot be touched, and every character is still '
-    'ASCII/unicode-filtered, so invisible or homoglyph text cannot hide. But a '
+    'interpreting the terminal escape sequences the strict cli mode refuses. '
+    'It stays confined to an isolated screen model, and every character is still '
+    'ASCII/unicode-filtered, so no invisible or homoglyph text can hide. But a '
     'program CAN draw a misleading interface within its screen, so only run '
-    'programs you trust. The default CLI mode remains safe by design.')
+    'programs you trust. The strict cli mode remains safe by design.')
 
 # Plain-language threat model for the OSC controls, shown in the security lamp so
 # a lay user does not over-trust the feature. Safe example only (no destructive
@@ -3259,7 +3258,7 @@ class MainWindow(QMainWindow):
 
         rendering = _section('Text rendering')
         mode = QComboBox()
-        for label, key in (('Box (safe)', 'box'), ('Reveal unicode', 'reveal'),
+        for label, key in (('Box', 'box'), ('Reveal unicode', 'reveal'),
                            ('Detail (named)', 'detail'), ('Show unicode', 'show')):
             mode.addItem(label, key)
         mode.setCurrentIndex(mode.findData(self._default_mode))
@@ -3561,7 +3560,7 @@ class MainWindow(QMainWindow):
         # full-screen). TUI is the riskier choice, so its chip is yellow.
         mode_frame, self._tui_buttons = self._chip_group('mode:', (
             ('cli', 'CLI', None,
-             'CLI mode: program output is shown as safe display, the default.'),
+             'CLI mode: program output is shown as safe display.'),
             ('tui', 'TUI', '#e5a50a', TUI_TOOLTIP),
         ), lambda k: self.set_tui(k == 'tui'))
         self._tui_frame = mode_frame
