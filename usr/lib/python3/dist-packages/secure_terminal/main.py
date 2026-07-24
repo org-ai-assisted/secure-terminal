@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QKeySequenceEdit,
-    QTextEdit, QFontDialog, QGroupBox, QToolButton,
+    QTextEdit, QFontDialog, QFontComboBox, QGroupBox, QToolButton,
 )
 
 from secure_terminal import settings, session, ipc
@@ -35,6 +35,7 @@ from secure_terminal.sanitize import (
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES, tui_available,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
+    BASE_POINT_SIZE, FONT_SIZE_MIN, FONT_SIZE_MAX,
 )
 from secure_terminal.review import ReviewBar
 
@@ -413,6 +414,13 @@ class MainWindow(QMainWindow):
         # has no ligature tables; an uninstalled family falls back in the widget.
         self._default_font_family = (cfg.get('font_family') or '').strip() \
             or DEFAULT_FONT_FAMILY
+        # Default base font size (points); the zoom scales it. Clamped so a bad
+        # stored value cannot make the glyph unreadable.
+        try:
+            self._default_font_size = max(FONT_SIZE_MIN,
+                                          min(FONT_SIZE_MAX, int(cfg['font_size'])))
+        except (KeyError, ValueError, TypeError):
+            self._default_font_size = BASE_POINT_SIZE
         # Colours on by default: with a capable TERM the shell prompt, ls, git
         # and friends emit SGR colour, and a terminal that silently dropped it
         # looks broken. Parsing is bounded (16 palette colours) and the renderer's
@@ -785,6 +793,7 @@ class MainWindow(QMainWindow):
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(self._default_font_family)
+        term.set_font_size(self._default_font_size)
         term.apply_mode(self._default_mode)
         term.apply_colors(self._default_colors)
         term.apply_markings(self._default_markings)
@@ -819,6 +828,7 @@ class MainWindow(QMainWindow):
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(spec.get('font_family') or self._default_font_family)
+        term.set_font_size(spec.get('font_size') or self._default_font_size)
         mode = spec.get('mode')
         if mode not in DISPLAY_MODES or 'unicode_mode' in self._locked:
             mode = self._default_mode
@@ -1085,6 +1095,7 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             term.apply_zoom(self._default_zoom)
         term.set_font_family(info.get('font_family') or self._default_font_family)
+        term.set_font_size(info.get('font_size') or self._default_font_size)
         try:
             term.apply_scrollback(int(info.get('scrollback', self._scrollback)))
         except (TypeError, ValueError):
@@ -2334,6 +2345,7 @@ class MainWindow(QMainWindow):
             'zoom': str(self._default_zoom),
             'unicode_mode': self._default_mode,
             'font_family': self._default_font_family,
+            'font_size': str(self._default_font_size),
             'colors': 'true' if self._default_colors else 'false',
             'colored_markings': 'true' if self._default_markings else 'false',
             'auto_tab_colors': 'true' if self._auto_tab_colors else 'false',
@@ -3124,6 +3136,27 @@ class MainWindow(QMainWindow):
                  'Colour theme for the terminal background and text. Applies to '
                  'every open tab and to new ones.')
 
+        font_family = QFontComboBox()
+        try:
+            font_family.setFontFilters(QFontComboBox.FontFilter.MonospacedFonts)
+        except AttributeError:            # pragma: no cover - older Qt has no filter
+            pass                          # allow all families (fixed-pitch fallback holds)
+        font_family.setEditable(False)
+        font_family.setCurrentFont(QFont(self._default_font_family))
+        font_family.setEnabled('font_family' not in self._locked)
+        _tip_row(appearance, 'Font', font_family,
+                 'Monospaced font family for the terminal. A fixed-pitch face keeps '
+                 'columns aligned; the default (Hack) also disambiguates confusable '
+                 'glyphs and has no ligatures. Applies to every open tab and new ones.')
+
+        font_size = QSpinBox()
+        font_size.setRange(FONT_SIZE_MIN, FONT_SIZE_MAX)
+        font_size.setSuffix(' pt')
+        font_size.setValue(self._default_font_size)
+        _tip_row(appearance, 'Font size', font_size,
+                 'Base font size in points; the zoom below scales this. Applies to '
+                 'every open tab and to new ones.')
+
         zoom = QSpinBox()
         zoom.setRange(ZOOM_MIN, ZOOM_MAX)
         zoom.setSingleStep(ZOOM_STEP)
@@ -3233,6 +3266,8 @@ class MainWindow(QMainWindow):
             return
         self._apply_global({
             'theme': theme.currentData(), 'zoom': zoom.value(),
+            'font_family': font_family.currentFont().family(),
+            'font_size': font_size.value(),
             'mode': mode.currentData(), 'colors': colors.isChecked(),
             'tui': tui.isChecked(),
             'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
@@ -3251,6 +3286,7 @@ class MainWindow(QMainWindow):
                 ('unicode_mode', 'mode', self._default_mode),
                 ('colors', 'colors', self._default_colors),
                 ('tui', 'tui', self._default_tui),
+                ('font_family', 'font_family', self._default_font_family),
                 ('osc_notice', 'osc_notice', self._osc_notice)):
             if key in self._locked:
                 opts[field] = current
@@ -3264,6 +3300,8 @@ class MainWindow(QMainWindow):
             self.act_osc_notice.setChecked(self._osc_notice)
         self._default_theme = opts['theme']
         self._default_zoom = opts['zoom']
+        self._default_font_family = opts.get('font_family', self._default_font_family)
+        self._default_font_size = opts.get('font_size', self._default_font_size)
         self._default_mode = opts['mode']
         self._default_colors = opts['colors']
         self._default_tui = opts['tui']
@@ -3278,6 +3316,8 @@ class MainWindow(QMainWindow):
         for term in self._real_terms():
             term.apply_theme(opts['theme'])
             term.apply_zoom(opts['zoom'])
+            term.set_font_family(self._default_font_family)
+            term.set_font_size(self._default_font_size)
             term.apply_mode(opts['mode'])
             term.apply_colors(opts['colors'])
             for key, value in osc.items():

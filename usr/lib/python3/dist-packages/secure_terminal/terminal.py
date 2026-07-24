@@ -170,6 +170,11 @@ from secure_terminal.sanitize import (
 # uninstalled family falls back to DejaVu Sans Mono, then the generic monospace.
 DEFAULT_FONT_FAMILY = 'Hack'
 
+# Base font point-size bounds (the zoom scales this); a stored or typed value is
+# clamped so the glyph can never be made unreadably tiny or huge.
+FONT_SIZE_MIN = 6
+FONT_SIZE_MAX = 72
+
 _CP_PROP = QTextFormat.Property.UserProperty + 1
 
 # Human-readable gloss for each risk class (marking_class), for the click popup.
@@ -692,6 +697,15 @@ class SecureTerminal(QPlainTextEdit):
 
     def current_font_family(self):
         return self._font_family
+
+    def set_font_size(self, points):
+        """Set the BASE font point size (the zoom then scales it). Clamped to a
+        sane range so a stored/typed value cannot make the glyph unreadable."""
+        self._base_point_size = max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, int(points)))
+        self._apply_font()
+
+    def current_font_size(self):
+        return self._base_point_size
 
     def current_zoom(self):
         return self._zoom
