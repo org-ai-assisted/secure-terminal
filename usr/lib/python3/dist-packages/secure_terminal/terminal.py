@@ -2120,10 +2120,16 @@ class SecureTerminal(QPlainTextEdit):
                     text = frag.text()
                     if BOX in text:
                         cp = frag.charFormat().property(_CP_PROP)
-                        # a neutralized run carries its source codepoint; name it.
-                        # A box without one (should not happen) still exports '_'.
-                        text = (text.replace(BOX, render_output(chr(cp), 'detail'))
-                                if cp is not None else text.replace(BOX, '_'))
+                        # A real U+25A1 the program printed is kept as its glyph in
+                        # Show mode (cp is its own codepoint) -- it is NOT a
+                        # neutralization placeholder, so it is left untouched,
+                        # matching _export_ascii's Show invariant. Otherwise the box
+                        # stands in for a neutralized byte: name its source codepoint
+                        # inline, or (untagged, e.g. past the marking cap) the ASCII
+                        # placeholder.
+                        if not (cp == 0x25a1 and self._mode == 'show'):
+                            text = (text.replace(BOX, render_output(chr(cp), 'detail'))
+                                    if cp is not None else text.replace(BOX, '_'))
                     out.append(text)
                 it += 1
             block = block.next()
