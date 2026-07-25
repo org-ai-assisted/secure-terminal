@@ -33,7 +33,7 @@ from secure_terminal import settings, session, ipc
 from secure_terminal.sanitize import (
     sanitize_paste, OSC_FEATURES, OSC_FEATURE_BY_KEY, luminance)
 from secure_terminal.terminal import (
-    SecureTerminal, THEMES, DISPLAY_MODES, tui_available,
+    SecureTerminal, THEMES, DISPLAY_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
     BASE_POINT_SIZE, FONT_SIZE_MIN, FONT_SIZE_MAX,
 )
@@ -863,10 +863,10 @@ class MainWindow(QMainWindow):
 
     def new_tab(self, command=None, tui=None):
         # tui=None -> the window default; True/False forces the mode for this tab
-        # so New Tab can offer CLI vs TUI at creation. TUI needs pyte.
+        # so New Tab can offer CLI vs TUI at creation.
         if tui is None:
             tui = self._default_tui
-        tui = bool(tui) and tui_available()
+        tui = bool(tui)
         term = SecureTerminal(tui=tui, command=command or None)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
@@ -2524,10 +2524,7 @@ class MainWindow(QMainWindow):
 
         self.act_new_tui = QAction('New Tab (T&UI)', self)
         self._bind(self.act_new_tui, 'new_tab_tui', '')
-        self.act_new_tui.setEnabled(tui_available())
-        self.act_new_tui.setToolTip(
-            TUI_TOOLTIP if tui_available()
-            else 'TUI mode is unavailable on this system.')
+        self.act_new_tui.setToolTip(TUI_TOOLTIP)
         self.act_new_tui.triggered.connect(lambda: self.new_tab(tui=True))
         file_menu.addAction(self.act_new_tui)
 
@@ -2844,10 +2841,7 @@ class MainWindow(QMainWindow):
         self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', '#e5a50a'),
                                '&TUI mode', self, checkable=True)
         self.act_tui.setChecked(self._default_tui)
-        self.act_tui.setEnabled(tui_available())
         self.act_tui.setToolTip(TUI_TOOLTIP)
-        if not tui_available():
-            self.act_tui.setText('TUI mode (unavailable)')
         self.act_tui.toggled.connect(self.set_tui)
         view_menu.addAction(self.act_tui)
 
@@ -3351,7 +3345,6 @@ class MainWindow(QMainWindow):
 
         tui = QCheckBox()
         tui.setChecked(self._default_tui)
-        tui.setEnabled(tui_available())
         _tip_row(rendering, 'TUI mode (new tabs)', tui,
                  'Start new tabs in TUI mode (for full-screen programs like vim or '
                  'htop) instead of CLI mode. TUI mode interprets cursor/screen '
@@ -3696,11 +3689,6 @@ class MainWindow(QMainWindow):
             ('off', 'Off', None, 'Show program output without ANSI colours.'),
         ), lambda k: self.set_colors(k == 'on'))
         bar.addWidget(col_frame)
-
-        if not tui_available():
-            for btn in self._tui_buttons.values():
-                btn.setEnabled(False)
-            self._tui_buttons['tui'].setToolTip('TUI mode is unavailable on this system.')
 
         # reflect the current defaults on the freshly-built chips
         self._set_chip(self._mode_buttons, self._default_mode)

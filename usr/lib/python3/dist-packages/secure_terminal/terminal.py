@@ -81,60 +81,54 @@ import termios
 import shlex
 import unicodedata
 
-try:
-    import pyte
-except ImportError:  # pragma: no cover - pyte is a hard runtime dependency
-    pyte = None                          # (TUI mode is unavailable without it)
+import pyte
 
-if pyte is not None:
-    # Per base cell; Unicode UAX #15 stream-safe format allows at most 30
-    # combining marks, so any conformant text stays untouched.
-    _TUI_COMBINE_CAP = 32
+# Per base cell; Unicode UAX #15 stream-safe format allows at most 30
+# combining marks, so any conformant text stays untouched.
+_TUI_COMBINE_CAP = 32
 
-    class _SafeHistoryScreen(pyte.HistoryScreen):
-        """pyte 0.8.0's HistoryScreen.select_graphic_rendition() takes only
-        *attrs, but pyte's stream dispatches a private ("?"-prefixed) CSI with
-        private=True, so a private-marked SGR raises TypeError and _feed_bytes
-        drops the whole frame. Programs like vim, htop and tmux emit such
-        sequences, which showed up as dropped frames in that render. A private
-        SGR is not a standard colour operation, so ignore it (as upstream pyte
-        later did) instead of crashing; every other private CSI (set/reset mode)
-        already accepts private=. Nothing here weakens the cell filter: this only
-        governs how pyte parses, never what is allowed onto the screen."""
+class _SafeHistoryScreen(pyte.HistoryScreen):
+    """pyte 0.8.0's HistoryScreen.select_graphic_rendition() takes only
+    *attrs, but pyte's stream dispatches a private ("?"-prefixed) CSI with
+    private=True, so a private-marked SGR raises TypeError and _feed_bytes
+    drops the whole frame. Programs like vim, htop and tmux emit such
+    sequences, which showed up as dropped frames in that render. A private
+    SGR is not a standard colour operation, so ignore it (as upstream pyte
+    later did) instead of crashing; every other private CSI (set/reset mode)
+    already accepts private=. Nothing here weakens the cell filter: this only
+    governs how pyte parses, never what is allowed onto the screen."""
 
-        def select_graphic_rendition(self, *attrs, private=False, **kwargs):
-            if private:
-                return
-            super().select_graphic_rendition(*attrs)
+    def select_graphic_rendition(self, *attrs, private=False, **kwargs):
+        if private:
+            return
+        super().select_graphic_rendition(*attrs)
 
-        def draw(self, data):
-            # Bound a Zalgo flood. pyte merges each zero-width combining mark into
-            # the cell before the cursor via unicodedata.normalize("NFC",
-            # cell.data + mark) -- O(len) per mark -- so a base plus thousands of
-            # marks, OR a cursor that steers many chunks back onto ONE cell, reshapes
-            # in O(n^2) and freezes the render for seconds. Drop a mark once its
-            # TARGET cell already holds the Unicode stream-safe maximum: cell-accurate,
-            # so neither read boundaries nor cursor moves can bypass it. Lossless for
-            # real decomposed text (never nears the cap). Fast path: an all-ASCII
-            # chunk (the common case) batches through at C speed, since ASCII can
-            # never be a combining mark.
-            if data.isascii():
-                super().draw(data)
-                return
-            for ch in data:
-                if ord(ch) >= 0x0300 and unicodedata.combining(ch):
-                    x = self.cursor.x
-                    if x:
-                        target = self.buffer[self.cursor.y].get(x - 1)
-                    elif self.cursor.y:
-                        target = self.buffer[self.cursor.y - 1].get(self.columns - 1)
-                    else:
-                        target = None
-                    if target is not None and len(target.data) > _TUI_COMBINE_CAP:
-                        continue                  # target cell already at the cap
-                super().draw(ch)
-else:  # pragma: no cover - pyte is a hard runtime dependency (always present)
-    _SafeHistoryScreen = None
+    def draw(self, data):
+        # Bound a Zalgo flood. pyte merges each zero-width combining mark into
+        # the cell before the cursor via unicodedata.normalize("NFC",
+        # cell.data + mark) -- O(len) per mark -- so a base plus thousands of
+        # marks, OR a cursor that steers many chunks back onto ONE cell, reshapes
+        # in O(n^2) and freezes the render for seconds. Drop a mark once its
+        # TARGET cell already holds the Unicode stream-safe maximum: cell-accurate,
+        # so neither read boundaries nor cursor moves can bypass it. Lossless for
+        # real decomposed text (never nears the cap). Fast path: an all-ASCII
+        # chunk (the common case) batches through at C speed, since ASCII can
+        # never be a combining mark.
+        if data.isascii():
+            super().draw(data)
+            return
+        for ch in data:
+            if ord(ch) >= 0x0300 and unicodedata.combining(ch):
+                x = self.cursor.x
+                if x:
+                    target = self.buffer[self.cursor.y].get(x - 1)
+                elif self.cursor.y:
+                    target = self.buffer[self.cursor.y - 1].get(self.columns - 1)
+                else:
+                    target = None
+                if target is not None and len(target.data) > _TUI_COMBINE_CAP:
+                    continue                  # target cell already at the cap
+            super().draw(ch)
 
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData)
@@ -243,7 +237,9 @@ _BRACKETED_PASTE_MODE = 2004 << 5
 
 
 def tui_available():
-    return pyte is not None
+    # python3-pyte is a hard dependency (see debian/control), so TUI mode is
+    # always available. Retained as a stable capability query for callers/tests.
+    return True
 
 
 # Directories a bell sound file may live in. Restricting to these keeps the
@@ -494,7 +490,7 @@ class SecureTerminal(QPlainTextEdit):
         # TUI mode: interpret escapes through a pyte screen so full-screen
         # programs (ssh, vim, htop, tmux) work. Off by default; the strict, no-parser
         # line mode above is the safe default.
-        self._tui = bool(tui) and tui_available()
+        self._tui = bool(tui)
         if self._tui:
             # a TUI screen is fixed; no scrollback scrollbar (see apply_tui)
             self.setVerticalScrollBarPolicy(
@@ -790,8 +786,6 @@ class SecureTerminal(QPlainTextEdit):
         re-export cannot reach the shell -- sending it would type `export TERM=...`
         into that program. So the switch is REFUSED with a clear message. Returns
         True if the mode changed (or was already set), False if it was refused."""
-        if bool(enabled) and not tui_available():
-            return False              # TUI requested but pyte missing: not applied
         enabled = bool(enabled)
         if enabled == self._tui:
             return True
@@ -992,7 +986,7 @@ class SecureTerminal(QPlainTextEdit):
         return self._osc['osc_title'] or self._osc['osc_notify']
 
     def tui_active(self):
-        return getattr(self, '_tui', False) and tui_available()
+        return getattr(self, '_tui', False)
 
     def _text_area(self):
         """The viewport size MINUS the document margins, i.e. the pixels actually
@@ -1563,7 +1557,7 @@ class SecureTerminal(QPlainTextEdit):
         # rebuilt from the retained raw output (see _seed_grid), so no CLI-period
         # output is lost. _feed_stream handles the alternate-screen snapshot/restore
         # inline (at the byte boundary), so this works for live output and the seed.
-        if self.tui_active() and pyte is not None:
+        if self.tui_active():
             if self._screen is None:
                 self._make_screen()
             # Hold back a possible split alt-screen marker tail so _feed_stream never
