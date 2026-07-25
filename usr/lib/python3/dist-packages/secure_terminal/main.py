@@ -3450,6 +3450,14 @@ class MainWindow(QMainWindow):
                  'tabs are easy to tell apart at a glance. On by default; a colour '
                  'you set on a tab (right-click) overrides the automatic one.')
 
+        # Size every dropdown to its own item count (capped): a Qt desktop theme
+        # that reserves maxVisibleItems rows for the popup would otherwise leave
+        # scrollable empty space below a short list -- most visibly the Font list,
+        # which rarely has as many monospaced faces as the default cap.
+        for _combo in (theme, font_family, scrollback, mode,
+                       paste_warn, copy_warn, pdelay):
+            _combo.setMaxVisibleItems(max(1, min(_combo.count(), 15)))
+
         scroll.setWidget(content)           # all sections scroll; buttons pinned below
         outer.addWidget(scroll)
         buttons = QHBoxLayout()
