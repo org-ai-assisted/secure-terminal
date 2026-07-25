@@ -13,15 +13,18 @@ import importlib.util
 import sys
 
 
-def require(*modules):
-    """Exit 1, naming the first missing module on stderr, if any dependency in
-    `modules` (dotted import names) is not importable. A no-op when all present."""
-    for module in modules:
+def require(*deps):
+    """Exit 1, naming the first missing dependency on stderr with a Debian install
+    hint, if it is not importable. Each dep is an (import_name, apt_package) pair;
+    dotted import names are supported. A no-op when every dependency is present."""
+    for module, package in deps:
         try:
             present = importlib.util.find_spec(module) is not None
         except (ImportError, ValueError):   # a dotted name whose parent is absent
             present = False
         if not present:
             sys.stderr.write(
-                'secure-terminal: missing dependency: %s\n' % module)
+                'secure-terminal: missing dependency: %s\n'
+                'if on debian:\n'
+                'sudo apt install %s\n' % (module, package))
             raise SystemExit(1)
