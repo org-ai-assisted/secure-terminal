@@ -2527,7 +2527,7 @@ class MainWindow(QMainWindow):
         self.act_new_tui.setEnabled(tui_available())
         self.act_new_tui.setToolTip(
             TUI_TOOLTIP if tui_available()
-            else 'TUI mode needs python3-pyte.')
+            else 'TUI mode is unavailable on this system.')
         self.act_new_tui.triggered.connect(lambda: self.new_tab(tui=True))
         file_menu.addAction(self.act_new_tui)
 
@@ -2847,7 +2847,7 @@ class MainWindow(QMainWindow):
         self.act_tui.setEnabled(tui_available())
         self.act_tui.setToolTip(TUI_TOOLTIP)
         if not tui_available():
-            self.act_tui.setText('TUI mode (needs python3-pyte)')
+            self.act_tui.setText('TUI mode (unavailable)')
         self.act_tui.toggled.connect(self.set_tui)
         view_menu.addAction(self.act_tui)
 
@@ -3356,7 +3356,7 @@ class MainWindow(QMainWindow):
                  'Start new tabs in TUI mode (for full-screen programs like vim or '
                  'htop) instead of CLI mode. TUI mode interprets cursor/screen '
                  'escapes inside an isolated grid so full-screen programs can '
-                 'redraw. Needs python3-pyte.')
+                 'redraw.')
 
         # granular OSC feature toggles: each off by default, its risk coloured in
         # the label and its layman attack-surface hint as the tooltip.
@@ -3700,7 +3700,7 @@ class MainWindow(QMainWindow):
         if not tui_available():
             for btn in self._tui_buttons.values():
                 btn.setEnabled(False)
-            self._tui_buttons['tui'].setToolTip('TUI mode needs python3-pyte.')
+            self._tui_buttons['tui'].setToolTip('TUI mode is unavailable on this system.')
 
         # reflect the current defaults on the freshly-built chips
         self._set_chip(self._mode_buttons, self._default_mode)
