@@ -16,6 +16,11 @@ _dev = os.path.join(
 if os.path.isdir(os.path.join(_dev, 'secure_terminal')):
     sys.path.insert(0, _dev)
 
+## Fail loud on a missing runtime dependency (clear stderr message + non-zero
+## exit) before the app import. The CLI drives a real UNIX pseudo-terminal.
+from secure_terminal.preflight import require
+require('termios', 'pty')
+
 from secure_terminal.cli import main
 
 if __name__ == '__main__':

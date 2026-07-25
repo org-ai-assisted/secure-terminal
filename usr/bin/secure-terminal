@@ -17,6 +17,11 @@ _dev = os.path.join(
 if os.path.isdir(os.path.join(_dev, 'secure_terminal')):
     sys.path.insert(0, _dev)
 
+## Fail loud on a missing runtime dependency (clear stderr message + non-zero
+## exit) before the heavy import below would traceback.
+from secure_terminal.preflight import require
+require('PyQt6.QtWidgets', 'PyQt6.QtMultimedia', 'pyte')
+
 from secure_terminal.main import main
 
 if __name__ == '__main__':
