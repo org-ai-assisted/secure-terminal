@@ -1,0 +1,127 @@
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## Run the terminal-poc-corpus adversarial suite against THIS checkout.
+##
+## The corpus repo already has adversarial.yml, but it triggers on pushes to the
+## CORPUS and tests them against secure-terminal master. That is one-directional:
+## a change HERE that regresses corpus handling is not caught until the corpus
+## repo happens to push again, or never. This workflow closes the other
+## direction, so the PoC corpus gates secure-terminal changes too.
+##
+## dist-ai's terminal-poc-corpus-tests entrypoint cannot serve this: it is
+## unreachable from any component-filtered run (dist-ai-tests-all's
+## suite_component() has no terminal-poc-corpus case, so it resolves to the empty
+## string and never matches a --component), and the reusable always filters by
+## component. It would also SKIP (exit 77) without a corpus checkout, which the
+## orchestrator counts as green.
+##
+## Conformance (conformance/acquire.sh + harness/conformance.py) is deliberately
+## NOT run here: it fetches third-party suites over the network, which belongs in
+## the corpus repo's own scheduled run rather than in a per-push gate.
+##
+## The harness refuses to decode live payloads outside a sandbox or GitHub CI, and
+## leads with a --test-canary positive control so a broken detector fails loud
+## instead of passing vacuously.
+
+name: external corpora
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  adversarial:
+    name: terminal-poc-corpus adversarial
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    ## Fork-PR guard, matching the other workflows in this repo.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout secure-terminal (the code under test)
+        ## https://github.com/actions/checkout/releases/tag/v6.0.2
+        ## > de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout terminal-poc-corpus
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: secure-terminal/terminal-poc-corpus
+          ref: master
+          path: _corpus
+          persist-credentials: false
+
+      - name: Install dependencies (apt only)
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --no-install-recommends \
+            python3-pyqt6 python3-pyte python3-yaml python3-jsonschema
+
+      - name: Validate the corpus (schema + sanitization lint)
+        working-directory: _corpus
+        run: python3 tools/validate.py
+
+      - name: Positive control + adversarial corpus
+        working-directory: _corpus
+        env:
+          SECURE_TERMINAL_REPO: ${{ github.workspace }}
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python3 harness/run.py --self-test
+          python3 harness/adversarial.py --self-test
+          python3 harness/adversarial.py
+
+  git-diffs-lie-drift:
+    ## The git-diffs-lie content/* fixtures are vendored as byte literals into
+    ## dist-ai's test_corpus.py, because CI checks out only the code under test
+    ## and dist-ai -- never the corpus. A vendored copy that silently diverges
+    ## still passes while testing bytes nobody chose, which is how three of them
+    ## had already drifted from upstream. This job compares them and fails on a
+    ## mismatch or on a NEW upstream content/* fixture that is not vendored.
+    name: git-diffs-lie vendored-fixture drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout dist-ai (holds the vendored fixtures)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: org-ai-assisted/dist-ai
+          ref: master
+          path: _dist-ai
+          persist-credentials: false
+
+      - name: Checkout git-diffs-lie (all branches)
+        ## fetch-depth 0: the fixtures live one per payload BRANCH, so a shallow
+        ## single-branch clone would find nothing to compare against. The checker
+        ## fails loud rather than passing vacuously if that ever regresses.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: output-lies/git-diffs-lie
+          ref: master
+          path: _git-diffs-lie
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare vendored fixtures against upstream
+        run: |
+          python3 _dist-ai/usr/share/secure-terminal-tests/check_corpus_drift.py \
+            --git-diffs-lie _git-diffs-lie
