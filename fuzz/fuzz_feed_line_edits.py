@@ -15,7 +15,7 @@ line. On any input it must:
   - never smuggle a raw ESC into a cell (an escape in a cell is an escape that
     reaches the widget);
   - keep the logical cursor within the current line;
-  - render (via cells_to_runs) to only the safe alphabet in strip mode.
+  - render (via cells_to_runs) to only the safe alphabet in box mode.
 The resulting state, fed again, must still not raise. This is the editor whose
 mishandling once froze the GUI on `cat /dev/random`.
 
@@ -29,7 +29,7 @@ import atheris
 
 with atheris.instrument_imports():
     from secure_terminal.sanitize import (feed_line_edits, cells_to_runs,
-                                          cells_display_col, STRIP_BOX)
+                                          cells_display_col, BOX)
 
 _HONORED = {0x08, 0x09, 0x0A, 0x0D}
 _SAFE = frozenset(_HONORED | set(range(0x20, 0x7F)))
@@ -59,12 +59,12 @@ def TestOneInput(data):
         raise RuntimeError(
             "cells_to_runs bad prefix {0!r}: input={1!r}".format(prefix, text))
     for run_text, _key in runs:
-        # STRIP_BOX (U+25A1) is cells_to_runs' intentional strip-mode placeholder
-        # for a neutralized cell (the widget maps it back to '_' on export) --
-        # safe by design, so allow it alongside the ASCII set.
-        if not all(ord(ch) in _SAFE or ch in ('\n', STRIP_BOX) for ch in run_text):
+        # BOX (U+25A1) is cells_to_runs' intentional box-mode placeholder for a
+        # neutralized cell (the widget maps it back to '_' on export) -- safe by
+        # design, so allow it alongside the ASCII set.
+        if not all(ord(ch) in _SAFE or ch in ('\n', BOX) for ch in run_text):
             raise RuntimeError(
-                "cells_to_runs strip run not safe: input={0!r} run={1!r}".format(
+                "cells_to_runs box run not safe: input={0!r} run={1!r}".format(
                     text, run_text))
 
     if cells_display_col(cells, col, 'box') < 0:
