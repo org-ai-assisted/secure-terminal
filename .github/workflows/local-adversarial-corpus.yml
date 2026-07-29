@@ -67,11 +67,32 @@ jobs:
           path: _corpus
           persist-credentials: false
 
-      - name: Install dependencies (apt only)
+      - name: Resolve the declared dependency set
+        id: deps
+        ## Read the package list from .github/dm-consumer.yml rather than copying
+        ## it. usr/bin/secure-terminal preflight-checks its runtime dependencies
+        ## and exits 1 naming the first missing one, so a hand-copied list that
+        ## falls behind does not fail with "missing PyQt6.QtMultimedia" -- the app
+        ## never starts, the --test-canary positive control does not fire, and the
+        ## harness refuses to trust the whole run. One source of truth instead.
         run: |
           sudo apt-get update --quiet
-          sudo apt-get install --yes --no-install-recommends \
-            python3-pyqt6 python3-pyte python3-yaml python3-jsonschema
+          sudo apt-get install --yes --no-install-recommends python3-yaml
+          python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+          import yaml
+          with open('.github/dm-consumer.yml', encoding='utf-8') as handle:
+              declared = yaml.safe_load(handle)['dist-ai-tests']['apt-packages']
+          # python3-jsonschema is the corpus tooling's own need, not secure-terminal's.
+          print('packages=%s python3-jsonschema' % declared)
+          PY
+
+      - name: Install dependencies (apt only)
+        env:
+          PACKAGES: ${{ steps.deps.outputs.packages }}
+        run: |
+          # word splitting is intended: PACKAGES is a space-separated apt list
+          # shellcheck disable=SC2086
+          sudo apt-get install --yes --no-install-recommends ${PACKAGES}
 
       - name: Validate the corpus (schema + sanitization lint)
         working-directory: _corpus
@@ -122,6 +143,15 @@ jobs:
           persist-credentials: false
 
       - name: Compare vendored fixtures against upstream
+        ## The checker lives in dist-ai, so a change that needs both repos must
+        ## land in dist-ai FIRST -- otherwise this job checks out a dist-ai master
+        ## that predates it. Say so explicitly rather than dying on a bare
+        ## "python3: can't open file".
         run: |
-          python3 _dist-ai/usr/share/secure-terminal-tests/check_corpus_drift.py \
-            --git-diffs-lie _git-diffs-lie
+          checker='_dist-ai/usr/share/secure-terminal-tests/check_corpus_drift.py'
+          if [ ! -f "${checker}" ]; then
+            printf 'FAIL: %s absent from dist-ai master; land the dist-ai change first\n' \
+              "${checker}" >&2
+            exit 1
+          fi
+          python3 "${checker}" --git-diffs-lie _git-diffs-lie
