@@ -1,0 +1,45 @@
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## Scheduled run of the heavy randomized dist-ai fuzz suites
+## (secure-terminal-tests-fuzz, secure-terminal-tests-fuzz-gui).
+##
+## Why a repo-owned 'local-*' workflow and not consumer-dist-ai-tests.yml:
+## that file is propagated byte-identically from developer-meta-files and is
+## overwritten on the next propagation pass, so it cannot carry a per-repo
+## schedule. It also calls the reusable with its default '--core', which
+## selects only secure-terminal-tests and secure-terminal-tests-coverage --
+## the '--fuzz' category (dist-ai-tests-all fuzz_suites) was unreachable from
+## CI entirely. These two suites are the ONLY live-widget and pyte-path fuzzing
+## the project has; ClusterFuzzLite covers the Qt-free parser surface only.
+##
+## Nightly rather than per-push: 40000 parser iterations plus 6000 live-widget
+## iterations is minutes of wall clock, and the seed is random per run, so
+## repeated runs explore new inputs. A failure prints the seed for `--seed N`
+## replay.
+
+name: dist-ai fuzz
+
+on:
+  schedule:
+    - cron: '15 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dist-ai-fuzz:
+    uses: org-ai-assisted/developer-meta-files/.github/workflows/reusable-dist-ai-tests.yml@master
+    with:
+      ## Measured at full iteration count: ~50s for the parser suite, ~330s for
+      ## the live-widget suite. Both sit inside dist-ai-tests-all's default
+      ## 600s-per-fuzz-suite cap, and the pair plus apt setup inside the
+      ## reusable's 20-minute job timeout.
+      categories: '--fuzz'

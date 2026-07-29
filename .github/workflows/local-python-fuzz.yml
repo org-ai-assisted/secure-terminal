@@ -8,8 +8,13 @@
 ## base-builder + compile_python_fuzzer pipeline wraps each
 ## fuzz/fuzz_*.py harness into a libFuzzer-style runnable.
 ##
-## Two jobs in one workflow, gated by event:
+## Three jobs in one workflow, gated by event:
 ##   - pr:    short per-fuzzer budget on PRs touching python/fuzz/.clusterfuzzlite.
+##   - push:  same budget on a direct push to master. master history is direct
+##            pushes, not merges, so a PR-only trigger leaves the path code
+##            actually lands by completely unfuzzed -- and a harness that no
+##            longer builds (a renamed import) then rots until the nightly
+##            notices, which nothing blocks on.
 ##   - batch: longer per-fuzzer budget on schedule + workflow_dispatch.
 ##
 ## Reference: https://google.github.io/clusterfuzzlite/running-clusterfuzzlite/github-actions/
@@ -24,6 +29,13 @@ on:
         required: false
         default: '600'
   pull_request:
+    branches: [master]
+    paths:
+      - 'usr/lib/python3/dist-packages/**/*.py'
+      - 'fuzz/**'
+      - '.clusterfuzzlite/**'
+      - '.github/workflows/local-python-fuzz.yml'
+  push:
     branches: [master]
     paths:
       - 'usr/lib/python3/dist-packages/**/*.py'
@@ -109,6 +121,71 @@ jobs:
             --column-header field \
             --row "outcome=${JOB_STATUS}" \
             --row "mode=code-change" \
+            --row "fuzz-seconds=60"
+
+  push:
+    name: ClusterFuzzLite push fuzz
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        ## https://github.com/actions/checkout/releases/tag/v6.0.2
+        ## > de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build fuzzers
+        ## A harness that no longer compiles fails the whole build here
+        ## (bad_build_check), which is the point: a rename in the package that
+        ## misses fuzz/ must go red on the commit that lands it.
+        ## https://github.com/google/clusterfuzzlite/tree/v1
+        ## > 884713a6c30a92e5e8544c39945cd7cb630abcd1 (HEAD of v1; no release tag)
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1  # v1
+        with:
+          language: python
+          sanitizer: address
+
+      - name: Run fuzzers (batch)
+        ## 'batch', not 'code-change': code-change derives its diff from the
+        ## pull_request context, which a push event does not carry.
+        ## https://github.com/google/clusterfuzzlite/tree/v1
+        ## > 884713a6c30a92e5e8544c39945cd7cb630abcd1
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1  # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 60
+          mode: 'batch'
+          sanitizer: address
+          output-sarif: true
+
+      - name: Checkout developer-meta-files (summary script)
+        if: always()
+        ## Needed for ci/step-summary-emit.sh. See same step in the
+        ## 'pr' job above for rationale.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: org-ai-assisted/developer-meta-files
+          ref: master
+          path: .dmf
+          persist-credentials: false
+
+      - name: Emit step summary
+        if: always()
+        ## Same minimal pattern as the 'pr' job above. Template values
+        ## routed through env: per developer-meta-files#87.
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          ./.dmf/ci/step-summary-emit.sh \
+            --tool 'ClusterFuzzLite (push)' \
+            --column-header field \
+            --row "outcome=${JOB_STATUS}" \
+            --row "mode=batch" \
             --row "fuzz-seconds=60"
 
   batch:
