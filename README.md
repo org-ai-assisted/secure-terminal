@@ -4,8 +4,10 @@ A terminal where paste is safe by design.
 
 Paste a command copied from the web, or read text a program printed, without
 worrying about invisible characters, bidi overrides or escape sequences.
-secure-terminal accepts and displays plain printable ASCII by default and nothing
-else, so a pasted or printed lie has nothing to hide in.
+secure-terminal accepts plain printable ASCII and, in its default display mode,
+shows only that -- so a pasted or printed lie has nothing to hide in. The other
+display modes trade some of that back deliberately (see below); what holds in
+every mode is that no invisible, bidi or control character reaches you unmarked.
 
 This is the problem [output lies](https://output-lies.github.io) documents,
 removed at the source.
@@ -32,7 +34,7 @@ It does nothing about the programs you deliberately run.
 
 ## How it stays safe
 
-- **ASCII-only display.** Program output is passed through a sanitizer: ANSI/OSC
+- **Printable-ASCII display by default.** Program output is passed through a sanitizer: ANSI/OSC
   escape sequences are removed and every byte that is not printable ASCII (plus
   tab and newline) is dropped, the way `stcat` does for logs. A hostile filename
   or a Trojan-Source comment cannot reorder what you read, and nothing a program

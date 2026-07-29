@@ -18,8 +18,11 @@ secure-terminal(1) -- a terminal where paste is safe by design
 
 secure-terminal is a small terminal for pasting commands into, and reading text
 out of, without worrying about invisible characters, bidi overrides or escape
-sequences. Its default display is printable ASCII only (everything else is
-neutralized). It runs no escape-sequence parser on program output beyond safe
+sequences. Its default (Box) display is printable ASCII, with everything else
+neutralized to a placeholder; the three other display modes trade some of that
+back deliberately -- Show keeps real printable non-ASCII, Reveal and Detail name
+the hidden characters inline. What holds in EVERY mode is that no invisible, bidi
+or control character reaches you unmarked. It runs no escape-sequence parser on program output beyond safe
 colour and four line-local edits within the line being written, so a pasted or
 printed lie cannot reorder what you see or reach a line you have already scrolled
 past. Paste is sanitized to ASCII before it reaches the shell.
