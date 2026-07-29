@@ -38,9 +38,13 @@ _SAFE = frozenset(_HONORED | set(range(0x20, 0x7F)))
 def TestOneInput(data):
     fdp = atheris.FuzzedDataProvider(data)
     max_line = fdp.ConsumeIntInRange(0, 256)   # 0 = unbounded; >0 = width bound
+    # Both settings share every invariant below: with line editing off the CSI ops
+    # are consumed but inert (append-only), which must not weaken any of them.
+    line_edits = bool(fdp.ConsumeIntInRange(0, 1))
     text = fdp.ConsumeUnicodeNoSurrogates(2 ** 18)
 
-    comp, cells, col, sgr, _wraps = feed_line_edits([], 0, {}, text, max_line)
+    comp, cells, col, sgr, _wraps = feed_line_edits([], 0, {}, text, max_line,
+                                                    line_edits)
     if not 0 <= col <= len(cells):
         raise RuntimeError(
             "feed_line_edits cursor {0} out of [0,{1}]: input={2!r}".format(
@@ -72,7 +76,7 @@ def TestOneInput(data):
             "cells_display_col negative: input={0!r}".format(text))
 
     ## Feeding the resulting state again must not raise.
-    feed_line_edits(cells, col, sgr, text, max_line)
+    feed_line_edits(cells, col, sgr, text, max_line, line_edits)
 
 
 def main():

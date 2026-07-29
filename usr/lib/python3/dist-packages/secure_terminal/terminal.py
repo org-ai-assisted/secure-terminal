@@ -403,7 +403,7 @@ class SecureTerminal(QPlainTextEdit):
 
     def __init__(self, parent=None, command=None, tui=False, history='',
                  preview=False, cwd=None, mode='detail', colors=False,
-                 markings=True):
+                 markings=True, line_edits=True):
         super().__init__(parent)
         # working directory to start the shell in (restored session tab); None ->
         # inherit the app's cwd.
@@ -462,6 +462,12 @@ class SecureTerminal(QPlainTextEdit):
         # the ctor before the history render, for the same render-once reason.
         self._colors = bool(colors)
         self._markings = bool(markings)   # colour the box / badge by risk class
+        # Whether the line-local cursor/erase escapes a shell's line editor emits
+        # are honored. Off makes ESCAPE-driven editing append-only, so a program
+        # cannot redraw a line it already wrote (the cost: tab completion and
+        # progress bars append instead of updating in place). Set from the ctor
+        # before the history render, for the same render-once reason as colours.
+        self._line_edits = bool(line_edits)
         self._sgr_reset()
 
         # Scrollback limit in lines. Default to a bounded window (like every
@@ -1294,6 +1300,16 @@ class SecureTerminal(QPlainTextEdit):
     def colors_enabled(self):
         return self._colors
 
+    # -- line-local editing escapes ------------------------------------------
+    def apply_line_edits(self, enabled):
+        if bool(enabled) == self._line_edits:
+            return
+        self._line_edits = bool(enabled)
+        self._rerender()      # replay the retained output under the new rule
+
+    def line_edits_enabled(self):
+        return self._line_edits
+
     def _effective_colors(self):
         return self._colors and colors_allowed()
 
@@ -2034,7 +2050,7 @@ class SecureTerminal(QPlainTextEdit):
         wrap = self._cols if 8 <= self._cols <= self._MAX_LINE else self._MAX_LINE
         completed, self._line_cells, self._line_col, self._sgr, wraps = \
             feed_line_edits(self._line_cells, self._line_col, self._sgr, text,
-                            wrap)
+                            wrap, self._line_edits)
         self._paint_line(completed, wraps)
 
     def _paint_line(self, completed, wraps=None):

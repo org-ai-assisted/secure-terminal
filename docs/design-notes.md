@@ -53,7 +53,9 @@ source of truth for behaviour.
   scrolled past). Scope, per the previous point: the line currently being written
   is not covered -- horizontal moves and erase-in-line redraw it, exactly as `\r`
   does, so its earlier content is lost. A once-per-tab notice explains the
-  whole-screen no-op rather than letting it read as broken.
+  whole-screen no-op rather than letting it read as broken. The `line_edits`
+  setting (default true) turns the four ops off for anyone who wants the stricter
+  guarantee; it is admin-lockable like the other display keys.
 
 ## Paste review (text coming IN)
 

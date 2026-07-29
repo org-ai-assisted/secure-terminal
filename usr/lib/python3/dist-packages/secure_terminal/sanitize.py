@@ -507,7 +507,7 @@ def _is_mark(ch):
     return unicodedata.category(ch)[0] == 'M'
 
 
-def feed_line_edits(cells, col, sgr, raw, max_line=0):
+def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
     """Advance the current line's LOGICAL cell buffer by one raw output chunk.
 
     A cell is (source_char, sgr_state) -- one SOURCE character, whatever its later
@@ -515,14 +515,22 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0):
     shell's cursor/erase ops act on characters, not on the rendering. This is what
     makes backspacing over a badge delete the whole badge. Pure and testable.
 
-    Honors \r, \b, \n and the line-local CSI ops (see _LINE_CSI_RE); folds SGR into
+    Honors \r, \b, \n and, when `line_edits` is true (the default), the line-local
+    CSI ops (see _LINE_CSI_RE); folds SGR into
     `sgr` (so colour survives a redraw); strips every other escape and treats a
     stray control byte as an overwrite cell (rendered as the box placeholder
     later). Returns
     (completed, cells, col, sgr, wraps): cell-lists finished by a newline or an
     autowrap, plus the new current buffer, cursor column, SGR state, and a bool
     per completed line -- True where the line ended by a soft autowrap (so the
-    widget can join the wrapped rows on copy). max_line (>0) autowraps."""
+    widget can join the wrapped rows on copy). max_line (>0) autowraps.
+
+    line_edits=False makes ESCAPE-driven line editing append-only: the CSI ops are
+    still CONSUMED (they fall through to the generic escape strip, so no `[3G`
+    garbage is displayed) but no longer move the cursor or erase, so a program
+    cannot redraw a line it already wrote. \r and \b are NOT covered -- they are
+    raw control bytes the local caret echo and the kernel line discipline depend
+    on, so this makes output append-only against escapes, not against every byte."""
     completed = []
     wraps = []                            # parallel to completed: True == autowrap
     cells = list(cells)
@@ -530,7 +538,11 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0):
     while i < n:
         ch = raw[i]
         if ch == '\x1b':
-            m = _LINE_CSI_RE.match(raw, i)
+            # When line editing is off, do NOT match here: control falls through to
+            # the generic ANSI_RE strip below, which consumes the same bytes and
+            # displays nothing. That is the append-only behaviour, with no leftover
+            # partial sequence on screen.
+            m = _LINE_CSI_RE.match(raw, i) if line_edits else None
             if m:
                 num = _safe_int(m.group(1), None) if m.group(1) else None
                 op = m.group(2)

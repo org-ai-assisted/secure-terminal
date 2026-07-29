@@ -492,6 +492,12 @@ class MainWindow(QMainWindow):
         self._default_colors = cfg.get('colors', 'true') == 'true'
         self._default_markings = cfg.get('colored_markings', 'true') == 'true'
         self._auto_tab_colors = cfg.get('auto_tab_colors', 'true') == 'true'
+        # Line-local editing escapes on by default: without them tab completion
+        # prints a mangled duplicate instead of updating the line, and a \r
+        # progress bar stacks one line per update. Off makes escape-driven editing
+        # append-only, so a program cannot redraw a line it already wrote. An
+        # explicit saved 'false' still wins.
+        self._default_line_edits = cfg.get('line_edits', 'true') == 'true'
         self._auto_color_idx = 0      # cycles TAB_PALETTE so neighbours differ
         try:
             self._default_zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(cfg['zoom'])))
@@ -874,6 +880,7 @@ class MainWindow(QMainWindow):
         term.set_font_size(self._default_font_size)
         term.apply_mode(self._default_mode)
         term.apply_colors(self._default_colors)
+        term.apply_line_edits(self._default_line_edits)
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
@@ -912,6 +919,7 @@ class MainWindow(QMainWindow):
             mode = self._default_mode
         term.apply_mode(mode)
         term.apply_colors(_tab('colors', self._default_colors))
+        term.apply_line_edits(_tab('line_edits', self._default_line_edits))
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
@@ -1165,6 +1173,7 @@ class MainWindow(QMainWindow):
                               cwd=cwd if isinstance(cwd, str) and cwd else None,
                               mode=mode if mode in DISPLAY_MODES else self._default_mode,
                               colors=bool(info.get('colors')),
+                              line_edits=bool(info.get('line_edits', True)),
                               markings=bool(info.get('markings', True)))
         theme = info.get('theme')
         term.apply_theme(theme if theme in THEMES else self._default_theme)
@@ -1616,6 +1625,7 @@ class MainWindow(QMainWindow):
         # so a tab switch only DISPLAYS state, never mutates it.
         _sync = [
             (self.act_colors, term.colors_enabled()),
+            (self.act_line_edits, term.line_edits_enabled()),
             (self.act_markings, term.markings_enabled()),
             (self.act_tui, term.current_tui()),
             (self.act_title, term.allow_title_enabled()),
@@ -1735,6 +1745,16 @@ class MainWindow(QMainWindow):
         self.act_colors.setChecked(enabled)
         self._set_chip(self._colors_buttons, 'on' if enabled else 'off')
         self._default_colors = bool(enabled)
+        self._persist()
+
+    def set_line_edits(self, enabled):
+        if 'line_edits' in self._locked:
+            return                        # admin-locked; not user-changeable
+        term = self.current()
+        if term is not None:
+            term.apply_line_edits(enabled)
+        self.act_line_edits.setChecked(enabled)
+        self._default_line_edits = bool(enabled)
         self._persist()
 
     def set_auto_tab_colors(self, enabled):
@@ -2429,6 +2449,7 @@ class MainWindow(QMainWindow):
         gated = [
             ('unicode_mode', list(self._mode_actions.values())),
             ('colors', [self.act_colors]),
+            ('line_edits', [self.act_line_edits]),
             ('colored_markings', [self.act_markings]),
             ('auto_tab_colors', [self.act_auto_tab_colors]),
             ('osc_notice', [self.act_osc_notice]),
@@ -2478,6 +2499,7 @@ class MainWindow(QMainWindow):
             'font_size': str(self._default_font_size),
             'ui_scale': str(self._ui_scale),
             'colors': 'true' if self._default_colors else 'false',
+            'line_edits': 'true' if self._default_line_edits else 'false',
             'colored_markings': 'true' if self._default_markings else 'false',
             'auto_tab_colors': 'true' if self._auto_tab_colors else 'false',
             'scrollback': str(self._scrollback),
@@ -2720,6 +2742,21 @@ class MainWindow(QMainWindow):
             'is on.')
         self.act_colors.toggled.connect(self.set_colors)
         view_menu.addAction(self.act_colors)
+
+        self.act_line_edits = QAction(
+            _toggle_icon('format-text-direction-ltr', 'L', '#0969da'),
+            '&Line editing', self, checkable=True)
+        self.act_line_edits.setChecked(self._default_line_edits)
+        self.act_line_edits.setToolTip(
+            'Honour the line-local cursor/erase escapes a shell emits to redraw '
+            'the line you are typing -- tab completion, Ctrl+R history search, a '
+            'carriage-return progress bar. On by default. Off makes output '
+            'append-only against escapes: a program can no longer redraw a line it '
+            'already wrote, at the cost of completion and progress bars appending '
+            'instead of updating in place. Carriage return and backspace are raw '
+            'control bytes and stay honoured either way.')
+        self.act_line_edits.toggled.connect(self.set_line_edits)
+        view_menu.addAction(self.act_line_edits)
 
         self.act_markings = QAction('Colored &markings', self, checkable=True)
         self.act_markings.setChecked(self._default_markings)
@@ -3343,6 +3380,18 @@ class MainWindow(QMainWindow):
                  "Honour a program's ANSI colour escapes. Off shows plain text; "
                  'risk-class markings still apply either way.')
 
+        line_edits = QCheckBox()
+        line_edits.setChecked(self._default_line_edits)
+        line_edits.setEnabled('line_edits' not in self._locked)
+        _tip_row(rendering, 'Line editing', line_edits,
+                 'Honour the line-local cursor/erase escapes a shell emits to '
+                 'redraw the line you are typing (tab completion, Ctrl+R, a \\r '
+                 'progress bar). OFF makes output append-only against escapes, so '
+                 'a program cannot redraw a line it already wrote -- at the cost '
+                 'of completion and progress bars appending instead of updating '
+                 'in place. Carriage return and backspace are raw control bytes '
+                 'and stay honoured either way.')
+
         tui = QCheckBox()
         tui.setChecked(self._default_tui)
         _tip_row(rendering, 'TUI mode (new tabs)', tui,
@@ -3482,6 +3531,7 @@ class MainWindow(QMainWindow):
             'font_size': font_size.value(),
             'ui_scale': ui_scale.value(),
             'mode': mode.currentData(), 'colors': colors.isChecked(),
+            'line_edits': line_edits.isChecked(),
             'tui': tui.isChecked(),
             'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
             'osc_notice': osc.isChecked(),
@@ -3501,6 +3551,7 @@ class MainWindow(QMainWindow):
         for key, field, current in (
                 ('unicode_mode', 'mode', self._default_mode),
                 ('colors', 'colors', self._default_colors),
+            ('line_edits', 'line_edits', self._default_line_edits),
                 ('tui', 'tui', self._default_tui),
                 ('font_family', 'font_family', self._default_font_family),
                 ('osc_notice', 'osc_notice', self._osc_notice)):
@@ -3521,6 +3572,7 @@ class MainWindow(QMainWindow):
         self._ui_scale = opts.get('ui_scale', self._ui_scale)
         self._default_mode = opts['mode']
         self._default_colors = opts['colors']
+        self._default_line_edits = opts['line_edits']
         self._default_tui = opts['tui']
         for key, value in osc.items():
             self._osc_defaults[key] = value
@@ -3539,6 +3591,7 @@ class MainWindow(QMainWindow):
             term.set_font_size(self._default_font_size)
             term.apply_mode(opts['mode'])
             term.apply_colors(opts['colors'])
+            term.apply_line_edits(opts['line_edits'])
             for key, value in osc.items():
                 term.apply_osc(key, value)
             term.apply_scrollback(opts['scrollback'])
@@ -3731,6 +3784,7 @@ class MainWindow(QMainWindow):
                 'mode': term.current_mode(),
                 'font_family': term.current_font_family(),
                 'colors': term.colors_enabled(),
+            'line_edits': term.line_edits_enabled(),
                 'markings': term.markings_enabled(),
                 'tui': term.current_tui(),
                 'allow_title': term.allow_title_enabled(),

@@ -79,7 +79,10 @@ secure-terminal has two rendering modes, chosen per tab:
     four line-local edits (cursor forward/back, cursor-to-column, erase-in-line),
     and only within the line being written; vertical and absolute movement is
     stripped. A program can redraw its own current line, exactly as a carriage
-    return does, but can never reach back to a line already scrolled past.
+    return does, but can never reach back to a line already scrolled past. Set
+    `line_edits=false` (see CONFIGURATION) to drop even those four, making output
+    append-only against escapes -- at the cost of tab completion and progress bars
+    appending instead of updating in place.
 
   * TUI mode (opt-in):
     Escapes are interpreted inside an isolated in-memory screen model that has
