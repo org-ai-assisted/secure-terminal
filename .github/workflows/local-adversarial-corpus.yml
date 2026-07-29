@@ -3,7 +3,10 @@
 
 ## AI-Assisted
 
-## Run the terminal-poc-corpus adversarial suite against THIS checkout.
+## Gate this repo on the external adversarial corpora, which live in their own
+## repos and are therefore not checked out by the reusable dist-ai run.
+##   - adversarial:           terminal-poc-corpus, 22 PoCs + canary positive control
+##   - git-diffs-lie-corpus:  every content/* payload branch, read from a checkout
 ##
 ## The corpus repo already has adversarial.yml, but it triggers on pushes to the
 ## CORPUS and tests them against secure-terminal master. That is one-directional:
@@ -108,21 +111,31 @@ jobs:
           python3 harness/adversarial.py --self-test
           python3 harness/adversarial.py
 
-  git-diffs-lie-drift:
-    ## The git-diffs-lie content/* fixtures are vendored as byte literals into
-    ## dist-ai's test_corpus.py, because CI checks out only the code under test
-    ## and dist-ai -- never the corpus. A vendored copy that silently diverges
-    ## still passes while testing bytes nobody chose, which is how three of them
-    ## had already drifted from upstream. This job compares them and fails on a
-    ## mismatch or on a NEW upstream content/* fixture that is not vendored.
-    name: git-diffs-lie vendored-fixture drift
+  git-diffs-lie-corpus:
+    ## Run the corpus suite against the REAL git-diffs-lie checkout. test_corpus.py
+    ## resolves it from $GIT_DIFFS_LIE_DIR (the same discovery git-meld-tests uses),
+    ## reads every content/* payload branch, and asserts each is safely sanitized --
+    ## so a fixture added upstream is exercised automatically instead of being
+    ## reported as drift for someone to hand-sync. It also checks the in-tree copy
+    ## still matches the branch it stands in for, which is what the separate
+    ## drift-checker used to do.
+    ##
+    ## The in-tree copy is the floor for the reusable dist-ai run, which checks out
+    ## only the code under test plus dist-ai; this job is what makes the disk path
+    ## actually run in CI rather than only on a developer box.
+    name: git-diffs-lie corpus
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
     permissions:
       contents: read
     steps:
-      - name: Checkout dist-ai (holds the vendored fixtures)
+      - name: Checkout secure-terminal (the code under test)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout dist-ai (holds the suite)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: org-ai-assisted/dist-ai
@@ -132,8 +145,8 @@ jobs:
 
       - name: Checkout git-diffs-lie (all branches)
         ## fetch-depth 0: the fixtures live one per payload BRANCH, so a shallow
-        ## single-branch clone would find nothing to compare against. The checker
-        ## fails loud rather than passing vacuously if that ever regresses.
+        ## single-branch clone would find none. The suite asserts the branches are
+        ## readable, so that regression fails loud instead of passing vacuously.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: output-lies/git-diffs-lie
@@ -142,16 +155,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Compare vendored fixtures against upstream
-        ## The checker lives in dist-ai, so a change that needs both repos must
-        ## land in dist-ai FIRST -- otherwise this job checks out a dist-ai master
-        ## that predates it. Say so explicitly rather than dying on a bare
-        ## "python3: can't open file".
+      - name: Install dependencies (apt only)
+        ## confusable-homoglyphs is a HARD dependency of the sanitizer: without it
+        ## the confusables set is empty and the homoglyph assertions pass vacuously.
         run: |
-          checker='_dist-ai/usr/share/secure-terminal-tests/check_corpus_drift.py'
-          if [ ! -f "${checker}" ]; then
-            printf 'FAIL: %s absent from dist-ai master; land the dist-ai change first\n' \
-              "${checker}" >&2
-            exit 1
-          fi
-          python3 "${checker}" --git-diffs-lie _git-diffs-lie
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --no-install-recommends \
+            python3 python3-confusable-homoglyphs
+
+      - name: Run the corpus suite against the real checkout
+        env:
+          PYTHONPATH: ${{ github.workspace }}/usr/lib/python3/dist-packages
+          GIT_DIFFS_LIE_DIR: ${{ github.workspace }}/_git-diffs-lie
+        run: python3 _dist-ai/usr/share/secure-terminal-tests/test_corpus.py
