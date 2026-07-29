@@ -16,8 +16,11 @@ secure-terminal-cli is the same safe core as `secure-terminal`(1) without the
 GUI. It runs a command (or your login shell) in a pseudo-terminal and sanitizes
 the program's output before it reaches your existing terminal: escape sequences
 are removed and every byte that is not printable ASCII is neutralized, so a
-crafted file, log or SSH banner cannot redraw the screen, move the cursor, set
-the window title or touch the clipboard.
+crafted file, log or SSH banner cannot repaint the screen, reach a line already
+scrolled past, set the window title or touch the clipboard. Safe colour and four
+line-local edits (cursor forward/back, cursor-to-column, erase-in-line) are
+honored within the line being written, so a program can still redraw its own
+current line, exactly as a carriage return does.
 
 Unlike the GUI, it does not sanitize your keystrokes and does not run the paste
 warning: it makes what a program *displays* safe, on a plain console or inside an

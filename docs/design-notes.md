@@ -49,8 +49,11 @@ source of truth for behaviour.
   (`wants_screen_repaint`). Kept precise: a `\r` progress bar, `clear`, horizontal
   moves and erase-line do not trip it.
 - A whole-screen `clear` / `Ctrl+L` / `reset` (ED2/ED3/RIS) is a no-op BY DESIGN
-  (append-only scrollback is tamper-evident; nothing may erase what was shown). A
-  once-per-tab notice explains it rather than letting it read as broken.
+  (append-only SCROLLBACK is tamper-evident; nothing may erase a line already
+  scrolled past). Scope, per the previous point: the line currently being written
+  is not covered -- horizontal moves and erase-in-line redraw it, exactly as `\r`
+  does, so its earlier content is lost. A once-per-tab notice explains the
+  whole-screen no-op rather than letting it read as broken.
 
 ## Paste review (text coming IN)
 

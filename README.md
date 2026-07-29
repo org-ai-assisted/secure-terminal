@@ -34,12 +34,19 @@ It does nothing about the programs you deliberately run.
 
 - **ASCII-only display.** Program output is passed through a sanitizer: ANSI/OSC
   escape sequences are removed and every byte that is not printable ASCII (plus
-  tab and newline) is dropped, the way `stcat` does for logs. A hostile filename,
-  a forged status line or a Trojan-Source comment cannot redraw or reorder what
-  you read.
-- **No escape-sequence interpretation.** There is no ANSI parser to attack. The
-  terminal advertises `TERM=dumb` and honors no cursor moves, colors, alternate
-  screens or OSC hyperlinks from the child process.
+  tab and newline) is dropped, the way `stcat` does for logs. A hostile filename
+  or a Trojan-Source comment cannot reorder what you read, and nothing a program
+  prints can reach a line you have already scrolled past.
+- **No escape-sequence parser to attack.** CLI mode runs no ANSI/OSC/APC/DCS
+  parser. Two narrow exceptions are honored, both deliberate: safe,
+  contrast-guarded colour (SGR), and the four line-local editing ops a shell's
+  line editor emits -- cursor forward/back, cursor-to-column, and erase-in-line
+  -- and those only **within the line being written**. Vertical and absolute
+  movement, alternate screens and OSC hyperlinks are stripped, so a program can
+  never reach an earlier line or the scrollback. The worst it can do is redraw
+  its own current line, exactly as a carriage return already does -- so a forged
+  status line *can* overwrite itself before you read it, the same way a progress
+  bar does.
 - **Sanitized paste, with a review.** Pasted text is stripped to printable
   ASCII before it reaches the shell, so invisible or bidi characters never enter
   your command line. When a paste actually contains unicode or control
@@ -164,10 +171,14 @@ so only run programs you trust. This is "restricted-emulator safe," not "safe by
 design."
 
 **Security comparison with CLI mode.** The line (CLI) mode, and
-everything the project's guarantees rest on, is **unchanged**: it never interprets
-an escape, the confined screen model is **never fed** in CLI mode, and output is
-append-only, so a program can never reach back and rewrite a line you have already
-seen (transcript integrity). TUI mode is the one place escapes are interpreted;
+everything the project's guarantees rest on, is **unchanged**: it runs no escape
+parser beyond safe colour and four line-local edits, the confined screen model is
+**never fed** in CLI mode, and vertical/absolute cursor movement is stripped, so a
+program can never reach back to an earlier line or the scrollback. Transcript
+integrity is therefore **per-line**: anything already scrolled past is
+append-only, while the line a program is currently writing can be redrawn by it
+(exactly as a carriage return does). TUI mode is the one place escapes are
+interpreted;
 the only change from earlier versions is that it now does so **uniformly** (at a
 shell prompt too, not only while a full-screen program holds the alternate
 screen). No new class of side-effect is enabled -- title, clipboard (OSC 52) and

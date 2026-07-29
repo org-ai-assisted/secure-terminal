@@ -19,9 +19,10 @@ secure-terminal(1) -- a terminal where paste is safe by design
 secure-terminal is a small terminal for pasting commands into, and reading text
 out of, without worrying about invisible characters, bidi overrides or escape
 sequences. Its default display is printable ASCII only (everything else is
-neutralized) and it interprets no escape sequences from program output, so a
-pasted or printed lie cannot redraw or reorder what you see. Paste is sanitized
-to ASCII before it reaches the shell.
+neutralized). It runs no escape-sequence parser on program output beyond safe
+colour and four line-local edits within the line being written, so a pasted or
+printed lie cannot reorder what you see or reach a line you have already scrolled
+past. Paste is sanitized to ASCII before it reaches the shell.
 
 Without `--`, `-e` or a reused instance, a shell (from `$SHELL`, else
 `/bin/bash`) is started. With `--` the remaining arguments are run as a real
@@ -71,9 +72,11 @@ argv, with no shell reparse.
 secure-terminal has two rendering modes, chosen per tab:
 
   * CLI mode (default, safe):
-    A strict, line-oriented display. No escape sequence from program output is
-    interpreted; output is append-only, so a program can never reach back and
-    rewrite a line already shown.
+    A strict, line-oriented display. The only escapes honored are safe colour and
+    four line-local edits (cursor forward/back, cursor-to-column, erase-in-line),
+    and only within the line being written; vertical and absolute movement is
+    stripped. A program can redraw its own current line, exactly as a carriage
+    return does, but can never reach back to a line already scrolled past.
 
   * TUI mode (opt-in):
     Escapes are interpreted inside an isolated in-memory screen model that has
