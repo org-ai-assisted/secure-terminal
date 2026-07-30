@@ -18,14 +18,18 @@ secure-terminal(1) -- a terminal where paste is safe by design
 
 secure-terminal is a small terminal for pasting commands into, and reading text
 out of, without worrying about invisible characters, bidi overrides or escape
-sequences. Its default (Box) display is printable ASCII, with everything else
-neutralized to a placeholder; the three other display modes trade some of that
-back deliberately -- Show keeps real printable non-ASCII, Reveal and Detail name
-the hidden characters inline. What holds in EVERY mode is that no invisible, bidi
-or control character reaches you unmarked. It runs no escape-sequence parser on program output beyond safe
-colour and four line-local edits within the line being written, so a pasted or
-printed lie cannot reorder what you see or reach a line you have already scrolled
-past. Paste is sanitized to ASCII before it reaches the shell.
+sequences. Its default display mode, `detail`, is printable ASCII: a non-ASCII
+character is NAMED inline as `<U+XXXX NAME>` rather than drawn, so a look-alike
+reads as its identity. The other modes trade that differently -- `reveal` shortens
+the badge to the codepoint, `box` replaces the character with one coloured
+placeholder glyph, and `show` renders a printable glyph as itself (tinted by risk
+class), which is the one mode that puts real non-ASCII on screen. What holds in
+EVERY mode is that no invisible, bidi or control character reaches you unmarked.
+
+It runs no escape-sequence parser on program output beyond safe colour and four
+line-local edits within the line being written, so a pasted or printed lie cannot
+reorder what you see or reach a line you have already scrolled past. Paste is
+sanitized to ASCII before it reaches the shell.
 
 Without `--`, `-e` or a reused instance, a shell (from `$SHELL`, else
 `/bin/bash`) is started. With `--` the remaining arguments are run as a real
