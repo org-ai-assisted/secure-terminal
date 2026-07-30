@@ -6,6 +6,7 @@
 
 """Application entry point and main window for secure-terminal."""
 
+import functools
 import os
 import signal
 import sys
@@ -37,8 +38,19 @@ from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
     BASE_POINT_SIZE, FONT_SIZE_MIN, FONT_SIZE_MAX,
+    _build_tui_keys, _build_line_edit_keys,
 )
 from secure_terminal.review import ReviewBar
+
+
+@functools.lru_cache(maxsize=1)
+def _forwarded_keys():
+    """Every Qt.Key the terminal sends to the running program, from the widget's
+    OWN tables. A window shortcut on one of these would be swallowed by QAction
+    processing before keyPressEvent could forward it, silently breaking the key for
+    vim/htop/readline -- so the reserved set is DERIVED here rather than restated,
+    and a key added to either table is reserved the same day."""
+    return frozenset(_build_tui_keys()) | frozenset(_build_line_edit_keys())
 
 TUI_TOOLTIP = (
     'TUI mode runs full-screen programs (ssh, vim, htop, tmux) by '
@@ -1655,6 +1667,8 @@ class MainWindow(QMainWindow):
 
     # -- zoom: per current tab ------------------------------------------------
     def set_zoom(self, percent):
+        if 'zoom' in self._locked:
+            return                        # admin-locked; not user-changeable
         percent = max(ZOOM_MIN, min(ZOOM_MAX, int(percent)))
         term = self.current()
         if term is not None:
@@ -1685,6 +1699,8 @@ class MainWindow(QMainWindow):
 
     # -- theme: per current tab -----------------------------------------------
     def set_theme(self, theme):
+        if 'theme' in self._locked:
+            return                        # admin-locked; not user-changeable
         term = self.current()
         if term is not None:
             term.apply_theme(theme)
@@ -1783,6 +1799,8 @@ class MainWindow(QMainWindow):
     def set_osc_notice_type(self, key, notify):
         """Mute or un-mute the OSC notice for one type (the feature is unaffected;
         this only controls whether its neutralized use raises a banner)."""
+        if 'osc_notice_off' in self._locked:
+            return                        # admin-locked; not user-changeable
         if notify:
             self._osc_notice_off.discard(key)
         else:
@@ -2374,12 +2392,16 @@ class MainWindow(QMainWindow):
         term.grant_clipboard_read(result['decision'])
 
     def set_scrollback(self, lines):
+        if 'scrollback' in self._locked:
+            return                        # admin-locked; not user-changeable
         self._scrollback = int(lines)
         for t in self._real_terms():
             t.apply_scrollback(lines)
         self._persist()
 
     def set_paste_delay(self, seconds):
+        if 'paste_delay' in self._locked:
+            return                        # admin-locked; not user-changeable
         self._paste_delay = int(seconds)
         for t in self._real_terms():
             t.apply_paste_delay(seconds)
@@ -2494,6 +2516,31 @@ class MainWindow(QMainWindow):
                    'config for them was ignored: ' + keys)
             self.statusBar().showMessage(msg, 15000)
             sys.stderr.write('secure-terminal: ' + msg + '\n')
+
+    # Every key the global Settings dialog can set, as
+    # (config key, dialog field, attribute). One table so the lock check and the
+    # store cannot fall out of step -- the whole reason a locked paste_warn was
+    # once overridable from the dialog while its menu setter refused. Keys not
+    # listed here are not settable from that dialog; their own set_* method owns
+    # the lock check. test_mainwin drives this table against the _persist() key
+    # set, so a persisted key that becomes dialog-settable without being added
+    # here fails rather than silently escaping lock=.
+    _GLOBAL_KEYS = (
+        ('theme', 'theme', '_default_theme'),
+        ('zoom', 'zoom', '_default_zoom'),
+        ('unicode_mode', 'mode', '_default_mode'),
+        ('font_family', 'font_family', '_default_font_family'),
+        ('font_size', 'font_size', '_default_font_size'),
+        ('ui_scale', 'ui_scale', '_ui_scale'),
+        ('colors', 'colors', '_default_colors'),
+        ('line_edits', 'line_edits', '_default_line_edits'),
+        ('tui', 'tui', '_default_tui'),
+        ('osc_notice', 'osc_notice', '_osc_notice'),
+        ('scrollback', 'scrollback', '_scrollback'),
+        ('paste_delay', 'paste_delay', '_paste_delay'),
+        ('paste_warn', 'paste_warn', '_paste_warn'),
+        ('copy_warn', 'copy_warn', '_copy_warn'),
+    )
 
     def _persist(self):
         # admin-locked keys are dropped by settings.save, so a locked setting is
@@ -2667,7 +2714,7 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         self.act_full = QAction(QIcon.fromTheme('view-fullscreen'),
                                 '&Full Screen', self, checkable=True)
-        self._bind(self.act_full, 'fullscreen', 'F11')
+        self._bind(self.act_full, 'fullscreen', 'Ctrl+Shift+M')
         self.act_full.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(self.act_full)
 
@@ -2991,7 +3038,11 @@ class MainWindow(QMainWindow):
         tabs_menu.addSeparator()
         for _n in range(1, 10):
             act = QAction('Tab &%d' % _n, self)
-            act.setShortcut(QKeySequence('Alt+%d' % _n))
+            # via _bind, not setShortcut: a bare setShortcut leaves the key out of
+            # self._shortcuts, so it was absent from the Keyboard Shortcuts dialog
+            # AND invisible to the duplicate check -- a user could bind another
+            # action to Alt+3 and be told there was no conflict.
+            self._bind(act, 'goto_tab_%d' % _n, 'Alt+%d' % _n)
             act.triggered.connect(lambda _c=False, i=_n - 1: self._goto_tab(i))
             tabs_menu.addAction(act)
 
@@ -3023,7 +3074,7 @@ class MainWindow(QMainWindow):
                            '&Keyboard Shortcuts...', self)
         act_keys.setToolTip('List every window shortcut and rebind it.')
         act_keys.triggered.connect(self.show_shortcuts)
-        self._bind(act_keys, 'shortcuts_help', 'F1')
+        self._bind(act_keys, 'shortcuts_help', 'Ctrl+Shift+H')
         help_menu.addAction(act_keys)
         help_menu.addSeparator()
         act_about = QAction(QIcon.fromTheme('help-about'), '&About', self)
@@ -3056,8 +3107,13 @@ class MainWindow(QMainWindow):
         running program, or the dialog's promise (Ctrl+C/U/R reach the program) is
         broken -- QAction shortcut processing would fire first. Reserved: a bare
         Ctrl+<letter> (the tty/readline control keys) and a bare printable key
-        (which would eat ordinary typing). Ctrl+Shift/Ctrl+Alt combos and function
-        keys are fine."""
+        (which would eat ordinary typing). Ctrl+Shift/Ctrl+Alt combos are fine.
+
+        The unmodified keys come from the terminal's OWN forwarding tables rather
+        than a list repeated here, so the two agree by construction: this docstring
+        used to claim "function keys are fine" while _build_tui_keys maps F1 to
+        ESC O P and F11 to ESC [ 23 ~, so the F1/F11 window defaults shadowed them
+        and vim/htop never received either key in TUI mode."""
         qks = QKeySequence(seq)
         if qks.isEmpty():
             return False
@@ -3068,6 +3124,15 @@ class MainWindow(QMainWindow):
         if mods == ctrl and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
             return True
         if mods == Qt.KeyboardModifier.NoModifier and 0x20 <= key <= 0x7E:
+            return True
+        # A bare key the terminal forwards to the running program: the cursor keys,
+        # Home/End, PageUp/Down, Insert/Delete and every function key.
+        if mods == Qt.KeyboardModifier.NoModifier and key in _forwarded_keys():
+            return True
+        # Ctrl+PageUp/Down (switch tab) and Ctrl+Shift+PageUp/Down (move tab) are
+        # consumed by the widget itself, so a window shortcut there never fires.
+        if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown) and mods in (
+                ctrl, ctrl | Qt.KeyboardModifier.ShiftModifier):
             return True
         return False
 
@@ -3091,7 +3156,17 @@ class MainWindow(QMainWindow):
                 label = entry[2] if entry else ident
                 problems.append('%s: %s is reserved for the terminal (always sent '
                                 'to the running program).' % (label, norm))
+        # Seed from the LIVE registry, not just the submitted mapping: the dialog
+        # may send one ident, and a collision with an action it did not mention is
+        # still a collision. Checking the mapping alone accepted
+        # {'copy': 'Ctrl+Q'} and left both copy and quit on Ctrl+Q.
         seen = {}
+        for ident, entry in self._shortcuts.items():
+            if ident in mapping:
+                continue                          # the submitted value wins below
+            norm = QKeySequence(entry[0].shortcut()).toString()
+            if norm:
+                seen.setdefault(norm, []).append(ident)
         for ident, seq in mapping.items():
             norm = QKeySequence(seq).toString()   # canonicalise ("ctrl+t" -> "Ctrl+T")
             if norm:
@@ -3552,43 +3627,33 @@ class MainWindow(QMainWindow):
         defaults. TUI mode changes only the default for new tabs -- switching it
         would restart the shell in each existing tab, throwing away running work,
         which a settings dialog must not do."""
-        # A locked key keeps its admin value regardless of what the dialog returns.
-        for key, field, current in (
-                ('unicode_mode', 'mode', self._default_mode),
-                ('colors', 'colors', self._default_colors),
-            ('line_edits', 'line_edits', self._default_line_edits),
-                ('tui', 'tui', self._default_tui),
-                ('font_family', 'font_family', self._default_font_family),
-                ('osc_notice', 'osc_notice', self._osc_notice)):
+        # ONE guarded pass over every key this dialog can set, driven by the
+        # _GLOBAL_KEYS table. A locked key keeps its admin value -- written back
+        # into `opts` so the per-tab apply below uses the admin value too -- and an
+        # unlocked one is stored. Previously the lock list covered six keys while
+        # the assignments below covered fourteen, so paste_warn/copy_warn (and the
+        # rest) were settable from here even when an administrator had locked them,
+        # although their menu setters correctly refused. A table keyed off the
+        # persisted set means a NEW key is guarded by default rather than by
+        # remembering to extend a second list.
+        for key, field, attr in self._GLOBAL_KEYS:
             if key in self._locked:
-                opts[field] = current
+                opts[field] = getattr(self, attr)
+            elif field in opts:
+                setattr(self, attr, opts[field])
         # granular OSC defaults: a locked feature keeps its current value.
         osc = dict(opts.get('osc', {}))
         for key in osc:
             if key in self._locked:
                 osc[key] = self._osc_defaults.get(key, False)
         if 'osc_notice' in opts:
-            self._osc_notice = opts['osc_notice']
             self.act_osc_notice.setChecked(self._osc_notice)
-        self._default_theme = opts['theme']
-        self._default_zoom = opts['zoom']
-        self._default_font_family = opts.get('font_family', self._default_font_family)
-        self._default_font_size = opts.get('font_size', self._default_font_size)
-        self._ui_scale = opts.get('ui_scale', self._ui_scale)
-        self._default_mode = opts['mode']
-        self._default_colors = opts['colors']
-        self._default_line_edits = opts['line_edits']
-        self._default_tui = opts['tui']
         for key, value in osc.items():
             self._osc_defaults[key] = value
             if key in self._osc_actions:
                 self._osc_actions[key].setChecked(value)
         self._default_allow_title = (self._osc_defaults.get('osc_title')
                                      or self._osc_defaults.get('osc_notify'))
-        self._scrollback = opts['scrollback']
-        self._paste_delay = opts['paste_delay']
-        self._paste_warn = opts.get('paste_warn', self._paste_warn)
-        self._copy_warn = opts.get('copy_warn', self._copy_warn)
         for term in self._real_terms():
             term.apply_theme(opts['theme'])
             term.apply_zoom(opts['zoom'])
@@ -3802,14 +3867,20 @@ class MainWindow(QMainWindow):
         return tabs
 
     def set_persist_session(self, enabled):
+        if 'persist_session' in self._locked:
+            return                        # admin-locked; not user-changeable
         self._persist_session = bool(enabled)
         self.act_persist.setChecked(enabled)
         if not enabled:
             session.clear()
+        self._persist()
 
     def set_confirm_close(self, enabled):
+        if 'confirm_close' in self._locked:
+            return                        # admin-locked; not user-changeable
         self._confirm_close = bool(enabled)
         self.act_confirm_close.setChecked(enabled)
+        self._persist()
 
     def _confirm_running_close(self, title, question, terms):
         """True if it is OK to proceed with a close. When the confirm-on-close
