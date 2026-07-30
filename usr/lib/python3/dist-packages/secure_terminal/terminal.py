@@ -146,8 +146,24 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                     # data is not purely printable and renders the placeholder.
                     if target is not None:
                         self._merge_invisible(target, ch)
+                    else:
+                        # Nothing precedes it (cursor at the very start of the
+                        # screen), so there is no cell to attach to. Occupy THIS
+                        # cell instead: a leading invisible is exactly the
+                        # spoofing position that must not go unmarked.
+                        self._mark_own_cell(ch)
                     continue
             super().draw(ch)
+
+    def _mark_own_cell(self, ch):
+        """Store a zero-width character in the cell AT the cursor and step past it.
+        Used only when nothing precedes it, so there is no cell to merge into.
+        tui_cell renders any cell whose data is not purely printable as the
+        placeholder, so the character is marked rather than silently dropped."""
+        row = self.buffer[self.cursor.y]
+        row[self.cursor.x] = self.cursor.attrs._replace(data=ch)
+        self.dirty.add(self.cursor.y)
+        self.cursor.x = min(self.cursor.x + 1, self.columns)
 
     def _merge_invisible(self, target, ch):
         """Append a zero-width character to `target`'s data so the cell is marked.
