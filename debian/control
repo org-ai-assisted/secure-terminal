@@ -20,6 +20,7 @@ Depends: ${misc:Depends},
  python3-pyqt6.qtmultimedia,
  python3-pyte,
  python3-confusable-homoglyphs,
+ python3-regex,
  fonts-hack,
  qt6-svg-plugins
 Description: safe-by-design terminal for untrusted paste and output

@@ -14,9 +14,15 @@ safe to display and names the class of anything that is not; the widget layer
 (terminal.py) adds only the interactive cursor handling and, optionally, colour.
 """
 
+import functools
 import os
 import re
 import unicodedata
+
+# python3-regex, a hard dependency (checked by preflight): the stdlib `re` has no
+# \X, and grapheme-cluster extension is not derivable from the general categories
+# (see _is_mark). A missing module must fail at startup, never degrade the cap.
+import regex
 
 # two-letter Unicode general categories -> a readable name, so the reveal-badge
 # tooltip can say "Currency Symbol" rather than only "Sc".
@@ -521,13 +527,27 @@ def _printable_follows(raw, i):
 _COMBINING_RUN_MAX = 32
 
 
+_CLUSTER_RE = regex.compile(r'\X')
+
+
+@functools.lru_cache(maxsize=None)
 def _is_mark(ch):
-    # A Unicode Mark (Mn/Mc/Me): a grapheme-extending character that stacks onto the
-    # preceding base into one cluster, WHATEVER its canonical combining class. Many
-    # spacing marks (Mc) and some nonspacing marks (Mn) have class 0, so
-    # unicodedata.combining() alone would miss them and let a flood past the cap.
-    # (The lowest Mark is U+0300, so callers fast-reject on ord(ch) < 0x0300 first.)
-    return unicodedata.category(ch)[0] == 'M'
+    """True when `ch` EXTENDS the preceding grapheme cluster instead of starting a
+    new one -- the property the flood cap must bound.
+
+    Asked of UAX #29 directly (is 'a' + ch a single \\X cluster?), because no
+    general-category test answers it. `category(ch)[0] == 'M'` misses 158
+    cluster-extenders, including U+200C/U+200D, the halfwidth katakana sound marks
+    U+FF9E/U+FF9F, Thai SARA AM, and the emoji modifiers -- each of which builds a
+    5001-code-point cluster out of one base plus 5000 copies, which is exactly the
+    O(n^2) reshape the cap exists to prevent. `\\p{Grapheme_Extend}` is no better:
+    it excludes the spacing marks (Mc) that do extend.
+
+    Memoized: the answer per code point never changes, and real text repeats a
+    handful of them, so the regex runs once per distinct character.
+    (Callers fast-reject ord(ch) < 0x0300 first; no code point below that
+    extends -- asserted in the test suite, not assumed.)"""
+    return len(_CLUSTER_RE.findall('a' + ch)) == 1
 
 
 def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):

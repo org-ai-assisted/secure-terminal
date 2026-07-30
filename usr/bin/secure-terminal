@@ -30,6 +30,10 @@ require(
     # degrading with no signal, indistinguishable from "this input has no
     # look-alikes". A partial install must fail here instead.
     ('confusable_homoglyphs', 'python3-confusable-homoglyphs'),
+    # \X (UAX #29 grapheme clusters): the stdlib re has no equivalent and the
+    # property is not derivable from the general categories, so the flood cap
+    # depends on it. Absent module must not mean absent cap.
+    ('regex', 'python3-regex'),
 )
 
 from secure_terminal.main import main
