@@ -154,6 +154,11 @@ _TRAILING_ESCAPE = re.compile(
     r'\][^\x07\x1b]*'        # OSC: ESC ] ... still awaiting its BEL or ST
     r'|[PX^_][^\x1b]*'       # DCS/SOS/PM/APC: ESC P/X/^/_ ... awaiting ST (BEL is body)
     r'|\[[0-?]*[ -/]*'       # CSI: ESC [ params/intermediates, no final byte yet
+    r'|[NO]'                 # SS2/SS3: ESC N/O awaiting the ONE byte it shifts.
+                             # ANSI_RE consumes that byte, so without this arm a
+                             # read boundary between introducer and byte leaves the
+                             # introducer to be stripped alone and the shifted byte
+                             # to render as literal text.
     r'|[ -/]*'               # ESC + intermediate bytes, awaiting a final (charsets)
     r')?\Z'                  # \Z, not $: $ also matches BEFORE a trailing newline,
 )                            # so 'ESC \n' would match the ESC and DROP the newline
@@ -165,6 +170,40 @@ def has_bell(text):
     ends a title with one). ANSI_RE removes the OSC/escape matches, so only a
     standalone BEL survives."""
     return '\x07' in ANSI_RE.sub('', text)
+
+
+def tail_from_escape_boundary(text, keep):
+    """The last `keep` characters of `text`, cut at an escape-sequence BOUNDARY.
+
+    A retained buffer is capped by keeping its tail. A plain ``text[-keep:]`` can
+    slice INSIDE a sequence, and the surviving remainder then has no introducer:
+    the line renderer shows it as literal text ("31mHELLO" from a halved SGR) and
+    pyte mis-parses it when the grid is re-seeded -- i.e. the cap itself becomes an
+    escape leak. Move the cut forward past a sequence it landed in, so the tail
+    never STARTS mid-escape. Never returns more than `keep` characters."""
+    if keep <= 0:
+        return ''
+    if len(text) <= keep:
+        return text
+    start = len(text) - keep
+    intro = text.rfind('\x1b', 0, start)
+    if intro == -1:
+        return text[start:]               # no sequence can span the cut
+    match = ANSI_RE.match(text, intro)
+    if match and match.end() > start:
+        return text[match.end():]         # the cut fell inside this sequence
+    return text[start:]
+
+
+def display_len(text):
+    r"""Length of `text` in the units a QTextDocument position counts (UTF-16 code
+    units), NOT Python code points. A caret offset is added to a Qt block position,
+    so a non-BMP character -- one Python character, TWO document positions -- would
+    otherwise put the caret one place too far left for every astral character
+    before it (Show mode passes emoji and the astral math alphabets through)."""
+    if text.isascii():
+        return len(text)
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
 
 
 def split_trailing_escape(text, cap=4096):
@@ -869,17 +908,19 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
         # the wrapped rows on copy (see WRAP_NL); a real line break stays None.
         soft = wraps is not None and idx < len(wraps) and wraps[idx]
         add('\n', WRAP_NL if soft else None)
-    prefix_len = sum(len(p) for parts, _ in runs for p in parts)
+    prefix_len = sum(display_len(p) for parts, _ in runs for p in parts)
     for ch, key in current:
         emit(ch, key)
     return [(''.join(parts), key) for parts, key in runs], prefix_len
 
 
 def cells_display_col(cells, col, mode):
-    """The DISPLAY column (character offset) of logical cursor position `col`,
+    """The DISPLAY column (document offset) of logical cursor position `col`,
     i.e. the width of rendering cells[0:col] under `mode` -- needed to place the
-    caret, since a reveal badge is many columns wide."""
-    return sum(len(render_output(c, mode)) for c, _ in cells[:col])
+    caret, since a reveal badge is many columns wide. Counted in the UTF-16 units
+    a document position uses (see display_len), so an astral character does not
+    shift the caret."""
+    return sum(display_len(render_output(c, mode)) for c, _ in cells[:col])
 
 
 # Unicode Default_Ignorable_Code_Point ranges that str.isprintable() does NOT
