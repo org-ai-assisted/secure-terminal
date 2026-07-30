@@ -2137,7 +2137,11 @@ class SecureTerminal(QPlainTextEdit):
             return                        # read/clear query or oversized: decline
         try:
             text = base64.b64decode(payload, validate=True).decode('utf-8', 'replace')
-        except (ValueError, base64.binascii.Error):
+        # binascii.Error subclasses ValueError, so ValueError alone covers a bad
+        # payload. Reaching through base64.binascii relied on a private re-export
+        # (base64 imports binascii for its own use and does not export it), which
+        # would raise AttributeError -- inside the handler -- if that ever changed.
+        except ValueError:
             return
         QGuiApplication.clipboard().setText(sanitize_clipboard(text))
 

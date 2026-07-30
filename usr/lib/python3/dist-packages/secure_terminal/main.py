@@ -2491,6 +2491,15 @@ class MainWindow(QMainWindow):
             ('systray', [self.act_systray]),
             ('paste_warn', list(self._paste_warn_actions.values())),
             ('copy_warn', list(self._copy_warn_actions.values())),
+            # These setters refuse a locked change, so their controls must be
+            # disabled too: Qt updates a checkable action or a spin box BEFORE
+            # the handler returns, so an ungated control would sit showing a
+            # value that was never applied -- a UI that lies about the setting.
+            ('theme', list(self._theme_actions.values())),
+            ('paste_delay', list(self._paste_delay_actions.values())),
+            ('scrollback', list(getattr(self, '_scrollback_actions', {}).values())),
+            ('persist_session', [self.act_persist]),
+            ('confirm_close', [self.act_confirm_close]),
         ] + [(k, [self._osc_actions[k]]) for k in self._osc_actions]
         # a legacy allow_title lock also greys the granular title + notify controls
         if 'allow_title' in self._locked:
@@ -2510,6 +2519,11 @@ class MainWindow(QMainWindow):
                 for btn in buttons.values():
                     btn.setEnabled(False)
                     btn.setToolTip(btn.toolTip() + note)
+        # the zoom control is a spin box, not an action, so it is gated here
+        zoom_box = getattr(self, 'zoom_box', None)
+        if zoom_box is not None and 'zoom' in self._locked:
+            zoom_box.setEnabled(False)
+            zoom_box.setToolTip(zoom_box.toolTip() + note)
         if self._locked_violations:
             keys = ', '.join(self._locked_violations)
             msg = ('These settings are locked by the administrator; your home '
@@ -2961,12 +2975,14 @@ class MainWindow(QMainWindow):
         sb_menu = view_menu.addMenu('&Scrollback')
         sb_group = QActionGroup(self)
         sb_group.setExclusive(True)
+        self._scrollback_actions = {}
         for label, lines in SCROLLBACK_CHOICES:
             act = QAction(label, self, checkable=True)
             act.setChecked(lines == self._scrollback)
             act.triggered.connect(lambda _checked, n=lines: self.set_scrollback(n))
             sb_group.addAction(act)
             sb_menu.addAction(act)
+            self._scrollback_actions[lines] = act
 
         pd_menu = view_menu.addMenu('&Paste delay')
         pd_group = QActionGroup(self)
@@ -3644,7 +3660,10 @@ class MainWindow(QMainWindow):
         # granular OSC defaults: a locked feature keeps its current value.
         osc = dict(opts.get('osc', {}))
         for key in osc:
-            if key in self._locked:
+            # _osc_locked, not `in self._locked`: a legacy lock=allow_title also
+            # locks osc_title/osc_notify, and checking the raw key let the dialog
+            # apply them to every tab straight past that lock.
+            if self._osc_locked(key):
                 osc[key] = self._osc_defaults.get(key, False)
         if 'osc_notice' in opts:
             self.act_osc_notice.setChecked(self._osc_notice)

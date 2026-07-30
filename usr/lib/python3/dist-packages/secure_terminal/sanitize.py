@@ -569,7 +569,12 @@ _COMBINING_RUN_MAX = 32
 _CLUSTER_RE = regex.compile(r'\X')
 
 
-@functools.lru_cache(maxsize=None)
+# BOUNDED, not maxsize=None: the input is untrusted, so a stream of many
+# distinct high code points would otherwise grow this cache toward the whole
+# ~1.1M code point space for the life of the process -- an unbounded cache
+# inside the very function that bounds a flood. Real text repeats a handful of
+# distinct marks, so a small cache keeps the hit rate.
+@functools.lru_cache(maxsize=4096)
 def _is_mark(ch):
     """True when `ch` EXTENDS the preceding grapheme cluster instead of starting a
     new one -- the property the flood cap must bound.
