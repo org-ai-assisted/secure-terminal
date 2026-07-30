@@ -24,6 +24,12 @@ require(
     ('PyQt6.QtWidgets', 'python3-pyqt6'),
     ('PyQt6.QtMultimedia', 'python3-pyqt6.qtmultimedia'),
     ('pyte', 'python3-pyte'),
+    # Not optional, despite sanitize importing it defensively: without it
+    # _ASCII_CONFUSABLES is empty and every homoglyph silently drops from the
+    # `confusable` risk class to generic `nonascii` -- a security classification
+    # degrading with no signal, indistinguishable from "this input has no
+    # look-alikes". A partial install must fail here instead.
+    ('confusable_homoglyphs', 'python3-confusable-homoglyphs'),
 )
 
 from secure_terminal.main import main
