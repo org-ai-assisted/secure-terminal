@@ -15,7 +15,7 @@ reviewer if a detached run comes back empty.
 
 ## Open
 
-### agy + glm pass on the clash/bypass hardening (uncommitted at time of writing)
+### agy + glm pass on the clash/bypass hardening (704e942..HEAD, now committed)
 - Scope: the escape-grammar widening in `ANSI_RE` (charset designators, SS2/SS3),
   the `tui_cell` default-ignorable + combining-run caps, the shared
   `is_bidi_control` / `is_invisible` predicates, `cli.py`'s escape carry,
@@ -29,6 +29,12 @@ reviewer if a detached run comes back empty.
   (79df146) and their findings are folded in.
 - Action: re-run on a backoff after the quota resets; fold in any findings and
   delete this entry.
+- Since committed, codex + coderabbit + static DID run over 704e942..HEAD and
+  their findings are folded in: the granular-OSC legacy lock escape, the
+  ungated controls whose setters now refuse a locked change, the unbounded
+  lru_cache on _is_mark, a leading zero-width character left unmarked in the
+  TUI grid, and a private base64.binascii re-export. agy + glm remain a
+  NO-RESULT for this range, not a clean pass.
 
 ### claude final pass on the transcript_text rework (commit 2d38ded)
 - Scope: `ai-review --with claude 2d38ded^ 2d38ded` -- the document-walk
