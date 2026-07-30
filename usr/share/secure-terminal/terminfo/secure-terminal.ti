@@ -27,3 +27,15 @@ secure-terminal|secure-terminal safe CLI (escape-stripping, line-local rendering
 	civis@, cnorm@, cvvis@, flash@, initc@, initp@, oc@,
 	mc0@, mc4@, mc5@, mc5i@, smglp@, smglr@, smgrp@, smgl@, smgr@, sitm@, ritm@,
 	use=xterm-16color,
+
+# Same, but for line_edits=false: the renderer then STRIPS the four line-local
+# editing escapes too, so output is append-only against escapes. Cancel the caps
+# that advertise them, or the shell emits sequences we drop on the floor and its
+# line redraw silently does nothing.
+#
+# cub1 is deliberately KEPT: that is \b, a raw control byte the kernel line
+# discipline and the local caret echo depend on, and it stays honoured in both
+# settings. Cancelling it would over-restrict.
+secure-terminal-noedit|secure-terminal safe CLI, append-only (no line editing),
+	el@, el1@, cuf@, cuf1@, cub@, hpa@,
+	use=secure-terminal,

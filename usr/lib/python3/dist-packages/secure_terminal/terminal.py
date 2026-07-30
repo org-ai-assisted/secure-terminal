@@ -1432,6 +1432,11 @@ class SecureTerminal(QPlainTextEdit):
           no alternate screen. A program then LISTS completions plainly and never
           draws an in-place menu or full screen that line mode would strip into
           garbage. Falls back to xterm-256color if the entry does not resolve.
+        - CLI mode with line_edits off -> `secure-terminal-noedit`, which also
+          cancels el/el1/cuf/cuf1/cub/hpa. Those four ops are STRIPPED in that
+          setting, so advertising them would have the shell emit redraws we drop on
+          the floor. cub1 (\b) stays advertised: it is a raw control byte, honoured
+          either way.
         - TUI mode -> xterm-256color, so full-screen programs (and ssh) work.
 
         The terminfo DIR is returned in BOTH modes (so TERMINFO_DIRS always resolves
@@ -1442,7 +1447,9 @@ class SecureTerminal(QPlainTextEdit):
         -- line mode strips every escape regardless."""
         tdir = cli_terminfo_dir()
         if not self._tui and tdir:
-            return 'secure-terminal', tdir
+            if self._line_edits:
+                return 'secure-terminal', tdir
+            return 'secure-terminal-noedit', tdir
         return 'xterm-256color', tdir
 
     # -- child process over a pseudo-terminal ---------------------------------
