@@ -2566,7 +2566,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_new_cmd)
 
         self.act_close = QAction(QIcon.fromTheme('window-close'),
-                                 '&Close Tab', self)
+                                 'C&lose Tab', self)
         self._bind(self.act_close, 'close_tab', 'Ctrl+Shift+W')
         self.act_close.triggered.connect(
             lambda: self.close_tab(self.tabs.currentIndex()))
@@ -2583,7 +2583,7 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
         self.act_terminate = QAction(QIcon.fromTheme('process-stop'),
-                                     '&Terminate Program', self)
+                                     'Terminate &Program', self)
         self._bind(self.act_terminate, 'terminate', 'Ctrl+Shift+K')
         self.act_terminate.setToolTip(
             'Force-terminate the running program (SIGTERM, then SIGKILL). '
@@ -2593,7 +2593,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_terminate)
 
         file_menu.addSeparator()
-        self.act_persist = QAction('Restore &session on start', self,
+        self.act_persist = QAction('Restore session &on start', self,
                                    checkable=True)
         self.act_persist.setChecked(self._persist_session)
         self.act_persist.setToolTip(
@@ -2603,7 +2603,7 @@ class MainWindow(QMainWindow):
         self.act_persist.toggled.connect(self.set_persist_session)
         file_menu.addAction(self.act_persist)
 
-        self.act_confirm_close = QAction('&Confirm close if a program is running',
+        self.act_confirm_close = QAction('Co&nfirm close if a program is running',
                                          self, checkable=True)
         self.act_confirm_close.setChecked(self._confirm_close)
         self.act_confirm_close.setToolTip(
@@ -2613,7 +2613,7 @@ class MainWindow(QMainWindow):
         self.act_confirm_close.toggled.connect(self.set_confirm_close)
         file_menu.addAction(self.act_confirm_close)
 
-        act_clear_session = QAction('&Clear Saved Session', self)
+        act_clear_session = QAction('Clear Save&d Session', self)
         act_clear_session.triggered.connect(self.clear_saved_session)
         file_menu.addAction(act_clear_session)
 
@@ -2727,7 +2727,7 @@ class MainWindow(QMainWindow):
         self.act_show = self._mode_actions['show']
         self._sync_mode_toggles(self._default_mode)
 
-        self.act_font = QAction('&Font...', self)
+        self.act_font = QAction('Fo&nt...', self)
         self.act_font.setToolTip(
             'Choose the terminal font for this tab, and the default for new tabs. '
             'The default, Hack, is designed to disambiguate look-alike glyphs '
@@ -2788,7 +2788,7 @@ class MainWindow(QMainWindow):
         # Window-global (not per-tab): lives in Global settings, not this menu. The
         # action is kept as the state-holder set_auto_tab_colors ticks.
 
-        osc_notice_menu = view_menu.addMenu('Notify on &OSC use')
+        osc_notice_menu = view_menu.addMenu('Notif&y on OSC use')
         self.act_osc_notice = QAction('&All OSC notices', self, checkable=True)
         self.act_osc_notice.setChecked(self._osc_notice)
         self.act_osc_notice.setToolTip(
@@ -2811,7 +2811,7 @@ class MainWindow(QMainWindow):
         # by default; enabling one only has effect in TUI mode and dims the OSC
         # security lamp by its risk class. Kept next to "Notify on OSC use" -- both
         # govern the same OSC escapes.
-        osc_menu = view_menu.addMenu('&OSC features')
+        osc_menu = view_menu.addMenu('OSC f&eatures')
         osc_menu.setToolTip('Each is a way a program can act on your system '
                             '(title, clipboard, ...). All neutralized by default; '
                             'enable at your own risk (only in TUI mode). iTerm2 '
@@ -2881,7 +2881,7 @@ class MainWindow(QMainWindow):
         bell_menu.addAction(self.act_bell_sound_clear)
 
         self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', '#e5a50a'),
-                               '&TUI mode', self, checkable=True)
+                               'TUI mo&de', self, checkable=True)
         self.act_tui.setChecked(self._default_tui)
         self.act_tui.setToolTip(TUI_TOOLTIP)
         self.act_tui.toggled.connect(self.set_tui)
@@ -2956,7 +2956,7 @@ class MainWindow(QMainWindow):
             pw_menu.addAction(act)
             self._paste_warn_actions[key] = act
 
-        cw_menu = view_menu.addMenu('&Copy warning')
+        cw_menu = view_menu.addMenu('Copy warnin&g')
         cw_group = QActionGroup(self)
         cw_group.setExclusive(True)
         self._copy_warn_actions = {}
@@ -3009,7 +3009,9 @@ class MainWindow(QMainWindow):
         act_command.triggered.connect(self.show_command_palette)
         settings_menu.addAction(act_command)
         settings_menu.addSeparator()
-        act_locations = QAction('&Folders & Files...', self)
+        # '&&' is a LITERAL ampersand to Qt; a bare '&' would be eaten as the
+        # mnemonic marker and the item would read "Folders  Files...".
+        act_locations = QAction('&Folders && Files...', self)
         act_locations.setToolTip(
             'Show where settings and session state are stored, with buttons to '
             'copy the path or open the folder.')
@@ -3224,7 +3226,7 @@ class MainWindow(QMainWindow):
     _COMMAND_HELP = (
         'Slash commands (the leading / is optional):\n\n'
         '  /theme dark|light\n'
-        '  /mode box|show|reveal\n'
+        '  /mode box|show|reveal|detail\n'
         '  /colors on|off\n'
         '  /tui on|off\n'
         '  /title on|off\n'
@@ -3266,7 +3268,7 @@ class MainWindow(QMainWindow):
             self.set_zoom(int(arg))
         elif cmd == 'scrollback' and arg.isdigit():
             self.set_scrollback(int(arg))
-        elif cmd in ('paste-delay', 'pastedelay') and arg.isdigit():
+        elif cmd == 'paste-delay' and arg.isdigit():
             self.set_paste_delay(int(arg))
         else:
             self.statusBar().showMessage(
