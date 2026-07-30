@@ -148,7 +148,13 @@ def load():
         if not isinstance(entry, dict):
             continue
         try:
-            with open(_log_path(position), encoding='utf-8') as handle:
+            # errors='replace': a log truncated mid-UTF-8, or corrupted on disk,
+            # must not break startup. Strict decoding raises UnicodeDecodeError
+            # (a ValueError, not an OSError), which would escape "Never raises"
+            # and leave the user with no window at all. The replacement chars
+            # are then sanitized like any other output on the restore path.
+            with open(_log_path(position), encoding='utf-8',
+                      errors='replace') as handle:
                 entry['text'] = handle.read()
         except OSError:
             entry['text'] = ''  # a missing log just restores an empty tab
