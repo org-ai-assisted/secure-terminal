@@ -161,7 +161,7 @@ jobs:
         run: |
           sudo apt-get update --quiet
           sudo apt-get install --yes --no-install-recommends \
-            python3 python3-confusable-homoglyphs
+            python3 python3-confusable-homoglyphs python3-regex
 
       - name: Run the corpus suite against the real checkout
         env:

@@ -37,4 +37,4 @@ dist-ai-tests:
   ## build libvterm's. Without them those stages skip, which is the false-green this
   ## opt-in exists to remove. python3-jsonschema + python3-yaml are the corpus
   ## schema-validation tooling.
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config"
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs python3-regex ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config"

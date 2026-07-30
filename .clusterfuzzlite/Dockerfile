@@ -30,6 +30,12 @@
 ## forking CFLite to override its hardcoded run image.
 FROM gcr.io/oss-fuzz-base/base-builder-python@sha256:9dd557a4ba0e0cdfbeabc0bb115c98896f2dab68c3e8f301abf169469b8b5ef5
 
+## sanitize.py imports regex unconditionally: the grapheme-cluster flood cap
+## needs UAX #29 \X, which the stdlib re cannot express. The base image has no
+## Debian packaging, so install the wheel; without it every harness fails
+## bad_build_check at startup with ModuleNotFoundError.
+RUN pip3 install --no-cache-dir regex
+
 COPY . $SRC/secure-terminal
 COPY .clusterfuzzlite/build.sh $SRC/build.sh
 WORKDIR $SRC/secure-terminal
