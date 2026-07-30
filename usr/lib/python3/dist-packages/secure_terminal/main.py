@@ -1002,6 +1002,12 @@ class MainWindow(QMainWindow):
             conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
             conn.flush()
             conn.disconnectFromServer()
+            # deleteLater, never disconnect-from-inside-the-slot: dropping the
+            # readyRead connection here releases the last reference to this very
+            # closure while it is still executing, which segfaults. deleteLater is
+            # deferred to the event loop, so `conn` outlives the call and the
+            # per-handoff socket is still reclaimed.
+            conn.deleteLater()
 
         conn.readyRead.connect(on_ready)
 
