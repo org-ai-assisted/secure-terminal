@@ -183,6 +183,7 @@ from secure_terminal.sanitize import (
     wants_line_clears,
     describe_codepoint, marking_class, PROMPT_START,
     split_trailing_escape, feed_chunk_carry, has_bell, OSC_FEATURES,
+    tail_from_escape_boundary,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 
@@ -680,7 +681,9 @@ class SecureTerminal(QPlainTextEdit):
             # bound the retained raw as for live output, so entering TUI does not
             # replay a huge restored scrollback (up to the 100k-line setting)
             # synchronously through pyte on the first switch.
-            self._raw = restored[-self._RAW_MAX:]   # so a mode toggle re-renders it too
+            # cut at an escape boundary: a raw slice can start mid-sequence, and
+            # the headless remainder then renders as literal escape garbage.
+            self._raw = tail_from_escape_boundary(restored, self._RAW_MAX)
             self._append(restored)
 
         self._notifier = None
@@ -791,6 +794,15 @@ class SecureTerminal(QPlainTextEdit):
         self._mode = mode
         self._rerender()
 
+    def _cap_raw(self):
+        """Bound the retained raw output, cutting at an escape BOUNDARY. A plain
+        tail slice can land inside a sequence; the remainder then has no
+        introducer, so the line renderer prints it as literal text and pyte
+        mis-parses it when the grid is seeded -- the cap would itself leak an
+        escape."""
+        if len(self._raw) > self._RAW_MAX:
+            self._raw = tail_from_escape_boundary(self._raw, self._RAW_MAX)
+
     def _rerender(self):
         """Re-display existing output under the current display mode. While a
         full-screen program owns the grid the pyte screen is simply repainted;
@@ -807,7 +819,8 @@ class SecureTerminal(QPlainTextEdit):
         if self._raw:
             # Only the recent tail, so a mode toggle after a flood cannot freeze
             # the UI re-rendering (and reveal-expanding) megabytes of scrollback.
-            self._feed_line(self._raw[-self._RERENDER_TAIL:])
+            self._feed_line(tail_from_escape_boundary(self._raw,
+                                                      self._RERENDER_TAIL))
 
     def current_mode(self):
         return self._mode
@@ -1744,8 +1757,7 @@ class SecureTerminal(QPlainTextEdit):
 
         if self._grid_mode():
             self._raw += text
-            if len(self._raw) > self._RAW_MAX:
-                self._raw = self._raw[-self._RAW_MAX:]
+            self._cap_raw()
             # hold the paint during a synchronized update (the model keeps updating);
             # _end_sync_update renders the completed frame.
             if not self._sync_update and not self._render_timer.isActive():
@@ -1795,8 +1807,7 @@ class SecureTerminal(QPlainTextEdit):
         # re-render reproduces the clean prompt rather than re-sticking the colour.
         text = self._reset_leftover_sgr(text)
         self._raw += text
-        if len(self._raw) > self._RAW_MAX:
-            self._raw = self._raw[-self._RAW_MAX:]     # drop the oldest output
+        self._cap_raw()                     # drop the oldest output
         self._feed_line(text)
         # A program that draws in place -- a full-screen app (htop, vim, on the
         # alternate screen) OR an in-place vertical repaint without it (the shell's
@@ -1813,6 +1824,22 @@ class SecureTerminal(QPlainTextEdit):
                          'interface, or a completion menu or progress display that '
                          'repaints -- which the safe CLI mode cannot show. Turn on '
                          'TUI mode to see it.')
+        # With line editing OFF the child runs under `secure-terminal-noedit`,
+        # which cancels el/el1 on top of the base entry's cup/cuu/smcup -- so
+        # every escape-based detector above is structurally dead: a curses program
+        # emits no alternate screen, no cursor motion and no EL burst, and the
+        # advisory would never fire at all. Fall back to a terminfo-independent
+        # signal: the pty in raw mode with a program (not the shell's own line
+        # editor) in the foreground means that program is driving the screen
+        # itself. Used only in that setting, so an ordinary readline REPL in the
+        # normal CLI mode -- which line editing renders fine -- is not nagged.
+        elif (not self._tui_hint_shown and not self._line_edits
+                and self.has_foreground_program() and self._child_raw_mode()):
+            self._tui_hint_shown = True
+            self._advise('This program has taken over the keyboard and is drawing '
+                         'its own screen. With line editing off the safe CLI mode '
+                         'shows almost nothing it draws. Turn on TUI mode to see '
+                         'it.')
         # A whole-screen clear or reset (from `clear`, Ctrl+L or `reset`) is a
         # no-op here BY DESIGN: line mode is append-only, so nothing -- not a
         # program, not a stray clear -- can erase what you have already seen. Note
@@ -1923,11 +1950,6 @@ class SecureTerminal(QPlainTextEdit):
         if carry_at >= 0 and (len(data) - carry_at) <= self._OSC_CARRY_MAX:
             self._osc_carry = data[carry_at:]
             data = data[:carry_at]
-        if self._osc['osc_title']:
-            title = sanitize_title(getattr(self._screen, 'title', ''))
-            if title and title != self._last_title:
-                self._last_title = title
-                self.title_changed.emit(title)
         if self._osc['osc_hyperlink']:
             for m in _OSC8.finditer(data):
                 uri = sanitize_title(m.group(1).decode('utf-8', 'replace'))
@@ -1941,7 +1963,19 @@ class SecureTerminal(QPlainTextEdit):
         for match in _OSC_ANY.finditer(data):
             code = int(match.group(1))
             params = match.group(2)
-            if code == 9 and self._osc['osc_notify']:
+            if code in (0, 2) and self._osc['osc_title']:
+                # Read the title out of the bytes arriving NOW, never out of
+                # pyte's screen.title: pyte LATCHES the last title it ever saw, so
+                # a title set while osc_title was off would be adopted by the next
+                # unrelated OSC once the user enables it, and re-seeding the grid
+                # on a CLI->TUI switch replays every historical title out of the
+                # retained scrollback -- both adopt a title from output the tab was
+                # not showing titles for.
+                title = sanitize_title(params.decode('utf-8', 'replace'))
+                if title and title != self._last_title:
+                    self._last_title = title
+                    self.title_changed.emit(title)
+            elif code == 9 and self._osc['osc_notify']:
                 text = sanitize_title(params.decode('ascii', 'ignore'))
                 if text:
                     self.notified.emit(text)
@@ -2158,8 +2192,7 @@ class SecureTerminal(QPlainTextEdit):
         DOES echo (bash's readline prints ^C), remember it briefly so the shell's
         own copy in the next output is absorbed (see _absorb_caret)."""
         self._raw += s
-        if len(self._raw) > self._RAW_MAX:
-            self._raw = self._raw[-self._RAW_MAX:]
+        self._cap_raw()
         self._feed_line(s)
         self._pending_caret.append((s, time.monotonic() + 0.4))
 
@@ -2433,6 +2466,21 @@ class SecureTerminal(QPlainTextEdit):
         except OSError:
             return None
         return pgrp if pgrp > 0 else None
+
+    def _child_raw_mode(self):
+        """True when the pty is in NON-CANONICAL (raw) mode, i.e. a program has
+        taken the keyboard over character-by-character instead of letting the
+        kernel cook a line -- what every full-screen and cursor-addressing program
+        does. TIOCGETS on the master reports the pty's line discipline, so this
+        needs no cooperation from the child and, unlike every escape-based
+        detector, does not depend on what the terminfo entry advertises."""
+        if self._fd is None:
+            return False
+        try:
+            attrs = termios.tcgetattr(self._fd)
+        except (OSError, termios.error):
+            return False
+        return not attrs[3] & termios.ICANON        # attrs[3] == c_lflag
 
     def cwd_basename(self):
         """The basename of the foreground process's working directory (the shell's
