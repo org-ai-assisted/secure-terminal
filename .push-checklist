@@ -1,5 +1,5 @@
 # Pre-push reminder checklist (read by the global pre-push hook in
-# dist-ai-config/claude/git-hooks/pre-push). Reminder only -- never blocks.
+# private-ai-config/claude/git-hooks/pre-push). Reminder only -- never blocks.
 name: secure-terminal
 tests: SECURE_TERMINAL_REPO=$PWD QT_QPA_PLATFORM=offscreen bash $HOME/private-sources/dist-ai/usr/bin/secure-terminal-tests
 pages: secure-terminal.github.io
