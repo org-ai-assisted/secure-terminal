@@ -23,7 +23,18 @@ coverity:
 ## ncurses-term -- absent from trixie-slim, so tic could not resolve it and the
 ## compile silently fell back to xterm-256color. All on top of python3.
 dist-ai-tests:
+  ## Check out secure-terminal/terminal-poc-corpus too, so terminal-poc-corpus-tests
+  ## can actually resolve a corpus. Without it that suite exits 77, which
+  ## dist-ai-tests-all reports as SKIP and counts toward a green run -- the gate
+  ## reads as wired while never having run a single PoC.
+  terminal-poc-corpus: true
   ## vim/htop/nano/tmux back the full-screen-program E2E (start it in TUI mode,
   ## confirm it renders a frame in the pyte grid, send its quit key, confirm a clean
-  ## exit) -- the widget suite SKIPs a program that is absent, so add them to gate it.
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs ncurses-bin ncurses-term vim htop nano tmux"
+  ## exit) -- the widget suite FAILS on a program that is absent, so they must be here.
+  ##
+  ## The last five are for the PoC corpus's conformance harness: python3-pytest runs
+  ## pyte's own test suite (Part A), and build-essential/libtool-bin/perl/pkg-config
+  ## build libvterm's. Without them those stages skip, which is the false-green this
+  ## opt-in exists to remove. python3-jsonschema + python3-yaml are the corpus
+  ## schema-validation tooling.
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config"
