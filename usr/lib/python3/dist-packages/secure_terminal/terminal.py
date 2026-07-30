@@ -625,6 +625,10 @@ class SecureTerminal(QPlainTextEdit):
         # real shell line, so the hook fails safe (asks) rather than judge a stale
         # line. See keyPressEvent (line-edit keys) and _hook_intercept.
         self._line_dirty = False
+        # a mode change wanted to re-export TERM but the prompt held a pending
+        # line, so the CR-terminated re-export would have submitted it. Held here
+        # until the line is clear again. See _reexport_term / _flush_reexport.
+        self._reexport_pending = False
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._render_tui)
@@ -848,6 +852,14 @@ class SecureTerminal(QPlainTextEdit):
         self._sync_display()
         return True
 
+    def _line_pending(self):
+        """True when the shell's line editor may hold text at the prompt. Either we
+        mirrored it (_line_buffer) or we know we CANNOT mirror it (_line_dirty: a
+        history recall or an in-place cursor edit). Both mean "do not type a
+        CR-terminated command in here"; the dirty case is the dangerous one, since
+        the recalled line is invisible to us but very much present to the shell."""
+        return bool(self._line_buffer) or self._line_dirty
+
     def _reexport_term(self):
         """Tell the running shell to re-export TERM for the current mode, so it and
         the programs it launches advertise what the mode can render -- without a
@@ -856,9 +868,47 @@ class SecureTerminal(QPlainTextEdit):
         reconfigured the shell, rather than a hidden change. Terminated with CR
         (\\r, the same byte Enter sends), NOT \\n: an interactive shell's line
         editor (zsh's zle) binds accept-line to CR, so a bare \\n leaves the command
-        sitting UNSUBMITTED at the prompt."""
+        sitting UNSUBMITTED at the prompt.
+
+        That CR is why a pending line DEFERS the re-export instead of racing it.
+        This is typed input: with a half-typed line at the prompt the shell would
+        receive `<pending>export TERM=...` and RUN it -- an Enter the user never
+        pressed, submitting their unfinished text. Worse, that submission is
+        generated here rather than by the Enter handler, so it never passes
+        command_hook: the one control that judges what reaches the shell would be
+        routed around by the terminal itself. So the line is left untouched (never
+        killed -- discarding what someone typed to satisfy our own housekeeping is
+        not ours to do) and the re-export waits for a clear prompt."""
+        if self._line_pending():
+            self._reexport_pending = True
+            self._advise('Display switched now; the shell will be told once the '
+                         'line you are typing is submitted or cleared.')
+            return
+        self._send_reexport()
+
+    def _send_reexport(self):
+        """Type the re-export into the shell. Only ever called with a clear prompt,
+        so nothing of the user's concatenates with it."""
+        self._reexport_pending = False
         term, _ = self._child_term()
         self._write(('export TERM=%s\r' % term).encode())
+
+    def _flush_reexport(self):
+        """Send a deferred re-export once the prompt is clear again. Driven from
+        _on_readable -- output arriving is what a returning prompt looks like from
+        here -- and gated on the pending flag, so a terminal with nothing deferred
+        pays nothing for it. Re-checks EVERY precondition rather than trusting the
+        ones that held when the switch was made: by now a program may have been
+        started, in which case the re-export would be typed into that program."""
+        if not self._reexport_pending:
+            return
+        if (self._preview or self._fd is None or self._pid is None
+                or self._command is not None):
+            self._reexport_pending = False      # no longer a re-exportable tab
+            return
+        if self._line_pending() or self.has_foreground_program():
+            return                              # still not a clear prompt; keep waiting
+        self._send_reexport()
 
     def _grid_mode(self):
         """True whenever TUI mode is on: the pyte grid owns the screen (with its
@@ -1571,6 +1621,10 @@ class SecureTerminal(QPlainTextEdit):
                 self._notifier.setEnabled(False)
             self.shell_exited.emit()
             return
+        # output arriving is how a returning prompt looks from here, so it is the
+        # cue to retry a re-export deferred by a pending line. No-ops (one flag
+        # test) unless a mode switch is actually waiting.
+        self._flush_reexport()
         text = self._decoder.decode(data)
         # The bell is rung where each mode consumes the stream, NOT here: in TUI via
         # pyte's BEL dispatch (_pyte_bell), in CLI on the carry-aware renderable text
@@ -2518,11 +2572,14 @@ class SecureTerminal(QPlainTextEdit):
                 if key in (Qt.Key.Key_C, Qt.Key.Key_U):
                     self._line_buffer = ''    # SIGINT / kill-line discards the line
                     self._line_dirty = False
-                elif self._hook is not None:
+                else:
                     # any OTHER readline control edit (Ctrl+A/E/B/F move, Ctrl+K/W
                     # kill, Ctrl+Y yank, Ctrl+T transpose, Ctrl+D delete, Ctrl+R
                     # search) rewrites the real line without updating _line_buffer,
                     # so the hook must not judge the stale buffer -- fail safe (ask).
+                    # Flagged whether or not a hook is configured: _line_pending
+                    # reads it too, and a line we cannot see is exactly the line a
+                    # CR-terminated re-export must not be typed into.
                     self._line_dirty = True
                 return
             # The rest of the Ctrl+@..Ctrl+_ range (Ctrl+[ -> 0x1b ESC, Ctrl+] ->
@@ -2532,8 +2589,7 @@ class SecureTerminal(QPlainTextEdit):
             # hard-coded keymap. Enter/Tab/Backspace keep their dedicated handling.
             ctl = event.text()
             if len(ctl) == 1 and ord(ctl) < 0x20 and ctl not in '\b\t\n\r':
-                if self._hook is not None:
-                    self._line_dirty = True   # an unmirrored control edit may desync
+                self._line_dirty = True       # an unmirrored control edit may desync
                 self._write(ctl.encode('latin-1'))
                 return
 
@@ -2554,8 +2610,7 @@ class SecureTerminal(QPlainTextEdit):
             # Tab completion rewrites the shell's line (path/command completion)
             # without updating _line_buffer, so the hook would judge the
             # pre-completion fragment. Fail safe: ask.
-            if self._hook is not None:
-                self._line_dirty = True
+            self._line_dirty = True
             self._write(b'\t')
             return
 
@@ -2574,9 +2629,9 @@ class SecureTerminal(QPlainTextEdit):
                 # shell's line editor, which we do not mirror -- so once one of
                 # these is used, _line_buffer no longer reflects the real command.
                 # Mark it, so the hook fails safe (asks) instead of judging a
-                # stale or empty line. Only matters when a hook is configured.
-                if self._hook is not None:
-                    self._line_dirty = True
+                # stale or empty line -- and so _line_pending knows a recalled
+                # command is sitting at the prompt even though we never saw it.
+                self._line_dirty = True
                 self._write(seq)
                 return
 
@@ -2742,6 +2797,18 @@ class SecureTerminal(QPlainTextEdit):
 
         if SecureTerminal._TUI_KEYS is None:
             SecureTerminal._TUI_KEYS = _build_tui_keys()
+
+        # TUI mode does not mirror the shell's line -- a full-screen program may own
+        # the keys entirely -- so the CLI line model is not maintained here. It must
+        # still be RELEASED, though: a re-export deferred by a pending line at the
+        # moment of a CLI->TUI switch would otherwise wait forever, because nothing
+        # in this path ever clears the flags _line_pending reads. Accept-line and
+        # the two discard keys are exactly the keystrokes that empty the prompt.
+        if (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                or (ctrl and key in (Qt.Key.Key_J, Qt.Key.Key_M,
+                                     Qt.Key.Key_C, Qt.Key.Key_U))):
+            self._line_buffer = ''
+            self._line_dirty = False
 
         if key == Qt.Key.Key_Tab and shift:
             self._write(b'\x1b[Z')                  # back-tab
