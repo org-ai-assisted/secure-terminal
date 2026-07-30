@@ -309,7 +309,15 @@ def render_output(text, mode='detail'):
             out.append(_detail_badge(cp))
         elif mode == 'reveal':
             out.append('<U+%04X>' % cp)
-        elif mode == 'show' and cp >= 0x80 and ch.isprintable():
+        elif (mode == 'show' and cp >= 0x80 and ch.isprintable()
+              and not is_default_ignorable(ch)):
+            # str.isprintable() is TRUE for the default-ignorable set (variation
+            # selectors, the Hangul fillers, the combining grapheme joiner), which
+            # render as nothing at all. Show's contract is that a character with no
+            # glyph cannot be "shown", so it falls through to a placeholder like any
+            # other invisible -- otherwise an invisible character reaches the screen
+            # unmarked, which is the one thing every mode is supposed to prevent.
+            # sanitize_clipboard_unicode already excludes them on the copy path.
             out.append(ch)
         else:
             out.append('_')
