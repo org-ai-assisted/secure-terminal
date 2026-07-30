@@ -2547,6 +2547,14 @@ class SecureTerminal(QPlainTextEdit):
             return False                  # child already gone (auto-reaped)
         if child_pgrp is not None and pgrp == child_pgrp:
             return self._command is not None   # a launched program, not a shell prompt
+        if pgrp == os.getpgrp():
+            # The tty is still owned by OUR process group: between pty.fork() and
+            # the child's execvp the shell has not yet taken the terminal, so
+            # "some other pgrp holds it" is us, not a program worth terminating.
+            # Without this, a tab closed within milliseconds of opening asked "A
+            # program is still running in this tab", and the test harness -- which
+            # cannot answer a modal -- blocked forever on that dialog.
+            return False
         return True
 
     def terminate_foreground(self):
