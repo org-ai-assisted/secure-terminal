@@ -1586,7 +1586,13 @@ class SecureTerminal(QPlainTextEdit):
         # Scan a tail-carried probe so an alt-screen marker split across an os.read()
         # boundary is still seen (as the sync-2026 scan below does). F6.
         alt_probe = self._alt_scan_carry + text
-        self._alt_scan_carry = text[-(_ALT_MARKER_MAX - 1):]
+        # Carry the tail of the JOINED probe, not of this chunk: a marker split
+        # across three or more reads otherwise loses its introducer. Reads
+        # "\x1b[?1", "04", "9h" leave carry "\x1b[?1", then carry "04" -- the ESC
+        # dropped -- so the final probe "049h" matches nothing and the alt screen
+        # goes unnoticed. (The TUI feed carry, _alt_partial_tail, already slices
+        # the joined buffer; the two must not disagree.)
+        self._alt_scan_carry = alt_probe[-(_ALT_MARKER_MAX - 1):]
         entered = wants_full_screen(alt_probe)
         left = leaves_full_screen(alt_probe)
         alt_changed = False
@@ -1604,7 +1610,9 @@ class SecureTerminal(QPlainTextEdit):
         # pending partial paint, take the hold); defer END until AFTER pyte is fed
         # the closing chunk, so _end_sync_update paints the COMPLETED frame.
         probe = self._sync_scan_carry + text
-        self._sync_scan_carry = text[-(len(_SYNC_BEGIN) - 1):]
+        # Same as the alt-screen carry above: slice the joined probe, so a marker
+        # spanning three or more reads keeps its introducer.
+        self._sync_scan_carry = probe[-(len(_SYNC_BEGIN) - 1):]
         sync_end = False
         if _SYNC_BEGIN in probe or _SYNC_END in probe:
             if probe.rfind(_SYNC_BEGIN) > probe.rfind(_SYNC_END):
