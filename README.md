@@ -48,11 +48,11 @@ It does nothing about the programs you deliberately run.
   never reach an earlier line or the scrollback. The worst it can do is redraw
   its own current line, exactly as a carriage return already does -- so a forged
   status line *can* overwrite itself before you read it, the same way a progress
-  bar does. If you would rather not have even that, `line_edits=false` (or **View
-  -> Line editing**) drops the four ops, making output append-only against
-  escapes; tab completion and progress bars then append instead of updating in
-  place. Carriage return and backspace are raw control bytes, not escapes, and
-  stay honored either way.
+  bar does. Those four ops are what **tab completion** needs: Tab makes the shell
+  rewrite the line you are typing in place. If you would rather not have even
+  that, **View -> Line editing** (or `line_edits=false`) turns them off -- see the
+  `line_edits` entry in `usr/lib/secure-terminal.d/30_defaults.conf` for what you
+  gain and what it costs.
 - **Sanitized paste, with a review.** Pasted text is stripped to printable
   ASCII before it reaches the shell, so invisible or bidi characters never enter
   your command line. When a paste actually contains unicode or control

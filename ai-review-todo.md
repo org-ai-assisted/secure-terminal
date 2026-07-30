@@ -15,6 +15,21 @@ reviewer if a detached run comes back empty.
 
 ## Open
 
+### agy + glm pass on the clash/bypass hardening (uncommitted at time of writing)
+- Scope: the escape-grammar widening in `ANSI_RE` (charset designators, SS2/SS3),
+  the `tui_cell` default-ignorable + combining-run caps, the shared
+  `is_bidi_control` / `is_invisible` predicates, `cli.py`'s escape carry,
+  `cli_terminfo_dir` freshness + both-entries rule, and the `Cs@/Cr@/rv@/xr@`
+  terminfo cancellations. Re-run once the work is committed:
+  `ai-review --only agy,glm <base>`.
+- Why pending: both are quota-locked until roughly 2026-08-04 (weekly lockout),
+  so they were not attempted -- a NO-RESULT for the two non-Claude, non-OpenAI
+  model families, not a clean pass.
+- codex + coderabbit + static + claude did run on the related terminfo commit
+  (79df146) and their findings are folded in.
+- Action: re-run on a backoff after the quota resets; fold in any findings and
+  delete this entry.
+
 ### claude final pass on the transcript_text rework (commit 2d38ded)
 - Scope: `ai-review --with claude 2d38ded^ 2d38ded` -- the document-walk
   transcript_text, the "pure ASCII" claim scoping, and the prompt chunk-boundary

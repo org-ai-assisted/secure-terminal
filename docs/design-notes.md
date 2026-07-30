@@ -55,7 +55,9 @@ source of truth for behaviour.
   does, so its earlier content is lost. A once-per-tab notice explains the
   whole-screen no-op rather than letting it read as broken. The `line_edits`
   setting (default true) turns the four ops off for anyone who wants the stricter
-  guarantee; it is admin-lockable like the other display keys.
+  guarantee; it is admin-lockable like the other display keys. What the ops are
+  for and what turning them off costs: the `line_edits` entry in
+  `usr/lib/secure-terminal.d/30_defaults.conf` (the single authoritative copy).
 
 ## Paste review (text coming IN)
 

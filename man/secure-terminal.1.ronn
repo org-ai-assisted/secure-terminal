@@ -52,6 +52,14 @@ argv, with no shell reparse.
     Run <STRING>, shell-split but without a shell. Prefer `--` <PROGRAM>
     <ARGS> for a real argv.
 
+  * `--tab`:
+    Start another per-tab option group: the options after it configure the next
+    tab.
+
+  * `--colors`, `--no-colors`, `--line-edits`, `--no-line-edits`, `--bell` <CHANNELS>, `--osc` <FEATURE>:
+    Per-tab overrides of the configured defaults for the matching keys (see
+    CONFIGURATION); an administrator `lock` still wins. `--osc` is repeatable.
+
   * `--class` <CLASS>:
     Set the window WM_CLASS / Wayland app-id, for window-manager rules.
 
@@ -83,10 +91,11 @@ secure-terminal has two rendering modes, chosen per tab:
     four line-local edits (cursor forward/back, cursor-to-column, erase-in-line),
     and only within the line being written; vertical and absolute movement is
     stripped. A program can redraw its own current line, exactly as a carriage
-    return does, but can never reach back to a line already scrolled past. Set
-    `line_edits=false` (see CONFIGURATION) to drop even those four, making output
-    append-only against escapes -- at the cost of tab completion and progress bars
-    appending instead of updating in place.
+    return does, but can never reach back to a line already scrolled past. Those
+    four are what tab completion needs (Tab makes the shell rewrite the line you
+    are typing in place); `line_edits=false`, or **View > Line editing**, turns
+    them off -- see the key's entry in the defaults file (see CONFIGURATION) for
+    what that gains and costs.
 
   * TUI mode (opt-in):
     Escapes are interpreted inside an isolated in-memory screen model that has

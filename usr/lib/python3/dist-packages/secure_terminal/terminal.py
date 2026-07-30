@@ -1,3 +1,4 @@
+#!/usr/bin/python3 -Bsu
 ## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
@@ -275,22 +276,47 @@ def cli_terminfo_dir():
     on demand when it is not already compiled, or None if it cannot be produced
     (caller then falls back to xterm-256color). Pure lookup + at most one `tic`."""
     src = _terminfo_source()
-    if src:
-        pkg_dir = os.path.dirname(src)
-        if os.path.isfile(os.path.join(pkg_dir, 's', 'secure-terminal')):
-            return pkg_dir                # compiled at build time next to the source
+
+    def _fresh(directory):
+        """True when `directory` holds BOTH compiled entries and neither is OLDER
+        than the shipped source.
+
+        Both, because _child_term hands the child `secure-terminal-noedit` purely
+        on the strength of this probe: a directory carrying only the older single
+        entry gave the shell a TERM with no compiled entry at all ("unknown
+        terminal type" -- ncurses programs refuse to start).
+
+        Not older, because the cache otherwise outlived every .ti change: an
+        upgrade that cancelled a capability left existing users on the stale
+        compilation, so the terminal kept advertising what the renderer no longer
+        matched -- the source-vs-artifact drift these entries exist to prevent."""
+        compiled = [os.path.join(directory, 's', name)
+                    for name in ('secure-terminal', 'secure-terminal-noedit')]
+        if not all(os.path.isfile(path) for path in compiled):
+            return False
+        if not src:
+            return True
+        try:
+            return min(os.path.getmtime(p) for p in compiled) >= os.path.getmtime(src)
+        except OSError:
+            return False
+
+    if src and _fresh(os.path.dirname(src)):
+        return os.path.dirname(src)       # compiled at build time next to the source
     cache = os.path.join(
         os.environ.get('XDG_CACHE_HOME') or os.path.join(
             os.path.expanduser('~'), '.cache'),
         'secure-terminal', 'terminfo')
-    if os.path.isfile(os.path.join(cache, 's', 'secure-terminal')):
+    if _fresh(cache):
         return cache
     if src:
         try:
             os.makedirs(cache, exist_ok=True)
             subprocess.run(['tic', '-x', '-o', cache, src],
                            check=True, capture_output=True, timeout=15)
-            if os.path.isfile(os.path.join(cache, 's', 'secure-terminal')):
+            # the same both-entries test: a tic that produced only one of them is
+            # not a usable result, because _child_term may ask for either.
+            if _fresh(cache):
                 return cache
         except (OSError, subprocess.SubprocessError):
             pass
@@ -463,10 +489,10 @@ class SecureTerminal(QPlainTextEdit):
         self._colors = bool(colors)
         self._markings = bool(markings)   # colour the box / badge by risk class
         # Whether the line-local cursor/erase escapes a shell's line editor emits
-        # are honored. Off makes ESCAPE-driven editing append-only, so a program
-        # cannot redraw a line it already wrote (the cost: tab completion and
-        # progress bars append instead of updating in place). Set from the ctor
-        # before the history render, for the same render-once reason as colours.
+        # are honored (see the `line_edits` entry in 30_defaults.conf). Set from the
+        # ctor before the history render, for the same render-once reason as
+        # colours -- and, unlike an apply_line_edits() call after construction, in
+        # time for the fork, so the child gets the matching terminfo entry.
         self._line_edits = bool(line_edits)
         self._sgr_reset()
 
@@ -1302,10 +1328,29 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- line-local editing escapes ------------------------------------------
     def apply_line_edits(self, enabled):
+        """Honour (or drop) the four line-local editing escapes. See the
+        `line_edits` entry in `30_defaults.conf` for what they are for.
+
+        The RENDERER change alone is not the whole setting: the child shell must
+        also stop EMITTING redraws the renderer would now drop on the floor, or a
+        completion reprints mangled instead of degrading to a plain append. So the
+        matching terminfo entry is re-advertised to the running shell, exactly as a
+        CLI/TUI switch does -- same reachability guard: only a login-shell CLI tab
+        sitting at its prompt can be re-exported into, since the `export TERM=...`
+        is typed input and any other target would receive it as data."""
         if bool(enabled) == self._line_edits:
             return
         self._line_edits = bool(enabled)
         self._rerender()      # replay the retained output under the new rule
+        if self._preview or self._tui or self._pid is None or self._command is not None:
+            return
+        if self.has_foreground_program():
+            self._advise('Line editing changed for the display only: a program is '
+                         'running and owns the terminal, so the shell was not told '
+                         'about it. Toggle it again at a shell prompt (or open a '
+                         'new tab) to update the shell too.')
+            return
+        self._reexport_term()
 
     def line_edits_enabled(self):
         return self._line_edits

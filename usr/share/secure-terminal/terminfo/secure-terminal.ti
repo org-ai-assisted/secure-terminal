@@ -11,6 +11,13 @@
 # never answers. Cursor keys are NORMAL mode (\E[A..D), matching what the widget
 # sends; vertical-down is \n; there is no cursor-up.
 #
+# No surviving cap may expand to an OSC (\E]) or DCS (\EP) introducer, so:
+#   Cs/Cr  -- OSC 12 / OSC 112 cursor colour. Every OSC feature is NEUTRALIZED by
+#             default, so advertising these promised a side effect we drop.
+#   xr/rv  -- the xterm version-query RESPONSE patterns (xr is itself a DCS).
+#             Their queries RV/XR are already cancelled; leaving the responses
+#             advertised a reply this terminal never sends.
+#
 # Opt-in as TERM for local CLI-mode shells; keep xterm-256color when you ssh or
 # use TUI mode (a remote host lacks this entry). AI-Assisted.
 secure-terminal|secure-terminal safe CLI (escape-stripping, line-local rendering),
@@ -24,6 +31,7 @@ secure-terminal|secure-terminal safe CLI (escape-stripping, line-local rendering
 	smkx@, rmkx@, is2@, rs1@, rs2@, hts@, tbc@,
 	hs@, tsl@, fsl@, dsl@,
 	u6@, u7@, u8@, u9@, RV@, XR@, XM@, xm@, kmous@, Ms@, Se@, Ss@,
+	Cs@, Cr@, rv@, xr@,
 	civis@, cnorm@, cvvis@, flash@, initc@, initp@, oc@,
 	mc0@, mc4@, mc5@, mc5i@, smglp@, smglr@, smgrp@, smgl@, smgr@, sitm@, ritm@,
 	use=xterm-16color,

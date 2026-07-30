@@ -1,3 +1,4 @@
+#!/usr/bin/python3 -Bsu
 ## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
@@ -115,7 +116,21 @@ ANSI_RE = re.compile(
     # two-byte opener (the generic arm below) would leak the body as text, so a
     # cat'd DECRQSS/XTGETTCAP/Sixel/APC payload ("\x1bP$qm\x1b\\") would show "$qm".
     r'|\x1b[PX^_][^\x1b]*(?:\x1b\\)?'
-    r'|\x1b[@-Z\\-_]'
+    # SS2 / SS3 (ESC N, ESC O): a single shift, which takes the ONE graphic byte
+    # after it from an alternate character set. Three bytes, so the generic arm
+    # below would consume only two and leave that byte on screen as text.
+    r'|\x1b[NO][ -~]'
+    # The generic escape: ESC, any intermediate bytes (0x20-0x2F), a final byte
+    # (0x30-0x7E) -- the whole ECMA-48 escape grammar, not just an uppercase
+    # final. A narrower class left the sequence UNMATCHED, and an unmatched ESC
+    # is merely dropped, so the rest of the sequence rendered as literal text:
+    # the charset designators (ESC ( B from every terminfo `sgr0`, ESC ( 0 for
+    # line drawing) leaked "(B" / "(0", and ESC c / ESC 7 / ESC 8 / ESC # 8 / ESC
+    # = leaked their final byte -- unmarked, so the neutralization marking was
+    # bypassed rather than broken. The introducer arms above run first, so a
+    # well-formed CSI/OSC/DCS is still consumed whole; only a malformed one
+    # reaches here, where dropping the introducer is right.
+    r'|\x1b[ -/]*[0-~]'
 )
 
 # SGR: ESC [ <params> m -- the only escape sequence honored, and only when
@@ -533,12 +548,11 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
     per completed line -- True where the line ended by a soft autowrap (so the
     widget can join the wrapped rows on copy). max_line (>0) autowraps.
 
-    line_edits=False makes ESCAPE-driven line editing append-only: the CSI ops are
-    still CONSUMED (they fall through to the generic escape strip, so no `[3G`
-    garbage is displayed) but no longer move the cursor or erase, so a program
-    cannot redraw a line it already wrote. \r and \b are NOT covered -- they are
-    raw control bytes the local caret echo and the kernel line discipline depend
-    on, so this makes output append-only against escapes, not against every byte."""
+    line_edits=False (what the setting is for: see the `line_edits` entry in
+    30_defaults.conf) still CONSUMES the CSI ops -- they fall through to the
+    generic escape strip, so no `[3G` garbage is displayed -- but they no longer
+    move the cursor or erase. \r and \b are deliberately NOT covered: they are raw
+    control bytes the local caret echo and the kernel line discipline depend on."""
     completed = []
     wraps = []                            # parallel to completed: True == autowrap
     cells = list(cells)
@@ -632,10 +646,10 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
         elif ch == '\x07':
             # BEL is cursor-neutral on every real terminal: it rings the bell
             # (handled by has_bell over the raw text) and writes NO glyph and moves
-            # NO column. Treating it as a cell used to shift the cursor one column
-            # off on any line-editor redraw that beeps -- a completion menu emits a
-            # BEL -- so a following \b + reprint duplicated a character (garbled
-            # tab-completion). Consume it.
+            # NO column, so it must be CONSUMED, not stored as a cell. Counting it
+            # shifts the cursor one column off on any line-editor redraw that beeps
+            # -- a completion menu emits a BEL -- and the following \b + reprint
+            # then duplicates a character (garbled tab-completion).
             pass
         else:
             # DEFERRED autowrap (VT "last column" behaviour): filling the last
@@ -722,15 +736,34 @@ def _ascii_confusables():
 # Risk class of a neutralized/revealed character, so its marking (the box
 # placeholder or the <U+XXXX> badge) can be coloured by WHY the character is
 # dangerous, not just that it is. Ordered worst-first.
+def is_bidi_control(cp):
+    """A directional formatting character: it REORDERS the text around it, the
+    worst of the deceptions. Shared by the display marking and the paste review so
+    the two can never name the same character differently (U+061C used to be bidi
+    to one and merely 'invisible' to the other, so the paste warning understated
+    exactly what the display coloured red)."""
+    return (0x202A <= cp <= 0x202E or 0x2066 <= cp <= 0x2069
+            or cp in (0x200E, 0x200F, 0x061C))
+
+
+def is_invisible(ch):
+    """True for a character that renders as NOTHING yet is not a control byte:
+    zero-width, BOM, the line/paragraph separators, the invisible math operators,
+    and the default-ignorables str.isprintable() wrongly reports as printable.
+    Derived from the Unicode properties rather than a hand-written list, which is
+    how U+2061..U+2064 and U+00AD ended up unlisted and mis-coloured."""
+    return not ch.isprintable() or is_default_ignorable(ch)
+
+
 def marking_class(cp):
-    if (0x202A <= cp <= 0x202E or 0x2066 <= cp <= 0x2069
-            or cp in (0x200E, 0x200F, 0x061C)):
+    if not 0 <= cp <= 0x10FFFF:
+        return 'nonascii'             # not a code point at all: generic fallback
+    if is_bidi_control(cp):
         return 'bidi'                 # reorders text -- the worst deception
-    if (cp in (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF)
-            or 0x2028 <= cp <= 0x2029):
-        return 'invisible'            # zero-width / BOM / line-paragraph separator
     if cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
         return 'control'              # C0 / DEL / C1 control bytes
+    if is_invisible(chr(cp)):
+        return 'invisible'            # zero-width / BOM / separators / ignorables
     if cp > 0x7F and cp in _ascii_confusables():
         return 'confusable'           # a homoglyph: a non-ASCII look-alike of ASCII
     return 'nonascii'                 # other non-ASCII (foreign, but not a look-alike)
@@ -951,7 +984,22 @@ def tui_cell(ch, mode):
     result is a single display unit, so the grid and the neutralization hold."""
     if not ch:
         return ' '
-    if all(_cell_cp_safe(ord(c), mode) and c.isprintable() for c in ch):
+    # Bound a Zalgo flood at the CELL, the same cap feed_line_edits applies to the
+    # line model -- pyte merges every combining mark into the preceding cell's
+    # data, so one grid cell can hold thousands of code points that the text engine
+    # reshapes in O(n^2). Without this the cap was CLI-only and a flood routed
+    # around it simply by being viewed in TUI mode. Lossless for conformant text:
+    # UAX #15 stream-safe format allows at most 30 marks per base.
+    if len(ch) > _COMBINING_RUN_MAX + 1:
+        ch = ch[:_COMBINING_RUN_MAX + 1]
+    # is_default_ignorable, not str.isprintable() alone: the default-ignorable set
+    # (variation selectors, the Hangul fillers, the combining grapheme joiner)
+    # reports as printable yet renders as NOTHING, so "show" would have passed an
+    # invisible straight into a grid cell -- the same hole render_output closes, and
+    # a live spoofing primitive (ad<U+3164>min reads as "admin"). Leaving it here
+    # made a payload safe in CLI show mode and unsafe in TUI show mode.
+    if all(_cell_cp_safe(ord(c), mode) and c.isprintable()
+           and not is_default_ignorable(c) for c in ch):
         return ch
     return BOX
 
@@ -993,11 +1041,13 @@ def classify_paste(text):
         cp = ord(ch)
         if ch in ('\n', '\r', '\t') or 0x20 <= cp <= 0x7E:
             continue
-        if cp in (0x200E, 0x200F) or 0x202A <= cp <= 0x202E or 0x2066 <= cp <= 0x2069:
+        # The SAME predicates the display marking uses, so the warning text and the
+        # on-screen risk colour can never disagree about what a character is.
+        if is_bidi_control(cp):
             key = 'bidirectional control'
         elif cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
             key = 'control character'
-        elif not ch.isprintable():
+        elif is_invisible(ch):
             key = 'invisible character'
         else:
             key = 'non-ASCII character'   # homoglyphs and other printable non-ASCII

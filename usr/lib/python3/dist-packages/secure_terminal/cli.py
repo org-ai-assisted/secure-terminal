@@ -1,3 +1,4 @@
+#!/usr/bin/python3 -Bsu
 ## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
@@ -32,7 +33,8 @@ import struct
 import termios
 import argparse
 
-from secure_terminal.sanitize import render_output, DISPLAY_MODES
+from secure_terminal.sanitize import (
+    render_output, feed_chunk_carry, DISPLAY_MODES)
 
 
 def _set_winsize(fd, rows, cols):
@@ -82,6 +84,8 @@ def _run(argv, mode):
         pass            # no controlling terminal -> resize just does not fire
 
     decoder = codecs.getincrementaldecoder('utf-8')('replace')
+    esc_carry = ''              # incomplete escape held from the previous read
+    esc_drop = ''               # introducer of an over-cap string sequence
     stdin_fd = sys.stdin.fileno()
     out_fd = sys.stdout.fileno()
     old_attr = None
@@ -101,7 +105,14 @@ def _run(argv, mode):
                     break
                 if not data:  # pragma: no cover - Linux pty EOF raises EIO (above)
                     break           # child exited / pty closed
-                safe = render_output(decoder.decode(data), mode)
+                # Carry an escape split across reads, exactly as the widget does.
+                # render_output alone is stateless per chunk, so a sequence cut by
+                # a read boundary lost its introducer and the REMAINDER printed as
+                # text -- straight onto the outer terminal, `\r` and all, which is
+                # a prompt-spoofing primitive that needs no escape to survive.
+                text, esc_carry, esc_drop = feed_chunk_carry(
+                    decoder.decode(data), esc_carry, esc_drop)
+                safe = render_output(text, mode)
                 os.write(out_fd, safe.encode('utf-8', 'replace'))
             if stdin_fd in readable:
                 try:

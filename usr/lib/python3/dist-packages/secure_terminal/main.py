@@ -1,3 +1,4 @@
+#!/usr/bin/python3 -Bsu
 ## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
@@ -873,14 +874,17 @@ class MainWindow(QMainWindow):
         if tui is None:
             tui = self._default_tui
         tui = bool(tui)
-        term = SecureTerminal(tui=tui, command=command or None)
+        # line_edits goes through the ctor, not apply_line_edits: the ctor forks the
+        # child, so only a ctor value reaches the fork in time to pick the matching
+        # terminfo entry (secure-terminal vs secure-terminal-noedit).
+        term = SecureTerminal(tui=tui, command=command or None,
+                              line_edits=self._default_line_edits)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(self._default_font_family)
         term.set_font_size(self._default_font_size)
         term.apply_mode(self._default_mode)
         term.apply_colors(self._default_colors)
-        term.apply_line_edits(self._default_line_edits)
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
@@ -909,7 +913,11 @@ class MainWindow(QMainWindow):
 
         tui = self._default_tui if (spec.get('tui') is None
                                     or 'tui' in self._locked) else spec['tui']
-        term = SecureTerminal(tui=tui, command=spec.get('command') or None)
+        # line_edits via the ctor: it must be set before the ctor forks the child,
+        # or the shell is handed the wrong terminfo entry (see new_tab).
+        term = SecureTerminal(tui=tui, command=spec.get('command') or None,
+                              line_edits=bool(_tab('line_edits',
+                                                   self._default_line_edits)))
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(spec.get('font_family') or self._default_font_family)
@@ -919,7 +927,6 @@ class MainWindow(QMainWindow):
             mode = self._default_mode
         term.apply_mode(mode)
         term.apply_colors(_tab('colors', self._default_colors))
-        term.apply_line_edits(_tab('line_edits', self._default_line_edits))
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
@@ -2748,13 +2755,11 @@ class MainWindow(QMainWindow):
             '&Line editing', self, checkable=True)
         self.act_line_edits.setChecked(self._default_line_edits)
         self.act_line_edits.setToolTip(
-            'Honour the line-local cursor/erase escapes a shell emits to redraw '
-            'the line you are typing -- tab completion, Ctrl+R history search, a '
-            'carriage-return progress bar. On by default. Off makes output '
-            'append-only against escapes: a program can no longer redraw a line it '
-            'already wrote, at the cost of completion and progress bars appending '
-            'instead of updating in place. Carriage return and backspace are raw '
-            'control bytes and stay honoured either way.')
+            'Let the shell rewrite the line you are typing in place -- this is what '
+            'tab completion needs. On by default. Off makes output append-only '
+            'against escapes, so nothing can redraw a line it already wrote, and '
+            'completion appends instead. Full explanation: secure-terminal(1), '
+            'CONFIGURATION.')
         self.act_line_edits.toggled.connect(self.set_line_edits)
         view_menu.addAction(self.act_line_edits)
 
@@ -3384,13 +3389,11 @@ class MainWindow(QMainWindow):
         line_edits.setChecked(self._default_line_edits)
         line_edits.setEnabled('line_edits' not in self._locked)
         _tip_row(rendering, 'Line editing', line_edits,
-                 'Honour the line-local cursor/erase escapes a shell emits to '
-                 'redraw the line you are typing (tab completion, Ctrl+R, a \\r '
-                 'progress bar). OFF makes output append-only against escapes, so '
-                 'a program cannot redraw a line it already wrote -- at the cost '
-                 'of completion and progress bars appending instead of updating '
-                 'in place. Carriage return and backspace are raw control bytes '
-                 'and stay honoured either way.')
+                 'Let the shell rewrite the line you are typing in place -- this '
+                 'is what tab completion needs. ON by default. OFF makes output '
+                 'append-only against escapes, so nothing can redraw a line it '
+                 'already wrote, and completion appends instead. Full explanation: '
+                 'secure-terminal(1), CONFIGURATION.')
 
         tui = QCheckBox()
         tui.setChecked(self._default_tui)
@@ -3953,7 +3956,7 @@ def _launch_parser(with_globals):
         prog='secure-terminal', add_help=with_globals,
         description='A terminal that shows untrusted output safely.',
         epilog="Run a command with '-- PROGRAM ARGS' (a real argv, no shell "
-               "reparse). Open several tabs by repeating --tab.")
+               'reparse). Open several tabs by repeating --tab.')
     if with_globals:
         p.add_argument('--version', action='version',
                        version='secure-terminal ' + APP_VERSION)
@@ -3987,6 +3990,13 @@ def _launch_parser(with_globals):
                    help='enable ANSI colours for this tab')
     p.add_argument('--no-colors', dest='colors', action='store_false',
                    help='disable ANSI colours for this tab')
+    p.add_argument('--line-edits', dest='line_edits', action='store_true',
+                   default=None,
+                   help='let the shell rewrite the current line in place for this '
+                        'tab (what tab completion needs)')
+    p.add_argument('--no-line-edits', dest='line_edits', action='store_false',
+                   help='append-only against escapes for this tab: nothing can '
+                        'redraw a line it already wrote')
     p.add_argument('--bell', metavar='CHANNELS',
                    help='bell channels for this tab, e.g. "audible,visual" (empty = silent)')
     p.add_argument('--osc', dest='osc', metavar='FEATURE', action='append',
@@ -4029,7 +4039,7 @@ def _parse_launch_args(argv):
         launch.tabs.append({
             'title': namespace.title, 'tui': namespace.tui,
             'mode': namespace.mode, 'command': namespace.cmd_string,
-            'colors': namespace.colors,
+            'colors': namespace.colors, 'line_edits': namespace.line_edits,
             'bell': namespace.bell, 'osc': namespace.osc})
     if command is not None:
         launch.tabs[-1]['command'] = command
@@ -4037,7 +4047,7 @@ def _parse_launch_args(argv):
     def _empty(spec):
         return not any(spec.get(k) is not None
                        for k in ('title', 'tui', 'mode', 'command',
-                                 'colors', 'bell', 'osc'))
+                                 'colors', 'line_edits', 'bell', 'osc'))
 
     # A leading '--tab' means the first tab IS that group; drop the empty
     # placeholder for tokens before it (its globals were already read).
@@ -4059,7 +4069,7 @@ def _sanitize_tab_spec(spec):
     """Type-validate a tab spec received over IPC (owner-only, but defensive)."""
     title, tui = spec.get('title'), spec.get('tui')
     mode, command = spec.get('mode'), spec.get('command')
-    colors = spec.get('colors')
+    colors, line_edits = spec.get('colors'), spec.get('line_edits')
     bell, osc = spec.get('bell'), spec.get('osc')
     return {
         'title': title if isinstance(title, str) else None,
@@ -4067,6 +4077,7 @@ def _sanitize_tab_spec(spec):
         'mode': mode if mode in DISPLAY_MODES else None,
         'command': command if isinstance(command, (str, list)) else None,
         'colors': colors if isinstance(colors, bool) else None,
+        'line_edits': line_edits if isinstance(line_edits, bool) else None,
         'bell': bell if isinstance(bell, str) else None,
         'osc': [f for f in osc if isinstance(f, str)] if isinstance(osc, list) else None,
     }
@@ -4088,7 +4099,7 @@ def _ctl_main(argv):
                                             'sanitized)')
     send.add_argument('--tab', required=True, metavar='MATCH',
                       help='target tab: id:N or title:NAME')
-    send.add_argument('text', help="text to send (include a newline to submit)")
+    send.add_argument('text', help='text to send (include a newline to submit)')
     title = sub.add_parser('set-tab-title', help='rename a tab')
     title.add_argument('--tab', required=True, metavar='MATCH')
     title.add_argument('title')
