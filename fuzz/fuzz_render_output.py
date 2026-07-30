@@ -23,22 +23,36 @@ Run locally:
 """
 
 import sys
+import unicodedata
 
 import atheris
 
 with atheris.instrument_imports():
-    from secure_terminal.sanitize import render_output, DISPLAY_MODES
+    from secure_terminal.sanitize import (
+        render_output, is_default_ignorable, DISPLAY_MODES)
 
 _HONORED = {0x08, 0x09, 0x0A, 0x0D}
 _SAFE = frozenset(_HONORED | set(range(0x20, 0x7F)))
+# DERIVED from the Unicode general categories, never enumerated -- the same
+# derivation as test_corpus.py and fuzz_secure_terminal.py. An enumerated ORACLE
+# cannot report its own holes: a member nobody listed weakens the leak check below
+# instead of failing it, which is why this copy went on missing U+061C,
+# U+2061..2064 and U+180E. Cc control, Cf format (bidi controls, zero-widths,
+# invisible math operators, BOM, soft hyphen), Zl/Zp separators -- plus the
+# default-ignorables, printable to str.isprintable() yet rendering as nothing.
+_DANGEROUS_CATEGORIES = frozenset(('Cc', 'Cf', 'Zl', 'Zp'))
 _DANGEROUS = frozenset(
-    [c for c in range(0x00, 0x20) if c not in _HONORED]
-    + [0x7F]
-    + list(range(0x80, 0xA0))
-    + [0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x2060, 0xFEFF]
-    + list(range(0x202A, 0x202F))
-    + list(range(0x2066, 0x206A))
-    + [0x2028, 0x2029])
+    cp for cp in range(0x110000)
+    if cp not in _HONORED
+    and (unicodedata.category(chr(cp)) in _DANGEROUS_CATEGORIES
+         or is_default_ignorable(chr(cp))))
+# Canary: the default-ignorable arm borrows a PRODUCT predicate, so gutting it
+# would shrink this oracle silently. Fail at import, before any fuzz iteration.
+for _cp in (0x00, 0x1B, 0x7F, 0x9B, 0x061C, 0x180E, 0x200B, 0x200D, 0x200E,
+            0x202E, 0x2066, 0x2028, 0x2029, 0xFEFF, 0x2061, 0x2062, 0x2063,
+            0x2064, 0xFE0F, 0x3164, 0x115F, 0x034F):
+    assert _cp in _DANGEROUS, '_DANGEROUS lost U+%04X' % _cp
+assert not (_DANGEROUS & _SAFE), '_SAFE and _DANGEROUS must be disjoint'
 
 
 def TestOneInput(data):
