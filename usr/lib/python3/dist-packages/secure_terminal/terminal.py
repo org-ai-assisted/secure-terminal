@@ -83,6 +83,10 @@ import shlex
 import unicodedata
 
 import pyte
+# pyte's own hard dependency, so no new package: it is what pyte's draw() uses to
+# decide a character's cell width, and _SafeHistoryScreen.draw has to agree with
+# that decision to know which characters pyte would silently drop.
+from wcwidth import wcwidth
 
 # Per base cell; Unicode UAX #15 stream-safe format allows at most 30
 # combining marks, so any conformant text stays untouched.
@@ -119,7 +123,8 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             super().draw(data)
             return
         for ch in data:
-            if ord(ch) >= 0x0300 and unicodedata.combining(ch):
+            combining = ord(ch) >= 0x0300 and unicodedata.combining(ch)
+            if combining or wcwidth(ch) < 1:
                 x = self.cursor.x
                 if x:
                     target = self.buffer[self.cursor.y].get(x - 1)
@@ -129,7 +134,33 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                     target = None
                 if target is not None and len(target.data) > _TUI_COMBINE_CAP:
                     continue                  # target cell already at the cap
+                if not combining:
+                    # pyte's draw() takes `else: break` for a character that is
+                    # zero-width but NOT a combining mark -- U+200D, U+FE0F, the
+                    # emoji modifiers -- so it writes no cell and the character
+                    # VANISHES: nothing shown, nothing marked. CLI mode names the
+                    # same byte inline, so TUI mode was the one place an invisible
+                    # reached the user unmarked, which is the guarantee every mode
+                    # is supposed to keep. Merge it into the preceding cell the way
+                    # pyte does for a combining mark, so tui_cell sees a cell whose
+                    # data is not purely printable and renders the placeholder.
+                    if target is not None:
+                        self._merge_invisible(target, ch)
+                    continue
             super().draw(ch)
+
+    def _merge_invisible(self, target, ch):
+        """Append a zero-width character to `target`'s data so the cell is marked.
+        No NFC normalization: this is not a combining mark and must not compose
+        with the base -- the point is that the cell stops being purely printable,
+        which is what tui_cell keys the placeholder on."""
+        x = self.cursor.x
+        if x:
+            row, col = self.cursor.y, x - 1
+        else:
+            row, col = self.cursor.y - 1, self.columns - 1
+        self.buffer[row][col] = target._replace(data=target.data + ch)
+        self.dirty.add(row)
 
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData)
