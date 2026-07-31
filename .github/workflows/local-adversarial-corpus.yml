@@ -55,12 +55,12 @@ jobs:
       - name: Checkout secure-terminal (the code under test)
         ## https://github.com/actions/checkout/releases/tag/v6.0.2
         ## > de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Checkout terminal-poc-corpus
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: secure-terminal/terminal-poc-corpus
           ref: master
@@ -130,12 +130,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout secure-terminal (the code under test)
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Checkout dist-ai (holds the suite)
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: org-ai-assisted/dist-ai
           ref: master
@@ -146,7 +146,7 @@ jobs:
         ## fetch-depth 0: the fixtures live one per payload BRANCH, so a shallow
         ## single-branch clone would find none. The suite asserts the branches are
         ## readable, so that regression fails loud instead of passing vacuously.
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: output-lies/git-diffs-lie
           ref: master

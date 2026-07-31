@@ -77,7 +77,7 @@ jobs:
       - name: Checkout repository
         ## https://github.com/actions/checkout/releases/tag/v6.0.2
         ## > de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -105,7 +105,7 @@ jobs:
         if: always()
         ## step-summary-emit ships in dist-ai's usr/bin/, so the summary step
         ## below needs a dist-ai checkout on the runner.
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: org-ai-assisted/dist-ai
           ref: master
@@ -141,7 +141,7 @@ jobs:
       - name: Checkout repository
         ## https://github.com/actions/checkout/releases/tag/v6.0.2
         ## > de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -172,7 +172,7 @@ jobs:
       - name: Checkout dist-ai (shared CI helper binaries)
         if: always()
         ## See the same step in the 'pr' job above for rationale.
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: org-ai-assisted/dist-ai
           ref: master
@@ -213,7 +213,7 @@ jobs:
       - name: Checkout repository
         ## https://github.com/actions/checkout/releases/tag/v6.0.2
         ## > de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -239,7 +239,7 @@ jobs:
       - name: Checkout dist-ai (shared CI helper binaries)
         if: always()
         ## See the same step in the 'pr' job above for rationale.
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: org-ai-assisted/dist-ai
           ref: master
