@@ -10,9 +10,9 @@
 ## that file is propagated byte-identically from developer-meta-files and is
 ## overwritten on the next propagation pass, so it cannot carry a per-repo
 ## schedule. It also calls the reusable with its default '--core', which
-## selects only secure-terminal-tests and secure-terminal-tests-coverage --
-## the '--fuzz' category (dist-ai-tests-all fuzz_suites) was unreachable from
-## CI entirely. These two suites are the ONLY live-widget and pyte-path fuzzing
+## selects only secure-terminal-tests and secure-terminal-tests-coverage, so
+## the '--fuzz' category (dist-ai-tests-all fuzz_suites) is reachable from no
+## other lane. These two suites are the ONLY live-widget and pyte-path fuzzing
 ## the project has; ClusterFuzzLite covers the Qt-free parser surface only.
 ##
 ## Nightly rather than per-push: 40000 parser iterations plus 6000 live-widget

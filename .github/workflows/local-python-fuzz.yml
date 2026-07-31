@@ -49,8 +49,7 @@ on:
 ## redeclares its full set. Job-level permissions REPLACE
 ## top-level (not merge), so jobs using actions/checkout MUST
 ## re-list 'contents: read' even though it's already at top-level
-## here. See agents/github-actions.md G-A-006 (or
-## test_workflow_yaml.sh W-005).
+## here. See test_workflow_yaml.sh W-005 (PERMISSIONS-CHECKOUT).
 permissions:
   contents: read
 
@@ -104,9 +103,8 @@ jobs:
 
       - name: Checkout dist-ai (shared CI helper binaries)
         if: always()
-        ## step-summary-emit moved from developer-meta-files' ci/ to dist-ai's
-        ## usr/bin/ (the shared-CI-helper migration, developer-meta-files#165).
-        ## The old path is deleted, so calling it exits 127.
+        ## step-summary-emit ships in dist-ai's usr/bin/, so the summary step
+        ## below needs a dist-ai checkout on the runner.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: org-ai-assisted/dist-ai

@@ -14,13 +14,6 @@
 ## repo happens to push again, or never. This workflow closes the other
 ## direction, so the PoC corpus gates secure-terminal changes too.
 ##
-## dist-ai's terminal-poc-corpus-tests entrypoint cannot serve this: it is
-## unreachable from any component-filtered run (dist-ai-tests-all's
-## suite_component() has no terminal-poc-corpus case, so it resolves to the empty
-## string and never matches a --component), and the reusable always filters by
-## component. It would also SKIP (exit 77) without a corpus checkout, which the
-## orchestrator counts as green.
-##
 ## Conformance (conformance/acquire.sh + harness/conformance.py) is deliberately
 ## NOT run here: it fetches third-party suites over the network, which belongs in
 ## the corpus repo's own scheduled run rather than in a per-push gate.
@@ -85,8 +78,7 @@ jobs:
           import yaml
           with open('.github/dm-consumer.yml', encoding='utf-8') as handle:
               declared = yaml.safe_load(handle)['dist-ai-tests']['apt-packages']
-          # python3-jsonschema is the corpus tooling's own need, not secure-terminal's.
-          print('packages=%s python3-jsonschema' % declared)
+          print('packages=%s' % declared)
           PY
 
       - name: Install dependencies (apt only)
@@ -117,8 +109,7 @@ jobs:
     ## reads every content/* payload branch, and asserts each is safely sanitized --
     ## so a fixture added upstream is exercised automatically instead of being
     ## reported as drift for someone to hand-sync. It also checks the in-tree copy
-    ## still matches the branch it stands in for, which is what the separate
-    ## drift-checker used to do.
+    ## still matches the branch it stands in for.
     ##
     ## The in-tree copy is the floor for the reusable dist-ai run, which checks out
     ## only the code under test plus dist-ai; this job is what makes the disk path
