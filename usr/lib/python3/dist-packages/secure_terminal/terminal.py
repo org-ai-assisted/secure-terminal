@@ -198,7 +198,7 @@ from secure_terminal.sanitize import (
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
     describe_codepoint, marking_class, PROMPT_START,
-    split_trailing_escape, feed_chunk_carry, has_bell, OSC_FEATURES,
+    feed_chunk_carry, has_bell, OSC_FEATURES,
     tail_from_escape_boundary,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
@@ -1709,13 +1709,10 @@ class SecureTerminal(QPlainTextEdit):
         self._alt_scan_carry = alt_probe[-(_ALT_MARKER_MAX - 1):]
         entered = wants_full_screen(alt_probe)
         left = leaves_full_screen(alt_probe)
-        alt_changed = False
         if entered or left:
             last_enter = max((alt_probe.rfind(s) for s in _ALT_ENTER), default=-1)
             last_leave = max((alt_probe.rfind(s) for s in _ALT_LEAVE), default=-1)
-            was_alt = self._alt_screen
             self._alt_screen = last_enter > last_leave
-            alt_changed = self._alt_screen != was_alt
             if not self._alt_screen:
                 self._tui_hint_shown = False   # a later full-screen app re-advises
 
