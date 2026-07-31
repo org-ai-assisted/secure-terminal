@@ -61,7 +61,14 @@ concurrency:
 jobs:
   pr:
     name: ClusterFuzzLite PR fuzz
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    ## CI runs only where we enabled it. Unset variable -> the job is
+    ## skipped, no runner is allocated, and the run stays green: upstream
+    ## and forks are never handed a red X for a lane they did not opt into.
+    ## A fork that WANTS our CI sets the same variable in its own repo.
+    if: >-
+      vars.CI_ENABLED_ORG_AI_ASSISTED == 'true'
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -125,7 +132,8 @@ jobs:
 
   push:
     name: ClusterFuzzLite push fuzz
-    if: github.event_name == 'push'
+    ## See the 'pr' job for why this gate exists.
+    if: vars.CI_ENABLED_ORG_AI_ASSISTED == 'true' && github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -189,7 +197,12 @@ jobs:
 
   batch:
     name: ClusterFuzzLite batch fuzz
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    ## See the 'pr' job for why this gate exists. Note the parentheses:
+    ## the gate must AND the whole event test, not just the first branch
+    ## of the or.
+    if: >-
+      vars.CI_ENABLED_ORG_AI_ASSISTED == 'true'
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
