@@ -44,7 +44,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     ## Fork-PR guard, matching the other workflows in this repo.
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+    ## CI runs only where we enabled it. Unset variable -> skipped, no
+    ## runner allocated, run stays green. ANDed with the fork-PR guard.
+    if: >-
+      vars.CI_ENABLED_ORG_AI_ASSISTED == 'true'
+      && (github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request')
     permissions:
       contents: read
     steps:
@@ -117,7 +121,11 @@ jobs:
     name: git-diffs-lie corpus
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+    ## CI runs only where we enabled it. Unset variable -> skipped, no
+    ## runner allocated, run stays green. ANDed with the fork-PR guard.
+    if: >-
+      vars.CI_ENABLED_ORG_AI_ASSISTED == 'true'
+      && (github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request')
     permissions:
       contents: read
     steps:
