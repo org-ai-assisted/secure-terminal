@@ -3903,7 +3903,15 @@ class MainWindow(QMainWindow):
         # for the current window width. Set _toolbar LAST so an early resizeEvent
         # (before this point) stays a no-op.
         self._toolbar = bar
+        # Measure the WORST-case full width -- with the TUI indicator visible. The
+        # dot is shown only while TUI is active; a threshold cached without it would
+        # let the bar overflow near the boundary once TUI turns on, so account for
+        # it up front rather than re-measuring on every mode change.
+        _dot_visible = self.tui_dot_action.isVisible()
+        self.tui_dot_action.setVisible(True)
+        bar.layout().activate()
         self._toolbar_full_width = bar.sizeHint().width()
+        self.tui_dot_action.setVisible(_dot_visible)
         self._relayout_toolbar()
 
     def resizeEvent(self, event):
