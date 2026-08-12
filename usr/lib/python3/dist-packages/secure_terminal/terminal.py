@@ -260,6 +260,23 @@ _RISK_LABELS = {
     'nonascii':   'other non-ASCII -- foreign text, not an ASCII look-alike',
 }
 
+# Both marking-format caches (line mode's _line_fmt_cache, the TUI grid's
+# _grid_mark_cache) are keyed by SOURCE code point, so untrusted output cycling
+# through distinct non-ASCII code points would grow them toward the whole ~1.1M
+# code-point space for the life of the tab. Cap admission -- the same bound
+# sanitize._is_mark uses -- so a flood cannot leak formats without limit; an
+# over-cap format is still built and returned, just not retained.
+_MARK_CACHE_MAX = 4096
+
+
+def _cache_bounded(cache, key, fmt):
+    """Store fmt under key only while cache is below the admission cap, then return
+    it, so a code-point-keyed format cache cannot grow without bound."""
+    if len(cache) < _MARK_CACHE_MAX:
+        cache[key] = fmt
+    return fmt
+
+
 # Any numeric-code OSC: ESC ] <code> ; <params> (BEL | ST). The dispatcher acts on
 # the codes for enabled OSC features and ignores the rest (still stripped).
 _OSC_ANY = re.compile(rb'\x1b\](\d{1,8});([^\x07\x1b]*)(?:\x07|\x1b\\)')
@@ -1373,32 +1390,38 @@ class SecureTerminal(QPlainTextEdit):
         self.viewport().update()
 
     def _grid_cell_format(self, cell, disp):
-        """Format for one grid cell. Normally the program's own SGR (_pyte_format).
-        When display markings are on and the cell is a MARKING, colour it by the
-        risk class of its non-ASCII code point -- the SAME MARKING_COLORS the CLI
-        line renderer uses -- and tag it with that source code point, so the TUI
-        grid names WHY a byte is dangerous (bidi / homoglyph / zero-width / control
-        / other-foreign) and hover/click can inspect it. Parity with cells_to_runs:
-        before, every neutralized cell was a uniform box in the program's colour and
-        hover reported the box glyph itself (U+25A1).
+        """Format for one grid cell. A cell that is NOT a marking takes the
+        program's own SGR (_pyte_format). A MARKING -- a cell neutralized to the box
+        placeholder (box / detail / reveal, or an invisible/bidi/control in show
+        mode), OR a non-ASCII glyph SHOWN as itself in show mode (a line-drawing
+        border, a homoglyph, foreign text) -- ALWAYS carries its source code point
+        (_CP_PROP), so hover/click names the real character in EVERY mode and
+        whether or not markings are on, at parity with the CLI line renderer
+        (cells_to_runs tags the code point even with markings off). Before, hover on
+        a neutralized cell reported the box glyph itself (U+25A1).
 
-        A cell is a marking when it carries a non-ASCII code point AND either it was
-        neutralized to the box placeholder (box / detail / reveal mode, or an
-        invisible/bidi/control in show mode), OR it is a non-ASCII glyph SHOWN as
-        itself in show mode (a line-drawing border, a homoglyph, foreign text) --
-        the shown_nonascii case, tinted so a look-alike stands out while its glyph
-        stays readable, exactly as the compatibility page describes."""
+        When markings are ON the cell is also coloured by risk class
+        (MARKING_COLORS, keyed by code point since the colour follows the class);
+        when OFF it keeps the program's SGR (keyed by code point + the SGR attrs, so
+        two cells sharing a code point but not a colour do not collide). The cache
+        is admission-capped (_cache_bounded), and cleared wherever _fmt_cache is."""
+        cp = marking_cp_for_cell(cell.data)
+        if cp is None or not (disp == BOX or self._mode == 'show'):
+            return self._pyte_format(cell)
         if self._markings:
-            cp = marking_cp_for_cell(cell.data)
-            if cp is not None and (disp == BOX or self._mode == 'show'):
-                fmt = self._grid_mark_cache.get(cp)
-                if fmt is None:
-                    fmt = QTextCharFormat()
-                    fmt.setForeground(QColor(self.MARKING_COLORS[marking_class(cp)]))
-                    fmt.setProperty(_CP_PROP, cp)
-                    self._grid_mark_cache[cp] = fmt
-                return fmt
-        return self._pyte_format(cell)
+            key = cp                          # colour depends only on the risk class
+        else:
+            key = (cp, cell.fg, cell.bg, cell.bold, cell.reverse, cell.underscore)
+        fmt = self._grid_mark_cache.get(key)
+        if fmt is None:
+            if self._markings:
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor(self.MARKING_COLORS[marking_class(cp)]))
+            else:
+                fmt = QTextCharFormat(self._pyte_format(cell))   # keep program SGR
+            fmt.setProperty(_CP_PROP, cp)
+            return _cache_bounded(self._grid_mark_cache, key, fmt)
+        return fmt
 
     def _insert_grid_row(self, cursor, row, columns):
         """Insert one pyte row (coalescing same-format runs) at the cursor."""
@@ -1625,12 +1648,12 @@ class SecureTerminal(QPlainTextEdit):
                 else:
                     fmt = QTextCharFormat()
                 fmt.setProperty(_CP_PROP, key[2])
-                self._line_fmt_cache[key] = fmt
+                return _cache_bounded(self._line_fmt_cache, key, fmt)
             return fmt
         fmt = self._line_fmt_cache.get(key)
         if fmt is None:
             fmt = self._format_for(dict(key))
-            self._line_fmt_cache[key] = fmt
+            return _cache_bounded(self._line_fmt_cache, key, fmt)
         return fmt
 
     def wheelEvent(self, event):
@@ -2110,6 +2133,7 @@ class SecureTerminal(QPlainTextEdit):
         # timer (started after _handle_osc), so a program flooding OSC 4 palette
         # changes cannot force one full re-render per change.
         self._fmt_cache.clear()
+        self._grid_mark_cache.clear()   # markings-off grid formats clone _pyte_format
 
     def _osc_clipboard_read(self):
         """OSC 52 READ query. Answering exfiltrates the clipboard (which may hold
