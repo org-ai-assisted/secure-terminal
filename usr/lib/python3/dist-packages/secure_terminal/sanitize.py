@@ -820,17 +820,26 @@ def is_invisible(ch):
 
 
 def marking_cp_for_cell(data):
-    """The source code point to risk-classify for a TUI grid cell that tui_cell
-    neutralized to the box placeholder: the FIRST code point that is not plain
-    printable ASCII. A base+combining grapheme is one pyte cell, so the printable
-    ASCII base is skipped and a cell like 'a'+U+200B classifies as the zero-width
-    (invisible), not the 'a'. None when every code point is plain printable ASCII
-    (not a marking). Pure, so dist-ai unit-tests it beside marking_class."""
+    """The source code point to risk-classify / inspect for a TUI grid cell. A pyte
+    cell can hold a base grapheme plus combining / zero-width / format code points, so
+    a cell like 'a'+U+200B or U+2500+U+202E carries more than one. Return the MOST
+    DANGEROUS non-ASCII code point in the cell (by marking_class severity: bidi >
+    control > invisible > confusable > other non-ASCII), with box-drawing / block
+    structure ranked LOWEST -- so a bidi override or zero-width riding in the same
+    neutralized cell as a benign line is never masked by the line, and the grid tint
+    plus the inspect popup name the real hazard. None when every code point is plain
+    printable ASCII (not a marking). Pure, so dist-ai unit-tests it beside
+    marking_class."""
+    best_cp = None
+    best_rank = -1
     for ch in data:
         cp = ord(ch)
-        if not 0x20 <= cp <= 0x7E:
-            return cp
-    return None
+        if 0x20 <= cp <= 0x7E:
+            continue                          # plain printable ASCII: not a marking
+        rank = 0 if is_structural(cp) else _MARKING_SEVERITY.get(marking_class(cp), 1)
+        if rank > best_rank:                  # first of an equal rank wins (stable)
+            best_rank, best_cp = rank, cp
+    return best_cp
 
 
 def marking_class(cp):
@@ -847,6 +856,18 @@ def marking_class(cp):
     return 'nonascii'                 # other non-ASCII (foreign, but not a look-alike)
 
 
+# Severity order used by marking_cp_for_cell to pick the WORST code point in a
+# multi-code-point pyte cell: a deception outranks benign foreign text, which
+# outranks (via marking_cp_for_cell's is_structural test, rank 0) box-drawing.
+_MARKING_SEVERITY = {
+    'bidi': 5,          # reorders text -- the worst
+    'control': 4,       # C0 / DEL / C1
+    'invisible': 3,     # zero-width / BOM / separators / ignorables
+    'confusable': 2,    # a homoglyph posing as ASCII
+    'nonascii': 1,      # other non-ASCII (honest foreign)
+}
+
+
 def is_structural(cp):
     """True for the Unicode Box Drawing (U+2500..U+257F) and Block Elements
     (U+2580..U+259F) blocks -- the purely STRUCTURAL glyphs a curses/ncurses program
@@ -857,8 +878,14 @@ def is_structural(cp):
     -- while the strict modes (box/detail/reveal) keep neutralizing them, so the
     ASCII-only guarantee is untouched. NOT a classifier used by the paste review:
     marking_class still reports these as 'nonascii', so the display and the paste
-    warning stay in agreement (a benign glyph is still a non-ASCII byte)."""
-    return 0x2500 <= cp <= 0x259F
+    warning stay in agreement (a benign glyph is still a non-ASCII byte).
+
+    EXCLUDES the two box-drawing diagonals the Unicode confusables data maps to
+    ASCII -- U+2571 (looks like '/') and U+2573 (looks like 'X'): those ARE
+    look-alikes, so they keep their louder 'confusable' risk colour instead of being
+    waved through as benign structure. 'cannot pose as ASCII' is the whole predicate,
+    so a code point that CAN is not structural."""
+    return 0x2500 <= cp <= 0x259F and cp not in _ascii_confusables()
 
 
 # sentinel head of a run key that colours a marking by its risk class, kept
