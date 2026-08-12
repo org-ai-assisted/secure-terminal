@@ -4092,6 +4092,11 @@ def _install_signal_quit(app):
     tab's pty down inside the event loop (see main), so nothing fires into a
     half-destroyed object during the XCB teardown that follows.
 
+    The quit is QUEUED (QTimer.singleShot), not called directly: a signal can be
+    delivered after this handler is installed but before app.exec() starts, and a
+    bare quit() before the loop is running is a no-op that would drop the request.
+    A queued quit is honored the moment the loop starts instead.
+
     A signal is an unconditional "go down now": there is no user to answer the
     "a program is still running" confirmation, and a modal opened while the XCB
     connection is torn down (the harness windowkills then kills) segfaults. So
@@ -4105,7 +4110,7 @@ def _install_signal_quit(app):
         for window in app.topLevelWidgets():
             if isinstance(window, MainWindow):
                 window._force_close = True
-        app.quit()
+        QTimer.singleShot(0, app.quit)  # queued: honored even before exec() starts
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         try:
             signal.signal(sig, handler)
