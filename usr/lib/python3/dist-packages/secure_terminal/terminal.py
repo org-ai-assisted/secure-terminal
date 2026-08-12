@@ -178,6 +178,36 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         self.buffer[row][col] = target._replace(data=target.data + ch)
         self.dirty.add(row)
 
+
+class _Utf8CharsetByteStream(pyte.ByteStream):
+    """A pyte ByteStream that decodes UTF-8 itself yet still honours ISO-2022
+    charset designation -- so DEC line-drawing (``ESC ( 0``, and SI/SO) renders as
+    real box-drawing glyphs.
+
+    pyte's stock ByteStream ties both behaviours to one flag: with ``use_utf8``
+    True (its default) it UTF-8-decodes the bytes, but the parser then treats every
+    ``ESC ( <F>`` designation as a no-op (``if self.use_utf8: continue``), so an
+    ncurses/vt100 program's line-drawing borders arrive as literal ``lqqqk`` text.
+    Turning use_utf8 off re-enables the designation but drops UTF-8 decoding to
+    latin-1, corrupting every multi-byte character.
+
+    We want both, so decode UTF-8 unconditionally in feed() (the terminal already
+    knows its child speaks UTF-8) and keep use_utf8 False purely to arm the parser's
+    charset path. The Screen still character-filters every resulting cell via
+    tui_cell, so a translated glyph is subject to the same neutralization as any
+    other output; this only lets a benign box-drawing designation reach the grid."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_utf8 = False              # arm the parser's charset designation
+
+    def feed(self, data):
+        # Always UTF-8 (via the inherited incremental decoder, so a multi-byte
+        # character split across reads still decodes), then parse the str directly
+        # -- bypassing ByteStream.feed's use_utf8-gated latin-1 pass-through.
+        pyte.Stream.feed(self, self.utf8_decoder.decode(data))
+
+
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData)
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
@@ -197,7 +227,7 @@ from secure_terminal.sanitize import (
     render_output,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
-    describe_codepoint, marking_class, PROMPT_START,
+    describe_codepoint, marking_class, marking_cp_for_cell, PROMPT_START,
     feed_chunk_carry, has_bell, OSC_FEATURES,
     tail_from_escape_boundary,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
@@ -579,6 +609,11 @@ class SecureTerminal(QPlainTextEdit):
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
+        # sgr-format cache for the grid, plus a codepoint-keyed cache of the
+        # risk-class marking format a neutralized grid cell wears (see
+        # _grid_cell_format), so the TUI grid names WHY a byte was boxed, exactly
+        # as the CLI box mode does.
+        self._grid_mark_cache = {}
         # TUI grid view state: which pyte history rows are already rendered as
         # permanent scrollback (by id), and how many blocks the live grid occupies
         # at the bottom of the document. Lets each frame re-render only the grid.
@@ -747,6 +782,7 @@ class SecureTerminal(QPlainTextEdit):
         self.setPalette(pal)
         self._fmt_cache = {}          # theme changes the resolved cell colours
         self._line_fmt_cache = {}     # and the line-mode SGR format cache
+        self._grid_mark_cache = {}    # and the grid risk-class marking formats
         if self._grid_mode():         # repaint the grid ONLY while it owns the
             self._render_timer.start(16)   # screen; line-TUI keeps its scrollback
 
@@ -1188,7 +1224,7 @@ class SecureTerminal(QPlainTextEdit):
         cols, rows = self._tui_grid_size()
         self._screen = _SafeHistoryScreen(cols, rows,
                                           history=self._history_size(), ratio=0.5)
-        self._stream = pyte.ByteStream(self._screen)
+        self._stream = _Utf8CharsetByteStream(self._screen)
         # Route pyte's BEL to the tab's bell policy. pyte tracks OSC state across
         # feeds, so a BEL that merely terminates a (possibly split) OSC title is
         # consumed as the terminator and never reaches here -- only a real bell does.
@@ -1336,14 +1372,42 @@ class SecureTerminal(QPlainTextEdit):
             bar.setValue(min(prev_scroll, bar.maximum()))
         self.viewport().update()
 
+    def _grid_cell_format(self, cell, disp):
+        """Format for one grid cell. Normally the program's own SGR (_pyte_format).
+        When display markings are on and the cell is a MARKING, colour it by the
+        risk class of its non-ASCII code point -- the SAME MARKING_COLORS the CLI
+        line renderer uses -- and tag it with that source code point, so the TUI
+        grid names WHY a byte is dangerous (bidi / homoglyph / zero-width / control
+        / other-foreign) and hover/click can inspect it. Parity with cells_to_runs:
+        before, every neutralized cell was a uniform box in the program's colour and
+        hover reported the box glyph itself (U+25A1).
+
+        A cell is a marking when it carries a non-ASCII code point AND either it was
+        neutralized to the box placeholder (box / detail / reveal mode, or an
+        invisible/bidi/control in show mode), OR it is a non-ASCII glyph SHOWN as
+        itself in show mode (a line-drawing border, a homoglyph, foreign text) --
+        the shown_nonascii case, tinted so a look-alike stands out while its glyph
+        stays readable, exactly as the compatibility page describes."""
+        if self._markings:
+            cp = marking_cp_for_cell(cell.data)
+            if cp is not None and (disp == BOX or self._mode == 'show'):
+                fmt = self._grid_mark_cache.get(cp)
+                if fmt is None:
+                    fmt = QTextCharFormat()
+                    fmt.setForeground(QColor(self.MARKING_COLORS[marking_class(cp)]))
+                    fmt.setProperty(_CP_PROP, cp)
+                    self._grid_mark_cache[cp] = fmt
+                return fmt
+        return self._pyte_format(cell)
+
     def _insert_grid_row(self, cursor, row, columns):
         """Insert one pyte row (coalescing same-format runs) at the cursor."""
         run_text = ''
         run_fmt = None
         for x in range(columns):
             cell = row[x]
-            fmt = self._pyte_format(cell)
             ch = tui_cell(cell.data, self._mode)
+            fmt = self._grid_cell_format(cell, ch)
             if run_text and fmt is run_fmt:
                 run_text += ch
             else:

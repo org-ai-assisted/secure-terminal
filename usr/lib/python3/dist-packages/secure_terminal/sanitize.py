@@ -819,6 +819,20 @@ def is_invisible(ch):
     return not ch.isprintable() or is_default_ignorable(ch)
 
 
+def marking_cp_for_cell(data):
+    """The source code point to risk-classify for a TUI grid cell that tui_cell
+    neutralized to the box placeholder: the FIRST code point that is not plain
+    printable ASCII. A base+combining grapheme is one pyte cell, so the printable
+    ASCII base is skipped and a cell like 'a'+U+200B classifies as the zero-width
+    (invisible), not the 'a'. None when every code point is plain printable ASCII
+    (not a marking). Pure, so dist-ai unit-tests it beside marking_class."""
+    for ch in data:
+        cp = ord(ch)
+        if not 0x20 <= cp <= 0x7E:
+            return cp
+    return None
+
+
 def marking_class(cp):
     if not 0 <= cp <= 0x10FFFF:
         return 'nonascii'             # not a code point at all: generic fallback
