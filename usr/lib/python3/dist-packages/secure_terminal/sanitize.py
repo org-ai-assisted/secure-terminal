@@ -847,6 +847,20 @@ def marking_class(cp):
     return 'nonascii'                 # other non-ASCII (foreign, but not a look-alike)
 
 
+def is_structural(cp):
+    """True for the Unicode Box Drawing (U+2500..U+257F) and Block Elements
+    (U+2580..U+259F) blocks -- the purely STRUCTURAL glyphs a curses/ncurses program
+    (vim, htop, tmux) draws borders and bars with. They cannot pose as ASCII, hide,
+    reorder, or inject: unlike a homoglyph or a bidi/zero-width character they carry
+    a visible, honest glyph that is nothing but a line. So the SHOW-mode display
+    renders them in the program's OWN colour like a real terminal, never a risk tint
+    -- while the strict modes (box/detail/reveal) keep neutralizing them, so the
+    ASCII-only guarantee is untouched. NOT a classifier used by the paste review:
+    marking_class still reports these as 'nonascii', so the display and the paste
+    warning stay in agreement (a benign glyph is still a non-ASCII byte)."""
+    return 0x2500 <= cp <= 0x259F
+
+
 # sentinel head of a run key that colours a marking by its risk class, kept
 # distinct from an SGR-state key (a sorted-items tuple) or None.
 MARK_KEY = '\x00mark'
@@ -910,7 +924,15 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
         shown_nonascii = (mode == 'show' and disp == ch
                           and len(ch) == 1 and ord(ch) > 0x7F)
         if (disp != ch or shown_nonascii) and len(runs) < _RUN_CAP:
-            if markings:
+            # box-drawing / block elements shown as their real glyph in SHOW mode are
+            # purely structural, not a deception, so they wear the program's OWN SGR
+            # like a real terminal -- never a risk-class tint -- while still carrying
+            # the source code point for inspection. Strict modes never reach here with
+            # the glyph shown (tui_cell/render_output neutralize it first), so the
+            # ASCII-only guarantee is untouched.
+            structural = (mode == 'show' and len(ch) == 1
+                          and is_structural(ord(ch)))
+            if markings and not structural:
                 color = marking_class(ord(ch))
             elif colors:
                 color = key
