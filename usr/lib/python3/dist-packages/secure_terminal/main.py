@@ -4435,7 +4435,6 @@ def main():
     if launch.wm_class:
         # Wayland app-id and, on Qt6/XCB, the WM_CLASS class part.
         app.setDesktopFileName(launch.wm_class)
-    _install_signal_quit(app)
 
     # Auto-reap exited shells so closing a tab (which hangs up the child
     # asynchronously) cannot leave a defunct process behind: on Linux, ignoring
@@ -4448,6 +4447,13 @@ def main():
         pass            # if we cannot auto-reap, tabs simply reap on exit
 
     window = MainWindow(launch=launch)
+    # Install the terminate-on-signal handler only now, after the window exists:
+    # its handler force-closes every window (see _install_signal_quit), so a
+    # signal arriving mid-construction would otherwise flip _force_close on a
+    # half-built window that __init__ then resets. Before this point a signal
+    # takes its default disposition (prompt termination) -- correct for startup.
+    _install_signal_quit(app)
+
     # Become the single-instance server so later launches reuse this process
     # (unless the user asked for a standalone --new-instance).
     if not launch.new_instance:
