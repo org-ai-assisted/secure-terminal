@@ -683,6 +683,13 @@ class MainWindow(QMainWindow):
         self._build_security_indicator()
         self._apply_locks()
 
+        # Set on a signal-driven / programmatic quit (see _install_signal_quit) so
+        # closeEvent tears down directly instead of popping the interactive
+        # "a program is still running" confirmation. A SIGTERM/SIGHUP/SIGINT means
+        # "go down now" with no user to answer a modal -- and a modal opened while
+        # the XCB connection is being torn down (harness windowkill + kill) crashes.
+        self._force_close = False
+
         # Tabs still awaiting a deferred session restore (see below). Completed
         # before the session is saved on quit, so no tab is ever dropped.
         self._deferred_restore = []
@@ -4057,7 +4064,10 @@ class MainWindow(QMainWindow):
             self._swap_placeholder(self._deferred_restore.pop(0))
         running = sum(1 for i in range(self.tabs.count())
                       if self.tabs.widget(i).has_foreground_program())
-        if running and not self._confirm_running_close(
+        # A signal-driven / programmatic quit skips the interactive confirmation:
+        # there is no user to answer it, and a modal opened during XCB teardown
+        # segfaults (see _install_signal_quit).
+        if running and not self._force_close and not self._confirm_running_close(
                 'Quit?',
                 ('A program is still running in %d tab%s. Quit anyway?'
                  % (running, '' if running == 1 else 's')),
@@ -4080,13 +4090,27 @@ def _install_signal_quit(app):
     Python signal handlers on its own, so a periodic no-op timer wakes it often
     enough for the handler to run. quit() emits aboutToQuit, which tears every
     tab's pty down inside the event loop (see main), so nothing fires into a
-    half-destroyed object during the XCB teardown that follows."""
+    half-destroyed object during the XCB teardown that follows.
+
+    The quit is QUEUED (QTimer.singleShot), not called directly: a signal can be
+    delivered after this handler is installed but before app.exec() starts, and a
+    bare quit() before the loop is running is a no-op that would drop the request.
+    A queued quit is honored the moment the loop starts instead.
+
+    A signal is an unconditional "go down now": there is no user to answer the
+    "a program is still running" confirmation, and a modal opened while the XCB
+    connection is torn down (the harness windowkills then kills) segfaults. So
+    every window is marked _force_close first, and its closeEvent tears down
+    directly instead of prompting."""
     wake = QTimer(app)
     wake.timeout.connect(lambda: None)
 
     def handler(_signum, _frame):
         wake.stop()                     # no more wake ticks racing teardown
-        app.quit()
+        for window in app.topLevelWidgets():
+            if isinstance(window, MainWindow):
+                window._force_close = True
+        QTimer.singleShot(0, app.quit)  # queued: honored even before exec() starts
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         try:
             signal.signal(sig, handler)
@@ -4416,7 +4440,6 @@ def main():
     if launch.wm_class:
         # Wayland app-id and, on Qt6/XCB, the WM_CLASS class part.
         app.setDesktopFileName(launch.wm_class)
-    _install_signal_quit(app)
 
     # Auto-reap exited shells so closing a tab (which hangs up the child
     # asynchronously) cannot leave a defunct process behind: on Linux, ignoring
@@ -4429,6 +4452,13 @@ def main():
         pass            # if we cannot auto-reap, tabs simply reap on exit
 
     window = MainWindow(launch=launch)
+    # Install the terminate-on-signal handler only now, after the window exists:
+    # its handler force-closes every window (see _install_signal_quit), so a
+    # signal arriving mid-construction would otherwise flip _force_close on a
+    # half-built window that __init__ then resets. Before this point a signal
+    # takes its default disposition (prompt termination) -- correct for startup.
+    _install_signal_quit(app)
+
     # Become the single-instance server so later launches reuse this process
     # (unless the user asked for a standalone --new-instance).
     if not launch.new_instance:
