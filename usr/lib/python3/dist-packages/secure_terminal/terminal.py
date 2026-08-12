@@ -227,7 +227,8 @@ from secure_terminal.sanitize import (
     render_output,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
-    describe_codepoint, marking_class, marking_cp_for_cell, PROMPT_START,
+    describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
+    PROMPT_START,
     feed_chunk_carry, has_bell, OSC_FEATURES,
     tail_from_escape_boundary,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
@@ -1404,17 +1405,30 @@ class SecureTerminal(QPlainTextEdit):
         (MARKING_COLORS, keyed by code point since the colour follows the class);
         when OFF it keeps the program's SGR (keyed by code point + the SGR attrs, so
         two cells sharing a code point but not a colour do not collide). The cache
-        is admission-capped (_cache_bounded), and cleared wherever _fmt_cache is."""
+        is admission-capped (_cache_bounded), and cleared wherever _fmt_cache is.
+
+        The one exception is a SHOW-mode box-drawing / block-element glyph
+        (is_structural): it is shown as its real glyph in the program's OWN SGR, never
+        a risk tint, because a line or a bar cannot pose as ASCII, hide, or reorder --
+        it is honest structure, not a deception. It is still tagged with its code
+        point so hover/click can name it. Strict modes keep risk-colouring it."""
         cp = marking_cp_for_cell(cell.data)
         if cp is None or not (disp == BOX or self._mode == 'show'):
             return self._pyte_format(cell)
-        if self._markings:
+        # box-drawing / block elements shown as their real glyph in SHOW mode are
+        # purely structural, not a deception: they wear the program's OWN SGR like a
+        # real terminal, never a risk-class tint -- yet still carry their source code
+        # point so hover/click can name them. Strict modes (box/detail/reveal) keep
+        # neutralizing and risk-colouring them, so the ASCII-only guarantee is intact.
+        structural = self._mode == 'show' and is_structural(cp)
+        risk = self._markings and not structural
+        if risk:
             key = cp                          # colour depends only on the risk class
         else:
             key = (cp, cell.fg, cell.bg, cell.bold, cell.reverse, cell.underscore)
         fmt = self._grid_mark_cache.get(key)
         if fmt is None:
-            if self._markings:
+            if risk:
                 fmt = QTextCharFormat()
                 fmt.setForeground(QColor(self.MARKING_COLORS[marking_class(cp)]))
             else:
@@ -3122,8 +3136,13 @@ class SecureTerminal(QPlainTextEdit):
         dlg.setWindowTitle('Character U+%04X' % cp)
         dlg.setMinimumWidth(340)        # roomy enough to read the description
         col = QVBoxLayout(dlg)
-        info = QLabel(describe_codepoint(cp) + '\nRisk: '
-                      + _RISK_LABELS.get(marking_class(cp), marking_class(cp)), dlg)
+        # box-drawing / block elements are benign structure, not a risk class: name
+        # them honestly rather than as generic "foreign text" (marking_class, kept in
+        # step with the paste review, still reports them 'nonascii').
+        risk = ('box-drawing / block element -- structural, not deceptive'
+                if is_structural(cp)
+                else _RISK_LABELS.get(marking_class(cp), marking_class(cp)))
+        info = QLabel(describe_codepoint(cp) + '\nRisk: ' + risk, dlg)
         info.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard)
