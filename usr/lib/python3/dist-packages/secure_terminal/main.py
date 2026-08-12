@@ -91,6 +91,15 @@ TAB_PALETTE = ('#e5484d', '#e5a50a', '#1f8a54', '#3b9eff',
                '#a06cff', '#e06c9f', '#2ab0a0', '#c07a3a')
 ZOOM_STEP = 10
 
+# Responsive toolbar. Below the width the toolbar needs to show every control's
+# text label beside its icon (measured once, in the active font), it drops to
+# icon-only buttons with the chip captions hidden, so every control stays
+# reachable instead of folding behind Qt's ">>" overflow chevron. The default
+# window is wide enough that the compact toolbar fits with margin, so a first run
+# never overflows; widening the window past the full-layout width restores labels.
+TOOLBAR_DEFAULT_WIDTH = 940
+TOOLBAR_COMPACT_SLACK = 48       # hysteresis, px, so the switch does not oscillate
+
 # menu label -> theme key in terminal.THEMES
 THEME_LABELS = [
     ('Dark (white on black)', 'dark'),
@@ -464,7 +473,12 @@ class MainWindow(QMainWindow):
         _icon = _app_icon()
         if not _icon.isNull():
             self.setWindowIcon(_icon)
-        self.resize(820, 520)
+        # Open wide enough that the toolbar (in its compact form) fits without Qt
+        # folding controls behind the ">>" overflow chevron; _relayout_toolbar
+        # keeps them reachable as the window narrows and restores full labels as it
+        # widens. A restored session geometry (below) overrides this default.
+        self.resize(TOOLBAR_DEFAULT_WIDTH, 520)
+        self.setMinimumSize(640, 400)
         self._launch = launch
 
         # Global defaults inherited by every NEW tab; each tab then carries its
@@ -657,6 +671,13 @@ class MainWindow(QMainWindow):
         self._mode_buttons = {}
         self._colors_buttons = {}
         self._tui_buttons = {}
+        # Responsive toolbar state, populated by _build_toolbar. Initialised here
+        # so a resizeEvent dispatched during construction (before the toolbar is
+        # built) finds _toolbar None and is a harmless no-op.
+        self._toolbar = None
+        self._toolbar_compact = False
+        self._toolbar_full_width = 0
+        self._compact_hide = []          # labels hidden in icon-only compact mode
         self._build_menu()
         self._build_toolbar()
         self._build_security_indicator()
@@ -2595,7 +2616,9 @@ class MainWindow(QMainWindow):
         bar = self.menuBar()
 
         file_menu = bar.addMenu('&File')
-        self.act_new = QAction(QIcon.fromTheme('tab-new'), 'New &Tab', self)
+        self.act_new = QAction(
+            QIcon.fromTheme('tab-new', _letter_icon('+', '#5a5a5a')),
+            'New &Tab', self)
         self._bind(self.act_new, 'new_tab', 'Ctrl+Shift+T')
         self.act_new.triggered.connect(lambda: self.new_tab())
         file_menu.addAction(self.act_new)
@@ -2643,8 +2666,9 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_save)
 
         file_menu.addSeparator()
-        self.act_terminate = QAction(QIcon.fromTheme('process-stop'),
-                                     'Terminate &Program', self)
+        self.act_terminate = QAction(
+            QIcon.fromTheme('process-stop', _letter_icon('X', '#d83933')),
+            'Terminate &Program', self)
         self._bind(self.act_terminate, 'terminate', 'Ctrl+Shift+K')
         self.act_terminate.setToolTip(
             'Force-terminate the running program (SIGTERM, then SIGKILL). '
@@ -2685,12 +2709,16 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act_quit)
 
         edit_menu = bar.addMenu('&Edit')
-        self.act_copy = QAction(QIcon.fromTheme('edit-copy'), '&Copy', self)
+        self.act_copy = QAction(
+            QIcon.fromTheme('edit-copy', _letter_icon('C', '#5a5a5a')),
+            '&Copy', self)
         self._bind(self.act_copy, 'copy', 'Ctrl+Shift+C')
         self.act_copy.triggered.connect(self.copy_selection)
         edit_menu.addAction(self.act_copy)
 
-        self.act_paste = QAction(QIcon.fromTheme('edit-paste'), '&Paste', self)
+        self.act_paste = QAction(
+            QIcon.fromTheme('edit-paste', _letter_icon('V', '#5a5a5a')),
+            '&Paste', self)
         self._bind(self.act_paste, 'paste', 'Ctrl+Shift+V')
         self.act_paste.triggered.connect(self.paste_clipboard)
         edit_menu.addAction(self.act_paste)
@@ -3709,7 +3737,7 @@ class MainWindow(QMainWindow):
         'QFrame#chip > QLabel{color:palette(mid);font-size:11px;'
         'padding:0 3px 0 5px;background:transparent}'
         'QFrame#chip QPushButton{border:none;background:transparent;'
-        'padding:2px 9px;border-radius:4px;color:palette(text)}'
+        'padding:2px 7px;border-radius:4px;color:palette(text)}'
         'QFrame#chip QPushButton:hover{background:palette(midlight)}'
     )
 
@@ -3719,7 +3747,10 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout(frame)
         row.setContentsMargins(2, 1, 3, 1)
         row.setSpacing(1)
-        row.addWidget(QLabel(caption, frame))
+        # kept as an attribute so the responsive toolbar can hide the caption in
+        # icon-only compact mode (the chip labels and tooltips still identify it).
+        frame.caption_label = QLabel(caption, frame)
+        row.addWidget(frame.caption_label)
         group = QButtonGroup(frame)
         group.setExclusive(True)
         buttons = {}
@@ -3858,6 +3889,53 @@ class MainWindow(QMainWindow):
                                  'a value; Ctrl+wheel over the terminal)')
         self.zoom_box.valueChanged.connect(self.set_zoom)
         bar.addWidget(self.zoom_box)
+
+        # A shorter toolbar label than the "Terminate Program" menu entry, to keep
+        # the full layout narrow; the menu and tooltip keep the full wording.
+        self.act_terminate.setIconText('Terminate')
+        # Chip captions hidden in icon-only compact mode; the chip labels and every
+        # tooltip still identify each control. (Only frame-child widgets are hidden
+        # here -- a widget added straight to the toolbar is re-shown by the bar's
+        # own action-visibility management on relayout, so it would not stay hidden.)
+        self._compact_hide = [uni_frame.caption_label, mode_frame.caption_label,
+                              col_frame.caption_label]
+        # Learn, in the active font, the width the full layout needs, then relayout
+        # for the current window width. Set _toolbar LAST so an early resizeEvent
+        # (before this point) stays a no-op.
+        self._toolbar = bar
+        self._toolbar_full_width = bar.sizeHint().width()
+        self._relayout_toolbar()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout_toolbar()
+
+    def _relayout_toolbar(self):
+        """Keep every toolbar control reachable at narrow widths. Below the width
+        the toolbar needs to show every control's text label beside its icon, drop
+        to icon-only buttons with the chip captions hidden, so Qt never folds
+        controls behind the ">>" overflow chevron. A hysteresis band round the
+        measured full width stops the switch oscillating at the boundary."""
+        # getattr, not self._toolbar: a resizeEvent can be dispatched while the
+        # window is still constructing, before the attribute is even bound.
+        bar = getattr(self, '_toolbar', None)
+        if bar is None:
+            return
+        need = self._toolbar_full_width
+        width = self.width()
+        if self._toolbar_compact:
+            if width >= need + TOOLBAR_COMPACT_SLACK:
+                self._set_toolbar_compact(False)
+        elif width < need:
+            self._set_toolbar_compact(True)
+
+    def _set_toolbar_compact(self, compact):
+        self._toolbar_compact = compact
+        self._toolbar.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonIconOnly if compact
+            else Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        for label in self._compact_hide:
+            label.setVisible(not compact)
 
     # -- session persistence --------------------------------------------------
     def _session_tabs(self):
