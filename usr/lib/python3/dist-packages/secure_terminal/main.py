@@ -1338,6 +1338,7 @@ class MainWindow(QMainWindow):
         self._prog_titles.pop(term, None)
         self._tab_colors.pop(term, None)
         self._advisories.pop(term, None)
+        self._pre_tui_mode.pop(term, None)   # else a closed auto-boxed tab lingers
         self._osc_notified = {p for p in self._osc_notified if p[0] is not term}
         self._tab_ids.pop(term, None)
         self.tabs.removeTab(index)
@@ -1995,7 +1996,12 @@ class MainWindow(QMainWindow):
         if term.current_mode() in _INLINE_MODES:
             self._pre_tui_mode[term] = term.current_mode()
             term.apply_mode('box')
-            if notify and self._tui_autobox_notice:
+            # The banner slot is one-per-tab. A pending OSC notice is security-
+            # relevant and de-duped (it will not re-raise), so it must win: the
+            # greyed Reveal/Detail controls already convey the auto-switch. Only
+            # raise the autobox notice when it will not clobber an OSC one.
+            if notify and self._tui_autobox_notice \
+                    and self._advisories.get(term, (None,))[0] != 'osc':
                 self._on_advise(term, _TUI_AUTOBOX_MESSAGE, 'autobox')
 
     def _update_tui_indicator(self):
