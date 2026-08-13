@@ -32,8 +32,12 @@ This paste protection is scoped to a bracketed-paste-capable outer terminal
 (every modern terminal, and every shell already relies on it). On a legacy
 console that ignores DECSET 2004 no framing arrives, so a paste behaves like
 ordinary typed input -- exactly as in any other wrapper, no better and no worse.
-This wrapper does not judge whether a command is dangerous either; that is the
-(planned) hook's job.
+Like every bracketed-paste consumer, it relies on the outer terminal to filter a
+paste-end marker (ESC[201~) embedded in the clipboard, which the bracketed-paste
+spec requires and every modern terminal does; a non-compliant terminal could let a
+crafted clipboard break the framing, so this is a best-effort layer, not an absolute
+boundary. This wrapper does not judge whether a command is dangerous either; that is
+the (planned) hook's job.
 """
 
 import os
@@ -107,8 +111,13 @@ def feed_stdin_paste(data, state):
             else:
                 paste_buf, in_paste = b'', True
             i += len(marker)
-        elif marker.startswith(remaining):
-            carry = remaining                 # partial marker -> hold for next read
+        elif len(remaining) >= 2 and marker.startswith(remaining):
+            # a split marker PREFIX (>= 2 bytes, e.g. ESC[ or ESC[20) -> hold for the
+            # next read. A LONE ESC (len 1) is deliberately NOT held: buffering it would
+            # swallow an interactive ESC (vim, a lone Escape) indefinitely; it falls
+            # through below as a typed ESC. A marker split right after its ESC is rare
+            # (terminals emit the 6-byte marker in one write) and merely leaks "[200~".
+            carry = remaining
             break
         elif in_paste:
             paste_buf += buf[i:i + 1]          # an ESC in paste content (dropped later)
@@ -174,12 +183,14 @@ def _run(argv, mode):
     paste_state = (False, b'', b'')     # (in_paste, paste_buf, carry) for stdin framing
     if os.isatty(stdin_fd):
         old_attr = termios.tcgetattr(stdin_fd)
-        tty.setraw(stdin_fd)        # forward keystrokes immediately; child's pty cooks
-        # Enable bracketed paste on the OUTER terminal so a paste arrives framed
-        # (ESC[200~..201~) and can be told apart from typing. A legacy console that
-        # ignores this just delivers a paste as ordinary typed input.
-        os.write(out_fd, _BP_ENABLE)
     try:
+        if old_attr is not None:
+            tty.setraw(stdin_fd)    # forward keystrokes immediately; child's pty cooks
+            # Enable bracketed paste on the OUTER terminal so a paste arrives framed
+            # (ESC[200~..201~) and can be told apart from typing. A legacy console that
+            # ignores this just delivers a paste as ordinary typed input. Inside the try
+            # so a failed setraw / enable still hits the finally that restores termios.
+            os.write(out_fd, _BP_ENABLE)
         while True:
             try:
                 readable, _, _ = select.select([fd, stdin_fd], [], [])
@@ -221,8 +232,11 @@ def _run(argv, mode):
                         os.write(fd, to_child)
     finally:
         if old_attr is not None:
-            os.write(out_fd, _BP_DISABLE)     # disable bracketed paste on the outer term
-            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attr)
+            try:
+                os.write(out_fd, _BP_DISABLE)  # disable bracketed paste on the outer term
+            finally:
+                # ALWAYS restore the terminal, even if the disable write raised.
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attr)
 
     try:
         _, status = os.waitpid(pid, 0)
