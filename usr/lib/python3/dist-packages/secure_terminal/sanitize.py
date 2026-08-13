@@ -364,7 +364,11 @@ def render_output(text, mode='detail'):
     (0x08) and carriage return (0x0D) always pass through -- the widget honors the
     latter two as line-local edits. Everything else is handled per `mode`
     (see DISPLAY_MODES)."""
-    text = ANSI_RE.sub('', text)
+    if '\x1b' in text:
+        # Every ANSI_RE alternative begins with ESC, so on ESC-free text the sub is
+        # a guaranteed no-op; skipping it keeps plain output (the common case) off
+        # the regex engine without changing a single output byte.
+        text = ANSI_RE.sub('', text)
     out = []
     for ch in text:
         cp = ord(ch)
@@ -639,6 +643,10 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
     completed = []
     wraps = []                            # parallel to completed: True == autowrap
     cells = list(cells)
+    # SGR state tuple every printable cell carries. `sgr` changes ONLY in the
+    # _SGR_ONLY_RE branch below, so build the tuple once and recompute it there --
+    # not per printable char (this loop is the per-byte hot path).
+    state = tuple(sorted(sgr.items()))
     i, n = 0, len(raw)
     while i < n:
         ch = raw[i]
@@ -659,14 +667,14 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                     col = col + (num or 1)
                     col = min(col, max_line - 1) if max_line else min(col, len(cells))
                     while len(cells) < col:
-                        cells.append((' ', tuple(sorted(sgr.items()))))
+                        cells.append((' ', state))
                 elif op == 'D':
                     col = max(0, col - (num or 1))
                 elif op == 'G':
                     col = max(0, (num or 1) - 1)          # absolute column (1-based)
                     col = min(col, max_line - 1) if max_line else min(col, len(cells))
                     while len(cells) < col:
-                        cells.append((' ', tuple(sorted(sgr.items()))))
+                        cells.append((' ', state))
                 else:                                   # K: erase in line
                     if num in (None, 0):
                         del cells[col:]                 # cursor -> end of line
@@ -687,6 +695,7 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
             if m:
                 sgr = dict(sgr)
                 parse_sgr(m.group(1), sgr)
+                state = tuple(sorted(sgr.items()))   # sgr changed: refresh the cache
                 i = m.end()
                 continue
             if raw.startswith(PROMPT_START, i):
@@ -772,7 +781,6 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                 if left + 1 + right > _COMBINING_RUN_MAX:
                     i += 1
                     continue                        # would fuse an over-cap run: drop
-            state = tuple(sorted(sgr.items()))
             if col < len(cells):
                 cells[col] = (ch, state)
             else:
