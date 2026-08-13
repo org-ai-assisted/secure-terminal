@@ -60,6 +60,28 @@ TUI_TOOLTIP = (
     'program CAN draw a misleading interface within its screen, so only run '
     'programs you trust. The strict cli mode remains safe by design.')
 
+# The two display modes that expand a codepoint inline (Reveal <U+XXXX>, Detail
+# <U+XXXX NAME>) need a flowing line layout. TUI mode's fixed pyte grid has one
+# cell per character and cannot grow one, so they would fall back to Box while the
+# toolbar still highlighted them -- a control that lies about what is on screen.
+_INLINE_MODES = ('reveal', 'detail')
+
+# Passive banner shown once (dismissable, and switchable off via tui_autobox_notice)
+# when entering TUI auto-switches Reveal/Detail to Box. Box still marks every
+# non-ASCII byte by risk class, so the switch loses no security -- only the inline
+# codepoint text, which the grid cannot render anyway.
+_TUI_AUTOBOX_MESSAGE = (
+    'Reveal/Detail show each codepoint inline, which TUI mode\'s fixed grid '
+    'cannot do -- switched this tab to Box for the full-screen view. Box still '
+    'flags every non-ASCII byte by risk class, so nothing is hidden. Switch back '
+    'to CLI mode to use Reveal/Detail; turn this notice off under '
+    'View > Unicode > Notify on TUI auto-Box.')
+
+# Appended to the Reveal/Detail controls while they are unavailable (TUI grid
+# active). Stripped again when CLI mode restores them, so the note never lingers.
+_TUI_MODE_NOTE = ('\n\nUnavailable in TUI mode: the fixed grid cannot expand a '
+                  'codepoint inline. Switch to CLI mode to use it.')
+
 # Plain-language threat model for the OSC controls, shown in the security lamp so
 # a lay user does not over-trust the feature. Safe example only (no destructive
 # commands): the point is that a passive action can trigger a real side-effect.
@@ -571,6 +593,10 @@ class MainWindow(QMainWindow):
         # notice (a dismissible banner) when a program uses an OSC escape that line
         # mode strips; on by default, a global toggle turns it off
         self._osc_notice = cfg.get('osc_notice') != 'false'
+        # one-time passive banner when entering TUI auto-switches Reveal/Detail to
+        # Box (the grid cannot expand a codepoint inline); on by default, a global
+        # toggle turns it off. A notice only -- the auto-switch itself is unconditional.
+        self._tui_autobox_notice = cfg.get('tui_autobox_notice') != 'false'
         # OSC types the user has muted individually (still neutralized, just no
         # notice): a set of feature keys, comma-separated in config.
         self._osc_notice_off = set(
@@ -663,7 +689,7 @@ class MainWindow(QMainWindow):
         self._prog_titles = {}       # term -> program (OSC) title
         self._pre_tui_mode = {}      # term -> display mode to restore after TUI
         self._tab_colors = {}        # term -> tab colour name (for persistence)
-        self._advisories = {}        # term -> (kind, banner text); kind tui|osc
+        self._advisories = {}        # term -> (kind, banner text); kind tui|osc|autobox
         self._osc_notified = set()   # (term, key) pairs already shown the OSC notice
         self._syncing = False        # guard: programmatic chip sync vs user click
         # toolbar chip buttons, populated by _build_toolbar; empty here so a
@@ -833,7 +859,8 @@ class MainWindow(QMainWindow):
         """A terminal raised an advisory. It belongs to THAT tab, so remember it
         per-tab (with its kind) and only show the banner while its tab is current --
         otherwise the hint would hang over an unrelated terminal. kind is 'tui' for
-        a full-screen hint (auto-dismissed when TUI is enabled) or 'osc'."""
+        a full-screen hint (auto-dismissed when TUI is enabled), 'osc', or 'autobox'
+        (Reveal/Detail auto-switched to Box on entering TUI)."""
         self._advisories[term] = (kind, message)
         if term is self.current():
             self._refresh_banner()
@@ -934,6 +961,9 @@ class MainWindow(QMainWindow):
         term.apply_bell_sound(self._default_bell_sound)
         self._connect_bell_tray(term)
         self._apply_osc_defaults(term)
+        # a tab born in TUI cannot render Reveal/Detail -- box it so the chip never
+        # claims a mode the grid is not in. Silent: no active mode was yanked.
+        self._enforce_tui_autobox(term, notify=False)
         self._add_tab(term)
 
     def _osc_locked(self, feat):
@@ -984,6 +1014,7 @@ class MainWindow(QMainWindow):
         for feat in (spec.get('osc') or []):
             if feat in valid and not self._osc_locked(feat):
                 term.apply_osc(feat, True)
+        self._enforce_tui_autobox(term, notify=False)   # box Reveal/Detail in a TUI tab
         self._add_tab(term)
         if spec.get('title'):
             self._user_titles[term] = spec['title']
@@ -1254,6 +1285,10 @@ class MainWindow(QMainWindow):
                         else info.get('bell', self._default_bell))
         term.apply_bell_sound(self._default_bell_sound)
         self._connect_bell_tray(term)
+        # a restored TUI tab is normally already Box (saved after its own auto-box),
+        # but a session from older code could carry Reveal/Detail; box it so the
+        # restored chip never disagrees with the grid. Silent on restore.
+        self._enforce_tui_autobox(term, notify=False)
         index = self._add_tab(term, activate=activate, at=at)
         name = info.get('name')
         if isinstance(name, str) and name:
@@ -1740,8 +1775,21 @@ class MainWindow(QMainWindow):
         if 'unicode_mode' in self._locked:
             return                        # admin-locked; not user-changeable
         term = self.current()
+        if mode in _INLINE_MODES and isinstance(term, SecureTerminal) \
+                and term.tui_active():
+            # The chips/menu for these are disabled in TUI, but a /mode slash
+            # command bypasses the UI; refuse it here so this is the one choke
+            # point and the on-screen mode never disagrees with the control.
+            self.statusBar().showMessage(
+                'Reveal/Detail need CLI mode -- TUI mode\'s fixed grid cannot '
+                'expand a codepoint inline. Switch to CLI to use them.', 6000)
+            self._sync_mode_toggles(term.current_mode())
+            return
         if term is not None:
             term.apply_mode(mode)
+            # An explicit mode choice supersedes any remembered pre-TUI mode, so a
+            # later CLI switch must not overwrite it with a stale restore.
+            self._pre_tui_mode.pop(term, None)
         self._sync_mode_toggles(mode)
         self._update_security_indicator()
         self._default_mode = mode
@@ -1786,6 +1834,31 @@ class MainWindow(QMainWindow):
         if action is not None and not action.isChecked():
             action.setChecked(True)
         self._set_chip(self._mode_buttons, mode)
+        self._sync_mode_availability()
+
+    def _sync_mode_availability(self):
+        """Grey out the inline modes (Reveal/Detail) while the current tab's TUI
+        grid is active -- it cannot expand a codepoint inline, so leaving them
+        clickable would let a control claim a mode the screen is not in. Box and
+        Show stay selectable (both render meaningfully full-screen). A no-op when
+        an admin has locked unicode_mode: _apply_locks owns those controls then and
+        re-enabling here would undo the lock."""
+        if 'unicode_mode' in self._locked:
+            return
+        term = self.current()
+        disable = isinstance(term, SecureTerminal) and term.tui_active()
+        for key in _INLINE_MODES:
+            action = self._mode_actions.get(key)
+            button = self._mode_buttons.get(key)
+            for control in (action, button):
+                if control is None:
+                    continue
+                control.setEnabled(not disable)
+                tip = control.toolTip()
+                if disable and not tip.endswith(_TUI_MODE_NOTE):
+                    control.setToolTip(tip + _TUI_MODE_NOTE)
+                elif not disable and tip.endswith(_TUI_MODE_NOTE):
+                    control.setToolTip(tip[:-len(_TUI_MODE_NOTE)])
 
     def set_colors(self, enabled):
         if 'colors' in self._locked:
@@ -1836,6 +1909,19 @@ class MainWindow(QMainWindow):
             self._clear_advisories('osc')   # drop a showing notice for a muted type
         self._persist()
 
+    def set_tui_autobox_notice(self, enabled):
+        """Toggle the passive notice shown when TUI auto-switches Reveal/Detail to
+        Box. Off removes any showing notice too (a switched-off notice must not
+        linger). The auto-switch itself is unaffected -- this only governs whether
+        it is announced."""
+        if 'tui_autobox_notice' in self._locked:
+            return                        # admin-locked; not user-changeable
+        self._tui_autobox_notice = bool(enabled)
+        self.act_tui_autobox_notice.setChecked(enabled)
+        if not self._tui_autobox_notice:
+            self._clear_advisories('autobox')
+        self._persist()
+
     def set_markings(self, enabled):
         if 'colored_markings' in self._locked:
             return                        # admin-locked; not user-changeable
@@ -1874,21 +1960,19 @@ class MainWindow(QMainWindow):
                 if self._advisories.get(term, (None,))[0] == 'tui':
                     self._advisories.pop(term, None)
                     self._refresh_banner()
-                # Any non-'show' mode makes a TUI unreadable (box-drawing becomes
-                # a box in Box mode, or a badge in reveal/detail that breaks the grid),
-                # so lean this TAB to 'show'. Do it on the term only -- NOT via
-                # set_mode, which would persist 'show' as the global default for
-                # every future tab -- and remember the prior mode so turning TUI
-                # off restores it. Skip when the mode is admin-locked (a forced
-                # mode is a deliberate hardening choice to respect).
-                if term.current_mode() != 'show' \
-                        and 'unicode_mode' not in self._locked:
-                    self._pre_tui_mode[term] = term.current_mode()
-                    term.apply_mode('show')
+                # Reveal/Detail cannot render in the grid, so auto-switch this TAB
+                # to Box (marks every byte -- security unchanged) with a passive
+                # notice, remembering the prior mode to restore on CLI. Box and Show
+                # already render full-screen, so they are left as the user set them.
+                self._enforce_tui_autobox(term, notify=True)
             else:
                 prior = self._pre_tui_mode.pop(term, None)
                 if prior is not None:
                     term.apply_mode(prior)
+                # the "switched to Box" notice explained the now-undone switch
+                if self._advisories.get(term, (None,))[0] == 'autobox':
+                    self._advisories.pop(term, None)
+                    self._refresh_banner()
             self._sync_mode_toggles(term.current_mode())
         self._default_tui = bool(enabled)
         self.act_tui.setChecked(enabled)
@@ -1896,6 +1980,23 @@ class MainWindow(QMainWindow):
         self._update_tui_indicator()
         self._update_security_indicator()
         self._persist()
+
+    def _enforce_tui_autobox(self, term, notify):
+        """A tab entering TUI cannot render Reveal/Detail (the fixed grid has no
+        room to expand a codepoint inline), so silently boxes them. Make that
+        honest: switch such a tab to Box, remember the prior mode to restore when
+        it leaves TUI, and -- for a live toggle -- raise the passive notice. Box
+        marks every non-ASCII byte, so no security is lost. A no-op for a tab that
+        is not in TUI, is already Box/Show, or whose mode an admin has locked."""
+        if not (isinstance(term, SecureTerminal) and term.tui_active()):
+            return
+        if 'unicode_mode' in self._locked:
+            return                        # a locked mode is a deliberate choice
+        if term.current_mode() in _INLINE_MODES:
+            self._pre_tui_mode[term] = term.current_mode()
+            term.apply_mode('box')
+            if notify and self._tui_autobox_notice:
+                self._on_advise(term, _TUI_AUTOBOX_MESSAGE, 'autobox')
 
     def _update_tui_indicator(self):
         term = self.current()
@@ -2510,6 +2611,7 @@ class MainWindow(QMainWindow):
             ('colored_markings', [self.act_markings]),
             ('auto_tab_colors', [self.act_auto_tab_colors]),
             ('osc_notice', [self.act_osc_notice]),
+            ('tui_autobox_notice', [self.act_tui_autobox_notice]),
             ('osc_clipboard_read_always', [self.act_clip_read_always]),
             ('tui', [self.act_tui]),
             ('allow_title', [self.act_title]),
@@ -2578,6 +2680,7 @@ class MainWindow(QMainWindow):
         ('line_edits', 'line_edits', '_default_line_edits'),
         ('tui', 'tui', '_default_tui'),
         ('osc_notice', 'osc_notice', '_osc_notice'),
+        ('tui_autobox_notice', 'tui_autobox_notice', '_tui_autobox_notice'),
         ('scrollback', 'scrollback', '_scrollback'),
         ('paste_delay', 'paste_delay', '_paste_delay'),
         ('paste_warn', 'paste_warn', '_paste_warn'),
@@ -2610,6 +2713,7 @@ class MainWindow(QMainWindow):
             'keybindings': ' '.join('%s=%s' % (i, self._keybindings[i])
                                     for i in sorted(self._keybindings)),
             'osc_notice': 'true' if self._osc_notice else 'false',
+            'tui_autobox_notice': 'true' if self._tui_autobox_notice else 'false',
             'osc_clipboard_read_always': ('true' if self._osc_clipboard_read_always
                                           else 'false'),
             'osc_notice_off': ','.join(sorted(self._osc_notice_off)),
@@ -2821,6 +2925,18 @@ class MainWindow(QMainWindow):
         self.act_reveal = self._mode_actions['reveal']
         self.act_detail = self._mode_actions['detail']
         self.act_show = self._mode_actions['show']
+
+        mode_menu.addSeparator()
+        self.act_tui_autobox_notice = QAction(
+            '&Notify on TUI auto-Box', self, checkable=True)
+        self.act_tui_autobox_notice.setChecked(self._tui_autobox_notice)
+        self.act_tui_autobox_notice.setToolTip(
+            'Show a dismissible banner when entering TUI mode auto-switches this '
+            'tab from Reveal/Detail to Box (the fixed grid cannot expand a '
+            'codepoint inline). On by default. Box still marks every non-ASCII '
+            'byte, so the switch loses no security.')
+        self.act_tui_autobox_notice.toggled.connect(self.set_tui_autobox_notice)
+        mode_menu.addAction(self.act_tui_autobox_notice)
         self._sync_mode_toggles(self._default_mode)
 
         self.act_font = QAction('Fo&nt...', self)
@@ -3531,6 +3647,15 @@ class MainWindow(QMainWindow):
                  'escapes inside an isolated grid so full-screen programs can '
                  'redraw.')
 
+        tui_autobox_notice = QCheckBox()
+        tui_autobox_notice.setChecked(self._tui_autobox_notice)
+        tui_autobox_notice.setEnabled('tui_autobox_notice' not in self._locked)
+        _tip_row(rendering, 'Notify on TUI auto-Box', tui_autobox_notice,
+                 'Show a dismissible banner when entering TUI mode switches a tab '
+                 'from Reveal/Detail to Box (the fixed grid cannot expand a '
+                 'codepoint inline). On by default; Box still marks every non-ASCII '
+                 'byte, so the switch loses no security.')
+
         # granular OSC feature toggles: each off by default, its risk coloured in
         # the label and its layman attack-surface hint as the tooltip.
         osc_section = _section('OSC escape features')
@@ -3666,6 +3791,7 @@ class MainWindow(QMainWindow):
             'tui': tui.isChecked(),
             'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
             'osc_notice': osc.isChecked(),
+            'tui_autobox_notice': tui_autobox_notice.isChecked(),
             'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
             'paste_warn': paste_warn.currentData(), 'copy_warn': copy_warn.currentData(),
             'persist': persist.isChecked(),
@@ -3702,6 +3828,8 @@ class MainWindow(QMainWindow):
                 osc[key] = self._osc_defaults.get(key, False)
         if 'osc_notice' in opts:
             self.act_osc_notice.setChecked(self._osc_notice)
+        if 'tui_autobox_notice' in opts:
+            self.act_tui_autobox_notice.setChecked(self._tui_autobox_notice)
         for key, value in osc.items():
             self._osc_defaults[key] = value
             if key in self._osc_actions:
