@@ -115,8 +115,11 @@ label for `detail` is "Detail"):
   * `show`:
     Render the glyph when printable, tinted by risk class so a look-alike stands
     out (a homoglyph confusable with ASCII wears a louder colour than honest
-    foreign text). Non-printable classes (invisible, bidi, control) have no glyph,
-    so they still show as the same coloured box.
+    foreign text). Box-drawing and block-element glyphs are structural, not
+    deceptive, so they render in the program's own colour. A non-ASCII space is
+    shown as a distinct marker and copies as "_", never as a space. Non-printable
+    classes (invisible, bidi, control) have no glyph, so they still show as the same
+    coloured box.
 
   * `reveal`:
     Show a `<U+XXXX>` codepoint badge (hover for its name).

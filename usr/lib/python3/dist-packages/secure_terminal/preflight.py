@@ -15,17 +15,28 @@ import sys
 
 
 def require(*deps):
-    """Exit 1, naming the first missing dependency on stderr with a Debian install
-    hint, if it is not importable. Each dep is an (import_name, apt_package) pair;
+    """Exit 1 if ANY dependency is missing, naming every missing module on stderr
+    alongside a SINGLE Debian install command listing ALL declared packages -- not
+    only the one that failed -- so one `apt install` line pulls the complete set
+    (installing just the first-missing package would only surface the next missing
+    one on the following launch). Each dep is an (import_name, apt_package) pair;
     dotted import names are supported. A no-op when every dependency is present."""
-    for module, package in deps:
+    missing = []
+    for module, _package in deps:
         try:
             present = importlib.util.find_spec(module) is not None
         except (ImportError, ValueError):   # a dotted name whose parent is absent
             present = False
         if not present:
-            sys.stderr.write(
-                'secure-terminal: missing dependency: %s\n'
-                'if on debian:\n'
-                'sudo apt install %s\n' % (module, package))
-            raise SystemExit(1)
+            missing.append(module)
+    if not missing:
+        return
+    packages = []
+    for _module, package in deps:
+        if package not in packages:
+            packages.append(package)        # dedup, preserve declared order
+    sys.stderr.write(
+        'secure-terminal: missing dependency: %s\n'
+        'if on debian, install all dependencies:\n'
+        'sudo apt install %s\n' % (', '.join(missing), ' '.join(packages)))
+    raise SystemExit(1)

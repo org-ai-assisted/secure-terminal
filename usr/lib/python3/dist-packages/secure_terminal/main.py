@@ -113,13 +113,14 @@ TAB_PALETTE = ('#e5484d', '#e5a50a', '#1f8a54', '#3b9eff',
                '#a06cff', '#e06c9f', '#2ab0a0', '#c07a3a')
 ZOOM_STEP = 10
 
-# Responsive toolbar. Below the width the toolbar needs to show every control's
-# text label beside its icon (measured once, in the active font), it drops to
-# icon-only buttons with the chip captions hidden, so every control stays
-# reachable instead of folding behind Qt's ">>" overflow chevron. The default
-# window is wide enough that the compact toolbar fits with margin, so a first run
-# never overflows; widening the window past the full-layout width restores labels.
-TOOLBAR_DEFAULT_WIDTH = 940
+# Responsive toolbar. Three display tiers (full / labeled / icons), each width
+# measured once in the active font; _relayout_toolbar picks the richest tier that
+# fits the current width so no control ever folds behind Qt's ">>" overflow
+# chevron. The default window opens in the middle "labeled" tier -- icon-only
+# action buttons with the chip captions still shown -- with margin below the
+# full-layout width, so a first run never overflows; widening restores the full
+# text-beside-icon labels, narrowing hides the captions (icons tier).
+TOOLBAR_DEFAULT_WIDTH = 860
 TOOLBAR_COMPACT_SLACK = 48       # hysteresis, px, so the switch does not oscillate
 
 # menu label -> theme key in terminal.THEMES
@@ -515,7 +516,7 @@ class MainWindow(QMainWindow):
         self._locked = cfg.locked
         self._locked_violations = cfg.violations
         self._default_theme = cfg.get('theme') if cfg.get('theme') in THEMES \
-            else 'dark'
+            else 'light'
         self._default_mode = cfg.get('unicode_mode') \
             if cfg.get('unicode_mode') in DISPLAY_MODES else 'detail'
         # Default terminal font family (global). Hack disambiguates confusables and
@@ -701,9 +702,10 @@ class MainWindow(QMainWindow):
         # so a resizeEvent dispatched during construction (before the toolbar is
         # built) finds _toolbar None and is a harmless no-op.
         self._toolbar = None
-        self._toolbar_compact = False
-        self._toolbar_full_width = 0
-        self._compact_hide = []          # labels hidden in icon-only compact mode
+        self._toolbar_tier = 'full'
+        self._toolbar_tiers = []         # [(name, min_width)], richest first
+        self._toolbar_full_width = 0     # richest tier's width (TUI-worst-case guard)
+        self._compact_hide = []          # chip captions, hidden only in the icons tier
         self._build_menu()
         self._build_toolbar()
         self._build_security_indicator()
@@ -1247,14 +1249,16 @@ class MainWindow(QMainWindow):
         # rendered ONCE in its final mode/colours/markings -- constructing in the
         # default then apply_*-ing the saved values re-rendered the whole history up
         # to three times, flickering the mode and jumping the scrollbar (#78).
+        theme = info.get('theme')
+        theme = theme if theme in THEMES else self._default_theme
         term = SecureTerminal(tui=bool(info.get('tui')), history=history,
                               cwd=cwd if isinstance(cwd, str) and cwd else None,
                               mode=mode if mode in DISPLAY_MODES else self._default_mode,
                               colors=bool(info.get('colors')),
                               line_edits=bool(info.get('line_edits', True)),
-                              markings=bool(info.get('markings', True)))
-        theme = info.get('theme')
-        term.apply_theme(theme if theme in THEMES else self._default_theme)
+                              markings=bool(info.get('markings', True)),
+                              theme=theme)
+        term.apply_theme(theme)          # idempotent (ctor set it): no re-render
         try:
             term.apply_zoom(int(info.get('zoom', self._default_zoom)))
         except (TypeError, ValueError):
@@ -3872,21 +3876,31 @@ class MainWindow(QMainWindow):
     # visible, self-explaining form of a setting (e.g. "unicode: Box Reveal
     # Show"). Makes the setting's NAME and its options obvious to a new user,
     # where a bare row of toggle icons did not. Returns (frame, {key: button}).
+    # An inactive chip wears a RAISED (outset) 1px border over a top-lit
+    # gradient, so an unselected option looks physically clickable; the active
+    # chip (the per-key :checked rule below) flips to a PRESSED (inset) border
+    # over a top-shadowed fill. Border WIDTH is 1px in both states -- only the
+    # style flips -- and the padding drops by 1px per side to absorb it, so the
+    # chip's size (hence the responsive toolbar's tier widths) is unchanged.
     _CHIP_CSS = (
         'QFrame#chip{border:1px solid palette(mid);border-radius:6px;'
         'background:palette(base)}'
         'QFrame#chip > QLabel{color:palette(mid);font-size:11px;'
-        'padding:0 3px 0 5px;background:transparent}'
-        'QFrame#chip QPushButton{border:none;background:transparent;'
-        'padding:2px 7px;border-radius:4px;color:palette(text)}'
-        'QFrame#chip QPushButton:hover{background:palette(midlight)}'
+        'padding:0 2px 0 4px;background:transparent}'
+        'QFrame#chip QPushButton{border:1px solid palette(midlight);'
+        'border-style:outset;padding:1px 4px;border-radius:4px;'
+        'color:palette(text);background:qlineargradient(x1:0,y1:0,x2:0,y2:1,'
+        'stop:0 palette(light),stop:1 palette(button))}'
+        'QFrame#chip QPushButton:hover:!checked{'
+        'background:qlineargradient(x1:0,y1:0,x2:0,y2:1,'
+        'stop:0 palette(midlight),stop:1 palette(button))}'
     )
 
     def _chip_group(self, caption, specs, on_select):
         frame = QFrame(self)
         frame.setObjectName('chip')
         row = QHBoxLayout(frame)
-        row.setContentsMargins(2, 1, 3, 1)
+        row.setContentsMargins(1, 0, 2, 0)
         row.setSpacing(1)
         # kept as an attribute so the responsive toolbar can hide the caption in
         # icon-only compact mode (the chip labels and tooltips still identify it).
@@ -3916,8 +3930,19 @@ class MainWindow(QMainWindow):
             if colour:
                 btn.setIcon(_dot_icon(colour))
             checked = colour or '#3b7ddd'
+            # active chip = PRESSED: an inset border plus a top-shadowed gradient
+            # (a darker shade at the top edge fading to the class colour below)
+            # recesses it, so the selected mode reads as pushed in while keeping
+            # its class-colour fill and legible #fff text. `shadow` is the class
+            # colour at ~72% brightness (integer math, no float).
+            _ch = checked.lstrip('#')
+            shadow = '#%02x%02x%02x' % tuple(
+                int(_ch[i:i + 2], 16) * 46 // 64 for i in (0, 2, 4))
             css += ('QFrame#chip QPushButton#chip_%s:checked'
-                    '{background:%s;color:#fff;font-weight:600}' % (key, checked))
+                    '{border-style:inset;border-color:%s;color:#fff;'
+                    'font-weight:600;background:qlineargradient('
+                    'x1:0,y1:0,x2:0,y2:1,stop:0 %s,stop:0.55 %s,stop:1 %s)}'
+                    % (key, shadow, shadow, checked, checked))
             if colour:
                 # hover previews the option's safety colour (a light tint), so a
                 # user sees that Show / TUI are the less-safe, red/yellow choices
@@ -4034,25 +4059,36 @@ class MainWindow(QMainWindow):
         # A shorter toolbar label than the "Terminate Program" menu entry, to keep
         # the full layout narrow; the menu and tooltip keep the full wording.
         self.act_terminate.setIconText('Terminate')
-        # Chip captions hidden in icon-only compact mode; the chip labels and every
-        # tooltip still identify each control. (Only frame-child widgets are hidden
-        # here -- a widget added straight to the toolbar is re-shown by the bar's
-        # own action-visibility management on relayout, so it would not stay hidden.)
+        # Chip captions hidden ONLY in the narrowest (icons) tier; the chip labels
+        # and every tooltip still identify each control. (Only frame-child widgets
+        # are hidden here -- a widget added straight to the toolbar is re-shown by
+        # the bar's own action-visibility management on relayout, so it would not
+        # stay hidden.)
         self._compact_hide = [uni_frame.caption_label, mode_frame.caption_label,
                               col_frame.caption_label]
-        # Learn, in the active font, the width the full layout needs, then relayout
+        # Learn, in the active font, the width each display tier needs, then relayout
         # for the current window width. Set _toolbar LAST so an early resizeEvent
         # (before this point) stays a no-op.
         self._toolbar = bar
-        # Measure the WORST-case full width -- with the TUI indicator visible. The
-        # dot is shown only while TUI is active; a threshold cached without it would
-        # let the bar overflow near the boundary once TUI turns on, so account for
-        # it up front rather than re-measuring on every mode change.
+        # Three display tiers, richest first, so no control ever folds behind the
+        # ">>" overflow chevron while the labels stay as informative as the width
+        # allows:
+        #   full    -- text-beside-icon action buttons + chip captions
+        #   labeled -- icon-only action buttons + chip captions
+        #   icons   -- icon-only action buttons, chip captions hidden
+        # Measure each in the WORST case -- TUI indicator visible. The dot shows
+        # only while TUI is active; a threshold cached without it would let the bar
+        # overflow near a boundary once TUI turns on, so account for it up front.
         _dot_visible = self.tui_dot_action.isVisible()
         self.tui_dot_action.setVisible(True)
-        bar.layout().activate()
-        self._toolbar_full_width = bar.sizeHint().width()
+        self._toolbar_tiers = []
+        for _tier in ('full', 'labeled', 'icons'):
+            self._set_toolbar_tier(_tier)
+            bar.layout().activate()
+            self._toolbar_tiers.append((_tier, bar.sizeHint().width()))
+        self._toolbar_full_width = self._toolbar_tiers[0][1]
         self.tui_dot_action.setVisible(_dot_visible)
+        self._set_toolbar_tier('full')   # known state matching the hysteresis start
         self._relayout_toolbar()
 
     def resizeEvent(self, event):
@@ -4060,31 +4096,42 @@ class MainWindow(QMainWindow):
         self._relayout_toolbar()
 
     def _relayout_toolbar(self):
-        """Keep every toolbar control reachable at narrow widths. Below the width
-        the toolbar needs to show every control's text label beside its icon, drop
-        to icon-only buttons with the chip captions hidden, so Qt never folds
-        controls behind the ">>" overflow chevron. A hysteresis band round the
-        measured full width stops the switch oscillating at the boundary."""
+        """Keep every toolbar control reachable at narrow widths by picking the
+        richest display tier that fits the current width, so Qt never folds
+        controls behind the ">>" overflow chevron. Stepping DOWN to a leaner tier
+        happens immediately (a control would otherwise overflow); stepping UP waits
+        for a hysteresis band past the tier's width so the switch does not oscillate
+        at a boundary."""
         # getattr, not self._toolbar: a resizeEvent can be dispatched while the
         # window is still constructing, before the attribute is even bound.
         bar = getattr(self, '_toolbar', None)
         if bar is None:
             return
-        need = self._toolbar_full_width
+        tiers = self._toolbar_tiers
         width = self.width()
-        if self._toolbar_compact:
-            if width >= need + TOOLBAR_COMPACT_SLACK:
-                self._set_toolbar_compact(False)
-        elif width < need:
-            self._set_toolbar_compact(True)
+        # richest tier whose width fits; fall back to the leanest if none does
+        # (below the minimum window width nothing fits -- unavoidable, as today).
+        target = tiers[-1][0]
+        for name, need in tiers:
+            if width >= need:
+                target = name
+                break
+        order = [t[0] for t in tiers]
+        needs = dict(tiers)
+        # a lower index is a richer tier: block the step UP until past the slack.
+        if order.index(target) < order.index(self._toolbar_tier) \
+                and width < needs[target] + TOOLBAR_COMPACT_SLACK:
+            target = self._toolbar_tier
+        if target != self._toolbar_tier:
+            self._set_toolbar_tier(target)
 
-    def _set_toolbar_compact(self, compact):
-        self._toolbar_compact = compact
+    def _set_toolbar_tier(self, tier):
+        self._toolbar_tier = tier
         self._toolbar.setToolButtonStyle(
-            Qt.ToolButtonStyle.ToolButtonIconOnly if compact
-            else Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon if tier == 'full'
+            else Qt.ToolButtonStyle.ToolButtonIconOnly)
         for label in self._compact_hide:
-            label.setVisible(not compact)
+            label.setVisible(tier != 'icons')
 
     # -- session persistence --------------------------------------------------
     def _session_tabs(self):

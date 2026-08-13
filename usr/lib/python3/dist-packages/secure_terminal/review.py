@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 
 from secure_terminal.sanitize import (
     classify_paste, sanitize_paste, sanitize_paste_unicode,
-    sanitize_clipboard, sanitize_clipboard_unicode,
+    sanitize_clipboard_display, sanitize_clipboard_unicode,
 )
 from secure_terminal.terminal import SecureTerminal
 
@@ -81,7 +81,9 @@ _KINDS = {
         'titles': ('Original (as it looks)', 'Detail (what is really there)',
                    'Copy stripped puts', 'Copy with unicode puts'),
         'dispatch': 'dispatch_pending_copy',
-        'strip': sanitize_clipboard,
+        # the display-aware strip, so the "Copy stripped puts" preview matches what
+        # dispatch_pending_copy('stripped') actually places (a box -> '_', never gone).
+        'strip': sanitize_clipboard_display,
         'keep': sanitize_clipboard_unicode,
     },
 }

@@ -34,6 +34,10 @@ require(
     # property is not derivable from the general categories, so the flood cap
     # depends on it. Absent module must not mean absent cap.
     ('regex', 'python3-regex'),
+    # East-Asian / emoji display width: terminal.py sizes the pyte grid and the
+    # combining-mark cap by wcwidth. Absent module tracebacks on the terminal
+    # import instead of reporting the missing package here.
+    ('wcwidth', 'python3-wcwidth'),
 )
 
 from secure_terminal.main import main
