@@ -49,8 +49,7 @@ import termios
 import argparse
 
 from secure_terminal.sanitize import (
-    render_output, feed_chunk_carry, DISPLAY_MODES,
-    sanitize_paste, paste_no_autosubmit)
+    render_output, feed_chunk_carry, DISPLAY_MODES, sanitize_paste)
 
 # Bracketed-paste framing the OUTER terminal wraps a paste in once DECSET 2004 is
 # enabled. Stripped before the child sees it (the child runs TERM=dumb and never
@@ -70,8 +69,12 @@ def feed_stdin_paste(data, state):
       submit strip, so typing is never eaten.
     - A paste body (between ESC[200~ and ESC[201~, the framing the outer terminal
       adds) is buffered until its end marker, then run through the GUI's
-      neutralization (sanitize_paste + paste_no_autosubmit): the trailing
-      auto-submit is stripped so the pasted command waits at the prompt.
+      neutralization: sanitize_paste drops non-ASCII / control bytes, then EVERY
+      submit (CR) is stripped -- not only the trailing one. The GUI can HOLD a
+      multiline paste for review; the CLI has no such UI and forwards straight to
+      the dumb child, so an interior CR left in the body would auto-run the command
+      before it (embedded-CR pastejacking). The whole paste lands as one
+      un-submitted line for the user's explicit Enter.
     - The 200~/201~ markers are STRIPPED (the dumb child must not see them), and a
       marker split across two reads is carried to the next chunk.
     """
@@ -96,7 +99,10 @@ def feed_stdin_paste(data, state):
         if remaining.startswith(marker):
             if in_paste:                      # end of paste: neutralize + emit
                 text = paste_buf.decode('utf-8', 'replace')
-                out += paste_no_autosubmit(sanitize_paste(text)).encode('utf-8')
+                # Strip EVERY submit (CR), not just the trailing one: the CLI has no
+                # hold-for-review, so an interior CR forwarded to the dumb child would
+                # auto-run the command before it (embedded-CR pastejacking).
+                out += sanitize_paste(text).replace('\r', '').encode('utf-8')
                 paste_buf, in_paste = b'', False
             else:
                 paste_buf, in_paste = b'', True
