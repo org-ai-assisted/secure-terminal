@@ -1092,6 +1092,14 @@ class SecureTerminal(QPlainTextEdit):
         was_grid = self._grid_shown
         self._grid_shown = grid
         if grid:
+            # A debounced CLI paint must not survive the switch into the grid:
+            # apply_tui reaches here directly (not via _rerender), so a still-armed
+            # _paint_timer would later call _flush_paint and write stale CLI content
+            # into the grid document, corrupting it. Drop the pending paint first.
+            self._paint_timer.stop()
+            self._paint_pending = []
+            self._paint_pending_wraps = []
+            self._paint_dirty = False
             self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             if not was_grid:
                 # Entering the grid view. pyte is NOT fed in CLI mode (kept out of
