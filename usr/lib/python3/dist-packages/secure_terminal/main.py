@@ -1249,14 +1249,16 @@ class MainWindow(QMainWindow):
         # rendered ONCE in its final mode/colours/markings -- constructing in the
         # default then apply_*-ing the saved values re-rendered the whole history up
         # to three times, flickering the mode and jumping the scrollbar (#78).
+        theme = info.get('theme')
+        theme = theme if theme in THEMES else self._default_theme
         term = SecureTerminal(tui=bool(info.get('tui')), history=history,
                               cwd=cwd if isinstance(cwd, str) and cwd else None,
                               mode=mode if mode in DISPLAY_MODES else self._default_mode,
                               colors=bool(info.get('colors')),
                               line_edits=bool(info.get('line_edits', True)),
-                              markings=bool(info.get('markings', True)))
-        theme = info.get('theme')
-        term.apply_theme(theme if theme in THEMES else self._default_theme)
+                              markings=bool(info.get('markings', True)),
+                              theme=theme)
+        term.apply_theme(theme)          # idempotent (ctor set it): no re-render
         try:
             term.apply_zoom(int(info.get('zoom', self._default_zoom)))
         except (TypeError, ValueError):

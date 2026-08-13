@@ -226,7 +226,7 @@ from secure_terminal.sanitize import (
     paste_findings, paste_is_multiline, paste_no_autosubmit, tui_cell,
     sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL, BOX,
-    SPACE_MARK, is_space_separator,
+    SPACE_MARK,
     render_output,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
@@ -529,7 +529,7 @@ class SecureTerminal(QPlainTextEdit):
 
     def __init__(self, parent=None, command=None, tui=False, history='',
                  preview=False, cwd=None, mode='detail', colors=False,
-                 markings=True, line_edits=True):
+                 markings=True, line_edits=True, theme='light'):
         super().__init__(parent)
         # working directory to start the shell in (restored session tab); None ->
         # inherit the app's cwd.
@@ -556,10 +556,15 @@ class SecureTerminal(QPlainTextEdit):
         # re-wrapped under Show and a wide glyph jumped to the next line on a mode
         # toggle. With NoWrap the glyph keeps its line/column across box<->show.
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        # A terminal never scrolls sideways: line mode wraps at self._cols and the
-        # TUI grid is sized to fit, so a horizontal scrollbar is always wrong (it
-        # only appeared from a rounding overflow and clipped the right edge).
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # NoWrap keeps a glyph's line/column stable across box<->show, but it also
+        # means a single source line can render WIDER than the viewport -- a run of
+        # non-ASCII cells each shown as a long Detail/Reveal badge (the default mode
+        # is Detail) overflows the width the child was told. So the horizontal
+        # scrollbar must be AVAILABLE-AS-NEEDED, or that overflow is clipped and
+        # unreachable. It stays hidden for ordinary output (line mode wraps at
+        # self._cols, the TUI grid is sized to fit) and only appears when expanded
+        # markings genuinely exceed the width -- never a substitute for the wrap.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setFrameStyle(0)
 
         self._base_point_size = BASE_POINT_SIZE
@@ -567,7 +572,11 @@ class SecureTerminal(QPlainTextEdit):
         self._font_family = DEFAULT_FONT_FAMILY
         self._apply_font(sync=False)
 
-        self._theme = 'light'
+        # Render the (restored) history ONCE in the final theme: setting it before
+        # apply_theme keeps the CTOR's own apply_theme idempotent, and the saved
+        # scrollback below is coloured for this theme with no post-hoc re-render
+        # (mirrors the mode/colours/markings ctor kwargs -- #78 render-once).
+        self._theme = theme if theme in THEMES else 'light'
         self.apply_theme(self._theme)
 
         # display mode for non-ASCII output, and an incremental UTF-8 decoder so
@@ -817,8 +826,10 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- appearance: theme + zoom ---------------------------------------------
     def apply_theme(self, theme):
-        base, text = THEMES.get(theme, THEMES['dark'])
-        self._theme = theme if theme in THEMES else 'dark'
+        theme = theme if theme in THEMES else 'dark'
+        changed = theme != getattr(self, '_theme', None)
+        base, text = THEMES[theme]
+        self._theme = theme
         pal = self.palette()
         pal.setColor(QPalette.ColorRole.Base, QColor(base))
         pal.setColor(QPalette.ColorRole.Text, QColor(text))
@@ -828,6 +839,15 @@ class SecureTerminal(QPlainTextEdit):
         self._grid_mark_cache = {}    # and the grid risk-class marking formats
         if self._grid_mode():         # repaint the grid ONLY while it owns the
             self._render_timer.start(16)   # screen; line-TUI keeps its scrollback
+        elif changed and getattr(self, '_paint_timer', None) is not None:
+            # CLI (line) view: existing markings hold the OLD theme's colours in
+            # their stored QTextCharFormats -- clearing the caches does not touch a
+            # format already in the document. Replay the retained output so they are
+            # rebuilt in the new theme (mirrors apply_mode / apply_colors). Only on a
+            # REAL change: an idempotent re-apply (the restore path sets the current
+            # theme) must not re-render, or restore draws the scrollback twice (#78).
+            # Guarded: apply_theme also runs in __init__ before the line model exists.
+            self._rerender()
 
     def _apply_font(self, sync=True):
         """Build the terminal font from the chosen family and current zoom. The
@@ -903,6 +923,14 @@ class SecureTerminal(QPlainTextEdit):
         full-screen program owns the grid the pyte screen is simply repainted;
         otherwise (CLI, or TUI at a shell prompt) the retained raw output is
         replayed through the render pipeline from a clean document."""
+        # A debounced CLI paint must NOT survive the reset: its stale pending lines
+        # would be replayed on top of the freshly-rebuilt document (duplicating
+        # completed output), or painted over a TUI grid by the still-armed timer.
+        # Drop the pending paint before any document/line-model reset, both paths.
+        self._paint_timer.stop()
+        self._paint_pending = []
+        self._paint_pending_wraps = []
+        self._paint_dirty = False
         if self._grid_mode():
             self._render_tui()
             return
@@ -2538,12 +2566,33 @@ class SecureTerminal(QPlainTextEdit):
             block = block.next()
         return ''.join(out)
 
+    def _export_selection_fragment(self, text, fmt):
+        """Map ONE selected fragment's display text to what leaves the widget, using
+        the fragment's recorded SOURCE code point to tell a synthetic marker from a
+        real glyph the program printed -- the distinction _export_ascii, a pure
+        string map with no code-point context, cannot make.
+
+        Outside Show mode _export_ascii is exact (every non-ASCII byte is a marker),
+        so defer to it. In Show mode a real U+2423 the child printed is kept as its
+        glyph (its cp IS 0x2423, matching transcript_text's guard); only the
+        SYNTHETIC SPACE_MARK -- our stand-in for a neutralized non-ASCII space, whose
+        cp is the SOURCE byte, not 0x2423 -- is mapped to '_'. BOX is left as-is in
+        Show, exactly as _export_ascii does, so a real U+25A1 is preserved too."""
+        if self._mode != 'show':
+            return self._export_ascii(text)
+        if SPACE_MARK in text and fmt.property(_CP_PROP) != 0x2423:
+            return text.replace(SPACE_MARK, '_')
+        return text
+
     def _selection_text(self):
         """The current selection as it would leave the widget: soft-autowrapped
         rows (blocks _paint_line marked with userState 1) are joined so a line that
         wrapped at the terminal width copies as one line, like a real terminal --
-        not with a spurious newline at each wrap -- and the box placeholder is
-        mapped back to ASCII in Box mode (_export_ascii). '' if nothing selected."""
+        not with a spurious newline at each wrap -- and each neutralized placeholder
+        is mapped back to ASCII per _export_selection_fragment. '' if nothing
+        selected. Walks FRAGMENTS (not whole blocks) so each carries its own source
+        code point, the only way to keep a real Show-mode U+2423/U+25A1 the program
+        printed while still collapsing the synthetic markers."""
         cursor = self.textCursor()
         if not cursor.hasSelection():
             return ''
@@ -2552,20 +2601,27 @@ class SecureTerminal(QPlainTextEdit):
         parts = []
         block = doc.findBlock(start)
         while block.isValid() and block.position() <= end:
-            base = block.position()
-            # extract each block's selected slice with a QTextCursor, whose
-            # positions are the same UTF-16 code units as start/end -- Python
-            # str slicing would count code points and mis-slice an astral char.
-            seg_start = max(start, base)
-            seg_end = min(end, base + block.length() - 1)   # exclude block sep
-            seg = QTextCursor(doc)
-            seg.setPosition(seg_start)
-            seg.setPosition(seg_end, QTextCursor.MoveMode.KeepAnchor)
             if parts and block.userState() != 1:      # 1 == wrap continuation
                 parts.append('\n')
-            parts.append(seg.selectedText())
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    fstart = frag.position()
+                    fend = fstart + frag.length()
+                    lo, hi = max(start, fstart), min(end, fend)
+                    if lo < hi:
+                        # slice the fragment with a QTextCursor, whose positions are
+                        # the same UTF-16 code units as start/end -- Python str
+                        # slicing counts code points and mis-slices an astral char.
+                        seg = QTextCursor(doc)
+                        seg.setPosition(lo)
+                        seg.setPosition(hi, QTextCursor.MoveMode.KeepAnchor)
+                        parts.append(self._export_selection_fragment(
+                            seg.selectedText(), frag.charFormat()))
+                it += 1
             block = block.next()
-        return self._export_ascii(''.join(parts))
+        return ''.join(parts)
 
     def createMimeDataFromSelection(self):
         cursor = self.textCursor()
@@ -3302,6 +3358,15 @@ class SecureTerminal(QPlainTextEdit):
         self.reset_caret()
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
+    def _bracketed_paste_active(self):
+        """True when a TUI child has enabled bracketed paste (DEC mode 2004): it
+        then BUFFERS a pasted payload as inert data rather than interpreting the
+        bytes as keystrokes, so an embedded newline cannot auto-run a command. This
+        is the ONLY condition under which a multiline paste is safe to deliver
+        without a forced review, and the ONLY one that gets the 200~/201~ framing."""
+        return (self.tui_active() and self._screen is not None
+                and _BRACKETED_PASTE_MODE in getattr(self._screen, 'mode', ()))
+
     def insertFromMimeData(self, source):
         if self._review_active:
             # A copy or paste is already held for review: ignore a second paste
@@ -3321,17 +3386,20 @@ class SecureTerminal(QPlainTextEdit):
         has_unicode, has_control = paste_findings(raw)
         # A paste with an EMBEDDED newline carries MORE than one command: its first
         # newline would auto-run a command the instant the paste lands, before it
-        # can be read (a pure-ASCII pastejacking payload). In line mode HOLD such a
-        # paste for review WHATEVER the warn setting -- a security terminal must
-        # never auto-run a hidden second command, so this gate is not bypassable by
-        # paste_warn='never'. A SINGLE-line paste (with or without a trailing
-        # newline) is instead made safe in _dispatch_paste, which strips the
-        # trailing submit so the command waits at the prompt for the user's Enter;
-        # it needs no forced hold. In TUI a bracketed paste is delivered as inert
-        # data, so the ordinary warn-based gate applies there.
+        # can be read (a pure-ASCII pastejacking payload). HOLD such a paste for
+        # review WHATEVER the warn setting -- a security terminal must never auto-run
+        # a hidden second command, so this gate is not bypassable by paste_warn=
+        # 'never'. A SINGLE-line paste (with or without a trailing newline) is
+        # instead made safe in _dispatch_paste, which strips the trailing submit so
+        # the command waits at the prompt for the user's Enter; it needs no forced
+        # hold. The ONE exemption is a TUI child with bracketed paste (DEC 2004)
+        # active: it BUFFERS the payload as inert data, so an embedded newline cannot
+        # execute -- there the ordinary warn-based gate applies. A TUI WITHOUT
+        # bracketed paste is no safer than line mode (its embedded \r would run), so
+        # it is NOT exempt: tui_active() alone is the wrong test.
         multiline = paste_is_multiline(raw)
         risky = has_unicode or has_control or multiline
-        force_review = multiline and not self.tui_active()
+        force_review = multiline and not self._bracketed_paste_active()
         warn = self._paste_warn
         if force_review or warn == 'always' or (warn == 'unicode' and risky):
             self._pending_paste = raw
@@ -3375,8 +3443,7 @@ class SecureTerminal(QPlainTextEdit):
         # Bracketed paste when a TUI program asked for it (DEC mode 2004): the child
         # BUFFERS the payload as data rather than interpreting it as keystrokes, so
         # it cannot auto-execute -- deliver it verbatim between the markers.
-        bracketed = (self.tui_active() and self._screen is not None
-                     and _BRACKETED_PASTE_MODE in getattr(self._screen, 'mode', ()))
+        bracketed = self._bracketed_paste_active()
         if not bracketed:
             # No bracketed framing to make the child buffer it, so a trailing submit
             # byte ('\r', which sanitize_paste maps every newline to) would auto-run
