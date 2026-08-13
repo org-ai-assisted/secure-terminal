@@ -3455,12 +3455,17 @@ class SecureTerminal(QPlainTextEdit):
             safe = paste_no_autosubmit(safe)
             if not safe:
                 return
-        # Keep the hook's view of the line honest across a paste (line mode only; a
-        # TUI paste does not touch the line-mode command). A CLI paste now never
-        # submits (its trailing submit was stripped above), so the pasted text sits
-        # at the prompt un-entered and _line_buffer never saw it -> mark the line
-        # unverifiable so the hook FAILS SAFE (asks) on the user's next Enter.
-        if self._hook is not None and not self.tui_active():
+        # Keep our view of the line honest across a paste (line mode only; a TUI
+        # paste does not touch the line-mode command). A CLI paste now never submits
+        # (its trailing submit was stripped above), so the pasted text sits at the
+        # prompt un-entered and _line_buffer never saw it. Mark the line unverifiable
+        # whether or not a hook is configured: _line_dirty has TWO consumers -- the
+        # hook (which then FAILS SAFE, asking on the next Enter) AND _line_pending(),
+        # the guard that stops _send_reexport from typing "export TERM=...\r" onto a
+        # line that already holds text. Gating this on the hook left _line_pending()
+        # blind after a hookless paste, so a later mode switch / line_edits toggle
+        # would type the CR-terminated re-export onto the pasted command and submit it.
+        if not self.tui_active():
             self._line_dirty = True
         data = safe.encode('utf-8')
         if bracketed:
