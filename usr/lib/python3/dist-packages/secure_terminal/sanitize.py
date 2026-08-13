@@ -96,6 +96,17 @@ DISPLAY_MODES = ('box', 'show', 'reveal', 'detail')
 # this source file stays ASCII-only.
 BOX = '\u25a1'
 
+# SHOW mode renders a NON-ASCII space (is_space_separator: NBSP, U+2000..U+200A,
+# U+202F, U+205F, U+3000, ...) as this OPEN BOX (U+2423, the standard visible-space
+# symbol) instead of a full neutralization box, so a log carrying a non-breaking
+# space stays readable -- while the glyph still cannot pass for a plain ASCII space.
+# Width 1. The widget maps it back to '_' on copy and on every text export (NEVER to
+# ' ', which would re-introduce the NBSP-as-space deception); transcript_text names
+# its source codepoint inline (<U+00A0 NO-BREAK SPACE>). Encoded as an escape so this
+# source file stays ASCII-only. Only SHOW mode emits it; box/detail/reveal keep the
+# box, so the ASCII-only guarantee of the strict modes is untouched.
+SPACE_MARK = '\u2423'
+
 
 def _detail_badge(cp):
     """A verbose reveal badge: <U+XXXX NAME>, all printable ASCII (Unicode names
@@ -379,6 +390,14 @@ def render_output(text, mode='detail'):
             # unmarked, which is the one thing every mode is supposed to prevent.
             # sanitize_clipboard_unicode already excludes them on the copy path.
             out.append(ch)
+        elif mode == 'show' and is_space_separator(cp):
+            # A non-ASCII space (NBSP, the U+2000..U+200A set, U+202F, U+205F,
+            # U+3000, ...) is not str.isprintable(), so it would otherwise fall
+            # through to a placeholder. Show it as SPACE_MARK: a distinct visible
+            # glyph that keeps the line readable yet can never pose as a plain
+            # ASCII space, and copies as '_' not ' '. U+3000 (wide) renders as a
+            # 1-column marker here, the same width the box path already gave it.
+            out.append(SPACE_MARK)
         else:
             out.append('_')
     return ''.join(out)
@@ -824,7 +843,7 @@ def marking_cp_for_cell(data):
     cell can hold a base grapheme plus combining / zero-width / format code points, so
     a cell like 'a'+U+200B or U+2500+U+202E carries more than one. Return the MOST
     DANGEROUS non-ASCII code point in the cell (by marking_class severity: bidi >
-    control > invisible > confusable > other non-ASCII), with box-drawing / block
+    control > invisible > confusable > combining > other non-ASCII), with box-drawing / block
     structure ranked LOWEST -- so a bidi override or zero-width riding in the same
     neutralized cell as a benign line is never masked by the line, and the grid tint
     plus the inspect popup name the real hazard. None when every code point is plain
@@ -853,6 +872,8 @@ def marking_class(cp):
         return 'invisible'            # zero-width / BOM / separators / ignorables
     if cp > 0x7F and cp in _ascii_confusables():
         return 'confusable'           # a homoglyph: a non-ASCII look-alike of ASCII
+    if cp >= 0x0300 and _is_mark(chr(cp)):
+        return 'combining'            # a stacked combining mark (Zalgo), not honest foreign
     return 'nonascii'                 # other non-ASCII (foreign, but not a look-alike)
 
 
@@ -860,10 +881,11 @@ def marking_class(cp):
 # multi-code-point pyte cell: a deception outranks benign foreign text, which
 # outranks (via marking_cp_for_cell's is_structural test, rank 0) box-drawing.
 _MARKING_SEVERITY = {
-    'bidi': 5,          # reorders text -- the worst
-    'control': 4,       # C0 / DEL / C1
-    'invisible': 3,     # zero-width / BOM / separators / ignorables
-    'confusable': 2,    # a homoglyph posing as ASCII
+    'bidi': 6,          # reorders text -- the worst
+    'control': 5,       # C0 / DEL / C1
+    'invisible': 4,     # zero-width / BOM / separators / ignorables
+    'confusable': 3,    # a homoglyph posing as ASCII
+    'combining': 2,     # a stacked combining mark (Zalgo)
     'nonascii': 1,      # other non-ASCII (honest foreign)
 }
 
@@ -886,6 +908,26 @@ def is_structural(cp):
     waved through as benign structure. 'cannot pose as ASCII' is the whole predicate,
     so a code point that CAN is not structural."""
     return 0x2500 <= cp <= 0x259F and cp not in _ascii_confusables()
+
+
+def is_space_separator(cp):
+    """True for a NON-ASCII space: Unicode general category Zs excluding the plain
+    ASCII space U+0020 -- U+00A0 NO-BREAK SPACE, U+1680, U+2000..U+200A, U+202F,
+    U+205F, U+3000. SHOW mode renders these as a distinct visible marker
+    (SPACE_MARK) rather than a full box, so a log with a non-breaking space stays
+    readable -- yet the marker is a non-ASCII glyph that can never pass for a plain
+    ASCII space, copies as '_' (NEVER as ' '), and keeps its risk tint.
+
+    Everything else that merely looks blank stays STRICTLY boxed, because none of
+    it is category Zs: U+2028/U+2029 (Zl/Zp line/paragraph separators), the
+    zero-width and other Cf format characters, the bidi controls, the C0/C1 control
+    bytes, and the default-ignorables. So no invisible, reordering or confusable
+    character is ever waved onto this path. This mirrors the is_structural
+    carve-out: one narrow, honest-glyph class shown instead of boxed, with the
+    ASCII-only guarantee intact. NOT a paste-review classifier: marking_class still
+    reports these 'invisible', so the display and the paste warning stay in
+    agreement (a non-ASCII space is still a non-ASCII, blank-looking byte)."""
+    return cp != 0x20 and unicodedata.category(chr(cp)) == 'Zs'
 
 
 # sentinel head of a run key that colours a marking by its risk class, kept
@@ -1031,6 +1073,19 @@ def sanitize_paste(text):
     return ''.join(out)
 
 
+def paste_no_autosubmit(safe):
+    r"""Drop the TRAILING submit byte(s) from an ALREADY-sanitized paste so a paste
+    can never auto-execute: a single-line paste then lands at the prompt awaiting
+    the user's explicit Enter, instead of running the instant it is delivered.
+
+    sanitize_paste[_unicode] map every newline to '\r' (the shell's line-submit
+    byte); this removes only a trailing RUN of them, so an embedded newline in a
+    reviewed multi-command paste is preserved -- only the FINAL auto-run is
+    suppressed. A security terminal must never let a paste submit a command on its
+    own. Idempotent; '' in -> '' out."""
+    return safe.rstrip('\r')
+
+
 def sanitize_paste_unicode(text):
     """Like sanitize_paste but KEEP printable non-ASCII (the euro sign, accents,
     CJK) instead of dropping it, for a deliberate "paste with unicode". The
@@ -1070,6 +1125,55 @@ def sanitize_clipboard(text):
     plus tab and newline."""
     return ''.join(ch for ch in text
                    if ch in '\n\t' or 0x20 <= ord(ch) <= 0x7E)
+
+
+# Box-drawing code points whose glyph is a pure horizontal / vertical stroke; every
+# other structural glyph (corners, junctions, diagonals) becomes '+', block elements
+# '#'. Used only to give the inert DISPLAY glyphs an ASCII stand-in on copy.
+_BOX_HORIZONTAL = frozenset({
+    0x2500, 0x2501, 0x2504, 0x2505, 0x2508, 0x2509, 0x254C, 0x254D, 0x2550,
+    0x2574, 0x2576, 0x2578, 0x257A, 0x257C, 0x257E,
+})
+_BOX_VERTICAL = frozenset({
+    0x2502, 0x2503, 0x2506, 0x2507, 0x250A, 0x250B, 0x254E, 0x254F, 0x2551,
+    0x2575, 0x2577, 0x2579, 0x257B, 0x257D, 0x257F,
+})
+
+
+def _display_glyph_to_ascii(ch):
+    """The ASCII stand-in for one INERT display glyph Show mode keeps: the
+    neutralization box (U+25A1), the non-ASCII-space marker (SPACE_MARK, U+2423), or
+    a structural box-drawing / block glyph. Any other character is returned unchanged
+    for the caller's non-ASCII strip to handle -- a
+    homoglyph is NOT turned into its ASCII look-alike here (is_structural already
+    excludes the two confusable diagonals U+2571/U+2573)."""
+    cp = ord(ch)
+    if cp == 0x25A1:                     # BOX: the neutralization placeholder
+        return '_'
+    if cp == 0x2423:                     # SPACE_MARK: neutralized non-ASCII space
+        return '_'                       # never ' ' -- that would restore the deception
+    if not is_structural(cp):            # leave homoglyphs / foreign text to the strip
+        return ch
+    if cp >= 0x2580:                     # block elements U+2580..U+259F
+        return '#'
+    if cp in _BOX_HORIZONTAL:
+        return '-'
+    if cp in _BOX_VERTICAL:
+        return '|'
+    return '+'                           # corners, junctions, diagonals
+
+
+def sanitize_clipboard_display(text):
+    """sanitize_clipboard for text lifted from the RENDERED display (a mouse/PRIMARY
+    selection, a drag, or the copy review's 'stripped' action). First map the inert
+    display glyphs Show mode keeps -- the neutralization box (U+25A1) and the
+    structural box-drawing / block elements -- to an ASCII stand-in, THEN drop the
+    remaining non-ASCII. Plain sanitize_clipboard drops these glyphs to NOTHING, so a
+    copied box collapses to the surrounding spaces (on screen, gone on the clipboard)
+    -- present-but-lost, the "silently wrong" failure. Security is unchanged: the raw
+    neutralized codepoint is never in the display text (it rides the cell format), so
+    only inert glyphs are rewritten and a homoglyph is still dropped, never emitted."""
+    return sanitize_clipboard(''.join(_display_glyph_to_ascii(ch) for ch in text))
 
 
 def sanitize_title(text, limit=80):
@@ -1130,6 +1234,13 @@ def tui_cell(ch, mode):
     if all(_cell_cp_safe(ord(c), mode) and c.isprintable()
            and not is_default_ignorable(c) for c in ch):
         return ch
+    # A single non-ASCII space (NBSP, U+3000, ...) is not str.isprintable(), so it
+    # falls through the check above; in SHOW mode render it as the distinct
+    # SPACE_MARK rather than a full box, matching render_output. U+3000 (wide) shows
+    # as a 1-column marker -- the same width the box path already gave it. Any space
+    # riding with other code points in one cell stays boxed (len(ch) != 1).
+    if mode == 'show' and len(ch) == 1 and is_space_separator(ord(ch)):
+        return SPACE_MARK
     return BOX
 
 

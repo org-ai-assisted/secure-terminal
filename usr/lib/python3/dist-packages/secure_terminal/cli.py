@@ -16,9 +16,13 @@ sanitization core is shared with the GUI (secure_terminal.sanitize); this module
 adds no Qt and no escape parser.
 
 Scope, honestly: this sanitizes what a program DISPLAYS (the attack surface).
-Your own keystrokes are forwarded as typed -- unlike the GUI it does not gate a
-paste, because a raw stdin stream cannot tell typing from a paste. It also does
-not judge whether a command is dangerous; that is the (planned) hook's job.
+Your own keystrokes are forwarded as typed. A raw stdin stream cannot fully tell
+typing from a paste, but a paste arrives as ONE multi-byte burst while a real
+Enter is a lone control byte -- so a multi-byte burst that ENDS in a submit byte
+is treated as a paste and its trailing submit is dropped (see _strip_burst_submit),
+so a pasted command waits at the prompt for your explicit Enter instead of
+auto-running. It does not judge whether a command is dangerous; that is the
+(planned) hook's job.
 """
 
 import os
@@ -35,6 +39,21 @@ import argparse
 
 from secure_terminal.sanitize import (
     render_output, feed_chunk_carry, DISPLAY_MODES)
+
+
+def _strip_burst_submit(keys):
+    r"""Drop the trailing submit byte(s) from a pasted stdin BURST so a paste can
+    never auto-execute here (unlike the GUI, bracketed paste is off -- the child
+    runs under TERM=dumb, which strips DECSET 2004 -- so a raw newline would submit
+    the pasted command the instant it is written). A paste arrives as one
+    multi-byte read ending in a submit byte (\r or \n); a real Enter keystroke is a
+    lone byte. So a multi-byte burst ending in a submit is treated as a paste and
+    its trailing run of \r/\n is removed, leaving the command at the prompt for the
+    user's own Enter. A single keystroke -- including a lone Enter -- is forwarded
+    unchanged, so ordinary typing still submits."""
+    if len(keys) > 1 and keys[-1:] in (b'\r', b'\n'):
+        return keys.rstrip(b'\r\n')
+    return keys
 
 
 def _set_winsize(fd, rows, cols):
@@ -122,7 +141,7 @@ def _run(argv, mode):
                 if not keys:
                     os.write(fd, b'\x04')   # our EOF -> send the child EOF
                 else:
-                    os.write(fd, keys)
+                    os.write(fd, _strip_burst_submit(keys))
     finally:
         if old_attr is not None:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attr)
