@@ -481,6 +481,26 @@ def _build_line_edit_keys():
     }
 
 
+def _build_non_content_keys():
+    """Qt.Key values that, at a shell prompt, only move the cursor or delete --
+    they CANNOT introduce new submittable text. In TUI mode (where the line is not
+    mirrored) these must NOT flag the line pending: any real content always arrives
+    via a content-introducing key first (printable text, history recall, Tab
+    completion), which does the flagging, so a later navigation/deletion keystroke
+    need not re-flag. Flagging one of these at an EMPTY prompt would defer the
+    mode-switch re-export for no reason (a no-op Backspace/Left leaving TERM stale).
+    History recall (Up/Down) is deliberately ABSENT -- it recalls a command, which
+    is exactly the invisible content the flag must catch. Built lazily (Qt.Key)."""
+    k = Qt.Key
+    return frozenset((
+        k.Key_Left, k.Key_Right, k.Key_Home, k.Key_End,
+        k.Key_PageUp, k.Key_PageDown, k.Key_Insert, k.Key_Delete,
+        k.Key_Backspace,
+        k.Key_F1, k.Key_F2, k.Key_F3, k.Key_F4, k.Key_F5, k.Key_F6,
+        k.Key_F7, k.Key_F8, k.Key_F9, k.Key_F10, k.Key_F11, k.Key_F12,
+    ))
+
+
 class SecureTerminal(QPlainTextEdit):
     # emitted when the child shell exits, so the window can close its tab
     shell_exited = pyqtSignal()
@@ -1862,8 +1882,13 @@ class SecureTerminal(QPlainTextEdit):
             self._make_screen()
 
     def _on_readable(self):
+        fd = self._fd
+        if fd is None:
+            # teardown race: the fd was closed before a queued notifier event
+            # drained; os.read(None) would TypeError (uncaught below).
+            return
         try:
-            data = os.read(self._fd, 65536)
+            data = os.read(fd, 65536)
         except BlockingIOError:
             return                        # nothing ready yet (non-blocking fd)
         except OSError:
@@ -2108,7 +2133,7 @@ class SecureTerminal(QPlainTextEdit):
         """Feed one segment to the pyte parser, containing any error -- pyte parses
         untrusted output and a version quirk (private SGR from htop/vim/tmux) must
         never crash the terminal, worst case a rendering glitch, never a core dump."""
-        if not chunk:
+        if not chunk or self._stream is None:
             return
         try:
             self._stream.feed(chunk)
@@ -2878,6 +2903,7 @@ class SecureTerminal(QPlainTextEdit):
     # -- input: printable ASCII + signal-key allowlist ------------------------
     _TUI_KEYS = None      # built lazily below (needs Qt.Key at call time)
     _LINE_KEYS = None     # line-mode cursor/history keys, built lazily
+    _NON_CONTENT_KEYS = None   # keys that cannot leave prompt text, built lazily
 
     def keyPressEvent(self, event):
         if self._preview:
@@ -3115,10 +3141,11 @@ class SecureTerminal(QPlainTextEdit):
         command = self._line_buffer
         if not command.strip():
             return False
-        result = hook.evaluate(
-            self._hook['argv'], command,
-            timeout=self._hook.get('timeout', 10),
-            on_error=self._hook.get('on_error', 'allow'),
+        cfg = self._hook or {}            # never None here (the caller guards), and
+        result = hook.evaluate(           # the `or {}` mirrors _hook_transcript
+            cfg['argv'], command,
+            timeout=cfg.get('timeout', 10),
+            on_error=cfg.get('on_error', 'allow'),
             cwd=self._foreground_cwd(),
             transcript_provider=self._hook_transcript)
         if result['message']:
@@ -3180,38 +3207,83 @@ class SecureTerminal(QPlainTextEdit):
 
         if SecureTerminal._TUI_KEYS is None:
             SecureTerminal._TUI_KEYS = _build_tui_keys()
+        if SecureTerminal._NON_CONTENT_KEYS is None:
+            SecureTerminal._NON_CONTENT_KEYS = _build_non_content_keys()
 
         # TUI mode does not mirror the shell's line -- a full-screen program may own
-        # the keys entirely -- so the CLI line model is not maintained here. It must
-        # still be RELEASED, though: a re-export deferred by a pending line at the
-        # moment of a CLI->TUI switch would otherwise wait forever, because nothing
-        # in this path ever clears the flags _line_pending reads. Accept-line and
-        # the two discard keys are exactly the keystrokes that empty the prompt.
-        if (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                or (ctrl and key in (Qt.Key.Key_J, Qt.Key.Key_M,
-                                     Qt.Key.Key_C, Qt.Key.Key_U))):
+        # the keys entirely -- so the CLI line model is not maintained here. Two
+        # jobs still keep _line_pending honest (it gates the mode-switch re-export;
+        # see _reexport_term):
+        #   RELEASE a line a re-export is waiting on. A re-export deferred by a
+        #   pending line at a CLI->TUI switch would otherwise wait forever, because
+        #   nothing else here clears the flags. Accept-line and the two discard
+        #   keys are exactly the keystrokes that empty the prompt. The discard keys
+        #   need `not shift` to match the control-byte branch below (Ctrl+Shift+C is
+        #   a copy shortcut, not a discard): the window filters Ctrl+Shift before
+        #   _tui_key, so this only keeps the two branches self-consistent.
+        #   MARK a line a re-export must wait FOR. With no foreground program the
+        #   keys reach the shell's line editor, so a content-introducing key (typed
+        #   text, a history recall, a completion) leaves text at the bare prompt --
+        #   which TUI cannot mirror. Flag it dirty: otherwise a later TUI->CLI
+        #   switch fires an immediate CR-terminated re-export that concatenates onto
+        #   and SUBMITS that line, an Enter the user never pressed that also bypasses
+        #   command_hook. Pure navigation/deletion keys (_NON_CONTENT_KEYS) never
+        #   introduce content, so they do NOT flag -- else a no-op Backspace/Left at
+        #   an empty prompt would needlessly defer the re-export. Unlike the CLI path
+        #   the flag here feeds ONLY the re-export (the hook is not consulted in TUI),
+        #   so this precision is safe. Gated on "no foreground program" so a program's
+        #   own keys never strand the flag (a `less` quit with `q` leaves no prompt
+        #   line, yet marking would defer the re-export forever).
+        accept_line = (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                or (ctrl and not shift and key in (Qt.Key.Key_J, Qt.Key.Key_M)))
+        submit_or_discard = accept_line or (
+                ctrl and not shift and key in (Qt.Key.Key_C, Qt.Key.Key_U))
+        # A bare shell prompt in TUI mode still submits real commands, so the command
+        # hook must judge an accept-line here too -- otherwise switching to TUI is a
+        # SILENT BYPASS of it. Only a bare prompt routes through (a foreground program
+        # owns its own keys), and only when a hook is configured. TUI does not mirror
+        # the line, so _hook_intercept sees _line_dirty (set above for typed content)
+        # and falls through to a human review rather than judging an empty buffer -- a
+        # prompted override, never a silent pass. It performs the submit/discard itself
+        # when it fires, so return without also writing the accept byte; an empty prompt
+        # (nothing typed, not dirty) returns False and submits normally with no prompt.
+        if (accept_line and not self.has_foreground_program()
+                and self._hook is not None and self._hook_intercept()):
+            return
+        if submit_or_discard:
             self._line_buffer = ''
             self._line_dirty = False
 
-        if key == Qt.Key.Key_Tab and shift:
-            self._write(b'\x1b[Z')                  # back-tab
-            return
         seq = SecureTerminal._TUI_KEYS.get(key)
-        if seq is not None:
-            self._write(seq)
-            return
-        # Ctrl+letter -> the corresponding control byte (Ctrl+C -> 0x03), which
-        # the program receives; the Terminate action stays the escape hatch.
-        if ctrl and not shift and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
-            self._write(bytes([key & 0x1f]))
-            return
         text = event.text()
-        if text and len(text) == 1 and ord(text) < 0x20:
-            self._write(text.encode('latin-1'))     # e.g. Ctrl+[ -> ESC
-            return
-        if text and all(ch.isprintable() for ch in text):
-            self._write((b'\x1b' if alt else b'') + text.encode('utf-8'))
-        # non-printable input is still dropped
+        if key == Qt.Key.Key_Tab and shift:
+            out = b'\x1b[Z'                          # back-tab
+        elif seq is not None:
+            out = seq
+        elif ctrl and not shift and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            # Ctrl+letter -> the control byte (Ctrl+C -> 0x03) the program
+            # receives; the Terminate action stays the escape hatch.
+            out = bytes([key & 0x1f])
+        elif text and len(text) == 1 and ord(text) < 0x20:
+            out = text.encode('latin-1')            # e.g. Ctrl+[ -> ESC
+        elif text and all(ch.isprintable() for ch in text):
+            out = (b'\x1b' if alt else b'') + text.encode('utf-8')
+        else:
+            return                                  # non-input key: nothing sent
+
+        # A content key marks the line pending. So does a navigation/deletion key
+        # (_NON_CONTENT_KEYS) WHEN a CLI-typed line was carried into TUI (_line_buffer
+        # still populated): TUI cannot mirror the edit, so a Home/Delete/Backspace
+        # there desyncs that buffer from the real shell line -- and command_hook must
+        # not judge the stale buffer while the shell runs the edited command. Marking
+        # it dirty forces the hook to fail safe (ask). At an EMPTY prompt (no carried
+        # buffer) a no-op key still does not mark, so the re-export is not deferred
+        # needlessly.
+        if (not submit_or_discard and not self.has_foreground_program()
+                and (key not in SecureTerminal._NON_CONTENT_KEYS
+                     or self._line_buffer)):
+            self._line_dirty = True
+        self._write(out)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -3478,17 +3550,17 @@ class SecureTerminal(QPlainTextEdit):
             safe = paste_no_autosubmit(safe)
             if not safe:
                 return
-        # Keep our view of the line honest across a paste (line mode only; a TUI
-        # paste does not touch the line-mode command). A CLI paste now never submits
-        # (its trailing submit was stripped above), so the pasted text sits at the
-        # prompt un-entered and _line_buffer never saw it. Mark the line unverifiable
-        # whether or not a hook is configured: _line_dirty has TWO consumers -- the
-        # hook (which then FAILS SAFE, asking on the next Enter) AND _line_pending(),
-        # the guard that stops _send_reexport from typing "export TERM=...\r" onto a
-        # line that already holds text. Gating this on the hook left _line_pending()
-        # blind after a hookless paste, so a later mode switch / line_edits toggle
-        # would type the CR-terminated re-export onto the pasted command and submit it.
-        if not self.tui_active():
+        # Keep our view of the line honest across a paste. A paste that lands at a
+        # bare SHELL prompt (CLI, or TUI with no foreground program) sits there as a
+        # command the next Enter submits -- _line_buffer never saw it, so mark the
+        # line unverifiable. _line_dirty has TWO consumers, both of which must catch
+        # a pasted command: the hook (which then FAILS SAFE, asking on the next
+        # Enter, including in TUI where accept-line now routes through it) AND
+        # _line_pending(), the guard that stops _send_reexport from typing
+        # "export TERM=...\r" onto a line that already holds text. Only a paste
+        # delivered to a FOREGROUND PROGRAM (a TUI app that asked for it) is its
+        # data, not a shell line, so it is the sole case left unmarked.
+        if not self.tui_active() or not self.has_foreground_program():
             self._line_dirty = True
         data = safe.encode('utf-8')
         if bracketed:
