@@ -481,6 +481,26 @@ def _build_line_edit_keys():
     }
 
 
+def _build_non_content_keys():
+    """Qt.Key values that, at a shell prompt, only move the cursor or delete --
+    they CANNOT introduce new submittable text. In TUI mode (where the line is not
+    mirrored) these must NOT flag the line pending: any real content always arrives
+    via a content-introducing key first (printable text, history recall, Tab
+    completion), which does the flagging, so a later navigation/deletion keystroke
+    need not re-flag. Flagging one of these at an EMPTY prompt would defer the
+    mode-switch re-export for no reason (a no-op Backspace/Left leaving TERM stale).
+    History recall (Up/Down) is deliberately ABSENT -- it recalls a command, which
+    is exactly the invisible content the flag must catch. Built lazily (Qt.Key)."""
+    k = Qt.Key
+    return frozenset((
+        k.Key_Left, k.Key_Right, k.Key_Home, k.Key_End,
+        k.Key_PageUp, k.Key_PageDown, k.Key_Insert, k.Key_Delete,
+        k.Key_Backspace,
+        k.Key_F1, k.Key_F2, k.Key_F3, k.Key_F4, k.Key_F5, k.Key_F6,
+        k.Key_F7, k.Key_F8, k.Key_F9, k.Key_F10, k.Key_F11, k.Key_F12,
+    ))
+
+
 class SecureTerminal(QPlainTextEdit):
     # emitted when the child shell exits, so the window can close its tab
     shell_exited = pyqtSignal()
@@ -2878,6 +2898,7 @@ class SecureTerminal(QPlainTextEdit):
     # -- input: printable ASCII + signal-key allowlist ------------------------
     _TUI_KEYS = None      # built lazily below (needs Qt.Key at call time)
     _LINE_KEYS = None     # line-mode cursor/history keys, built lazily
+    _NON_CONTENT_KEYS = None   # keys that cannot leave prompt text, built lazily
 
     def keyPressEvent(self, event):
         if self._preview:
@@ -3180,6 +3201,8 @@ class SecureTerminal(QPlainTextEdit):
 
         if SecureTerminal._TUI_KEYS is None:
             SecureTerminal._TUI_KEYS = _build_tui_keys()
+        if SecureTerminal._NON_CONTENT_KEYS is None:
+            SecureTerminal._NON_CONTENT_KEYS = _build_non_content_keys()
 
         # TUI mode does not mirror the shell's line -- a full-screen program may own
         # the keys entirely -- so the CLI line model is not maintained here. Two
@@ -3188,19 +3211,26 @@ class SecureTerminal(QPlainTextEdit):
         #   RELEASE a line a re-export is waiting on. A re-export deferred by a
         #   pending line at a CLI->TUI switch would otherwise wait forever, because
         #   nothing else here clears the flags. Accept-line and the two discard
-        #   keys are exactly the keystrokes that empty the prompt.
+        #   keys are exactly the keystrokes that empty the prompt. The discard keys
+        #   need `not shift` to match the control-byte branch below (Ctrl+Shift+C is
+        #   a copy shortcut, not a discard): the window filters Ctrl+Shift before
+        #   _tui_key, so this only keeps the two branches self-consistent.
         #   MARK a line a re-export must wait FOR. With no foreground program the
-        #   keys reach the shell's line editor, so typed text (or a history recall)
-        #   now sits at the bare prompt -- which TUI cannot mirror. Flag it dirty:
-        #   otherwise a later TUI->CLI switch fires an immediate CR-terminated
-        #   re-export that concatenates onto and SUBMITS that line, an Enter the
-        #   user never pressed that also bypasses command_hook. Gated on "no
-        #   foreground program" so a program's own keys never strand the flag (a
-        #   `less` quit with `q` leaves no prompt line, yet marking would defer the
-        #   re-export forever).
+        #   keys reach the shell's line editor, so a content-introducing key (typed
+        #   text, a history recall, a completion) leaves text at the bare prompt --
+        #   which TUI cannot mirror. Flag it dirty: otherwise a later TUI->CLI
+        #   switch fires an immediate CR-terminated re-export that concatenates onto
+        #   and SUBMITS that line, an Enter the user never pressed that also bypasses
+        #   command_hook. Pure navigation/deletion keys (_NON_CONTENT_KEYS) never
+        #   introduce content, so they do NOT flag -- else a no-op Backspace/Left at
+        #   an empty prompt would needlessly defer the re-export. Unlike the CLI path
+        #   the flag here feeds ONLY the re-export (the hook is not consulted in TUI),
+        #   so this precision is safe. Gated on "no foreground program" so a program's
+        #   own keys never strand the flag (a `less` quit with `q` leaves no prompt
+        #   line, yet marking would defer the re-export forever).
         submit_or_discard = (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                or (ctrl and key in (Qt.Key.Key_J, Qt.Key.Key_M,
-                                     Qt.Key.Key_C, Qt.Key.Key_U)))
+                or (ctrl and not shift and key in (Qt.Key.Key_J, Qt.Key.Key_M,
+                                                   Qt.Key.Key_C, Qt.Key.Key_U)))
         if submit_or_discard:
             self._line_buffer = ''
             self._line_dirty = False
@@ -3222,7 +3252,9 @@ class SecureTerminal(QPlainTextEdit):
         else:
             return                                  # non-input key: nothing sent
 
-        if not submit_or_discard and not self.has_foreground_program():
+        if (not submit_or_discard
+                and key not in SecureTerminal._NON_CONTENT_KEYS
+                and not self.has_foreground_program()):
             self._line_dirty = True
         self._write(out)
 
