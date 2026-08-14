@@ -4580,6 +4580,14 @@ def _test_canary():
     return 0
 
 
+def _shot_mode():
+    """SECURE_TERMINAL_SHOT=1 -> deterministic screenshot mode: stop the app-wide
+    caret blink so no captured frame depends on the caret phase (SecureTerminal
+    also hides its caret and renders synchronously). A startup capture MODE for
+    byte-reproducible comparison shots, NOT a persisted user setting."""
+    return os.environ.get('SECURE_TERMINAL_SHOT') == '1'
+
+
 def main():
     _quiet_font_warnings()
     if sys.argv[1:2] == ['ctl']:
@@ -4614,6 +4622,8 @@ def main():
     if launch.wm_name:
         qt_argv += ['-name', launch.wm_name]     # Qt X11 resource/instance name
     app = QApplication(qt_argv)
+    if _shot_mode():
+        app.setCursorFlashTime(0)     # no caret blink -> no frame depends on its phase
     app.setApplicationName('secure-terminal')
     _icon = _app_icon()
     if not _icon.isNull():

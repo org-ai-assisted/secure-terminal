@@ -531,6 +531,16 @@ class SecureTerminal(QPlainTextEdit):
                  preview=False, cwd=None, mode='detail', colors=False,
                  markings=True, line_edits=True, theme='light'):
         super().__init__(parent)
+        # Deterministic screenshot mode (SECURE_TERMINAL_SHOT=1, a startup capture
+        # MODE -- never a persisted per-tab setting): hide the caret and render the
+        # document SYNCHRONOUSLY, so a capture of unchanged content is byte-identical
+        # run to run (the comparison shots jitter otherwise -- an async paint race
+        # lands the prompt +/-1 row, plus the blinking caret). Gates ONLY the
+        # shot-mode branches below; the normal render path and every security
+        # guarantee are unchanged when it is off.
+        self._shot = os.environ.get('SECURE_TERMINAL_SHOT') == '1'
+        if self._shot:
+            self.setCursorWidth(0)     # no caret drawn -> no frame depends on blink phase
         # working directory to start the shell in (restored session tab); None ->
         # inherit the app's cwd.
         self._cwd = cwd if isinstance(cwd, str) and cwd else None
@@ -1959,7 +1969,10 @@ class SecureTerminal(QPlainTextEdit):
             # hold the paint during a synchronized update (the model keeps updating);
             # _end_sync_update renders the completed frame.
             if not self._sync_update and not self._render_timer.isActive():
-                self._render_timer.start(16)     # coalesce bursts into ~60fps
+                if self._shot:
+                    self._render_tui()           # shot mode: render NOW (byte-stable capture)
+                else:
+                    self._render_timer.start(16)     # coalesce bursts into ~60fps
             return
 
         # CLI line mode: display through the escape-stripping pipeline. Prepend any
@@ -2435,6 +2448,8 @@ class SecureTerminal(QPlainTextEdit):
         wherever the document must be current (teardown, transcript, copy, save)."""
         # Hard-wrap at the reported terminal width (never below a sane floor, and
         # capped so a pathological newline-free flood still bounds each block).
+        if self._shot:
+            defer = False        # shot mode: paint NOW so the capture is byte-stable
         wrap = self._cols if 8 <= self._cols <= self._MAX_LINE else self._MAX_LINE
         completed, self._line_cells, self._line_col, self._sgr, wraps = \
             feed_line_edits(self._line_cells, self._line_col, self._sgr, text,
