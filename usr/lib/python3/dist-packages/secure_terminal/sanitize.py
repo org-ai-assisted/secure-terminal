@@ -588,6 +588,44 @@ def _printable_follows(raw, i):
 # Zalgo flood in the CLI cell model (feed_line_edits) and the TUI grid.
 _COMBINING_RUN_MAX = 32
 
+# Above this many combining marks on one base, a cell is a Zalgo obfuscation attack, not
+# honest text -- the heaviest real orthography (Masoretic Hebrew) reaches ~5, and no script
+# needs more (Greek polytonic 3, Arabic/Indic 3, Vietnamese 2, IPA ~4). So in SHOW mode such a
+# cell is neutralized to the box, where its risk band fills the whole cell, rather than shown
+# with the marks overflowing the band as a weak fringe. 8 clears the worst legit stack with
+# margin and sits far below both the Zalgo regime (dozens) and the stream-safe cap (30). Not a
+# setting: it has no per-mode cost and a terminal cannot know a cell's language.
+_ZALGO_MARK_MAX = 8
+
+
+def _combining_count(ch):
+    """Number of combining marks (grapheme extenders U+0300+) stacked in one cell."""
+    return sum(1 for c in ch if ord(c) >= 0x0300 and _is_mark(c))
+
+
+def _collapse_zalgo_runs(cellline):
+    """Merge a base cell plus a run of MORE than _ZALGO_MARK_MAX combining-mark cells into ONE
+    multi-cp cell, so the SHOW-mode line renderer boxes it (its risk band then fills the whole
+    cell) exactly as the TUI grid does -- the line model keeps each mark as its own cell, so
+    without this the band lands on each thin mark and overflows. A run <= the cap is left as
+    separate cells, so legitimate decomposed text is unchanged. Display-width-neutral: the
+    base is one column and the marks are zero-width, so the boxed cell (one column) leaves the
+    caret offsets intact."""
+    out = []
+    i = 0
+    n = len(cellline)
+    while i < n:
+        j = i + 1
+        while (j < n and len(cellline[j][0]) == 1
+               and ord(cellline[j][0]) >= 0x0300 and _is_mark(cellline[j][0])):
+            j += 1
+        if j - (i + 1) > _ZALGO_MARK_MAX:
+            out.append((''.join(cellline[k][0] for k in range(i, j)), cellline[i][1]))
+        else:
+            out.extend(cellline[i:j])
+        i = j
+    return out
+
 
 _CLUSTER_RE = regex.compile(r'\X')
 
@@ -974,7 +1012,14 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
             runs.append([[disp], key])
 
     def emit(ch, key):
-        disp = render_output(ch, mode)
+        # A Zalgo cell (> _ZALGO_MARK_MAX combining marks on one base) is neutralized to the
+        # box in SHOW mode so its 'combining' risk band fills the whole cell; shown, the
+        # stacked marks overflow the band as a weak violet fringe. Legitimate decomposed text
+        # (<= the cap) renders normally.
+        if mode == 'show' and _combining_count(ch) > _ZALGO_MARK_MAX:
+            disp = BOX
+        else:
+            disp = render_output(ch, mode)
         if mode in ('box', 'show') and disp == '_' and disp != ch:
             # A '_' from render_output means a neutralized no-glyph character:
             # every non-ASCII byte in Box mode, or an invisible / bidi / control
@@ -1009,25 +1054,28 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
             # ASCII-only guarantee is untouched.
             structural = (mode == 'show' and len(ch) == 1
                           and is_structural(ord(ch)))
+            # Source code point for the risk colour + hover inspection: a multi-cp cell (a
+            # boxed Zalgo base+marks) has no single ord(); use its worst code point.
+            src_cp = ord(ch) if len(ch) == 1 else marking_cp_for_cell(ch)
             if markings and not structural:
-                color = marking_class(ord(ch))
+                color = marking_class(src_cp)
             elif colors:
                 color = key
             else:
                 color = None
-            add(disp, (MARK_KEY, color, ord(ch)))
+            add(disp, (MARK_KEY, color, src_cp))
         else:
             add(disp, key if colors else None)
 
     for idx, cellline in enumerate(lines):
-        for ch, key in cellline:
+        for ch, key in (_collapse_zalgo_runs(cellline) if mode == 'show' else cellline):
             emit(ch, key)
         # a newline that ended a soft autowrap is tagged so the widget can join
         # the wrapped rows on copy (see WRAP_NL); a real line break stays None.
         soft = wraps is not None and idx < len(wraps) and wraps[idx]
         add('\n', WRAP_NL if soft else None)
     prefix_len = sum(display_len(p) for parts, _ in runs for p in parts)
-    for ch, key in current:
+    for ch, key in (_collapse_zalgo_runs(current) if mode == 'show' else current):
         emit(ch, key)
     return [(''.join(parts), key) for parts, key in runs], prefix_len
 
@@ -1239,6 +1287,12 @@ def tui_cell(ch, mode):
     # invisible straight into a grid cell -- the same hole render_output closes, and
     # a live spoofing primitive (ad<U+3164>min reads as "admin"). Leaving it here
     # made a payload safe in CLI show mode and unsafe in TUI show mode.
+    # A Zalgo stack (> _ZALGO_MARK_MAX combining marks on one base) is neutralized to the box
+    # even in SHOW mode: its risk band then fills the whole cell instead of the marks
+    # overflowing it as a weak fringe. Legitimate decomposed text (a few accents, a conformant
+    # cluster) stays shown. The strict modes already box any combining cell.
+    if mode == 'show' and _combining_count(ch) > _ZALGO_MARK_MAX:
+        return BOX
     if all(_cell_cp_safe(ord(c), mode) and c.isprintable()
            and not is_default_ignorable(c) for c in ch):
         return ch
