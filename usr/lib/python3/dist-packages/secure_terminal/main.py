@@ -2964,7 +2964,7 @@ class MainWindow(QMainWindow):
             '&Colors', self, checkable=True)
         self.act_colors.setChecked(self._default_colors)
         self.act_colors.setToolTip(
-            'Render a safe subset of ANSI colors (16-color SGR) in the current '
+            'Render safe ANSI colour (16-, 256- and 24-bit truecolor SGR) in the current '
             'tab. Off by default; contrast-guarded so text can never be painted '
             'invisibly. Honors the NO_COLOR convention (no-color.org): if the '
             'NO_COLOR environment variable is set, colors stay off even when this '
