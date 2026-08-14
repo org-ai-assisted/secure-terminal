@@ -29,10 +29,20 @@ malformed reply falls back per on_error ('allow' with a visible note, or
 
 import json
 import subprocess
+from typing import TypedDict
 
 from secure_terminal.sanitize import render_output, sanitize_paste
 
 VERDICTS = ('allow', 'block', 'ask')
+
+
+class HookResult(TypedDict):
+    """The decision evaluate() always returns: a fixed shape so a caller can rely
+    on `suggestion`/`message` being str (never the `error` bool) at the read site."""
+    verdict: str
+    message: str
+    suggestion: str
+    error: bool
 
 
 def _sanitize_message(text):
@@ -60,7 +70,7 @@ def _invoke(handler_argv, payload, timeout):
     return json.loads(raw) if raw else {}
 
 
-def _error(on_error, why):
+def _error(on_error, why) -> HookResult:
     verdict = 'block' if on_error == 'block' else 'allow'
     tail = ' (blocked)' if verdict == 'block' else ' (allowed)'
     return {'verdict': verdict, 'message': why + tail, 'suggestion': '',
@@ -68,7 +78,7 @@ def _error(on_error, why):
 
 
 def evaluate(handler_argv, command, timeout=10, on_error='allow',
-             cwd='', tab='', transcript_provider=None):
+             cwd='', tab='', transcript_provider=None) -> HookResult:
     """Run the handler for `command` and return a decision:
     {'verdict': 'allow'|'block'|'ask', 'message': str, 'suggestion': str,
      'error': bool}. transcript_provider, if given, is called only when the

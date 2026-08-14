@@ -1882,8 +1882,12 @@ class SecureTerminal(QPlainTextEdit):
             self._make_screen()
 
     def _on_readable(self):
+        fd = self._fd
+        if fd is None:
+            return                        # teardown race: fd closed before a
+                                          # queued notifier event drained
         try:
-            data = os.read(self._fd, 65536)
+            data = os.read(fd, 65536)
         except BlockingIOError:
             return                        # nothing ready yet (non-blocking fd)
         except OSError:
@@ -2128,7 +2132,7 @@ class SecureTerminal(QPlainTextEdit):
         """Feed one segment to the pyte parser, containing any error -- pyte parses
         untrusted output and a version quirk (private SGR from htop/vim/tmux) must
         never crash the terminal, worst case a rendering glitch, never a core dump."""
-        if not chunk:
+        if not chunk or self._stream is None:
             return
         try:
             self._stream.feed(chunk)
@@ -3136,10 +3140,11 @@ class SecureTerminal(QPlainTextEdit):
         command = self._line_buffer
         if not command.strip():
             return False
-        result = hook.evaluate(
-            self._hook['argv'], command,
-            timeout=self._hook.get('timeout', 10),
-            on_error=self._hook.get('on_error', 'allow'),
+        cfg = self._hook or {}            # never None here (the caller guards), and
+        result = hook.evaluate(           # the `or {}` mirrors _hook_transcript
+            cfg['argv'], command,
+            timeout=cfg.get('timeout', 10),
+            on_error=cfg.get('on_error', 'allow'),
             cwd=self._foreground_cwd(),
             transcript_provider=self._hook_transcript)
         if result['message']:
