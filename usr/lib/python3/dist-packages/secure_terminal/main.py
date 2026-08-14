@@ -943,11 +943,19 @@ class MainWindow(QMainWindow):
         if tui is None:
             tui = self._default_tui
         tui = bool(tui)
+        # A new tab opens in the ACTIVE tab's current working directory (as konsole/xterm
+        # do), not secure-terminal's own launch dir. shell_cwd() reads the child's cwd from
+        # /proc (our own child -- trustworthy, not the OSC-7 self-reported path); '' when
+        # there is no active terminal or it is unreadable, and _start falls back to the
+        # inherited cwd if the dir has vanished.
+        active = self.current()
+        inherit_cwd = active.shell_cwd() if isinstance(active, SecureTerminal) else ''
         # line_edits goes through the ctor, not apply_line_edits: the ctor forks the
         # child, so only a ctor value reaches the fork in time to pick the matching
         # terminfo entry (secure-terminal vs secure-terminal-noedit).
         term = SecureTerminal(tui=tui, command=command or None,
-                              line_edits=self._default_line_edits)
+                              line_edits=self._default_line_edits,
+                              cwd=inherit_cwd or None)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(self._default_font_family)
