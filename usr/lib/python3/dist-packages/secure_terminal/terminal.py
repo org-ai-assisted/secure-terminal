@@ -3182,36 +3182,49 @@ class SecureTerminal(QPlainTextEdit):
             SecureTerminal._TUI_KEYS = _build_tui_keys()
 
         # TUI mode does not mirror the shell's line -- a full-screen program may own
-        # the keys entirely -- so the CLI line model is not maintained here. It must
-        # still be RELEASED, though: a re-export deferred by a pending line at the
-        # moment of a CLI->TUI switch would otherwise wait forever, because nothing
-        # in this path ever clears the flags _line_pending reads. Accept-line and
-        # the two discard keys are exactly the keystrokes that empty the prompt.
-        if (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        # the keys entirely -- so the CLI line model is not maintained here. Two
+        # jobs still keep _line_pending honest (it gates the mode-switch re-export;
+        # see _reexport_term):
+        #   RELEASE a line a re-export is waiting on. A re-export deferred by a
+        #   pending line at a CLI->TUI switch would otherwise wait forever, because
+        #   nothing else here clears the flags. Accept-line and the two discard
+        #   keys are exactly the keystrokes that empty the prompt.
+        #   MARK a line a re-export must wait FOR. With no foreground program the
+        #   keys reach the shell's line editor, so typed text (or a history recall)
+        #   now sits at the bare prompt -- which TUI cannot mirror. Flag it dirty:
+        #   otherwise a later TUI->CLI switch fires an immediate CR-terminated
+        #   re-export that concatenates onto and SUBMITS that line, an Enter the
+        #   user never pressed that also bypasses command_hook. Gated on "no
+        #   foreground program" so a program's own keys never strand the flag (a
+        #   `less` quit with `q` leaves no prompt line, yet marking would defer the
+        #   re-export forever).
+        submit_or_discard = (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
                 or (ctrl and key in (Qt.Key.Key_J, Qt.Key.Key_M,
-                                     Qt.Key.Key_C, Qt.Key.Key_U))):
+                                     Qt.Key.Key_C, Qt.Key.Key_U)))
+        if submit_or_discard:
             self._line_buffer = ''
             self._line_dirty = False
 
-        if key == Qt.Key.Key_Tab and shift:
-            self._write(b'\x1b[Z')                  # back-tab
-            return
         seq = SecureTerminal._TUI_KEYS.get(key)
-        if seq is not None:
-            self._write(seq)
-            return
-        # Ctrl+letter -> the corresponding control byte (Ctrl+C -> 0x03), which
-        # the program receives; the Terminate action stays the escape hatch.
-        if ctrl and not shift and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
-            self._write(bytes([key & 0x1f]))
-            return
         text = event.text()
-        if text and len(text) == 1 and ord(text) < 0x20:
-            self._write(text.encode('latin-1'))     # e.g. Ctrl+[ -> ESC
-            return
-        if text and all(ch.isprintable() for ch in text):
-            self._write((b'\x1b' if alt else b'') + text.encode('utf-8'))
-        # non-printable input is still dropped
+        if key == Qt.Key.Key_Tab and shift:
+            out = b'\x1b[Z'                          # back-tab
+        elif seq is not None:
+            out = seq
+        elif ctrl and not shift and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            # Ctrl+letter -> the control byte (Ctrl+C -> 0x03) the program
+            # receives; the Terminate action stays the escape hatch.
+            out = bytes([key & 0x1f])
+        elif text and len(text) == 1 and ord(text) < 0x20:
+            out = text.encode('latin-1')            # e.g. Ctrl+[ -> ESC
+        elif text and all(ch.isprintable() for ch in text):
+            out = (b'\x1b' if alt else b'') + text.encode('utf-8')
+        else:
+            return                                  # non-input key: nothing sent
+
+        if not submit_or_discard and not self.has_foreground_program():
+            self._line_dirty = True
+        self._write(out)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
