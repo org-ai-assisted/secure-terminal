@@ -1380,7 +1380,11 @@ class SecureTerminal(QPlainTextEdit):
         return QColor(default) if default is not None else None
 
     def _pyte_format(self, cell):
-        key = (cell.fg, cell.bg, cell.bold, cell.reverse, cell.underscore)
+        # A structural block/half-block glyph IS its own pixels: skip the fg-vs-bg
+        # readability guard so its truecolor background is filled verbatim (a
+        # half-block colour ramp sets fg near bg on purpose; clamping bands it).
+        structural = len(cell.data) == 1 and is_structural(ord(cell.data))
+        key = (cell.fg, cell.bg, cell.bold, cell.reverse, cell.underscore, structural)
         fmt = self._fmt_cache.get(key)
         if fmt is not None:
             return fmt
@@ -1395,7 +1399,7 @@ class SecureTerminal(QPlainTextEdit):
         if fg is None:  # pragma: no cover - _pyte_qcolor always returns a non-None default here
             fg = QColor(base_fg)
         eff_bg = bg if bg is not None else QColor(base_bg)
-        if too_close(_rgb(fg), _rgb(eff_bg)):
+        if not structural and too_close(_rgb(fg), _rgb(eff_bg)):
             # force a readable foreground for the ACTUAL background, so a program
             # cannot hide text by setting fg == bg -- even by moving the default
             # colours together via OSC 10/11 (the fallback must NOT be a
@@ -1703,9 +1707,16 @@ class SecureTerminal(QPlainTextEdit):
             return QColor(self._osc_palette.get(val, ANSI_PALETTE[val]))
         return QColor(val)                # '#rrggbb' from color_256 / truecolor
 
-    def _format_for(self, state):
+    def _format_for(self, state, structural=False):
         """Build the QTextCharFormat for an SGR state dict, guarding against an
-        unreadable foreground/background combination."""
+        unreadable foreground/background combination.
+
+        A STRUCTURAL block/half-block glyph (U+2500-U+259F) IS its own pixels --
+        there is no hidden text behind it to protect, so the fg-vs-bg readability
+        guard must NOT run for it: a half-block colour ramp deliberately sets a
+        cell's fg (its top pixel) and bg (its bottom pixel) near-equal, and clamping
+        them would drop the truecolor background and band the gradient. For a
+        structural glyph, fill both colours verbatim."""
         fmt = QTextCharFormat()
         fg_i, bg_i, bold = state['fg'], state['bg'], state['bold']
         if fg_i is None and bg_i is None and not bold:
@@ -1713,11 +1724,12 @@ class SecureTerminal(QPlainTextEdit):
         base_bg, base_fg = THEMES.get(self._theme, THEMES['dark'])
         fg = self._sgr_qcolor(fg_i, base_fg)
         bg = self._sgr_qcolor(bg_i, None)
-        eff_bg = bg if bg is not None else QColor(base_bg)
-        if too_close(_rgb(fg), _rgb(eff_bg)):
-            fg = QColor(base_fg)          # never let the text vanish
-            if bg is not None and too_close(_rgb(fg), _rgb(bg)):
-                bg = None                 # base text collides with the bg -> drop it
+        if not structural:
+            eff_bg = bg if bg is not None else QColor(base_bg)
+            if too_close(_rgb(fg), _rgb(eff_bg)):
+                fg = QColor(base_fg)          # never let the text vanish
+                if bg is not None and too_close(_rgb(fg), _rgb(bg)):
+                    bg = None                 # base text collides with the bg -> drop it
         fmt.setForeground(fg)
         if bg is not None:
             fmt.setBackground(bg)
@@ -1772,7 +1784,9 @@ class SecureTerminal(QPlainTextEdit):
                     if spec['bg'] is not None:
                         fmt.setBackground(QColor(spec['bg']))
                 elif color:                   # the program's own SGR items-tuple
-                    fmt = self._format_for(dict(color))
+                    # a structural block/half-block glyph shown in its own SGR keeps
+                    # its truecolor bg -- the contrast guard must not band the gradient.
+                    fmt = self._format_for(dict(color), structural=is_structural(key[2]))
                 else:
                     fmt = QTextCharFormat()
                 fmt.setProperty(_CP_PROP, key[2])
