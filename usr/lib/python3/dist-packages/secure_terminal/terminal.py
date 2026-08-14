@@ -3271,9 +3271,17 @@ class SecureTerminal(QPlainTextEdit):
         else:
             return                                  # non-input key: nothing sent
 
-        if (not submit_or_discard
-                and key not in SecureTerminal._NON_CONTENT_KEYS
-                and not self.has_foreground_program()):
+        # A content key marks the line pending. So does a navigation/deletion key
+        # (_NON_CONTENT_KEYS) WHEN a CLI-typed line was carried into TUI (_line_buffer
+        # still populated): TUI cannot mirror the edit, so a Home/Delete/Backspace
+        # there desyncs that buffer from the real shell line -- and command_hook must
+        # not judge the stale buffer while the shell runs the edited command. Marking
+        # it dirty forces the hook to fail safe (ask). At an EMPTY prompt (no carried
+        # buffer) a no-op key still does not mark, so the re-export is not deferred
+        # needlessly.
+        if (not submit_or_discard and not self.has_foreground_program()
+                and (key not in SecureTerminal._NON_CONTENT_KEYS
+                     or self._line_buffer)):
             self._line_dirty = True
         self._write(out)
 
@@ -3542,17 +3550,17 @@ class SecureTerminal(QPlainTextEdit):
             safe = paste_no_autosubmit(safe)
             if not safe:
                 return
-        # Keep our view of the line honest across a paste (line mode only; a TUI
-        # paste does not touch the line-mode command). A CLI paste now never submits
-        # (its trailing submit was stripped above), so the pasted text sits at the
-        # prompt un-entered and _line_buffer never saw it. Mark the line unverifiable
-        # whether or not a hook is configured: _line_dirty has TWO consumers -- the
-        # hook (which then FAILS SAFE, asking on the next Enter) AND _line_pending(),
-        # the guard that stops _send_reexport from typing "export TERM=...\r" onto a
-        # line that already holds text. Gating this on the hook left _line_pending()
-        # blind after a hookless paste, so a later mode switch / line_edits toggle
-        # would type the CR-terminated re-export onto the pasted command and submit it.
-        if not self.tui_active():
+        # Keep our view of the line honest across a paste. A paste that lands at a
+        # bare SHELL prompt (CLI, or TUI with no foreground program) sits there as a
+        # command the next Enter submits -- _line_buffer never saw it, so mark the
+        # line unverifiable. _line_dirty has TWO consumers, both of which must catch
+        # a pasted command: the hook (which then FAILS SAFE, asking on the next
+        # Enter, including in TUI where accept-line now routes through it) AND
+        # _line_pending(), the guard that stops _send_reexport from typing
+        # "export TERM=...\r" onto a line that already holds text. Only a paste
+        # delivered to a FOREGROUND PROGRAM (a TUI app that asked for it) is its
+        # data, not a shell line, so it is the sole case left unmarked.
+        if not self.tui_active() or not self.has_foreground_program():
             self._line_dirty = True
         data = safe.encode('utf-8')
         if bracketed:
