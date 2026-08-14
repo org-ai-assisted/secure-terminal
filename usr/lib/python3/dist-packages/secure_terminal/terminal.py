@@ -760,6 +760,12 @@ class SecureTerminal(QPlainTextEdit):
         self._tui_follow = True
         self._programmatic_scroll = False
         self.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
+        # True while the user is dragging a text selection. The TUI grid is rebuilt
+        # (_delete_grid + _append_grid) every ~16ms frame; doing that under an active
+        # selection re-anchors it and drags it to the document bottom (the reported
+        # "selects to the bottom" bug). While a selection is active the rebuild is frozen,
+        # exactly as a traditional terminal holds the view still while you select.
+        self._mouse_selecting = False
         self._grid_shown = False      # is the fixed pyte grid currently on screen
         # Local caret echoes (^C, ^\) awaiting possible de-duplication against the
         # shell's own echo: [(text, deadline_monotonic), ...]. See _echo_caret.
@@ -1459,6 +1465,14 @@ class SecureTerminal(QPlainTextEdit):
         but cannot smuggle a deceptive glyph."""
         screen = self._screen
         if screen is None:
+            return
+        # Freeze the rebuild while a text selection is active (being dragged, or held after
+        # release): _delete_grid + _append_grid rewrites the document each frame, which
+        # re-anchors an in-progress selection and drags it to the bottom (the reported bug),
+        # and setTextCursor in the follow path would collapse a completed one. Output keeps
+        # feeding the pyte model; clearing the selection (a click / keypress) re-arms a render
+        # that catches up. This holds the view still during selection, as a real terminal does.
+        if self._mouse_selecting or self.textCursor().hasSelection():
             return
         # If the user has scrolled up into the history to read it while output is
         # still arriving, do NOT yank the view back to the bottom on every frame
@@ -3304,6 +3318,16 @@ class SecureTerminal(QPlainTextEdit):
         text = event.text()
         if key == Qt.Key.Key_Tab and shift:
             out = b'\x1b[Z'                          # back-tab
+        elif (seq is not None and (ctrl or shift or alt)
+              and len(seq) == 3 and seq[:2] == b'\x1b[' and 0x41 <= seq[2] <= 0x5a):
+            # A MODIFIED cursor / Home / End key (bare form ESC[<final>): encode the
+            # modifier in the xterm CSI form ESC[1;<p><final>, p = 1 + shift + 2*alt +
+            # 4*ctrl, so the child program actually sees it -- e.g. Ctrl+End -> ESC[1;5F,
+            # which claude-code's "jump to bottom" binding expects. The bare table drops
+            # the modifier. Ctrl+PageUp/Down never reach here (intercepted for tab
+            # switching), so the tilde-form keys need no modifier handling.
+            p = 1 + (1 if shift else 0) + (2 if alt else 0) + (4 if ctrl else 0)
+            out = b'\x1b[1;%d%c' % (p, seq[2])
         elif seq is not None:
             out = seq
         elif ctrl and not shift and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
@@ -3487,8 +3511,21 @@ class SecureTerminal(QPlainTextEdit):
             tc.movePosition(QTextCursor.MoveOperation.End)
             self.setTextCursor(tc)
 
+    def mousePressEvent(self, event):
+        # Mark a drag-selection in progress so _render_tui freezes the grid rebuild while
+        # the user selects (a left-button press begins a possible drag).
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._mouse_selecting = True
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
+        self._mouse_selecting = False
+        # The drag is over: re-arm a grid render so the view catches up once the selection
+        # is gone (if a selection is still held, _render_tui stays frozen and does not
+        # clobber it; clearing it later re-arms another render).
+        if self._grid_mode():
+            self._render_timer.start(16)
         # A terminal caret is not click-positionable: typed input always goes to
         # the shell at the output cursor, never where you click. A plain click
         # that moved the blinking caret elsewhere -- e.g. into zsh's trailing
