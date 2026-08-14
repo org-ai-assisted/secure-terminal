@@ -13,6 +13,7 @@ import sys
 import shlex
 import argparse
 import json
+import tempfile
 
 from PyQt6.QtCore import (
     QTimer, Qt, QUrl, QRect, QPoint, QByteArray, QObject, QEvent,
@@ -2616,6 +2617,19 @@ class MainWindow(QMainWindow):
         except OSError:
             pass            # a failed save (bad path, no space) is not fatal
 
+    def open_transcript(self):
+        term = self.current()
+        if term is None:
+            return
+        # Hand this tab's transcript to the system default text viewer/editor (xdg-open via
+        # Qt), no save dialog. transcript_text() is lossless plain ASCII -- Box names each
+        # neutralized character inline -- so the opened file is safe anywhere, unlike a raw
+        # terminal log. Written to a temp file the external app owns.
+        fd, path = tempfile.mkstemp(prefix='secure-terminal-transcript-', suffix='.txt')
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(term.transcript_text())
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
     def _apply_locks(self):
         """Reflect admin-locked settings in the UI: disable the controls the user
         cannot change (greyed out with a note), and warn once if the user's own
@@ -2793,6 +2807,15 @@ class MainWindow(QMainWindow):
             'plain ASCII, so the saved file is safe to open anywhere.')
         self.act_save.triggered.connect(self.save_transcript)
         file_menu.addAction(self.act_save)
+
+        self.act_open = QAction(QIcon.fromTheme('document-open'),
+                                'Op&en Transcript...', self)
+        self._bind(self.act_open, 'open_transcript', '')
+        self.act_open.setToolTip(
+            'Open this tab\'s transcript in your system default text editor. It is '
+            'already sanitized plain ASCII, so it is safe to open anywhere.')
+        self.act_open.triggered.connect(self.open_transcript)
+        file_menu.addAction(self.act_open)
 
         file_menu.addSeparator()
         self.act_terminate = QAction(
