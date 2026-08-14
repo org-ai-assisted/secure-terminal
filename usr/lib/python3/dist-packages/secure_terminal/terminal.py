@@ -108,6 +108,23 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             return
         super().select_graphic_rendition(*attrs)
 
+    def linefeed(self):
+        # A line that fills the EXACT width leaves the cursor "past" the last column (pyte's
+        # pending-wrap state, cursor.x == columns); pyte then lazy-wraps on the NEXT printable
+        # char with its own CR+LF. A bare LF here would advance a SECOND line, leaving a blank
+        # row between every full-width line (a full-screen `cat` of a width-filling board
+        # rendered as row, blank, row, blank ...). The usual ONLCR \r\n already reset the column
+        # with its CR, so this only fires for a BARE LF at full width: consume the pending wrap
+        # so the next char lands at column 0 of the new line, as a real terminal does. Purely a
+        # cursor fix -- it changes no cell and no character filtering.
+        #
+        # ONLY when autowrap (DECAWM) is on: with autowrap OFF pyte deliberately parks the
+        # cursor at the last column so the next char OVERWRITES it (no wrap), and column 0 would
+        # be the wrong place -- so leave that case to pyte.
+        if pyte.modes.DECAWM in self.mode and self.cursor.x >= self.columns:
+            self.cursor.x = 0
+        super().linefeed()
+
     def draw(self, data):
         # Bound a Zalgo flood. pyte merges each zero-width combining mark into
         # the cell before the cursor via unicodedata.normalize("NFC",
