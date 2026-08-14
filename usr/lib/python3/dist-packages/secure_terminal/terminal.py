@@ -3234,9 +3234,22 @@ class SecureTerminal(QPlainTextEdit):
         #   so this precision is safe. Gated on "no foreground program" so a program's
         #   own keys never strand the flag (a `less` quit with `q` leaves no prompt
         #   line, yet marking would defer the re-export forever).
-        submit_or_discard = (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                or (ctrl and not shift and key in (Qt.Key.Key_J, Qt.Key.Key_M,
-                                                   Qt.Key.Key_C, Qt.Key.Key_U)))
+        accept_line = (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                or (ctrl and not shift and key in (Qt.Key.Key_J, Qt.Key.Key_M)))
+        submit_or_discard = accept_line or (
+                ctrl and not shift and key in (Qt.Key.Key_C, Qt.Key.Key_U))
+        # A bare shell prompt in TUI mode still submits real commands, so the command
+        # hook must judge an accept-line here too -- otherwise switching to TUI is a
+        # SILENT BYPASS of it. Only a bare prompt routes through (a foreground program
+        # owns its own keys), and only when a hook is configured. TUI does not mirror
+        # the line, so _hook_intercept sees _line_dirty (set above for typed content)
+        # and falls through to a human review rather than judging an empty buffer -- a
+        # prompted override, never a silent pass. It performs the submit/discard itself
+        # when it fires, so return without also writing the accept byte; an empty prompt
+        # (nothing typed, not dirty) returns False and submits normally with no prompt.
+        if (accept_line and not self.has_foreground_program()
+                and self._hook is not None and self._hook_intercept()):
+            return
         if submit_or_discard:
             self._line_buffer = ''
             self._line_dirty = False
