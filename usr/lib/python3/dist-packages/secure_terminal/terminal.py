@@ -750,6 +750,16 @@ class SecureTerminal(QPlainTextEdit):
         # so its bottom row (e.g. tmux's status bar) is not pushed below the
         # viewport and no spurious scrollbar appears.
         self._alt_view = False
+        # TUI auto-follow intent: pin the view to the newest output ONLY while the user is at
+        # the very bottom. A per-frame value-vs-maximum test (with a 2-line tolerance) mistook a
+        # 1-2 line wheel scroll for "still at bottom" and yanked the view back every frame (the
+        # reported scroll flicker). This sticky flag is cleared the instant the user scrolls up
+        # and restored when they return to the bottom; _programmatic_scroll suppresses the signal
+        # handler while _render_tui does its OWN follow/rebuild writes, so only genuine user
+        # scrolling changes the intent.
+        self._tui_follow = True
+        self._programmatic_scroll = False
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
         self._grid_shown = False      # is the fixed pyte grid currently on screen
         # Local caret echoes (^C, ^\) awaiting possible de-duplication against the
         # shell's own echo: [(text, deadline_monotonic), ...]. See _echo_caret.
@@ -1353,6 +1363,17 @@ class SecureTerminal(QPlainTextEdit):
         self.clear()
         self._top_ids = set()
         self._grid_rows = 0
+        self._tui_follow = True       # a fresh grid view follows the tail until the user scrolls
+
+    def _on_scroll_value(self, value):
+        """Update the TUI auto-follow intent from USER scrolling. _render_tui's own
+        follow/rebuild writes set _programmatic_scroll so they do not clear the intent; a user
+        wheel/drag/key that lands anywhere but the very bottom stops the auto-follow, and
+        returning to the bottom resumes it."""
+        if self._programmatic_scroll:
+            return
+        # Connected to the bar's OWN valueChanged, so the bar exists here.
+        self._tui_follow = value >= self.verticalScrollBar().maximum()
 
     def _sync_tui_size(self):
         if self._screen is None:
@@ -1441,10 +1462,22 @@ class SecureTerminal(QPlainTextEdit):
             return
         # If the user has scrolled up into the history to read it while output is
         # still arriving, do NOT yank the view back to the bottom on every frame
-        # (and do not clobber a selection); only auto-follow when already at the end.
+        # (and do not clobber a selection); only auto-follow when the user is at the
+        # end. _tui_follow tracks that intent (set by _on_scroll_value on real user
+        # scrolling), so a 1-2 line wheel scroll is no longer mistaken for "at bottom".
         bar = self.verticalScrollBar()
-        at_bottom = bar is None or bar.value() >= bar.maximum() - 2
+        at_bottom = self._tui_follow
         prev_scroll = bar.value() if bar is not None else 0
+        # Everything below is OUR write: guard it so the scrollbar changes the rebuild and the
+        # follow cause do not fire _on_scroll_value and clobber the user's follow intent.
+        self._programmatic_scroll = True
+        try:
+            self._render_tui_body(screen, bar, at_bottom, prev_scroll)
+        finally:
+            self._programmatic_scroll = False
+        self.viewport().update()
+
+    def _render_tui_body(self, screen, bar, at_bottom, prev_scroll):
         self.setUpdatesEnabled(False)
         if self._alt_screen:
             # A full-screen program holds the alternate screen: it is a fixed
@@ -1483,7 +1516,6 @@ class SecureTerminal(QPlainTextEdit):
                 bar.setValue(bar.maximum())
         elif bar is not None:
             bar.setValue(min(prev_scroll, bar.maximum()))
-        self.viewport().update()
 
     def _grid_cell_format(self, cell, disp):
         """Format for one grid cell. A cell that is NOT a marking takes the
