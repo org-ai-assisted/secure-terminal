@@ -44,6 +44,7 @@ import os
 import sys
 import pty
 import tty
+import time
 import fcntl
 import codecs
 import select
@@ -104,23 +105,21 @@ def feed_stdin_paste(data, state):
     out = bytearray()
     i, n = 0, len(buf)
     while i < n:
-        if in_paste and len(paste_buf) > _PASTE_MAX:
-            # runaway / unterminated paste: bound memory and recover input (see _PASTE_MAX).
-            # Drop the buffer, leave paste mode, and stop scanning this chunk -- the next
-            # read resumes as ordinary typed input.
-            in_paste, paste_buf, carry = False, b'', b''
-            break
         marker = _PASTE_END if in_paste else _PASTE_START
         idx = buf.find(b'\x1b', i)
         chunk = buf[i:] if idx == -1 else buf[i:idx]
         # bytes before the next ESC: paste body -> buffer, else typed -> child
         if in_paste:
-            paste_buf += chunk
+            # Bound the buffer at _PASTE_MAX: past it, DROP further content but STAY in paste.
+            # An oversized / unterminated frame must not (a) grow memory without bound, nor (b)
+            # be exited so its runaway TAIL falls through as TYPED input and auto-runs
+            # (pastejacking). The end marker -- a real bracketed paste always sends ESC[201~ --
+            # or a terminal reset still ends it; a malicious never-closing frame simply drops.
+            if len(paste_buf) < _PASTE_MAX:
+                paste_buf += chunk[:_PASTE_MAX - len(paste_buf)]   # keep the buffer at the cap
         else:
             out += chunk
         if idx == -1:
-            if in_paste and len(paste_buf) > _PASTE_MAX:
-                in_paste, paste_buf, carry = False, b'', b''   # runaway tail: drop + recover
             break
         i = idx
         remaining = buf[i:]                    # from this ESC to end-of-buffer
@@ -147,7 +146,8 @@ def feed_stdin_paste(data, state):
             carry = remaining
             break
         elif in_paste:
-            paste_buf += buf[i:i + 1]          # an ESC in paste content (dropped later)
+            if len(paste_buf) < _PASTE_MAX:
+                paste_buf += buf[i:i + 1]      # an ESC in paste content (dropped later)
             i += 1
         else:
             out += buf[i:i + 1]                # a typed escape (arrow key) -> verbatim
@@ -218,24 +218,34 @@ def _run(argv, mode):
             # ignores this just delivers a paste as ordinary typed input. Inside the try
             # so a failed setraw / enable still hits the finally that restores termios.
             os.write(out_fd, _BP_ENABLE)
+        esc_deadline = None     # monotonic time to flush a held partial paste-start marker
         while True:
-            # A held partial paste-start marker (a lone ESC, or ESC[.. prefix) is carried
-            # in paste_state[2] while NOT already in a paste. Arm a bounded select timeout
-            # so that if no continuation arrives it is flushed to the child as a real
-            # interactive Escape -- without the timeout a lone ESC would be swallowed
-            # indefinitely; without holding it a split ESC|[200~ marker would slip through
-            # as typed input and auto-run (pastejacking). Any other loop uses no timeout.
+            # A held partial paste-start marker (a lone ESC, or ESC[.. prefix) is carried in
+            # paste_state[2] while NOT already in a paste. It is flushed to the child as a real
+            # interactive Escape once an ABSOLUTE hold deadline passes -- without holding it a
+            # split ESC|[200~ marker slips through as typed input and auto-runs (pastejacking);
+            # without a deadline a lone ESC is swallowed forever. The deadline is ABSOLUTE (not a
+            # per-call select timeout) so a continuously-readable child fd cannot starve it.
             hold = bool(paste_state[2]) and not paste_state[0]
-            timeout = _ESC_HOLD_TIMEOUT if hold else None
+            if hold:
+                if esc_deadline is None:
+                    esc_deadline = time.monotonic() + _ESC_HOLD_TIMEOUT
+                timeout = max(0.0, esc_deadline - time.monotonic())
+            else:
+                esc_deadline = None
+                timeout = None
             try:
                 readable, _, _ = select.select([fd, stdin_fd], [], [], timeout)
             except (OSError, select.error):  # pragma: no cover - PEP 475 retries EINTR
                 continue            # EINTR from SIGWINCH etc. -> retry
-            if not readable:
-                # timeout: the held marker prefix got no continuation -> a real Escape (or
-                # stray prefix), not a paste. Forward it verbatim and clear the hold.
+            if hold and time.monotonic() >= esc_deadline:
+                # deadline reached (even if the child fd is readable) -> the held prefix got no
+                # paste continuation; forward it verbatim and clear the hold, then service any
+                # readable fd this iteration.
                 os.write(fd, paste_state[2])
                 paste_state = (paste_state[0], paste_state[1], b'')
+                esc_deadline = None
+            if not readable:
                 continue
             if fd in readable:
                 try:

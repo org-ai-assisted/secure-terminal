@@ -619,12 +619,26 @@ def _collapse_zalgo_runs(cellline):
         while (j < n and len(cellline[j][0]) == 1
                and ord(cellline[j][0]) >= 0x0300 and _is_mark(cellline[j][0])):
             j += 1
-        if j - (i + 1) > _ZALGO_MARK_MAX:
+        base = cellline[i][0]
+        # A wide (East-Asian W/F) base occupies two columns; collapsing base+marks to a
+        # one-column box would shrink the line and desync the caret. Such a base is left
+        # un-collapsed (Zalgo on a wide base is exotic); every ordinary base is collapsed.
+        wide = len(base) == 1 and unicodedata.east_asian_width(base) in ('W', 'F')
+        if not wide and j - (i + 1) > _ZALGO_MARK_MAX:
             out.append((''.join(cellline[k][0] for k in range(i, j)), cellline[i][1]))
         else:
             out.extend(cellline[i:j])
         i = j
     return out
+
+
+def _cell_display(ch, mode):
+    """The display text of ONE cell under `mode`, so cells_to_runs (rendering) and
+    cells_display_col (caret offset) agree: a Zalgo cell (> _ZALGO_MARK_MAX combining marks)
+    in show mode is the box; every other cell is render_output."""
+    if mode == 'show' and _combining_count(ch) > _ZALGO_MARK_MAX:
+        return BOX
+    return render_output(ch, mode)
 
 
 _CLUSTER_RE = regex.compile(r'\X')
@@ -1015,11 +1029,9 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
         # A Zalgo cell (> _ZALGO_MARK_MAX combining marks on one base) is neutralized to the
         # box in SHOW mode so its 'combining' risk band fills the whole cell; shown, the
         # stacked marks overflow the band as a weak violet fringe. Legitimate decomposed text
-        # (<= the cap) renders normally.
-        if mode == 'show' and _combining_count(ch) > _ZALGO_MARK_MAX:
-            disp = BOX
-        else:
-            disp = render_output(ch, mode)
+        # (<= the cap) renders normally. _cell_display is shared with cells_display_col so the
+        # caret offset matches this rendering.
+        disp = _cell_display(ch, mode)
         if mode in ('box', 'show') and disp == '_' and disp != ch:
             # A '_' from render_output means a neutralized no-glyph character:
             # every non-ASCII byte in Box mode, or an invisible / bidi / control
@@ -1086,7 +1098,12 @@ def cells_display_col(cells, col, mode):
     caret, since a reveal badge is many columns wide. Counted in the UTF-16 units
     a document position uses (see display_len), so an astral character does not
     shift the caret."""
-    return sum(display_len(render_output(c, mode)) for c, _ in cells[:col])
+    prefix = cells[:col]
+    # match cells_to_runs: a Zalgo run collapses to ONE box, so its marks do not each add a
+    # document offset -- without this the caret drifts past text after a Zalgo cluster.
+    if mode == 'show':
+        prefix = _collapse_zalgo_runs(prefix)
+    return sum(display_len(_cell_display(c, mode)) for c, _ in prefix)
 
 
 # Unicode Default_Ignorable_Code_Point ranges that str.isprintable() does NOT

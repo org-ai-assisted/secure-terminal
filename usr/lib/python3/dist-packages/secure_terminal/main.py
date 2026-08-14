@@ -13,7 +13,6 @@ import sys
 import shlex
 import argparse
 import json
-import tempfile
 
 from PyQt6.QtCore import (
     QTimer, Qt, QUrl, QRect, QPoint, QByteArray, QObject, QEvent,
@@ -2624,9 +2623,14 @@ class MainWindow(QMainWindow):
         # Hand this tab's transcript to the system default text viewer/editor (xdg-open via
         # Qt), no save dialog. transcript_text() is lossless plain ASCII -- Box names each
         # neutralized character inline -- so the opened file is safe anywhere, unlike a raw
-        # terminal log. Written to a temp file the external app owns.
-        fd, path = tempfile.mkstemp(prefix='secure-terminal-transcript-', suffix='.txt')
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        # terminal log. Written to a FIXED file under the app's XDG state dir: the shipped
+        # AppArmor profile allows ~/.local/state/secure-terminal/** but NOT /tmp, and reusing
+        # one file (rather than a fresh temp each time) keeps sensitive history from
+        # accumulating on disk.
+        state_dir = session._state_dir()
+        os.makedirs(state_dir, exist_ok=True)
+        path = os.path.join(state_dir, 'transcript.txt')
+        with open(path, 'w', encoding='utf-8') as handle:
             handle.write(term.transcript_text())
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 

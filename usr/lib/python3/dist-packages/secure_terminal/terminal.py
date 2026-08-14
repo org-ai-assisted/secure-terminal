@@ -2997,6 +2997,15 @@ class SecureTerminal(QPlainTextEdit):
         # still reaches the window shortcuts, but everything else is encoded as
         # VT input (arrows, function keys, control bytes) and sent raw.
         if self.tui_active() and not (ctrl and shift):
+            # Typing resumes input: clear a held selection so the grid rebuild (frozen by
+            # _render_tui while a selection is active) resumes -- TUI keys go straight to the
+            # child, never through Qt's editor, so the selection would otherwise persist and
+            # freeze the view until a mouse click.
+            if self.textCursor().hasSelection():
+                cur = self.textCursor()
+                cur.clearSelection()
+                self.setTextCursor(cur)
+                self._render_timer.start(16)
             self._tui_key(event)
             return
 
