@@ -1884,8 +1884,9 @@ class SecureTerminal(QPlainTextEdit):
     def _on_readable(self):
         fd = self._fd
         if fd is None:
-            return                        # teardown race: fd closed before a
-                                          # queued notifier event drained
+            # teardown race: the fd was closed before a queued notifier event
+            # drained; os.read(None) would TypeError (uncaught below).
+            return
         try:
             data = os.read(fd, 65536)
         except BlockingIOError:
