@@ -583,6 +583,14 @@ class SecureTerminal(QPlainTextEdit):
         self._shot = os.environ.get('SECURE_TERMINAL_SHOT') == '1'
         if self._shot:
             self.setCursorWidth(0)     # no caret drawn -> no frame depends on blink phase
+        # Optional live transcript file: when SECURE_TERMINAL_TRANSCRIPT_FILE names a path,
+        # this tab's transcript is (re)written there after every read, kept current. A
+        # generic, mode-agnostic configuration -- set it on the command line
+        # (SECURE_TERMINAL_TRANSCRIPT_FILE=/path secure-terminal ...) to keep a live plain
+        # transcript on disk. A capture harness uses it to VERIFY a shot rendered its
+        # payload -- a screenshot alone cannot tell an empty terminal from a full one, the
+        # window chrome paints either way. Off (None) unless the path is set.
+        self._transcript_file = os.environ.get('SECURE_TERMINAL_TRANSCRIPT_FILE') or None
         # working directory to start the shell in (restored session tab); None ->
         # inherit the app's cwd.
         self._cwd = cwd if isinstance(cwd, str) and cwd else None
@@ -1543,7 +1551,19 @@ class SecureTerminal(QPlainTextEdit):
                     last = y
             self._append_grid(screen, last_row=max(last, screen.cursor.y))
         self.setUpdatesEnabled(True)
-        if at_bottom:
+        if self._alt_screen:
+            # The alternate screen is a fixed canvas with NO scrollback: its row 0 is the
+            # TOP of the program's screen and must always be visible, exactly as a real
+            # terminal shows it (a real terminal never scrolls the alt screen). Any
+            # off-by-one between the pyte grid and the viewport height leaves a 1-row
+            # scroll range, and following the TAIL there scrolls row 0 off the top -- so a
+            # SHORT full-screen frame (a one-line status program, or the alt-screen demo
+            # shot whose payload draws a single line at row 0) renders as an empty
+            # viewport even though the document holds the content. Pin to the top instead.
+            self._place_grid_cursor(screen)
+            if bar is not None:
+                bar.setValue(bar.minimum())
+        elif at_bottom:
             self._place_grid_cursor(screen)
             if bar is not None:
                 # Follow the tail: setTextCursor alone does not reliably scroll the
@@ -1964,6 +1984,13 @@ class SecureTerminal(QPlainTextEdit):
             self._make_screen()
 
     def _on_readable(self):
+        self._read_and_render()
+        # Keep the live transcript file current once the read has fed + rendered. No-op
+        # unless SECURE_TERMINAL_TRANSCRIPT_FILE is configured.
+        if self._transcript_file:
+            self._write_transcript_file()
+
+    def _read_and_render(self):
         fd = self._fd
         if fd is None:
             # teardown race: the fd was closed before a queued notifier event
@@ -2641,6 +2668,22 @@ class SecureTerminal(QPlainTextEdit):
         # display box. Qt's own rendering does not go through this method.
         self._flush_paint()          # never read a stale (debounced) document
         return self._export_ascii(super().toPlainText())
+
+    def _write_transcript_file(self):
+        """Write this tab's transcript to the configured SECURE_TERMINAL_TRANSCRIPT_FILE,
+        atomically. transcript_text() is the lossless plain-ASCII record and walks the
+        RENDERED document, so it reflects CLI and TUI (incl. the alternate screen) alike.
+        Best-effort: a write failure must never disturb the terminal. Only ever called
+        (from _on_readable) when the path is set, so no None-guard here."""
+        path = self._transcript_file
+        try:
+            text = self.transcript_text()
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+            os.replace(tmp, path)          # atomic: a reader never sees a half-write
+        except OSError:  # pragma: no cover - defensive: a transcript write failure is ignored
+            pass
 
     def transcript_text(self):
         """The scrollback for SAVING: lossless, and pure ASCII except the real
