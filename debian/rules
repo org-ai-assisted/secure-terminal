@@ -58,9 +58,9 @@ override_dh_clean:
 ## Register the AppArmor profile and reload it on install/upgrade (and handle
 ## removal), via debhelper's dh_apparmor.
 override_dh_installdeb:
-	dh_installdeb
 	dh_apparmor --profile-name=secure-terminal
 	dh_apparmor --profile-name=unicode-tag-stdin
+	dh_installdeb
 
 ## Ship the upstream git history as the upstream changelog, the way
 ## derivative-maker packages do (changelog.upstream is regenerated at release).

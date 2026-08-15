@@ -173,4 +173,10 @@ def main_stdin(argv=None):
     # Stdin-only entry point: reads NO files, so a confining AppArmor profile can
     # deny all data-file access. argv is accepted and ignored for a uniform
     # signature. Drives the AppArmor-confined `unicode-tag-stdin` (the hook path).
-    return _write_tagged(sys.stdin.buffer.read())
+    try:
+        data = sys.stdin.buffer.read()
+    except OSError as exc:
+        # e.g. stdin is a directory (`unicode-tag-stdin < /etc`): report cleanly.
+        sys.stderr.write('unicode-tag: %s\n' % exc)
+        return 1
+    return _write_tagged(data)
