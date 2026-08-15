@@ -140,6 +140,17 @@ def tag_bytes(data):
     return tag_text(data.decode('utf-8', 'surrogateescape'))
 
 
+def _write_tagged(data):
+    # Shared emit path for both entry points. tag_text removed every surrogate,
+    # so the UTF-8 re-encode cannot raise; only a downstream pipe closing early
+    # (e.g. `... | head`) can, and that exits 1 without a traceback.
+    try:
+        sys.stdout.buffer.write(tag_bytes(data).encode('utf-8'))
+    except BrokenPipeError:
+        return 1
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     try:
@@ -151,12 +162,15 @@ def main(argv=None):
             data = b''.join(chunks)
         else:
             data = sys.stdin.buffer.read()
-        # Re-encode UTF-8: tag_text removed every surrogate, so this cannot raise.
-        sys.stdout.buffer.write(tag_bytes(data).encode('utf-8'))
     except OSError as exc:
-        # An unreadable file, or a downstream pipe closed early -- BrokenPipeError
-        # is an OSError subclass, so `unicode-tag big | head` lands here too.
-        # Report cleanly and exit non-zero rather than dumping a traceback.
+        # An unreadable file: report cleanly and exit non-zero, no traceback.
         sys.stderr.write('unicode-tag: %s\n' % exc)
         return 1
-    return 0
+    return _write_tagged(data)
+
+
+def main_stdin(argv=None):
+    # Stdin-only entry point: reads NO files, so a confining AppArmor profile can
+    # deny all data-file access. argv is accepted and ignored for a uniform
+    # signature. Drives the AppArmor-confined `unicode-tag-stdin` (the hook path).
+    return _write_tagged(sys.stdin.buffer.read())
