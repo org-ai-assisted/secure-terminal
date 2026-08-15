@@ -110,17 +110,23 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
 
     def linefeed(self):
         # A line that fills the EXACT width leaves the cursor "past" the last column (pyte's
-        # pending-wrap state, cursor.x == columns); pyte then lazy-wraps on the NEXT printable
-        # char with its own CR+LF. A bare LF here would advance a SECOND line, leaving a blank
-        # row between every full-width line (a full-screen `cat` of a width-filling board
-        # rendered as row, blank, row, blank ...). The usual ONLCR \r\n already reset the column
-        # with its CR, so this only fires for a BARE LF at full width: consume the pending wrap
-        # so the next char lands at column 0 of the new line, as a real terminal does. Purely a
-        # cursor fix -- it changes no cell and no character filtering.
+        # deferred-wrap / last-column-flag state, cursor.x == columns); pyte then performs the
+        # wrap only on the NEXT printable char, with its own CR+LF. A bare LF here would advance
+        # a SECOND line, leaving a blank row between every full-width line (a full-screen `cat`
+        # of a width-filling board rendered as row, blank, row, blank ...). The usual ONLCR
+        # \r\n already reset the column with its CR, so this only fires for a BARE LF at full
+        # width: consume the deferred wrap. Purely a cursor fix -- no cell and no filtering change.
         #
-        # ONLY when autowrap (DECAWM) is on: with autowrap OFF pyte deliberately parks the
-        # cursor at the last column so the next char OVERWRITES it (no wrap), and column 0 would
-        # be the wrong place -- so leave that case to pyte.
+        # We normalise to column 0 so a raw-fed full-width board renders as clean, left-aligned
+        # rows -- a deliberate DISPLAY choice for legibility. NOTE this differs from a real
+        # terminal: xterm clears the last-column flag on a line feed but KEEPS the column, so the
+        # next char lands at the LAST column of the new line (a staircase), not column 0 -- proven
+        # with an ESC[6n (DSR) cursor probe. The fork's pyte fix is xterm-accurate (it preserves
+        # the column); we keep column 0 here on purpose. Guard on DECAWM: with autowrap off pyte
+        # parks the cursor at the last column so the next char OVERWRITES it -- leave that to pyte.
+        #
+        # pyte last-column-flag bug -- fork fix: https://github.com/org-ai-assisted/pyte/pull/7 ;
+        # report: https://github.com/org-ai-assisted/pyte-audit/blob/master/reports/bug-H-linefeed-pending-wrap.md
         if pyte.modes.DECAWM in self.mode and self.cursor.x >= self.columns:
             self.cursor.x = 0
         super().linefeed()
