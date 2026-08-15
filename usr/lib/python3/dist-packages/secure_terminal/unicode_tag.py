@@ -142,14 +142,21 @@ def tag_bytes(data):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if argv:
-        chunks = []
-        for path in argv:
-            with open(path, 'rb') as handle:
-                chunks.append(handle.read())
-        data = b''.join(chunks)
-    else:
-        data = sys.stdin.buffer.read()
-    # Re-encode UTF-8: tag_text removed every surrogate, so this cannot raise.
-    sys.stdout.buffer.write(tag_bytes(data).encode('utf-8'))
+    try:
+        if argv:
+            chunks = []
+            for path in argv:
+                with open(path, 'rb') as handle:
+                    chunks.append(handle.read())
+            data = b''.join(chunks)
+        else:
+            data = sys.stdin.buffer.read()
+        # Re-encode UTF-8: tag_text removed every surrogate, so this cannot raise.
+        sys.stdout.buffer.write(tag_bytes(data).encode('utf-8'))
+    except OSError as exc:
+        # An unreadable file, or a downstream pipe closed early -- BrokenPipeError
+        # is an OSError subclass, so `unicode-tag big | head` lands here too.
+        # Report cleanly and exit non-zero rather than dumping a traceback.
+        sys.stderr.write('unicode-tag: %s\n' % exc)
+        return 1
     return 0
