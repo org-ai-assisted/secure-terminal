@@ -1,0 +1,27 @@
+unicode-tag-stdin(1) -- stdin-only unicode-tag for confined use
+===============================================================
+
+<!--
+# Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+# See the file COPYING for copying conditions.
+-->
+
+## SYNOPSIS
+
+`unicode-tag-stdin`
+
+## DESCRIPTION
+
+unicode-tag-stdin is `unicode-tag`(1) restricted to standard input: it reads no
+files and takes no path arguments, so it can run under a tight AppArmor profile
+(named `unicode-tag-stdin`) that denies all data-file access. It is the tool the
+tool-output neutralizer pipes untrusted text through. The tagging is identical
+to `unicode-tag`(1).
+
+## EXIT STATUS
+
+0 on success; 1 on an unreadable standard input or a closed output pipe.
+
+## SEE ALSO
+
+`unicode-tag`(1)

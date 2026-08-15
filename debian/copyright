@@ -16,3 +16,10 @@ License: AGPL-3+
  .
  On Debian systems, the complete text of the GNU Affero General Public License
  version 3 can be found in "/usr/share/common-licenses/AGPL-3".
+
+Files: usr/share/metainfo/*
+Copyright: 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+License: FSFAP
+ Copying and distribution of this file, with or without modification, are
+ permitted in any medium without royalty provided the copyright notice and this
+ notice are preserved. This file is offered as-is, without any warranty.

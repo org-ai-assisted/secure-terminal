@@ -1,0 +1,6 @@
+# ai-judge-prompt.txt is a data/prompt file the app READS at runtime, not
+# documentation. It belongs beside the code it feeds, under /usr/lib, so the
+# "documentation outside /usr/share/doc" tag is a false positive here. The path
+# is shown by lintian as a pointer, not override context, so match the bare tag
+# (there is a single such file in the package).
+secure-terminal: package-contains-documentation-outside-usr-share-doc
