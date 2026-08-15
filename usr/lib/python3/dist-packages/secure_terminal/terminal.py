@@ -584,13 +584,22 @@ class SecureTerminal(QPlainTextEdit):
         if self._shot:
             self.setCursorWidth(0)     # no caret drawn -> no frame depends on blink phase
         # Optional live transcript file: when SECURE_TERMINAL_TRANSCRIPT_FILE names a path,
-        # this tab's transcript is (re)written there after every read, kept current. A
+        # this tab's transcript is written there whenever output SETTLES, kept current. A
         # generic, mode-agnostic configuration -- set it on the command line
         # (SECURE_TERMINAL_TRANSCRIPT_FILE=/path secure-terminal ...) to keep a live plain
         # transcript on disk. A capture harness uses it to VERIFY a shot rendered its
         # payload -- a screenshot alone cannot tell an empty terminal from a full one, the
         # window chrome paints either way. Off (None) unless the path is set.
         self._transcript_file = os.environ.get('SECURE_TERMINAL_TRANSCRIPT_FILE') or None
+        if self._transcript_file:
+            # Debounce the write to the TRAILING EDGE of an output burst: a busy stream fires
+            # _on_readable continuously, and serialising the whole (capped) document on every
+            # read is O(reads x document). Coalesce to one write when output pauses -- which is
+            # also AFTER the (possibly debounced) render, so the file reflects the painted frame.
+            self._transcript_timer = QTimer(self)
+            self._transcript_timer.setSingleShot(True)
+            self._transcript_timer.setInterval(30)     # > the 16ms render debounce
+            self._transcript_timer.timeout.connect(self._write_transcript_file)
         # working directory to start the shell in (restored session tab); None ->
         # inherit the app's cwd.
         self._cwd = cwd if isinstance(cwd, str) and cwd else None
@@ -1985,10 +1994,10 @@ class SecureTerminal(QPlainTextEdit):
 
     def _on_readable(self):
         self._read_and_render()
-        # Keep the live transcript file current once the read has fed + rendered. No-op
-        # unless SECURE_TERMINAL_TRANSCRIPT_FILE is configured.
+        # Refresh the live transcript file after output settles (debounced). No-op unless
+        # SECURE_TERMINAL_TRANSCRIPT_FILE is configured.
         if self._transcript_file:
-            self._write_transcript_file()
+            self._transcript_timer.start()
 
     def _read_and_render(self):
         fd = self._fd
@@ -2673,13 +2682,24 @@ class SecureTerminal(QPlainTextEdit):
         """Write this tab's transcript to the configured SECURE_TERMINAL_TRANSCRIPT_FILE,
         atomically. transcript_text() is the lossless plain-ASCII record and walks the
         RENDERED document, so it reflects CLI and TUI (incl. the alternate screen) alike.
-        Best-effort: a write failure must never disturb the terminal. Only ever called
-        (from _on_readable) when the path is set, so no None-guard here."""
+        Best-effort: a write failure must never disturb the terminal."""
         path = self._transcript_file
+        if path is None:  # pragma: no cover - the debounce timer only fires when a path is set
+            return
+        # Force any pending debounced GRID render first, so the transcript reflects the
+        # LATEST frame regardless of timer ordering (under load the render debounce can slip
+        # past this one). CLI mode needs no equivalent: transcript_text() flushes its paint.
+        if self._grid_mode() and self._render_timer.isActive():
+            self._render_timer.stop()
+            self._render_tui()
         try:
             text = self.transcript_text()
             tmp = path + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as handle:
+            # O_NOFOLLOW + owner-only: the target may be a user-chosen path in a shared dir,
+            # so never write THROUGH a pre-planted symlink at <path>.tmp (would let a local
+            # attacker redirect the write); a symlink there raises and is ignored below.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+            with os.fdopen(os.open(tmp, flags, 0o600), 'w', encoding='utf-8') as handle:
                 handle.write(text)
             os.replace(tmp, path)          # atomic: a reader never sees a half-write
         except OSError:  # pragma: no cover - defensive: a transcript write failure is ignored
