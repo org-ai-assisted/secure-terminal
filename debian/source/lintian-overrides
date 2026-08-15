@@ -1,0 +1,3 @@
+# The per-build version file is generated from the changelog on purpose (a
+# reproducible-date value the app reports); this info tag is the intended pattern.
+secure-terminal source: debian-rules-parses-dpkg-parsechangelog

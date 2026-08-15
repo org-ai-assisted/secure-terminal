@@ -943,11 +943,19 @@ class MainWindow(QMainWindow):
         if tui is None:
             tui = self._default_tui
         tui = bool(tui)
+        # A new tab opens in the ACTIVE tab's current working directory (as konsole/xterm
+        # do), not secure-terminal's own launch dir. shell_cwd() reads the child's cwd from
+        # /proc (our own child -- trustworthy, not the OSC-7 self-reported path); '' when
+        # there is no active terminal or it is unreadable, and _start falls back to the
+        # inherited cwd if the dir has vanished.
+        active = self.current()
+        inherit_cwd = active.shell_cwd() if isinstance(active, SecureTerminal) else ''
         # line_edits goes through the ctor, not apply_line_edits: the ctor forks the
         # child, so only a ctor value reaches the fork in time to pick the matching
         # terminfo entry (secure-terminal vs secure-terminal-noedit).
         term = SecureTerminal(tui=tui, command=command or None,
-                              line_edits=self._default_line_edits)
+                              line_edits=self._default_line_edits,
+                              cwd=inherit_cwd or None)
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(self._default_font_family)
@@ -2608,6 +2616,24 @@ class MainWindow(QMainWindow):
         except OSError:
             pass            # a failed save (bad path, no space) is not fatal
 
+    def open_transcript(self):
+        term = self.current()
+        if term is None:
+            return
+        # Hand this tab's transcript to the system default text viewer/editor (xdg-open via
+        # Qt), no save dialog. transcript_text() is lossless plain ASCII -- Box names each
+        # neutralized character inline -- so the opened file is safe anywhere, unlike a raw
+        # terminal log. Written to a FIXED file under the app's XDG state dir: the shipped
+        # AppArmor profile allows ~/.local/state/secure-terminal/** but NOT /tmp, and reusing
+        # one file (rather than a fresh temp each time) keeps sensitive history from
+        # accumulating on disk.
+        state_dir = session._state_dir()
+        os.makedirs(state_dir, exist_ok=True)
+        path = os.path.join(state_dir, 'transcript.txt')
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write(term.transcript_text())
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
     def _apply_locks(self):
         """Reflect admin-locked settings in the UI: disable the controls the user
         cannot change (greyed out with a note), and warn once if the user's own
@@ -2785,6 +2811,15 @@ class MainWindow(QMainWindow):
             'plain ASCII, so the saved file is safe to open anywhere.')
         self.act_save.triggered.connect(self.save_transcript)
         file_menu.addAction(self.act_save)
+
+        self.act_open = QAction(QIcon.fromTheme('document-open'),
+                                'Op&en Transcript...', self)
+        self._bind(self.act_open, 'open_transcript', '')
+        self.act_open.setToolTip(
+            'Open this tab\'s transcript in your system default text editor. It is '
+            'already sanitized plain ASCII, so it is safe to open anywhere.')
+        self.act_open.triggered.connect(self.open_transcript)
+        file_menu.addAction(self.act_open)
 
         file_menu.addSeparator()
         self.act_terminate = QAction(

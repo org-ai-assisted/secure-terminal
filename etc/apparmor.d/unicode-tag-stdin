@@ -1,0 +1,36 @@
+# AppArmor profile for unicode-tag-stdin.
+#
+# Defence-in-depth for the CONFINED tool-output neutralizer: it reads UNTRUSTED
+# text on stdin and writes tagged text on stdout, and nothing else. Far tighter
+# than the secure-terminal GUI profile -- no Qt/X/wayland/audio/dbus, no network,
+# no writes, and NO data-file reads (it takes no path arguments and opens no
+# file). So a parser bug on hostile input is contained to a process that can only
+# read its own code plus the Unicode data and write the fd it was handed.
+#
+# AI-Assisted. Validate with apparmor_parser; the dist-ai apparmor test enforces
+# it (allow a granted read, deny a non-granted one).
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile unicode-tag-stdin /usr/bin/unicode-tag-stdin {
+  include <abstractions/base>
+  include <abstractions/python>
+
+  # its own code + the Unicode classifier and its data (regex, and
+  # confusable_homoglyphs with its confusables.json). Read-only.
+  /usr/bin/unicode-tag-stdin r,
+  /usr/lib/python3/dist-packages/secure_terminal/{,**} r,
+  /usr/lib/python3/dist-packages/regex/{,**} r,
+  /usr/lib/python3/dist-packages/confusable_homoglyphs/{,**} r,
+
+  # stdin / stdout / stderr are inherited file descriptors -- no path rule needed.
+  # Everything else is default-denied: no other file read, no write, no exec of a
+  # child. Network is denied explicitly so a stray attempt is logged, not silent.
+  deny network,
+
+  # site / dev additions (e.g. granting a source-checkout path so the tool can run
+  # confined before it is installed) go here without editing this file.
+  include if exists <local/unicode-tag-stdin>
+}

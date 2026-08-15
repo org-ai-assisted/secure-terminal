@@ -47,8 +47,24 @@ override_dh_installman:
 		-- \
 		<man/secure-terminal-cli.1.ronn \
 		>auto-generated-man-pages/secure-terminal-cli.1
+	ronn \
+		--date=2020-01-01 \
+		--manual="secure-terminal Manual" \
+		--organization="secure-terminal" \
+		-- \
+		<man/unicode-tag.1.ronn \
+		>auto-generated-man-pages/unicode-tag.1
+	ronn \
+		--date=2020-01-01 \
+		--manual="secure-terminal Manual" \
+		--organization="secure-terminal" \
+		-- \
+		<man/unicode-tag-stdin.1.ronn \
+		>auto-generated-man-pages/unicode-tag-stdin.1
 	dh_installman auto-generated-man-pages/secure-terminal.1 \
-		auto-generated-man-pages/secure-terminal-cli.1
+		auto-generated-man-pages/secure-terminal-cli.1 \
+		auto-generated-man-pages/unicode-tag.1 \
+		auto-generated-man-pages/unicode-tag-stdin.1
 
 ## Remove the generated man page so the source tree stays pristine.
 override_dh_clean:
@@ -58,8 +74,9 @@ override_dh_clean:
 ## Register the AppArmor profile and reload it on install/upgrade (and handle
 ## removal), via debhelper's dh_apparmor.
 override_dh_installdeb:
-	dh_installdeb
 	dh_apparmor --profile-name=secure-terminal
+	dh_apparmor --profile-name=unicode-tag-stdin
+	dh_installdeb
 
 ## Ship the upstream git history as the upstream changelog, the way
 ## derivative-maker packages do (changelog.upstream is regenerated at release).

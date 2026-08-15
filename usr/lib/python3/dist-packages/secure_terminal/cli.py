@@ -44,6 +44,7 @@ import os
 import sys
 import pty
 import tty
+import time
 import fcntl
 import codecs
 import select
@@ -62,6 +63,22 @@ _BP_ENABLE = b'\x1b[?2004h'
 _BP_DISABLE = b'\x1b[?2004l'
 _PASTE_START = b'\x1b[200~'
 _PASTE_END = b'\x1b[201~'
+
+# Cap the stdin paste buffer. An unterminated or oversized bracketed-paste frame (a
+# never-arriving ESC[201~, or a stream repeating ESC[200~ with no close) would otherwise
+# grow paste_buf without bound and, because in_paste never clears, absorb every later
+# keystroke -- the terminal looks dead with no recovery. On overflow the runaway buffer is
+# dropped and paste mode is left, so memory is bounded and typed input recovers. 1 MiB is
+# far above any real interactive paste.
+_PASTE_MAX = 1 << 20
+
+# How long to hold a lone trailing ESC (a possible split paste-start marker) before
+# forwarding it to the child as a real interactive Escape. A paste-start marker split by an
+# os.read() boundary as ESC | '[200~...' has its continuation ALREADY in the OS buffer, so
+# select() reports stdin readable within microseconds and the marker reassembles; only a
+# genuine standalone Escape ever reaches this timeout. Small enough to keep interactive
+# Escape (vim) responsive, large enough to reassemble any split marker.
+_ESC_HOLD_TIMEOUT = 0.05
 
 
 def feed_stdin_paste(data, state):
@@ -93,7 +110,13 @@ def feed_stdin_paste(data, state):
         chunk = buf[i:] if idx == -1 else buf[i:idx]
         # bytes before the next ESC: paste body -> buffer, else typed -> child
         if in_paste:
-            paste_buf += chunk
+            # Bound the buffer at _PASTE_MAX: past it, DROP further content but STAY in paste.
+            # An oversized / unterminated frame must not (a) grow memory without bound, nor (b)
+            # be exited so its runaway TAIL falls through as TYPED input and auto-runs
+            # (pastejacking). The end marker -- a real bracketed paste always sends ESC[201~ --
+            # or a terminal reset still ends it; a malicious never-closing frame simply drops.
+            if len(paste_buf) < _PASTE_MAX:
+                paste_buf += chunk[:_PASTE_MAX - len(paste_buf)]   # keep the buffer at the cap
         else:
             out += chunk
         if idx == -1:
@@ -111,16 +134,20 @@ def feed_stdin_paste(data, state):
             else:
                 paste_buf, in_paste = b'', True
             i += len(marker)
-        elif len(remaining) >= 2 and marker.startswith(remaining):
-            # a split marker PREFIX (>= 2 bytes, e.g. ESC[ or ESC[20) -> hold for the
-            # next read. A LONE ESC (len 1) is deliberately NOT held: buffering it would
-            # swallow an interactive ESC (vim, a lone Escape) indefinitely; it falls
-            # through below as a typed ESC. A marker split right after its ESC is rare
-            # (terminals emit the 6-byte marker in one write) and merely leaks "[200~".
+        elif marker.startswith(remaining):
+            # a split marker PREFIX (>= 1 byte, e.g. a lone ESC, ESC[, or ESC[20) -> hold
+            # for the next read. Holding even a LONE ESC closes a pastejacking hole: a
+            # paste-start marker split by a read boundary as ESC | '[200~payload\r' must
+            # still enter paste mode, or that body reaches the child as typed input and the
+            # trailing CR auto-runs it. A real interactive Escape (vim, a lone Escape) has
+            # no continuation, so _run flushes the held ESC to the child after a bounded
+            # timeout (_ESC_HOLD_TIMEOUT); a split marker's continuation is already buffered
+            # and arrives first, so it reassembles here before that timeout fires.
             carry = remaining
             break
         elif in_paste:
-            paste_buf += buf[i:i + 1]          # an ESC in paste content (dropped later)
+            if len(paste_buf) < _PASTE_MAX:
+                paste_buf += buf[i:i + 1]      # an ESC in paste content (dropped later)
             i += 1
         else:
             out += buf[i:i + 1]                # a typed escape (arrow key) -> verbatim
@@ -191,11 +218,35 @@ def _run(argv, mode):
             # ignores this just delivers a paste as ordinary typed input. Inside the try
             # so a failed setraw / enable still hits the finally that restores termios.
             os.write(out_fd, _BP_ENABLE)
+        esc_deadline = None     # monotonic time to flush a held partial paste-start marker
         while True:
+            # A held partial paste-start marker (a lone ESC, or ESC[.. prefix) is carried in
+            # paste_state[2] while NOT already in a paste. It is flushed to the child as a real
+            # interactive Escape once an ABSOLUTE hold deadline passes -- without holding it a
+            # split ESC|[200~ marker slips through as typed input and auto-runs (pastejacking);
+            # without a deadline a lone ESC is swallowed forever. The deadline is ABSOLUTE (not a
+            # per-call select timeout) so a continuously-readable child fd cannot starve it.
+            hold = bool(paste_state[2]) and not paste_state[0]
+            if hold:
+                if esc_deadline is None:
+                    esc_deadline = time.monotonic() + _ESC_HOLD_TIMEOUT
+                timeout = max(0.0, esc_deadline - time.monotonic())
+            else:
+                esc_deadline = None
+                timeout = None
             try:
-                readable, _, _ = select.select([fd, stdin_fd], [], [])
+                readable, _, _ = select.select([fd, stdin_fd], [], [], timeout)
             except (OSError, select.error):  # pragma: no cover - PEP 475 retries EINTR
                 continue            # EINTR from SIGWINCH etc. -> retry
+            if hold and time.monotonic() >= esc_deadline:
+                # deadline reached (even if the child fd is readable) -> the held prefix got no
+                # paste continuation; forward it verbatim and clear the hold, then service any
+                # readable fd this iteration.
+                os.write(fd, paste_state[2])
+                paste_state = (paste_state[0], paste_state[1], b'')
+                esc_deadline = None
+            if not readable:
+                continue
             if fd in readable:
                 try:
                     data = os.read(fd, 65536)

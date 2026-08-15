@@ -2,7 +2,7 @@ Source: secure-terminal
 Section: utils
 Priority: optional
 Maintainer: ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
-Build-Depends: debhelper-compat (= 13), dh-apparmor, ncurses-bin, ncurses-term,
+Build-Depends: debhelper-compat (= 13), dh-apparmor, ncurses-bin (>= 6), ncurses-term,
  python3, ronn
 Standards-Version: 4.7.2
 Homepage: https://secure-terminal.github.io
@@ -33,11 +33,11 @@ Description: safe-by-design terminal for untrusted paste and output
  It is written in a memory-safe language, so the parser handling hostile bytes
  cannot be turned into a memory-corruption exploit.
  .
- Input is forwarded as bytes, not interpreted: printable ASCII, the control keys a
- shell's line editor uses (the Ctrl+A-Ctrl+Z range), and the arrow/Home/End/Delete
- line-edit keys. The pseudo-terminal turns the signal keys into signals: Ctrl+C
- (SIGINT), Ctrl+Z (SIGTSTP), Ctrl+\\ (SIGQUIT) and Ctrl+D (EOF). An opt-in, clearly-flagged TUI mode can run
- full-screen programs such as ssh, vim, htop or tmux by interpreting escapes
- inside an isolated screen model that still filters every character and cannot
- touch the title or clipboard; the strict line mode remains the
- safe-by-design default.
+ Input is forwarded as bytes, not interpreted: printable ASCII, the control
+ keys a shell's line editor uses (the Ctrl+A-Ctrl+Z range), and the
+ arrow/Home/End/Delete line-edit keys. The pseudo-terminal turns the signal
+ keys into signals: Ctrl+C (SIGINT), Ctrl+Z (SIGTSTP), Ctrl+\\ (SIGQUIT) and
+ Ctrl+D (EOF). An opt-in, clearly-flagged TUI mode can run full-screen programs
+ such as ssh, vim, htop or tmux by interpreting escapes inside an isolated
+ screen model that still filters every character and cannot touch the title or
+ clipboard; the strict line mode remains the safe-by-design default.

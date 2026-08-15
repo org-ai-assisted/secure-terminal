@@ -1,0 +1,36 @@
+unicode-tag(1) -- tag deceptive Unicode in text for safe machine reading
+========================================================================
+
+<!--
+# Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+# See the file COPYING for copying conditions.
+-->
+
+## SYNOPSIS
+
+`unicode-tag` [<FILE>...]
+
+## DESCRIPTION
+
+unicode-tag reads text -- from <FILE> arguments, or from standard input when
+none are given -- and writes it back byte-for-byte, except that every Unicode
+code point which could DECEIVE a reader is replaced, in place, by a
+self-describing `[U+XXXX NAME]` token: bidi controls that reorder text,
+zero-width and invisible characters, C0/C1 and DEL controls (including carriage
+return and ESC), and cross-script homoglyphs posing as ASCII (scoped to a
+mixed-script token, so an honest foreign word is left untouched).
+
+Honest text -- ASCII, accented Latin, CJK, emoji, whole-script foreign words --
+passes unchanged. Newline and tab pass verbatim and a trailing newline is
+neither added nor removed. An undecodable byte is tagged, not dropped.
+
+It is meant for feeding untrusted text to a program or model that must not be
+fooled by, or silently relay, an active control code point.
+
+## EXIT STATUS
+
+0 on success; 1 on an unreadable file or a closed output pipe.
+
+## SEE ALSO
+
+`unicode-tag-stdin`(1), `secure-terminal-cli`(1)

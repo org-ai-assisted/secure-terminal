@@ -108,6 +108,28 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             return
         super().select_graphic_rendition(*attrs)
 
+    def linefeed(self):
+        # A line that fills the EXACT width leaves the cursor "past" the last column (pyte's
+        # deferred-wrap / last-column-flag state, cursor.x == columns); pyte then performs the
+        # wrap only on the NEXT printable char, with its own CR+LF. A bare LF here would advance
+        # a SECOND line, leaving a blank row between every full-width line (a full-screen `cat`
+        # of a width-filling board rendered as row, blank, row, blank ...). The usual ONLCR
+        # \r\n already reset the column with its CR, so this only fires for a BARE LF at full
+        # width: consume the deferred wrap. Purely a cursor fix -- no cell and no filtering change.
+        #
+        # Match a real terminal exactly: xterm clears the last-column flag on a line feed but
+        # KEEPS the column, so the next char lands at the LAST column of the new line (a
+        # staircase), NOT column 0 -- proven with an ESC[6n (DSR) cursor probe. A truth-telling
+        # terminal must render what a real one does, so drop the cursor onto the last real column
+        # rather than normalising to column 0. Distribution pyte (which we pin) lacks this; the
+        # fork fixes it in every cursor-move primitive, matching what cursor_back already did.
+        #
+        # pyte last-column-flag bug -- fork fix: https://github.com/org-ai-assisted/pyte/pull/7 ;
+        # report: https://github.com/org-ai-assisted/pyte-audit/blob/master/reports/bug-H-linefeed-pending-wrap.md
+        if self.cursor.x == self.columns:
+            self.cursor.x -= 1
+        super().linefeed()
+
     def draw(self, data):
         # Bound a Zalgo flood. pyte merges each zero-width combining mark into
         # the cell before the cursor via unicodedata.normalize("NFC",
@@ -561,6 +583,23 @@ class SecureTerminal(QPlainTextEdit):
         self._shot = os.environ.get('SECURE_TERMINAL_SHOT') == '1'
         if self._shot:
             self.setCursorWidth(0)     # no caret drawn -> no frame depends on blink phase
+        # Optional live transcript file: when SECURE_TERMINAL_TRANSCRIPT_FILE names a path,
+        # this tab's transcript is written there whenever output SETTLES, kept current. A
+        # generic, mode-agnostic configuration -- set it on the command line
+        # (SECURE_TERMINAL_TRANSCRIPT_FILE=/path secure-terminal ...) to keep a live plain
+        # transcript on disk. A capture harness uses it to VERIFY a shot rendered its
+        # payload -- a screenshot alone cannot tell an empty terminal from a full one, the
+        # window chrome paints either way. Off (None) unless the path is set.
+        self._transcript_file = os.environ.get('SECURE_TERMINAL_TRANSCRIPT_FILE') or None
+        if self._transcript_file:
+            # Debounce the write to the TRAILING EDGE of an output burst: a busy stream fires
+            # _on_readable continuously, and serialising the whole (capped) document on every
+            # read is O(reads x document). Coalesce to one write when output pauses -- which is
+            # also AFTER the (possibly debounced) render, so the file reflects the painted frame.
+            self._transcript_timer = QTimer(self)
+            self._transcript_timer.setSingleShot(True)
+            self._transcript_timer.setInterval(30)     # > the 16ms render debounce
+            self._transcript_timer.timeout.connect(self._write_transcript_file)
         # working directory to start the shell in (restored session tab); None ->
         # inherit the app's cwd.
         self._cwd = cwd if isinstance(cwd, str) and cwd else None
@@ -750,6 +789,22 @@ class SecureTerminal(QPlainTextEdit):
         # so its bottom row (e.g. tmux's status bar) is not pushed below the
         # viewport and no spurious scrollbar appears.
         self._alt_view = False
+        # TUI auto-follow intent: pin the view to the newest output ONLY while the user is at
+        # the very bottom. A per-frame value-vs-maximum test (with a 2-line tolerance) mistook a
+        # 1-2 line wheel scroll for "still at bottom" and yanked the view back every frame (the
+        # reported scroll flicker). This sticky flag is cleared the instant the user scrolls up
+        # and restored when they return to the bottom; _programmatic_scroll suppresses the signal
+        # handler while _render_tui does its OWN follow/rebuild writes, so only genuine user
+        # scrolling changes the intent.
+        self._tui_follow = True
+        self._programmatic_scroll = False
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
+        # True while the user is dragging a text selection. The TUI grid is rebuilt
+        # (_delete_grid + _append_grid) every ~16ms frame; doing that under an active
+        # selection re-anchors it and drags it to the document bottom (the reported
+        # "selects to the bottom" bug). While a selection is active the rebuild is frozen,
+        # exactly as a traditional terminal holds the view still while you select.
+        self._mouse_selecting = False
         self._grid_shown = False      # is the fixed pyte grid currently on screen
         # Local caret echoes (^C, ^\) awaiting possible de-duplication against the
         # shell's own echo: [(text, deadline_monotonic), ...]. See _echo_caret.
@@ -953,6 +1008,14 @@ class SecureTerminal(QPlainTextEdit):
         full-screen program owns the grid the pyte screen is simply repainted;
         otherwise (CLI, or TUI at a shell prompt) the retained raw output is
         replayed through the render pipeline from a clean document."""
+        # Drop the format caches: a re-render follows a mode / colour / marking change,
+        # any of which alters how a cell is formatted (the structural-glyph contrast
+        # bypass is Show-only), yet the caches are keyed by source codepoint + SGR, not
+        # by that state. Stale would let a Show-mode structural bypass persist into a
+        # strict mode and hide a neutralized placeholder.
+        self._fmt_cache = {}
+        self._grid_mark_cache = {}
+        self._line_fmt_cache = {}
         # A debounced CLI paint must NOT survive the reset: its stale pending lines
         # would be replayed on top of the freshly-rebuilt document (duplicating
         # completed output), or painted over a TUI grid by the still-armed timer.
@@ -1353,6 +1416,17 @@ class SecureTerminal(QPlainTextEdit):
         self.clear()
         self._top_ids = set()
         self._grid_rows = 0
+        self._tui_follow = True       # a fresh grid view follows the tail until the user scrolls
+
+    def _on_scroll_value(self, value):
+        """Update the TUI auto-follow intent from USER scrolling. _render_tui's own
+        follow/rebuild writes set _programmatic_scroll so they do not clear the intent; a user
+        wheel/drag/key that lands anywhere but the very bottom stops the auto-follow, and
+        returning to the bottom resumes it."""
+        if self._programmatic_scroll:
+            return
+        # Connected to the bar's OWN valueChanged, so the bar exists here.
+        self._tui_follow = value >= self.verticalScrollBar().maximum()
 
     def _sync_tui_size(self):
         if self._screen is None:
@@ -1379,8 +1453,18 @@ class SecureTerminal(QPlainTextEdit):
             return col
         return QColor(default) if default is not None else None
 
-    def _pyte_format(self, cell):
-        key = (cell.fg, cell.bg, cell.bold, cell.reverse, cell.underscore)
+    def _pyte_format(self, cell, structural=None):
+        # A structural block/half-block glyph IS its own pixels: skip the fg-vs-bg
+        # readability guard so its truecolor background is filled verbatim (a
+        # half-block colour ramp sets fg near bg on purpose; clamping bands it). That
+        # bypass is valid ONLY where the glyph is DISPLAYED as itself (Show mode). A
+        # caller rendering a MARKING passes the effective (display-context) value, so a
+        # structural source char NEUTRALIZED to a placeholder in a strict mode keeps the
+        # guard -- else a program could set fg==bg to hide the placeholder. Default
+        # (None): judge by the source glyph, for the direct non-marking render path.
+        if structural is None:
+            structural = len(cell.data) == 1 and is_structural(ord(cell.data))
+        key = (cell.fg, cell.bg, cell.bold, cell.reverse, cell.underscore, structural)
         fmt = self._fmt_cache.get(key)
         if fmt is not None:
             return fmt
@@ -1395,7 +1479,7 @@ class SecureTerminal(QPlainTextEdit):
         if fg is None:  # pragma: no cover - _pyte_qcolor always returns a non-None default here
             fg = QColor(base_fg)
         eff_bg = bg if bg is not None else QColor(base_bg)
-        if too_close(_rgb(fg), _rgb(eff_bg)):
+        if not structural and too_close(_rgb(fg), _rgb(eff_bg)):
             # force a readable foreground for the ACTUAL background, so a program
             # cannot hide text by setting fg == bg -- even by moving the default
             # colours together via OSC 10/11 (the fallback must NOT be a
@@ -1435,12 +1519,32 @@ class SecureTerminal(QPlainTextEdit):
         screen = self._screen
         if screen is None:
             return
+        # Freeze the rebuild while a text selection is active (being dragged, or held after
+        # release): _delete_grid + _append_grid rewrites the document each frame, which
+        # re-anchors an in-progress selection and drags it to the bottom (the reported bug),
+        # and setTextCursor in the follow path would collapse a completed one. Output keeps
+        # feeding the pyte model; clearing the selection (a click / keypress) re-arms a render
+        # that catches up. This holds the view still during selection, as a real terminal does.
+        if self._mouse_selecting or self.textCursor().hasSelection():
+            return
         # If the user has scrolled up into the history to read it while output is
         # still arriving, do NOT yank the view back to the bottom on every frame
-        # (and do not clobber a selection); only auto-follow when already at the end.
+        # (and do not clobber a selection); only auto-follow when the user is at the
+        # end. _tui_follow tracks that intent (set by _on_scroll_value on real user
+        # scrolling), so a 1-2 line wheel scroll is no longer mistaken for "at bottom".
         bar = self.verticalScrollBar()
-        at_bottom = bar is None or bar.value() >= bar.maximum() - 2
+        at_bottom = self._tui_follow
         prev_scroll = bar.value() if bar is not None else 0
+        # Everything below is OUR write: guard it so the scrollbar changes the rebuild and the
+        # follow cause do not fire _on_scroll_value and clobber the user's follow intent.
+        self._programmatic_scroll = True
+        try:
+            self._render_tui_body(screen, bar, at_bottom, prev_scroll)
+        finally:
+            self._programmatic_scroll = False
+        self.viewport().update()
+
+    def _render_tui_body(self, screen, bar, at_bottom, prev_scroll):
         self.setUpdatesEnabled(False)
         if self._alt_screen:
             # A full-screen program holds the alternate screen: it is a fixed
@@ -1470,7 +1574,19 @@ class SecureTerminal(QPlainTextEdit):
                     last = y
             self._append_grid(screen, last_row=max(last, screen.cursor.y))
         self.setUpdatesEnabled(True)
-        if at_bottom:
+        if self._alt_screen:
+            # The alternate screen is a fixed canvas with NO scrollback: its row 0 is the
+            # TOP of the program's screen and must always be visible, exactly as a real
+            # terminal shows it (a real terminal never scrolls the alt screen). Any
+            # off-by-one between the pyte grid and the viewport height leaves a 1-row
+            # scroll range, and following the TAIL there scrolls row 0 off the top -- so a
+            # SHORT full-screen frame (a one-line status program, or the alt-screen demo
+            # shot whose payload draws a single line at row 0) renders as an empty
+            # viewport even though the document holds the content. Pin to the top instead.
+            self._place_grid_cursor(screen)
+            if bar is not None:
+                bar.setValue(bar.minimum())
+        elif at_bottom:
             self._place_grid_cursor(screen)
             if bar is not None:
                 # Follow the tail: setTextCursor alone does not reliably scroll the
@@ -1479,7 +1595,6 @@ class SecureTerminal(QPlainTextEdit):
                 bar.setValue(bar.maximum())
         elif bar is not None:
             bar.setValue(min(prev_scroll, bar.maximum()))
-        self.viewport().update()
 
     def _grid_cell_format(self, cell, disp):
         """Format for one grid cell. A cell that is NOT a marking takes the
@@ -1526,7 +1641,9 @@ class SecureTerminal(QPlainTextEdit):
                 if spec['bg'] is not None:
                     fmt.setBackground(QColor(spec['bg']))
             else:
-                fmt = QTextCharFormat(self._pyte_format(cell))   # keep program SGR
+                # Pass the EFFECTIVE structural (Show-only): a strict-mode placeholder is
+                # not displayed as its glyph, so it must keep the contrast guard.
+                fmt = QTextCharFormat(self._pyte_format(cell, structural))   # program SGR
             fmt.setProperty(_CP_PROP, cp)
             return _cache_bounded(self._grid_mark_cache, key, fmt)
         return fmt
@@ -1703,9 +1820,16 @@ class SecureTerminal(QPlainTextEdit):
             return QColor(self._osc_palette.get(val, ANSI_PALETTE[val]))
         return QColor(val)                # '#rrggbb' from color_256 / truecolor
 
-    def _format_for(self, state):
+    def _format_for(self, state, structural=False):
         """Build the QTextCharFormat for an SGR state dict, guarding against an
-        unreadable foreground/background combination."""
+        unreadable foreground/background combination.
+
+        A STRUCTURAL block/half-block glyph (U+2500-U+259F) IS its own pixels --
+        there is no hidden text behind it to protect, so the fg-vs-bg readability
+        guard must NOT run for it: a half-block colour ramp deliberately sets a
+        cell's fg (its top pixel) and bg (its bottom pixel) near-equal, and clamping
+        them would drop the truecolor background and band the gradient. For a
+        structural glyph, fill both colours verbatim."""
         fmt = QTextCharFormat()
         fg_i, bg_i, bold = state['fg'], state['bg'], state['bold']
         if fg_i is None and bg_i is None and not bold:
@@ -1713,11 +1837,12 @@ class SecureTerminal(QPlainTextEdit):
         base_bg, base_fg = THEMES.get(self._theme, THEMES['dark'])
         fg = self._sgr_qcolor(fg_i, base_fg)
         bg = self._sgr_qcolor(bg_i, None)
-        eff_bg = bg if bg is not None else QColor(base_bg)
-        if too_close(_rgb(fg), _rgb(eff_bg)):
-            fg = QColor(base_fg)          # never let the text vanish
-            if bg is not None and too_close(_rgb(fg), _rgb(bg)):
-                bg = None                 # base text collides with the bg -> drop it
+        if not structural:
+            eff_bg = bg if bg is not None else QColor(base_bg)
+            if too_close(_rgb(fg), _rgb(eff_bg)):
+                fg = QColor(base_fg)          # never let the text vanish
+                if bg is not None and too_close(_rgb(fg), _rgb(bg)):
+                    bg = None                 # base text collides with the bg -> drop it
         fmt.setForeground(fg)
         if bg is not None:
             fmt.setBackground(bg)
@@ -1772,7 +1897,13 @@ class SecureTerminal(QPlainTextEdit):
                     if spec['bg'] is not None:
                         fmt.setBackground(QColor(spec['bg']))
                 elif color:                   # the program's own SGR items-tuple
-                    fmt = self._format_for(dict(color))
+                    # a structural block/half-block glyph SHOWN in its own SGR keeps its
+                    # truecolor bg -- the contrast guard must not band the gradient. Gate
+                    # on Show: in a strict mode the same source glyph is a neutralized
+                    # placeholder that MUST keep the guard (else fg==bg hides it).
+                    fmt = self._format_for(
+                        dict(color),
+                        structural=(self._mode == 'show' and is_structural(key[2])))
                 else:
                     fmt = QTextCharFormat()
                 fmt.setProperty(_CP_PROP, key[2])
@@ -1882,6 +2013,13 @@ class SecureTerminal(QPlainTextEdit):
             self._make_screen()
 
     def _on_readable(self):
+        self._read_and_render()
+        # Refresh the live transcript file after output settles (debounced). No-op unless
+        # SECURE_TERMINAL_TRANSCRIPT_FILE is configured.
+        if self._transcript_file:
+            self._transcript_timer.start()
+
+    def _read_and_render(self):
         fd = self._fd
         if fd is None:
             # teardown race: the fd was closed before a queued notifier event
@@ -2560,6 +2698,33 @@ class SecureTerminal(QPlainTextEdit):
         self._flush_paint()          # never read a stale (debounced) document
         return self._export_ascii(super().toPlainText())
 
+    def _write_transcript_file(self):
+        """Write this tab's transcript to the configured SECURE_TERMINAL_TRANSCRIPT_FILE,
+        atomically. transcript_text() is the lossless plain-ASCII record and walks the
+        RENDERED document, so it reflects CLI and TUI (incl. the alternate screen) alike.
+        Best-effort: a write failure must never disturb the terminal."""
+        path = self._transcript_file
+        if path is None:  # pragma: no cover - the debounce timer only fires when a path is set
+            return
+        # Force any pending debounced GRID render first, so the transcript reflects the
+        # LATEST frame regardless of timer ordering (under load the render debounce can slip
+        # past this one). CLI mode needs no equivalent: transcript_text() flushes its paint.
+        if self._grid_mode() and self._render_timer.isActive():
+            self._render_timer.stop()
+            self._render_tui()
+        try:
+            text = self.transcript_text()
+            tmp = path + '.tmp'
+            # O_NOFOLLOW + owner-only: the target may be a user-chosen path in a shared dir,
+            # so never write THROUGH a pre-planted symlink at <path>.tmp (would let a local
+            # attacker redirect the write); a symlink there raises and is ignored below.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+            with os.fdopen(os.open(tmp, flags, 0o600), 'w', encoding='utf-8') as handle:
+                handle.write(text)
+            os.replace(tmp, path)          # atomic: a reader never sees a half-write
+        except OSError:  # pragma: no cover - defensive: a transcript write failure is ignored
+            pass
+
     def transcript_text(self):
         """The scrollback for SAVING: lossless, and pure ASCII except the real
         glyphs Show mode keeps. In Box mode the display collapses every neutralized
@@ -2937,6 +3102,15 @@ class SecureTerminal(QPlainTextEdit):
         # still reaches the window shortcuts, but everything else is encoded as
         # VT input (arrows, function keys, control bytes) and sent raw.
         if self.tui_active() and not (ctrl and shift):
+            # Typing resumes input: clear a held selection so the grid rebuild (frozen by
+            # _render_tui while a selection is active) resumes -- TUI keys go straight to the
+            # child, never through Qt's editor, so the selection would otherwise persist and
+            # freeze the view until a mouse click.
+            if self.textCursor().hasSelection():
+                cur = self.textCursor()
+                cur.clearSelection()
+                self.setTextCursor(cur)
+                self._render_timer.start(16)
             self._tui_key(event)
             return
 
@@ -3258,6 +3432,16 @@ class SecureTerminal(QPlainTextEdit):
         text = event.text()
         if key == Qt.Key.Key_Tab and shift:
             out = b'\x1b[Z'                          # back-tab
+        elif (seq is not None and (ctrl or shift or alt)
+              and len(seq) == 3 and seq[:2] == b'\x1b[' and 0x41 <= seq[2] <= 0x5a):
+            # A MODIFIED cursor / Home / End key (bare form ESC[<final>): encode the
+            # modifier in the xterm CSI form ESC[1;<p><final>, p = 1 + shift + 2*alt +
+            # 4*ctrl, so the child program actually sees it -- e.g. Ctrl+End -> ESC[1;5F,
+            # which claude-code's "jump to bottom" binding expects. The bare table drops
+            # the modifier. Ctrl+PageUp/Down never reach here (intercepted for tab
+            # switching), so the tilde-form keys need no modifier handling.
+            p = 1 + (1 if shift else 0) + (2 if alt else 0) + (4 if ctrl else 0)
+            out = b'\x1b[1;%d%c' % (p, seq[2])
         elif seq is not None:
             out = seq
         elif ctrl and not shift and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
@@ -3441,8 +3625,21 @@ class SecureTerminal(QPlainTextEdit):
             tc.movePosition(QTextCursor.MoveOperation.End)
             self.setTextCursor(tc)
 
+    def mousePressEvent(self, event):
+        # Mark a drag-selection in progress so _render_tui freezes the grid rebuild while
+        # the user selects (a left-button press begins a possible drag).
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._mouse_selecting = True
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
+        self._mouse_selecting = False
+        # The drag is over: re-arm a grid render so the view catches up once the selection
+        # is gone (if a selection is still held, _render_tui stays frozen and does not
+        # clobber it; clearing it later re-arms another render).
+        if self._grid_mode():
+            self._render_timer.start(16)
         # A terminal caret is not click-positionable: typed input always goes to
         # the shell at the output cursor, never where you click. A plain click
         # that moved the blinking caret elsewhere -- e.g. into zsh's trailing
