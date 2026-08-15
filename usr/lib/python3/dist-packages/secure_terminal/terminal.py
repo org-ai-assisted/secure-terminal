@@ -1008,6 +1008,14 @@ class SecureTerminal(QPlainTextEdit):
         full-screen program owns the grid the pyte screen is simply repainted;
         otherwise (CLI, or TUI at a shell prompt) the retained raw output is
         replayed through the render pipeline from a clean document."""
+        # Drop the format caches: a re-render follows a mode / colour / marking change,
+        # any of which alters how a cell is formatted (the structural-glyph contrast
+        # bypass is Show-only), yet the caches are keyed by source codepoint + SGR, not
+        # by that state. Stale would let a Show-mode structural bypass persist into a
+        # strict mode and hide a neutralized placeholder.
+        self._fmt_cache = {}
+        self._grid_mark_cache = {}
+        self._line_fmt_cache = {}
         # A debounced CLI paint must NOT survive the reset: its stale pending lines
         # would be replayed on top of the freshly-rebuilt document (duplicating
         # completed output), or painted over a TUI grid by the still-armed timer.
@@ -1445,11 +1453,17 @@ class SecureTerminal(QPlainTextEdit):
             return col
         return QColor(default) if default is not None else None
 
-    def _pyte_format(self, cell):
+    def _pyte_format(self, cell, structural=None):
         # A structural block/half-block glyph IS its own pixels: skip the fg-vs-bg
         # readability guard so its truecolor background is filled verbatim (a
-        # half-block colour ramp sets fg near bg on purpose; clamping bands it).
-        structural = len(cell.data) == 1 and is_structural(ord(cell.data))
+        # half-block colour ramp sets fg near bg on purpose; clamping bands it). That
+        # bypass is valid ONLY where the glyph is DISPLAYED as itself (Show mode). A
+        # caller rendering a MARKING passes the effective (display-context) value, so a
+        # structural source char NEUTRALIZED to a placeholder in a strict mode keeps the
+        # guard -- else a program could set fg==bg to hide the placeholder. Default
+        # (None): judge by the source glyph, for the direct non-marking render path.
+        if structural is None:
+            structural = len(cell.data) == 1 and is_structural(ord(cell.data))
         key = (cell.fg, cell.bg, cell.bold, cell.reverse, cell.underscore, structural)
         fmt = self._fmt_cache.get(key)
         if fmt is not None:
@@ -1627,7 +1641,9 @@ class SecureTerminal(QPlainTextEdit):
                 if spec['bg'] is not None:
                     fmt.setBackground(QColor(spec['bg']))
             else:
-                fmt = QTextCharFormat(self._pyte_format(cell))   # keep program SGR
+                # Pass the EFFECTIVE structural (Show-only): a strict-mode placeholder is
+                # not displayed as its glyph, so it must keep the contrast guard.
+                fmt = QTextCharFormat(self._pyte_format(cell, structural))   # program SGR
             fmt.setProperty(_CP_PROP, cp)
             return _cache_bounded(self._grid_mark_cache, key, fmt)
         return fmt
@@ -1881,9 +1897,13 @@ class SecureTerminal(QPlainTextEdit):
                     if spec['bg'] is not None:
                         fmt.setBackground(QColor(spec['bg']))
                 elif color:                   # the program's own SGR items-tuple
-                    # a structural block/half-block glyph shown in its own SGR keeps
-                    # its truecolor bg -- the contrast guard must not band the gradient.
-                    fmt = self._format_for(dict(color), structural=is_structural(key[2]))
+                    # a structural block/half-block glyph SHOWN in its own SGR keeps its
+                    # truecolor bg -- the contrast guard must not band the gradient. Gate
+                    # on Show: in a strict mode the same source glyph is a neutralized
+                    # placeholder that MUST keep the guard (else fg==bg hides it).
+                    fmt = self._format_for(
+                        dict(color),
+                        structural=(self._mode == 'show' and is_structural(key[2])))
                 else:
                     fmt = QTextCharFormat()
                 fmt.setProperty(_CP_PROP, key[2])
