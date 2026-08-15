@@ -29,4 +29,8 @@ profile unicode-tag-stdin /usr/bin/unicode-tag-stdin {
   # Everything else is default-denied: no other file read, no write, no exec of a
   # child. Network is denied explicitly so a stray attempt is logged, not silent.
   deny network,
+
+  # site / dev additions (e.g. granting a source-checkout path so the tool can run
+  # confined before it is installed) go here without editing this file.
+  include if exists <local/unicode-tag-stdin>
 }
