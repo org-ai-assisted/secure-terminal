@@ -1034,20 +1034,29 @@ class MainWindow(QMainWindow):
     def start_instance_server(self, group='default'):
         """Claim the group's owner-only socket as its PRIMARY instance (the one
         --reuse and ctl target), IF it is free. Multiple independent instances now
-        coexist, so the old unconditional removeServer would STEAL a live primary's
-        socket -- and a concurrent second launch must not steal a peer that has just
-        bound but cannot yet answer (its Qt event loop is not up). Use a CONNECT
-        probe (socket_is_live), not a reply-based ping: a live listener accepts the
-        connect immediately at bind time. Clear + claim only a genuinely stale
-        socket (a crashed primary's file, which refuses the connect)."""
+        coexist, so a claim must never STEAL a live peer's socket -- including a peer
+        that has just bound but cannot yet answer (its Qt event loop is not up).
+
+        The liveness guard MUST come before listen(): Qt's QLocalServer.listen() is
+        not a safe arbiter -- on an occupied path it silently removes and rebinds
+        (it steals). socket_is_live is a raw CONNECT probe the kernel accepts the
+        instant a peer has bound, even before that peer runs accept(), which a
+        reply-based ping would miss. If it answers, stay a server-less independent
+        instance and never touch the socket. Otherwise the socket is absent or a
+        crashed primary's stale file: clear it and bind.
+
+        Residual: the irreducible bind race -- a peer binding in the microsecond
+        after the probe returns 'not live' is then unlinked by removeServer. It only
+        orphans one instance (still a usable window), never crashes, and Qt offers no
+        atomic bind-or-fail to close it fully."""
         self._instance_group = group
         try:
             ipc.ensure_socket_dir()
         except OSError:
             return                          # no runtime dir -> no single instance
-        # A live listener already owns this group (even one still starting up, before
-        # it can reply): stay a server-less independent instance, never touch its
-        # socket. Only an absent/stale socket refuses the connect and falls through.
+        # A live listener already owns this group (even one still starting up): stay
+        # server-less, never disturb its socket. Only an absent/stale socket falls
+        # through -- listen() would STEAL a live one, so this check gates it.
         if ipc.socket_is_live(group):
             return
         # imported here, not at module top: an instance that stays server-less (a
@@ -1059,10 +1068,7 @@ class MainWindow(QMainWindow):
         self._server = QLocalServer(self)
         self._server.setSocketOptions(
             QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
-        # The irreducible TOCTOU window: a peer that binds between the connect probe
-        # and this listen wins, and our listen fails -> we stay server-less rather
-        # than steal it. (Also covers a rare OS-level listen fault.)
-        if not self._server.listen(path):  # pragma: no cover - lost a microsecond bind race, or a rare OS fault
+        if not self._server.listen(path):  # pragma: no cover - a same-UID path binds after removeServer; a failure is a rare OS fault
             self._server = None
             return
         self._server.newConnection.connect(self._on_instance_connection)
@@ -1071,6 +1077,11 @@ class MainWindow(QMainWindow):
         conn = self._server.nextPendingConnection()
         if conn is None:
             return
+        # Reap the accepted socket when the peer disconnects, so a bare connect (the
+        # socket_is_live liveness probe, which connects then closes with no data) and
+        # every completed request free their QLocalSocket instead of leaking one per
+        # launch onto the long-lived primary.
+        conn.disconnected.connect(conn.deleteLater)
         framer = ipc.Framer()
 
         def on_ready():
