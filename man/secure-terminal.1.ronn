@@ -12,6 +12,8 @@ secure-terminal(1) -- a terminal where paste is safe by design
 
 `secure-terminal` `-e` <STRING>
 
+`secure-terminal` `--reuse` [OPTIONS] [`--` <PROGRAM> [<ARGS>...]]
+
 `secure-terminal` `ctl` [`--instance-group` <NAME>] <COMMAND> [<ARGS>...]
 
 ## DESCRIPTION
@@ -31,9 +33,11 @@ line-local edits within the line being written, so a pasted or printed lie canno
 reorder what you see or reach a line you have already scrolled past. Paste is
 sanitized to ASCII before it reaches the shell.
 
-Without `--`, `-e` or a reused instance, a shell (from `$SHELL`, else
-`/bin/bash`) is started. With `--` the remaining arguments are run as a real
-argv, with no shell reparse.
+Without `--` or `-e`, a shell (from `$SHELL`, else `/bin/bash`) is started. With
+`--` the remaining arguments are run as a real argv, with no shell reparse.
+
+Each launch opens its own independent window and process (see INSTANCES); pass
+`--reuse` to add a tab to an already-running instance instead.
 
 ## OPTIONS
 
@@ -66,11 +70,24 @@ argv, with no shell reparse.
   * `--name` <NAME>:
     Set the window WM_CLASS instance name (X11).
 
+  * `--reuse`:
+    Open a new tab in the group's running (primary) instance instead of a new
+    window. Starts a fresh instance if none is running (see INSTANCES).
+
+  * `--window`:
+    Open a new independent window and process (the default). The explicit
+    spelling of the default behaviour.
+
   * `--new-instance`:
-    Force a fresh process instead of reusing a running instance.
+    Force a standalone, server-less process: like the default new window, but it
+    never becomes the group primary and answers no `ctl` or `--reuse`.
+
+`--reuse`, `--window` and `--new-instance` are three mutually exclusive
+dispositions; at most one may be given.
 
   * `--instance-group` <NAME>:
-    Which running instance to reuse (default: "default").
+    The instance group whose primary `--reuse` and `ctl` target (default:
+    "default"). See INSTANCES.
 
   * `--version`:
     Print the version and exit.
@@ -142,6 +159,25 @@ The user's own choices are written to
 `~/.config/secure-terminal.d/50_user.conf`. A privileged directory may `lock` a
 key so the user cannot override it. The built-in defaults file documents every
 key. See also the app's View menu and the global Settings dialog.
+
+## INSTANCES
+
+Every launch opens a new independent window in its own process, like konsole or
+qterminal -- a second `secure-terminal` gives you a second window, not a raised
+first one. Independent processes keep sessions isolated and re-read the
+administrator locks per process.
+
+Reuse is opt-in. `--reuse` hands the launch to the group's PRIMARY instance,
+which opens it as a new tab; with no tab options it opens a fresh default tab.
+The primary is the FIRST live instance of a group: it owns the group's
+owner-only socket and is what `--reuse` and `secure-terminal ctl` target. Later
+launches in the same group run independently and do not disturb it. If no
+primary is running, `--reuse` starts one.
+
+`--instance-group` <NAME> selects the group (socket identity); an instance is
+still a new window unless `--reuse` is also given. `--new-instance` forces a
+standalone process that never becomes a primary and answers no `ctl` or
+`--reuse`.
 
 ## REMOTE CONTROL
 
