@@ -1,0 +1,13 @@
+.\" generated with Ronn-NG/v0.10.1
+.\" http://github.com/apjanke/ronn-ng/tree/0.10.1
+.TH "UNICODE\-TAG\-STDIN" "1" "January 2020" "secure-terminal" "secure-terminal Manual"
+.SH "NAME"
+\fBunicode\-tag\-stdin\fR \- stdin\-only unicode\-tag for confined use
+.SH "SYNOPSIS"
+\fBunicode\-tag\-stdin\fR
+.SH "DESCRIPTION"
+unicode\-tag\-stdin is \fBunicode\-tag\fR(1) restricted to standard input: it reads no files and takes no path arguments, so it can run under a tight AppArmor profile (named \fBunicode\-tag\-stdin\fR) that denies all data\-file access\. It is the tool the tool\-output neutralizer pipes untrusted text through\. The tagging is identical to \fBunicode\-tag\fR(1)\.
+.SH "EXIT STATUS"
+0 on success; 1 on an unreadable standard input or a closed output pipe\.
+.SH "SEE ALSO"
+\fBunicode\-tag\fR(1)

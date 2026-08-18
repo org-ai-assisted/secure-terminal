@@ -3,7 +3,7 @@ Section: utils
 Priority: optional
 Maintainer: ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 Build-Depends: debhelper-compat (= 13), dh-apparmor, ncurses-bin (>= 6), ncurses-term,
- python3, ronn
+ python3
 Standards-Version: 4.7.2
 Homepage: https://secure-terminal.github.io
 Vcs-Browser: https://github.com/secure-terminal/secure-terminal
@@ -21,6 +21,7 @@ Depends: ${misc:Depends},
  python3-pyte,
  python3-confusable-homoglyphs,
  python3-regex,
+ python3-wcwidth,
  fonts-hack,
  qt6-svg-plugins
 Description: safe-by-design terminal for untrusted paste and output

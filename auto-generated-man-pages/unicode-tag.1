@@ -1,0 +1,17 @@
+.\" generated with Ronn-NG/v0.10.1
+.\" http://github.com/apjanke/ronn-ng/tree/0.10.1
+.TH "UNICODE\-TAG" "1" "January 2020" "secure-terminal" "secure-terminal Manual"
+.SH "NAME"
+\fBunicode\-tag\fR \- tag deceptive Unicode in text for safe machine reading
+.SH "SYNOPSIS"
+\fBunicode\-tag\fR [\fIFILE\fR\|\.\|\.\|\.]
+.SH "DESCRIPTION"
+unicode\-tag reads text \-\- from \fIFILE\fR arguments, or from standard input when none are given \-\- and writes it back byte\-for\-byte, except that every Unicode code point which could DECEIVE a reader is replaced, in place, by a self\-describing \fB[U+XXXX NAME]\fR token: bidi controls that reorder text, zero\-width and invisible characters, C0/C1 and DEL controls (including carriage return and ESC), and cross\-script homoglyphs posing as ASCII (scoped to a mixed\-script token, so an honest foreign word is left untouched)\.
+.P
+Honest text \-\- ASCII, accented Latin, CJK, emoji, whole\-script foreign words \-\- passes unchanged\. Newline and tab pass verbatim and a trailing newline is neither added nor removed\. An undecodable byte is tagged, not dropped\.
+.P
+It is meant for feeding untrusted text to a program or model that must not be fooled by, or silently relay, an active control code point\.
+.SH "EXIT STATUS"
+0 on success; 1 on an unreadable file or a closed output pipe\.
+.SH "SEE ALSO"
+\fBunicode\-tag\-stdin\fR(1), \fBsecure\-terminal\-cli\fR(1)
