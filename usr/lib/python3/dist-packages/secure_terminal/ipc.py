@@ -75,6 +75,25 @@ def send_request(group, request, timeout=1.5):
         client.close()
 
 
+def socket_is_live(group='default', timeout=0.5):
+    """True if a process is LISTENING on the group socket right now -- a raw
+    connect succeeds. Unlike send_request (which needs a REPLY, so a primary still
+    starting its Qt event loop reads as dead), this only needs the kernel to accept
+    the connection, which a QLocalServer.listen() enables immediately. That lets a
+    concurrent second launch see a peer that has already bound but cannot yet
+    answer, so it stays server-less instead of stealing the just-bound socket. A
+    stale socket file (no listener) refuses the connect -> False."""
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(socket_path(group))
+        return True
+    except OSError:
+        return False                        # no listener: absent or stale socket
+    finally:
+        client.close()
+
+
 def _recv_framed(sock):
     head = _recv_exactly(sock, 4)
     if head is None:

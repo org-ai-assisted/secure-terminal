@@ -1035,29 +1035,34 @@ class MainWindow(QMainWindow):
         """Claim the group's owner-only socket as its PRIMARY instance (the one
         --reuse and ctl target), IF it is free. Multiple independent instances now
         coexist, so the old unconditional removeServer would STEAL a live primary's
-        socket. Ping first: if a live server answers, stay server-less (an
-        independent, non-primary instance); only clear + claim the socket when
-        nothing answers (absent, or a stale file from a crashed primary)."""
+        socket -- and a concurrent second launch must not steal a peer that has just
+        bound but cannot yet answer (its Qt event loop is not up). Use a CONNECT
+        probe (socket_is_live), not a reply-based ping: a live listener accepts the
+        connect immediately at bind time. Clear + claim only a genuinely stale
+        socket (a crashed primary's file, which refuses the connect)."""
         self._instance_group = group
         try:
             ipc.ensure_socket_dir()
         except OSError:
             return                          # no runtime dir -> no single instance
-        # A live primary already owns this group: do not disturb its socket, run as
-        # an independent server-less instance. A stale socket (crashed primary) does
-        # not answer, so we fall through and reclaim it below.
-        if ipc.send_request(group, {'op': 'ping'}) is not None:
+        # A live listener already owns this group (even one still starting up, before
+        # it can reply): stay a server-less independent instance, never touch its
+        # socket. Only an absent/stale socket refuses the connect and falls through.
+        if ipc.socket_is_live(group):
             return
-        # imported here, not at module top: an instance that stays server-less (the
-        # ping above found a live primary, or a --reuse client that hands off and
-        # exits) should not pay QtNetwork's import cost; only the primary needs it.
+        # imported here, not at module top: an instance that stays server-less (a
+        # live peer owns the socket, or a --reuse client that hands off and exits)
+        # should not pay QtNetwork's import cost; only the primary needs it.
         from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
         path = ipc.socket_path(group)
         QLocalServer.removeServer(path)     # clear a stale socket, if any
         self._server = QLocalServer(self)
         self._server.setSocketOptions(
             QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
-        if not self._server.listen(path):  # pragma: no cover - a fresh same-UID socket path listens; a listen failure is a rare OS-level fault
+        # The irreducible TOCTOU window: a peer that binds between the connect probe
+        # and this listen wins, and our listen fails -> we stay server-less rather
+        # than steal it. (Also covers a rare OS-level listen fault.)
+        if not self._server.listen(path):  # pragma: no cover - lost a microsecond bind race, or a rare OS fault
             self._server = None
             return
         self._server.newConnection.connect(self._on_instance_connection)
@@ -4395,10 +4400,12 @@ def _launch_parser(with_globals):
                        help='window WM_CLASS / Wayland app-id (for WM rules)')
         p.add_argument('--name', dest='wm_name', metavar='NAME',
                        help='window WM_CLASS instance name (X11)')
-        # Instance model: a launch opens its OWN window+process by DEFAULT
-        # (konsole/qterminal convention). --reuse opts INTO handing the launch to
-        # the group's primary instance as a new tab; --window is the explicit
-        # spelling of the default and is mutually exclusive with --reuse.
+        # Instance model: three mutually exclusive dispositions. A launch opens its
+        # OWN window+process by DEFAULT (konsole/qterminal convention); --window is
+        # the explicit spelling of that default. --reuse opts INTO handing the launch
+        # to the group's primary as a new tab. --new-instance is a standalone new
+        # window that never becomes the primary. --reuse + --new-instance directly
+        # contradict, so the group rejects any two together.
         instance = p.add_mutually_exclusive_group()
         instance.add_argument('--reuse', dest='reuse', action='store_true',
                               help='open a new tab in the group\'s running (primary) '
@@ -4407,11 +4414,12 @@ def _launch_parser(with_globals):
         instance.add_argument('--window', dest='reuse', action='store_false',
                               help='open a new independent window+process (the '
                                    'default)')
+        instance.add_argument('--new-instance', dest='new_instance',
+                              action='store_true',
+                              help='force a standalone, server-less process: like the '
+                                   'default new window, but it never becomes the group '
+                                   'primary and answers no ctl/--reuse')
         p.set_defaults(reuse=False)
-        p.add_argument('--new-instance', dest='new_instance', action='store_true',
-                       help='force a standalone, server-less process: like the '
-                            'default new window, but it never becomes the group '
-                            'primary and answers no ctl/--reuse')
         p.add_argument('--instance-group', dest='instance_group',
                        metavar='NAME', default='default',
                        help='the instance group whose primary --reuse and ctl target '

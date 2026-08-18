@@ -76,11 +76,14 @@ Each launch opens its own independent window and process (see INSTANCES); pass
 
   * `--window`:
     Open a new independent window and process (the default). The explicit
-    spelling of the default behaviour; mutually exclusive with `--reuse`.
+    spelling of the default behaviour.
 
   * `--new-instance`:
     Force a standalone, server-less process: like the default new window, but it
     never becomes the group primary and answers no `ctl` or `--reuse`.
+
+`--reuse`, `--window` and `--new-instance` are three mutually exclusive
+dispositions; at most one may be given.
 
   * `--instance-group` <NAME>:
     The instance group whose primary `--reuse` and `ctl` target (default:
