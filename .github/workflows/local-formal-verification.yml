@@ -1,0 +1,83 @@
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## Machine-checked FORMAL VERIFICATION of the pure sanitizer (a PROOF over ALL
+## inputs, not a sample). The proof artifact lives out of tree with the other
+## suites, in org-ai-assisted/dist-ai (usr/share/secure-terminal-tests/
+## verify_formal.py); the reusable dist-ai run checks out only the code under test
+## plus dist-ai, so this lane is what makes the proof actually run in CI on every
+## change to secure-terminal.
+##
+## It discharges two theorems with Z3 (SMT) + exhaustive enumeration:
+##   T1  strict-mode output inertness -- render_output emits only inert display
+##       bytes for ANY input (the CLI output-becomes-input closure);
+##   T2  line-editor containment -- feed_line_edits keeps 0 <= col <= len(cells)
+##       inductively, so output never reaches an earlier line (INV-2, pure level).
+##
+## The suite is Qt-free (it imports only secure_terminal.sanitize), so this lane
+## installs just Z3 and the sanitizer's own hard dependencies (python3-regex,
+## python3-confusable-homoglyphs) rather than the full Qt/pyte test set -- a fast,
+## focused signal. python3-confusable-homoglyphs is a HARD dependency of the
+## sanitizer: without it the confusables set is empty and is_structural / the
+## show-mode whitelist would be checked against the wrong alphabet.
+
+name: formal verification
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: sanitizer formal verification (Z3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    ## CI runs only where we enabled it. Unset variable -> skipped, no runner
+    ## allocated, run stays green. ANDed with the fork-PR guard, matching the other
+    ## workflows in this repo.
+    if: >-
+      vars.CI_ENABLED_ORG_AI_ASSISTED == 'true'
+      && (github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request')
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout secure-terminal (the code under test)
+        ## https://github.com/actions/checkout/releases/tag/v7.0.1
+        ## > 3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout dist-ai (holds the proof suite)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: org-ai-assisted/dist-ai
+          ref: master
+          path: _dist-ai
+          persist-credentials: false
+
+      - name: Install dependencies (apt only)
+        ## Z3 is the proof engine; python3-regex + python3-confusable-homoglyphs are
+        ## the sanitizer's own hard runtime dependencies (a missing one makes the
+        ## suite FAIL loud, never skip -- it is a security-relevant proof).
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --no-install-recommends \
+            python3 python3-z3 python3-regex python3-confusable-homoglyphs
+
+      - name: Run the formal verification against the real checkout
+        env:
+          PYTHONPATH: ${{ github.workspace }}/usr/lib/python3/dist-packages
+        run: python3 _dist-ai/usr/share/secure-terminal-tests/verify_formal.py
