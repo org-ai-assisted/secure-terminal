@@ -4387,11 +4387,12 @@ def _require_default_font():
     fonts-hack package -- a hard dependency in debian/control) is not installed.
     Qt would otherwise SILENTLY substitute a monospace fallback (DejaVu), and the
     substitute may carry the confusable glyphs and ligatures Hack is chosen to
-    avoid -- the WYSIWYG guarantee degrading with no signal. Needs a live
-    QApplication, so it runs here rather than in the stdlib-only preflight. A
-    user-configured non-default family is their choice and is not checked.
-    Returns True when present; on absence writes the message and returns False so
-    the caller aborts with a non-zero exit."""
+    avoid -- the WYSIWYG guarantee degrading with no signal. fonts-hack is
+    required UNCONDITIONALLY, like every other hard dependency and independent of
+    any user-configured family (which is not additionally validated here) -- so
+    the shipped default always renders safely. Needs a live QApplication, so it
+    runs here rather than in the stdlib-only preflight. Returns True when present;
+    on absence writes the message and returns False so the caller aborts."""
     if DEFAULT_FONT_FAMILY in QFontDatabase.families():
         return True
     sys.stderr.write(
