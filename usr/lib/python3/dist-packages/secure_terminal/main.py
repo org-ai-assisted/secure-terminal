@@ -1032,16 +1032,25 @@ class MainWindow(QMainWindow):
 
     # -- single-instance IPC server (owner-only socket) -----------------------
     def start_instance_server(self, group='default'):
-        """Listen on the group's owner-only socket so later launches reuse this
-        process. A stale socket from a crashed instance is cleared first."""
+        """Claim the group's owner-only socket as its PRIMARY instance (the one
+        --reuse and ctl target), IF it is free. Multiple independent instances now
+        coexist, so the old unconditional removeServer would STEAL a live primary's
+        socket. Ping first: if a live server answers, stay server-less (an
+        independent, non-primary instance); only clear + claim the socket when
+        nothing answers (absent, or a stale file from a crashed primary)."""
         self._instance_group = group
         try:
             ipc.ensure_socket_dir()
         except OSError:
             return                          # no runtime dir -> no single instance
-        # imported here, not at module top: the single-instance CLIENT path (a
-        # second launch that hands off and exits) never creates a QApplication and
-        # so should not pay QtNetwork's import cost; only the server needs it.
+        # A live primary already owns this group: do not disturb its socket, run as
+        # an independent server-less instance. A stale socket (crashed primary) does
+        # not answer, so we fall through and reclaim it below.
+        if ipc.send_request(group, {'op': 'ping'}) is not None:
+            return
+        # imported here, not at module top: an instance that stays server-less (the
+        # ping above found a live primary, or a --reuse client that hands off and
+        # exits) should not pay QtNetwork's import cost; only the primary needs it.
         from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
         path = ipc.socket_path(group)
         QLocalServer.removeServer(path)     # clear a stale socket, if any
@@ -1170,14 +1179,17 @@ class MainWindow(QMainWindow):
         return {'ok': False, 'error': 'unknown ctl op: %r' % (op,)}
 
     def _ipc_open(self, request):
+        # Only a --reuse handoff reaches here (an 'open' request). --reuse always
+        # asks for a new tab, so a bare reuse (no tab specs) opens a fresh default
+        # tab -- 1 tab becomes 2 -- rather than only raising the existing window.
         tabs = request.get('tabs')
         opened = 0
         for spec in (tabs if isinstance(tabs, list) else []):
             if isinstance(spec, dict):
                 self._open_launch_tab(_sanitize_tab_spec(spec))
                 opened += 1
-        if opened == 0 and self.tabs.count() == 0:
-            self.new_tab()                  # a bare reuse: ensure a usable tab
+        if opened == 0:
+            self.new_tab()                  # a bare reuse: give the user a new tab
         self.show()
         self.raise_()
         self.activateWindow()
@@ -4361,7 +4373,8 @@ class _Launch:
     def __init__(self):
         self.wm_class = None       # --class  -> WM_CLASS class / Wayland app-id
         self.wm_name = None        # --name   -> WM_CLASS instance (X11)
-        self.new_instance = False  # --new-instance -> never reuse a running one
+        self.new_instance = False  # --new-instance -> standalone, never the primary
+        self.reuse = False         # --reuse -> hand off to the group's primary
         self.instance_group = 'default'   # --instance-group NAME
         self.qt_args = []          # unrecognized args, handed to Qt
         self.tabs = []             # [{title, tui, mode, command}]
@@ -4382,11 +4395,27 @@ def _launch_parser(with_globals):
                        help='window WM_CLASS / Wayland app-id (for WM rules)')
         p.add_argument('--name', dest='wm_name', metavar='NAME',
                        help='window WM_CLASS instance name (X11)')
+        # Instance model: a launch opens its OWN window+process by DEFAULT
+        # (konsole/qterminal convention). --reuse opts INTO handing the launch to
+        # the group's primary instance as a new tab; --window is the explicit
+        # spelling of the default and is mutually exclusive with --reuse.
+        instance = p.add_mutually_exclusive_group()
+        instance.add_argument('--reuse', dest='reuse', action='store_true',
+                              help='open a new tab in the group\'s running (primary) '
+                                   'instance instead of a new window; starts one if '
+                                   'none is running')
+        instance.add_argument('--window', dest='reuse', action='store_false',
+                              help='open a new independent window+process (the '
+                                   'default)')
+        p.set_defaults(reuse=False)
         p.add_argument('--new-instance', dest='new_instance', action='store_true',
-                       help='force a fresh process instead of reusing a running one')
+                       help='force a standalone, server-less process: like the '
+                            'default new window, but it never becomes the group '
+                            'primary and answers no ctl/--reuse')
         p.add_argument('--instance-group', dest='instance_group',
                        metavar='NAME', default='default',
-                       help='which running instance to reuse (default: "default")')
+                       help='the instance group whose primary --reuse and ctl target '
+                            '(default: "default")')
         # Handled by an early headless dispatch in main() (before Qt); listed here
         # only so --help documents it. See CANARY_TOKEN / _test_canary.
         p.add_argument('--test-canary', action='store_true',
@@ -4451,6 +4480,7 @@ def _parse_launch_args(argv):
             launch.wm_class = namespace.wm_class
             launch.wm_name = namespace.wm_name
             launch.new_instance = namespace.new_instance
+            launch.reuse = namespace.reuse
             launch.instance_group = namespace.instance_group
         else:
             namespace = parser.parse_args(group)
@@ -4640,10 +4670,13 @@ def main():
         return _test_canary()
     launch = _parse_launch_args(sys.argv[1:])
 
-    # Single instance by default: try to hand this launch to a running instance in
-    # the same group; if one answers, it opens the tabs and we exit. --new-instance
-    # skips this and always starts a fresh process.
-    if not launch.new_instance:
+    # New INDEPENDENT instance per launch (konsole/qterminal model): every launch
+    # opens its own window+process. Reuse is opt-IN via --reuse, which hands the
+    # launch to the group's PRIMARY instance to open there as a new tab; if none
+    # answers we fall through and become that primary ourselves. Without --reuse we
+    # never hand off -- we build our own window below (and, unless --new-instance,
+    # claim the group socket if it is free, per start_instance_server).
+    if launch.reuse:
         reply = ipc.send_request(launch.instance_group, _launch_to_request(launch))
         if reply is not None:
             if not reply.get('ok'):
@@ -4685,8 +4718,10 @@ def main():
     # takes its default disposition (prompt termination) -- correct for startup.
     _install_signal_quit(app)
 
-    # Become the single-instance server so later launches reuse this process
-    # (unless the user asked for a standalone --new-instance).
+    # Claim the group socket as its primary (so --reuse/ctl can target this
+    # process) -- but only if the group has no live primary yet; start_instance_server
+    # pings first and stays server-less otherwise. --new-instance opts out entirely:
+    # a standalone process that never becomes the primary.
     if not launch.new_instance:
         window.start_instance_server(launch.instance_group)
     window.show()
