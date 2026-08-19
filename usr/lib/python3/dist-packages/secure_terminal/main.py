@@ -1293,7 +1293,10 @@ class MainWindow(QMainWindow):
         # default then apply_*-ing the saved values re-rendered the whole history up
         # to three times, flickering the mode and jumping the scrollbar (#78).
         theme = info.get('theme')
-        theme = theme if theme in THEMES else self._default_theme
+        # THEMES is a dict, so an unhashable saved value (a JSON array/object) would
+        # raise TypeError on the membership test -- guard the type first, like mode
+        # (a tuple) tolerates any type. A non-theme string falls back to the default.
+        theme = theme if isinstance(theme, str) and theme in THEMES else self._default_theme
         theme = _locked('theme', theme, self._default_theme)
         term = SecureTerminal(
             tui=_locked('tui', bool(info.get('tui')), self._default_tui),
@@ -1312,12 +1315,20 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             zoom = self._default_zoom
         term.apply_zoom(_locked('zoom', zoom, self._default_zoom))
-        term.set_font_family(_locked(
-            'font_family', info.get('font_family') or self._default_font_family,
-            self._default_font_family))
-        term.set_font_size(_locked(
-            'font_size', info.get('font_size') or self._default_font_size,
-            self._default_font_size))
+        # font_family/font_size come from the session JSON, like zoom/scrollback, so
+        # a corrupt or hand-edited record must fall back to the default rather than
+        # crash the restore: a non-str family hits .strip() (AttributeError) and a
+        # non-int size hits int() (TypeError/ValueError). (ai-review)
+        font_family = info.get('font_family')
+        if not isinstance(font_family, str) or not font_family:
+            font_family = self._default_font_family
+        term.set_font_family(_locked('font_family', font_family,
+                                     self._default_font_family))
+        try:
+            font_size = int(info.get('font_size', self._default_font_size))
+        except (TypeError, ValueError):
+            font_size = self._default_font_size
+        term.set_font_size(_locked('font_size', font_size, self._default_font_size))
         try:
             scrollback = int(info.get('scrollback', self._scrollback))
         except (TypeError, ValueError):
