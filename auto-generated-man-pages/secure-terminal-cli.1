@@ -1,0 +1,27 @@
+.\" generated with Ronn-NG/v0.10.1
+.\" http://github.com/apjanke/ronn-ng/tree/0.10.1
+.TH "SECURE\-TERMINAL\-CLI" "1" "January 2020" "secure-terminal" "secure-terminal Manual"
+.SH "NAME"
+\fBsecure\-terminal\-cli\fR \- sanitizing terminal wrapper for the command line
+.SH "SYNOPSIS"
+\fBsecure\-terminal\-cli\fR [\fB\-\-mode\fR \fIMODE\fR] [\fICOMMAND\fR [\fIARGS\fR\|\.\|\.\|\.]]
+.SH "DESCRIPTION"
+secure\-terminal\-cli is the same safe core as \fBsecure\-terminal\fR(1) without the GUI\. It runs a command (or your login shell) in a pseudo\-terminal and sanitizes the program's output before it reaches your existing terminal: escape sequences are removed and every byte that is not printable ASCII is neutralized, so a crafted file, log or SSH banner cannot repaint the screen, reach a line already scrolled past, set the window title or touch the clipboard\. Safe colour and four line\-local edits (cursor forward/back, cursor\-to\-column, erase\-in\-line) are honored within the line being written, so a program can still redraw its own current line, exactly as a carriage return does\.
+.P
+Unlike the GUI, it does not sanitize your keystrokes and does not run the paste warning: it makes what a program \fIdisplays\fR safe, on a plain console or inside an SSH session that has no access to the GUI\. It does not sandbox the program you run; if you choose to run something harmful, it runs, exactly as in any terminal\.
+.SH "OPTIONS"
+.TP
+\fB\-\-mode\fR \fIMODE\fR
+How to show non\-ASCII output\. \fBdetail\fR (the safe default) names every non\-ASCII character inline as \fB<U+XXXX NAME>\fR, so a look\-alike reads as its identity; \fBbox\fR replaces non\-ASCII with \fB_\fR (the command\-line wrapper writes to an outer terminal, so it has no colour to tint the box with); \fBshow\fR renders legitimate printable glyphs, including homoglyphs that the outer terminal cannot tell from ASCII, while still neutralizing the invisible, bidi and control classes to \fB_\fR; \fBreveal\fR shows every non\-ASCII character as a \fB<U+XXXX>\fR badge\.
+.TP
+\fICOMMAND\fR [\fIARGS\fR\|\.\|\.\|\.]
+The command to run\. With no command, your login shell is started\.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Show a usage summary and exit\.
+.SH "SEE ALSO"
+\fBsecure\-terminal\fR(1)
+.SH "WWW"
+https://secure\-terminal\.github\.io
+.SH "AUTHOR"
+secure\-terminal and this man page are AI\-assisted; see https://github\.com/org\-ai\-assisted \.

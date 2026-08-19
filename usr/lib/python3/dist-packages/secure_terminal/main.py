@@ -19,7 +19,7 @@ from PyQt6.QtCore import (
     qInstallMessageHandler)
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QIcon, QColor, QPixmap,
-    QPainter, QBrush, QFont, QDesktopServices, QCursor,
+    QPainter, QBrush, QFont, QFontDatabase, QDesktopServices, QCursor,
     QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PyQt6.QtWidgets import (
@@ -4382,6 +4382,26 @@ def _quiet_font_warnings():
     qInstallMessageHandler(handler)
 
 
+def _require_default_font():
+    """Fail loud, like preflight.require, if the default font (Hack, the
+    fonts-hack package -- a hard dependency in debian/control) is not installed.
+    Qt would otherwise SILENTLY substitute a monospace fallback (DejaVu), and the
+    substitute may carry the confusable glyphs and ligatures Hack is chosen to
+    avoid -- the WYSIWYG guarantee degrading with no signal. fonts-hack is
+    required UNCONDITIONALLY, like every other hard dependency and independent of
+    any user-configured family (which is not additionally validated here) -- so
+    the shipped default always renders safely. Needs a live QApplication, so it
+    runs here rather than in the stdlib-only preflight. Returns True when present;
+    on absence writes the message and returns False so the caller aborts."""
+    if DEFAULT_FONT_FAMILY in QFontDatabase.families():
+        return True
+    sys.stderr.write(
+        'secure-terminal: missing dependency: %s font\n'
+        'if on debian, install all dependencies:\n'
+        'sudo apt install fonts-hack\n' % DEFAULT_FONT_FAMILY)
+    return False
+
+
 class _Launch:
     """The parsed launch command line: window identity, an optional session file,
     Qt pass-through args, and a list of tab specs to open."""
@@ -4709,6 +4729,8 @@ def main():
     if launch.wm_name:
         qt_argv += ['-name', launch.wm_name]     # Qt X11 resource/instance name
     app = QApplication(qt_argv)
+    if not _require_default_font():
+        return 1
     if _shot_mode():
         app.setCursorFlashTime(0)     # no caret blink -> no frame depends on its phase
     app.setApplicationName('secure-terminal')

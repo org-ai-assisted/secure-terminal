@@ -266,8 +266,9 @@ from secure_terminal.sanitize import (
 # confusable glyphs (dotted zero distinct from O, tailed l, serifed 1 and I,
 # rn kept apart from m) and -- crucially for a terminal that promises "what you
 # see is the exact bytes" -- it ships NO ligature tables, so it can never merge
-# characters (e.g. != into one glyph). Packaged in Debian as fonts-hack; an
-# uninstalled family falls back to DejaVu Sans Mono, then the generic monospace.
+# characters (e.g. != into one glyph). Packaged in Debian as fonts-hack, a hard
+# dependency; main._require_default_font fails loud at startup if it is absent
+# rather than let Qt silently substitute a fallback that may reintroduce them.
 DEFAULT_FONT_FAMILY = 'Hack'
 
 # Base font point-size bounds (the zoom scales this); a stored or typed value is
