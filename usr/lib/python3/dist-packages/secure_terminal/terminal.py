@@ -616,24 +616,20 @@ class SecureTerminal(QPlainTextEdit):
         self._pending_copy = None
         self._review_active = False
         self.setUndoRedoEnabled(False)
-        # NoWrap, NOT WidgetWidth: the terminal's OWN column model is the single
-        # wrap authority -- line mode hard-wraps at self._cols (feed_line_edits,
-        # mirroring the width the child is told) and the TUI grid is sized to fit.
-        # A second, pixel-based WidgetWidth wrap on top DISAGREED with that model
-        # per display mode: a neutralized cell is one narrow box (~1 char advance)
-        # while the shown glyph it stands for can be wider (a CJK/emoji renders at
-        # ~1.7 char advances in the shipped font), so a line that fit under Box
-        # re-wrapped under Show and a wide glyph jumped to the next line on a mode
-        # toggle. With NoWrap the glyph keeps its line/column across box<->show.
+        # Line-wrap is per display mode (_sync_wrap_mode, set once _mode/_tui are
+        # known below); NoWrap is the pre-render default. Box/Show stay NoWrap so a
+        # glyph keeps its line/column across a box<->show toggle (a pixel-width wrap
+        # made a wide CJK/emoji glyph, ~1.7 char advances vs a box's ~1, jump lines
+        # on the toggle). Detail/Reveal expand each cell to a wide <U+XXXX> badge and
+        # wrap to the width instead -- a real terminal has no horizontal scroll, and
+        # an auto-scroll to reach that overflow would hide the start of every row.
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        # NoWrap keeps a glyph's line/column stable across box<->show, but it also
-        # means a single source line can render WIDER than the viewport -- a run of
-        # non-ASCII cells each shown as a long Detail/Reveal badge (the default mode
-        # is Detail) overflows the width the child was told. So the horizontal
-        # scrollbar must be AVAILABLE-AS-NEEDED, or that overflow is clipped and
-        # unreachable. It stays hidden for ordinary output (line mode wraps at
-        # self._cols, the TUI grid is sized to fit) and only appears when expanded
-        # markings genuinely exceed the width -- never a substitute for the wrap.
+        # A residual Box/Show line of wide glyphs can still exceed the width (it is
+        # left NoWrap for cross-mode stability), so keep the horizontal scrollbar
+        # available-as-needed for MANUAL inspection of that overflow -- never as an
+        # auto-follow (see _paint_line's home-pin) and never for Detail/Reveal, which
+        # wrap. It stays hidden for ordinary output (the child hard-wraps at
+        # self._cols; the TUI grid is sized to fit).
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setFrameStyle(0)
 
@@ -715,6 +711,9 @@ class SecureTerminal(QPlainTextEdit):
             # a TUI screen is fixed; no scrollback scrollbar (see apply_tui)
             self.setVerticalScrollBarPolicy(
                 Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # _mode and _tui are now known: pick the per-mode wrap before any history
+        # render, so restored scrollback is drawn once under the final wrap mode.
+        self._sync_wrap_mode()
         self._command = command
         self._screen = None
         self._stream = None
@@ -908,6 +907,7 @@ class SecureTerminal(QPlainTextEdit):
         self._sgr_reset()
         self._mode = mode if mode in DISPLAY_MODES else 'detail'
         self._markings = bool(markings)
+        self._sync_wrap_mode()            # preview feeds the line path directly
         self._feed_line(text)
 
     # -- appearance: theme + zoom ---------------------------------------------
@@ -1009,6 +1009,10 @@ class SecureTerminal(QPlainTextEdit):
         full-screen program owns the grid the pyte screen is simply repainted;
         otherwise (CLI, or TUI at a shell prompt) the retained raw output is
         replayed through the render pipeline from a clean document."""
+        # A re-render follows a mode / grid change: repick the per-mode wrap first,
+        # so the rebuilt document lays out under the correct wrap (Detail/Reveal wrap
+        # to the width; Box/Show and the grid do not).
+        self._sync_wrap_mode()
         # Drop the format caches: a re-render follows a mode / colour / marking change,
         # any of which alters how a cell is formatted (the structural-glyph contrast
         # bypass is Show-only), yet the caches are keyed by source codepoint + SGR, not
@@ -1178,6 +1182,30 @@ class SecureTerminal(QPlainTextEdit):
         faithfully. CLI mode stays the safe one-dimensional line display."""
         return self.tui_active()
 
+    def _sync_wrap_mode(self):
+        """Pick the line-wrap mode for the current display mode, so the widget
+        behaves like a real terminal: content wraps to the width, it never scrolls
+        off the right edge.
+
+        - Box / Show: each cell is ~1 column, so NoWrap -- this keeps a glyph's
+          line/column STABLE across a box<->show toggle (a pixel-width wrap made a
+          wide glyph jump lines on the toggle; see the ctor). The child already
+          hard-wraps at self._cols, so ordinary output does not overflow; a residual
+          run of wide Show-mode glyphs is left-anchored by _paint_line's home-pin.
+        - Detail / Reveal: each cell expands to a wide <U+XXXX> badge that overflows
+          the width the child was told, so wrap the DISPLAY to the viewport --
+          otherwise the overflow is reachable only by a horizontal scroll that hides
+          the start of every row. This is a SOFT (visual) wrap: it inserts no
+          document newline, so copy/transcript are unchanged.
+        - TUI grid: sized to fit and its Detail/Reveal cells fall back to the box, so
+          it never overflows; NoWrap.
+        """
+        wrap = (not self._grid_mode()
+                and self._mode in ('detail', 'reveal'))
+        self.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth if wrap
+            else QPlainTextEdit.LineWrapMode.NoWrap)
+
     def _sync_display(self):
         """Match the on-screen view to the current mode. TUI mode shows the pyte
         grid with its scrollback; CLI mode shows the scrolling line document. The
@@ -1185,6 +1213,7 @@ class SecureTerminal(QPlainTextEdit):
         grid = self._grid_mode()
         was_grid = self._grid_shown
         self._grid_shown = grid
+        self._sync_wrap_mode()            # grid never wraps; CLI wraps per mode
         if grid:
             # A debounced CLI paint must not survive the switch into the grid:
             # apply_tui reaches here directly (not via _rerender), so a still-armed
@@ -2673,6 +2702,18 @@ class SecureTerminal(QPlainTextEdit):
         self._out_cursor = cursor
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
+        # A terminal has no horizontal scroll: column 0 is always the left edge, so
+        # the start of every row stays on screen. Left alone, ensureCursorVisible
+        # follows the caret's DISPLAY column -- far to the right in Detail/Reveal,
+        # where each cell expands to a wide <U+XXXX> badge -- and parks the viewport
+        # mid-line, clipping the start of every row (the codepoint prefix naming the
+        # character) off the left edge, silently hiding content. Detail/Reveal wrap
+        # to the width (see _sync_wrap_mode) so no overflow remains there; pinning
+        # home also keeps the residual Box/Show wide-glyph overflow left-anchored.
+        # Vertical tail-follow (the ensureCursorVisible above) is preserved.
+        hbar = self.horizontalScrollBar()
+        if hbar is not None:
+            hbar.setValue(hbar.minimum())
 
     def _export_ascii(self, text):
         """Map the display box (BOX) back to ASCII '_' for any text that LEAVES the
