@@ -1280,31 +1280,49 @@ class MainWindow(QMainWindow):
         background tab (a deferred multi-tab restore, so the view does not flash)."""
         history = info.get('text') if isinstance(info.get('text'), str) else ''
         cwd = info.get('cwd')
+        # Admin locks win over whatever the saved session carried, exactly as they
+        # do for a freshly-opened tab and for OSC/bell below: a session saved
+        # BEFORE a lock was applied must not reopen bypassing it. For every locked
+        # per-tab setting use the admin default, else the saved value.
+        def _locked(key, saved, default):
+            return default if key in self._locked else saved
         mode = info.get('mode')
+        mode = mode if mode in DISPLAY_MODES else self._default_mode
         # pass the saved display settings to the ctor so the restored scrollback is
         # rendered ONCE in its final mode/colours/markings -- constructing in the
         # default then apply_*-ing the saved values re-rendered the whole history up
         # to three times, flickering the mode and jumping the scrollbar (#78).
         theme = info.get('theme')
         theme = theme if theme in THEMES else self._default_theme
-        term = SecureTerminal(tui=bool(info.get('tui')), history=history,
-                              cwd=cwd if isinstance(cwd, str) and cwd else None,
-                              mode=mode if mode in DISPLAY_MODES else self._default_mode,
-                              colors=bool(info.get('colors')),
-                              line_edits=bool(info.get('line_edits', True)),
-                              markings=bool(info.get('markings', True)),
-                              theme=theme)
+        theme = _locked('theme', theme, self._default_theme)
+        term = SecureTerminal(
+            tui=_locked('tui', bool(info.get('tui')), self._default_tui),
+            history=history,
+            cwd=cwd if isinstance(cwd, str) and cwd else None,
+            mode=_locked('unicode_mode', mode, self._default_mode),
+            colors=_locked('colors', bool(info.get('colors')), self._default_colors),
+            line_edits=_locked('line_edits', bool(info.get('line_edits', True)),
+                               self._default_line_edits),
+            markings=_locked('colored_markings', bool(info.get('markings', True)),
+                             self._default_markings),
+            theme=theme)
         term.apply_theme(theme)          # idempotent (ctor set it): no re-render
         try:
-            term.apply_zoom(int(info.get('zoom', self._default_zoom)))
+            zoom = int(info.get('zoom', self._default_zoom))
         except (TypeError, ValueError):
-            term.apply_zoom(self._default_zoom)
-        term.set_font_family(info.get('font_family') or self._default_font_family)
-        term.set_font_size(info.get('font_size') or self._default_font_size)
+            zoom = self._default_zoom
+        term.apply_zoom(_locked('zoom', zoom, self._default_zoom))
+        term.set_font_family(_locked(
+            'font_family', info.get('font_family') or self._default_font_family,
+            self._default_font_family))
+        term.set_font_size(_locked(
+            'font_size', info.get('font_size') or self._default_font_size,
+            self._default_font_size))
         try:
-            term.apply_scrollback(int(info.get('scrollback', self._scrollback)))
+            scrollback = int(info.get('scrollback', self._scrollback))
         except (TypeError, ValueError):
-            term.apply_scrollback(self._scrollback)
+            scrollback = self._scrollback
+        term.apply_scrollback(_locked('scrollback', scrollback, self._scrollback))
         term.apply_paste_delay(self._paste_delay)
         term.apply_paste_warn(self._paste_warn)
         term.apply_copy_warn(self._copy_warn)
