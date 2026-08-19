@@ -1337,7 +1337,11 @@ class MainWindow(QMainWindow):
                 term.apply_osc(_f[0], self._osc_defaults.get(_f[0], False) if locked
                                else bool(osc_state.get(_f[0], False)))
         else:
-            term.apply_allow_title(bool(info.get('allow_title')))
+            # a locked allow_title must win over the legacy saved value too, exactly
+            # as the granular branch above enforces it -- else a pre-lock session with
+            # no 'osc' key re-enables the locked title/notify capability on restore.
+            term.apply_allow_title(self._default_allow_title if 'allow_title' in self._locked
+                                   else bool(info.get('allow_title')))
         # an admin-locked bell must win over whatever the saved session carried
         term.apply_bell(self._default_bell if 'bell' in self._locked
                         else info.get('bell', self._default_bell))
