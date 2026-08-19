@@ -723,10 +723,12 @@ class SecureTerminal(QPlainTextEdit):
         # _grid_cell_format), so the TUI grid names WHY a byte was boxed, exactly
         # as the CLI box mode does.
         self._grid_mark_cache = {}
-        # TUI grid view state: which pyte history rows are already rendered as
-        # permanent scrollback (by id), and how many blocks the live grid occupies
-        # at the bottom of the document. Lets each frame re-render only the grid.
-        self._top_ids = set()
+        # TUI grid view state: the pyte history rows already rendered as permanent
+        # scrollback, held BY REFERENCE (not by id()) so an evicted row's id cannot
+        # be recycled for a new row and make it look already-rendered (which would
+        # drop it); plus how many blocks the live grid occupies at the bottom of
+        # the document. Lets each frame re-render only the grid.
+        self._top_rows = []
         self._grid_rows = 0
         # Per-row incremental grid model: the row objects (by id) currently
         # rendered as the live grid's blocks, and the (text, format) runs each
@@ -1061,6 +1063,15 @@ class SecureTerminal(QPlainTextEdit):
         lines = max(0, int(lines))
         self._scrollback = lines
         self.setMaximumBlockCount(lines)
+        # setMaximumBlockCount prunes leading blocks IMMEDIATELY, which desyncs the
+        # incremental grid model (grid_rows / row ids / sigs / scrollback tracking)
+        # from the surviving document -- a stale grid_rows would make the next
+        # _delete_grid compute a wrong (or negative) start and wipe the document,
+        # and _place_grid_cursor a wrong grid top. Rebuild the grid view from the
+        # live pyte state so the model matches the document again.
+        if self._grid_mode() and self._screen is not None:
+            self._reset_grid_view()
+            self._render_tui()
 
     def current_scrollback(self):
         return self._scrollback
@@ -1455,7 +1466,7 @@ class SecureTerminal(QPlainTextEdit):
         """Start the grid view from a clean document: the next render rebuilds the
         whole scrollback + grid (all history rows count as new)."""
         self.clear()
-        self._top_ids = set()
+        self._top_rows = []
         self._grid_rows = 0
         self._grid_row_ids = []
         self._grid_row_sig = []
@@ -1772,7 +1783,7 @@ class SecureTerminal(QPlainTextEdit):
         tsig = [self._grid_row_runs(r, columns) for r in target]
 
         hist = list(screen.history.top)
-        new_hist = [r for r in hist if id(r) not in self._top_ids]
+        new_hist = self._new_history_rows(hist)
         # Promote the leading grid rows that have scrolled into history: their
         # blocks are already in the document, in order, so keep them as permanent
         # scrollback rather than re-render. Verify BOTH identity and that the
@@ -1796,11 +1807,10 @@ class SecureTerminal(QPlainTextEdit):
             self._set_grid_model(target, tsig)
             return
         self._grid_rows -= promote
-        # The promoted rows are now permanent scrollback. Reset _top_ids to
-        # exactly the current history top (which contains them), as
-        # _append_scrollback does, so a row evicted from the bounded history does
-        # not leak into the set forever.
-        self._top_ids = {id(r) for r in hist}
+        # The promoted rows are now permanent scrollback. Hold the current history
+        # top by reference (which contains them), as _append_scrollback does, so an
+        # evicted row's id cannot be recycled and its objects do not leak.
+        self._top_rows = list(hist)
         self._reconcile_grid_tail(target, tsig, columns,
                                   self._grid_row_sig[promote:])
 
@@ -1849,11 +1859,21 @@ class SecureTerminal(QPlainTextEdit):
         self._grid_row_ids = ids
         self._grid_row_sig = tsig
 
+    def _new_history_rows(self, current):
+        """The history-top rows not yet rendered as scrollback, by IDENTITY.
+        `_top_rows` holds references to the already-rendered set, so those objects
+        stay alive and their id() cannot be recycled for a NEW row -- an id()-only
+        set would risk dropping a new row whose id was reused after pyte evicted an
+        old one (two LIVE objects always have distinct ids, so comparing a live
+        `current` row's id against the held set is exact)."""
+        seen = {id(r) for r in self._top_rows}
+        return [r for r in current if id(r) not in seen]
+
     def _append_scrollback(self, screen):
-        """Append the newly scrolled-off history rows (identified by object id, so
+        """Append the newly scrolled-off history rows (identified by object, so
         only the new tail is rendered) at the end of the document."""
         current = list(screen.history.top)
-        new_rows = [r for r in current if id(r) not in self._top_ids]
+        new_rows = self._new_history_rows(current)
         if new_rows:
             cur = self.textCursor()
             cur.movePosition(QTextCursor.MoveOperation.End)
@@ -1863,7 +1883,7 @@ class SecureTerminal(QPlainTextEdit):
                     cur.insertText('\n')
                 self._insert_grid_row(cur, row, screen.columns)
                 have = True
-        self._top_ids = {id(r) for r in current}
+        self._top_rows = list(current)
 
     def _append_grid(self, screen, last_row=None):
         """Append the live grid at the end of the document. last_row (the last row
