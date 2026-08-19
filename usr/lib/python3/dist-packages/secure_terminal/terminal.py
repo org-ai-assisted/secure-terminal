@@ -233,7 +233,8 @@ class _Utf8CharsetByteStream(pyte.ByteStream):
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData)
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
-                         QTextFormat, QGuiApplication)
+                         QTextFormat, QGuiApplication, QSyntaxHighlighter,
+                         QTextBlockUserData)
 from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QApplication)
 
@@ -277,6 +278,39 @@ FONT_SIZE_MIN = 6
 FONT_SIZE_MAX = 72
 
 _CP_PROP = QTextFormat.Property.UserProperty + 1
+
+
+class _GridRow(QTextBlockUserData):
+    """The render model for one TUI-grid block, attached to the block so it
+    survives scrollback promotion and relayout. `runs` is a list of
+    (offset, length, fmt, cp): UTF-16 offset+length within the block, the
+    QTextCharFormat to paint, and the SOURCE code point that region stands for
+    (None for a plain cell). The grid stores its formats HERE rather than in the
+    document's char formats -- inserting plain text once per row and letting a
+    QSyntaxHighlighter paint the runs is dramatically cheaper than a per-cell
+    cursor.insertText(text, fmt) on a full-viewport distinct-colour board. Layout
+    formats are not readable via charFormat(), so the code point that hover / copy
+    / transcript need is kept here too (see _run_cp_at / _block_runs)."""
+
+    def __init__(self, runs):
+        super().__init__()
+        self.runs = runs
+
+
+class _GridHighlighter(QSyntaxHighlighter):
+    """Re-applies each grid block's stored formats. Qt drops layout formats on
+    every relayout (resize, font change, wrap), and calls highlightBlock to
+    rebuild them; painting from the block's own _GridRow makes the formats
+    durable with no invalidation bookkeeping. A non-grid block (CLI line mode,
+    whose formats live in the document via insertText) carries no _GridRow and is
+    left untouched."""
+
+    def highlightBlock(self, _text):
+        data = self.currentBlockUserData()
+        if isinstance(data, _GridRow):
+            for offset, length, fmt, _cp in data.runs:
+                self.setFormat(offset, length, fmt)
+
 
 # Human-readable gloss for each risk class (marking_class), for the click popup.
 _RISK_LABELS = {
@@ -740,6 +774,9 @@ class SecureTerminal(QPlainTextEdit):
         # re-render -- a stale cell can never survive a format change.
         self._grid_row_ids = []
         self._grid_row_sig = []
+        # Repaints each grid block's cached formats from its _GridRow on relayout
+        # (a non-grid line-mode block carries none and is left as inserted).
+        self._grid_hl = _GridHighlighter(self.document())
         self._grid_seeded = False     # has this TUI screen been seeded from _raw
         # snapshot of the primary pyte screen (buffer, history, cursor) saved as a
         # full-screen program takes the alternate screen, and restored on exit --
@@ -1726,9 +1763,26 @@ class SecureTerminal(QPlainTextEdit):
         return runs
 
     def _insert_grid_row(self, cursor, row, columns):
-        """Insert one pyte row (coalescing same-format runs) at the cursor."""
+        """Insert one pyte row at the cursor as PLAIN text, recording its format
+        runs on the block for the grid highlighter to paint. This is far cheaper
+        than a per-cell cursor.insertText(text, fmt) on a distinct-colour board,
+        and keeps each region's SOURCE code point (which layout formats do not
+        expose via charFormat) for hover / copy / transcript. Offsets are UTF-16
+        code units, to match Qt document positions and QSyntaxHighlighter.setFormat."""
+        block_pos = cursor.position()
+        runs = []
+        parts = []
+        offset = 0
         for text, fmt in self._grid_row_runs(row, columns):
-            cursor.insertText(text, fmt)
+            length = len(text) + sum(ord(ch) > 0xFFFF for ch in text)   # UTF-16 units
+            cp = fmt.property(_CP_PROP)
+            runs.append((offset, length, fmt, None if cp is None else int(cp)))
+            parts.append(text)
+            offset += length
+        cursor.insertText(''.join(parts))
+        block = self.document().findBlock(block_pos)
+        block.setUserData(_GridRow(runs))
+        self._grid_hl.rehighlightBlock(block)
 
     def _delete_grid(self, keep=0):
         """Remove the live grid down to its first `keep` blocks (default: all of
@@ -2932,6 +2986,40 @@ class SecureTerminal(QPlainTextEdit):
         except OSError:  # pragma: no cover - defensive: a transcript write failure is ignored
             pass
 
+    def _doc_runs(self, block):
+        """Yield (doc_start, doc_end, cp) for each run of a block in document
+        (UTF-16) positions: from the block's _GridRow in TUI grid mode (where the
+        formats and the source code point live in the layout / block model, not the
+        char format), else from the document fragments in CLI line mode (cp on the
+        fragment's char format). The single seam the code-point readers -- hover
+        (_run_cp_at), copy (_selection_text) and save (transcript_text) -- share, so
+        both render paths stay lossless with one implementation."""
+        data = block.userData()
+        base = block.position()
+        if isinstance(data, _GridRow):
+            for start, length, _fmt, cp in data.runs:
+                yield base + start, base + start + length, cp
+        else:
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    cp = frag.charFormat().property(_CP_PROP)
+                    yield (frag.position(), frag.position() + frag.length(),
+                           None if cp is None else int(cp))
+                it += 1
+
+    def _run_cp_at(self, docpos):
+        """The source code point of the character at document position `docpos`
+        (grid model or line fragment), or None for a plain cell. Replaces reading
+        _CP_PROP off the char format, which a layout-format grid cell does not
+        expose."""
+        block = self.document().findBlock(docpos)
+        for a, b, cp in self._doc_runs(block):
+            if a <= docpos < b:
+                return cp
+        return None
+
     def transcript_text(self):
         """The scrollback for SAVING: lossless, and pure ASCII except the real
         glyphs Show mode keeps. In Box mode the display collapses every neutralized
@@ -2946,51 +3034,49 @@ class SecureTerminal(QPlainTextEdit):
         self._flush_paint()          # a save must include the last unpainted line
         doc = self.document()
         out = []
+        cur = QTextCursor(doc)
         block = doc.begin()
         first = True
         while block.isValid():
             if not first:                       # blocks are newline-separated,
                 out.append('\n')                # exactly like toPlainText
             first = False
-            it = block.begin()
-            while not it.atEnd():
-                frag = it.fragment()
-                if frag.isValid():
-                    text = frag.text()
-                    if BOX in text:
-                        cp = frag.charFormat().property(_CP_PROP)
-                        # A real U+25A1 the program printed is kept as its glyph in
-                        # Show mode (cp is its own codepoint) -- it is NOT a
-                        # neutralization placeholder, so it is left untouched,
-                        # matching _export_ascii's Show invariant. Otherwise the box
-                        # stands in for a neutralized byte: name its source codepoint
-                        # inline, or (untagged, e.g. past the marking cap) the ASCII
-                        # placeholder.
-                        if not (cp == 0x25a1 and self._mode == 'show'):
-                            text = (text.replace(BOX, render_output(chr(cp), 'detail'))
-                                    if cp is not None else text.replace(BOX, '_'))
-                    if SPACE_MARK in text:
-                        cp = frag.charFormat().property(_CP_PROP)
-                        # SPACE_MARK stands in for a neutralized non-ASCII space:
-                        # name its source codepoint inline (<U+00A0 NO-BREAK SPACE>,
-                        # the Detail rendering), so the record stays lossless and a
-                        # non-breaking space is unmistakable. A real U+2423 the
-                        # program printed in Show mode (cp is its own, non-space code
-                        # point) is kept as its glyph, matching the BOX branch above;
-                        # untagged (past the marking cap) falls back to '_'.
-                        if not (cp == 0x2423 and self._mode == 'show'):
-                            text = (text.replace(SPACE_MARK, render_output(chr(cp), 'detail'))
-                                    if cp is not None else text.replace(SPACE_MARK, '_'))
-                    out.append(text)
-                it += 1
+            # Walk the per-run code points via the shared seam: in TUI grid mode
+            # the source cp is in the block's _GridRow (layout formats are not
+            # queryable), in CLI line mode it is on the fragment's char format.
+            for a, b, cp in self._doc_runs(block):
+                cur.setPosition(a)
+                cur.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
+                text = cur.selectedText()
+                if BOX in text:
+                    # A real U+25A1 the program printed is kept as its glyph in Show
+                    # mode (cp is its own codepoint) -- it is NOT a neutralization
+                    # placeholder, so it is left untouched, matching _export_ascii's
+                    # Show invariant. Otherwise the box stands in for a neutralized
+                    # byte: name its source codepoint inline, or (untagged, e.g. past
+                    # the marking cap) the ASCII placeholder.
+                    if not (cp == 0x25a1 and self._mode == 'show'):
+                        text = (text.replace(BOX, render_output(chr(cp), 'detail'))
+                                if cp is not None else text.replace(BOX, '_'))
+                if SPACE_MARK in text:
+                    # SPACE_MARK stands in for a neutralized non-ASCII space: name its
+                    # source codepoint inline (<U+00A0 NO-BREAK SPACE>, the Detail
+                    # rendering), so the record stays lossless and a non-breaking space
+                    # is unmistakable. A real U+2423 the program printed in Show mode
+                    # (cp is its own, non-space code point) is kept as its glyph,
+                    # matching the BOX branch; untagged falls back to '_'.
+                    if not (cp == 0x2423 and self._mode == 'show'):
+                        text = (text.replace(SPACE_MARK, render_output(chr(cp), 'detail'))
+                                if cp is not None else text.replace(SPACE_MARK, '_'))
+                out.append(text)
             block = block.next()
         return ''.join(out)
 
-    def _export_selection_fragment(self, text, fmt):
-        """Map ONE selected fragment's display text to what leaves the widget, using
-        the fragment's recorded SOURCE code point to tell a synthetic marker from a
-        real glyph the program printed -- the distinction _export_ascii, a pure
-        string map with no code-point context, cannot make.
+    def _export_selection_fragment(self, text, cp):
+        """Map ONE selected run's display text to what leaves the widget, using its
+        recorded SOURCE code point to tell a synthetic marker from a real glyph the
+        program printed -- the distinction _export_ascii, a pure string map with no
+        code-point context, cannot make.
 
         Outside Show mode _export_ascii is exact (every non-ASCII byte is a marker),
         so defer to it. In Show mode a real U+2423 the child printed is kept as its
@@ -3000,7 +3086,7 @@ class SecureTerminal(QPlainTextEdit):
         Show, exactly as _export_ascii does, so a real U+25A1 is preserved too."""
         if self._mode != 'show':
             return self._export_ascii(text)
-        if SPACE_MARK in text and fmt.property(_CP_PROP) != 0x2423:
+        if SPACE_MARK in text and cp != 0x2423:
             return text.replace(SPACE_MARK, '_')
         return text
 
@@ -3023,23 +3109,19 @@ class SecureTerminal(QPlainTextEdit):
         while block.isValid() and block.position() <= end:
             if parts and block.userState() != 1:      # 1 == wrap continuation
                 parts.append('\n')
-            it = block.begin()
-            while not it.atEnd():
-                frag = it.fragment()
-                if frag.isValid():
-                    fstart = frag.position()
-                    fend = fstart + frag.length()
-                    lo, hi = max(start, fstart), min(end, fend)
-                    if lo < hi:
-                        # slice the fragment with a QTextCursor, whose positions are
-                        # the same UTF-16 code units as start/end -- Python str
-                        # slicing counts code points and mis-slices an astral char.
-                        seg = QTextCursor(doc)
-                        seg.setPosition(lo)
-                        seg.setPosition(hi, QTextCursor.MoveMode.KeepAnchor)
-                        parts.append(self._export_selection_fragment(
-                            seg.selectedText(), frag.charFormat()))
-                it += 1
+            # Walk per-run (grid _GridRow or line fragments) so each carries its own
+            # source code point -- the only way to keep a real Show-mode U+2423/U+25A1
+            # the program printed while still collapsing the synthetic markers.
+            for a, b, cp in self._doc_runs(block):
+                lo, hi = max(start, a), min(end, b)
+                if lo < hi:
+                    # slice with a QTextCursor, whose positions are the same UTF-16
+                    # code units as start/end -- Python str slicing counts code points
+                    # and mis-slices an astral char.
+                    seg = QTextCursor(doc)
+                    seg.setPosition(lo)
+                    seg.setPosition(hi, QTextCursor.MoveMode.KeepAnchor)
+                    parts.append(self._export_selection_fragment(seg.selectedText(), cp))
             block = block.next()
         return ''.join(parts)
 
@@ -3726,12 +3808,12 @@ class SecureTerminal(QPlainTextEdit):
         if not (min(ra.x(), rb.x()) <= pos.x() <= max(ra.x(), rb.x())
                 and min(ra.top(), rb.top()) <= pos.y() <= max(ra.bottom(), rb.bottom())):
             return None
+        cp = self._run_cp_at(a)
+        if cp is not None:
+            return int(cp)
         fwd = QTextCursor(doc)
         fwd.setPosition(a)
         fwd.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
-        cp = fwd.charFormat().property(_CP_PROP)
-        if cp is not None:
-            return int(cp)
         text = fwd.selectedText()
         # a readable non-ASCII glyph (show mode) keeps no tag but IS its own code
         # point; skip Qt's block/line separators (U+2028/U+2029). A whole astral
