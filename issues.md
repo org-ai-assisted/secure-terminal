@@ -57,3 +57,14 @@ reconstruct the row). No renderer can salvage that; a real no-cursor-up terminal
 shows the same garble. It only bites below a normally-usable width. If it ever
 matters, the fix is at the terminfo level (a wide reported width, or restoring a
 minimal up-capability), not in the renderer.
+
+## 4. Line pitch is ~1px tighter than gnome-terminal/VTE
+
+The same font renders at a 26px line pitch in secure-terminal (Qt QPlainTextEdit)
+vs 27px in gnome-terminal (VTE), so text in the homepage before/after slider
+drifts ~1px per line. Both use their engine's natural default line height (no
+added leading) -- it is toolkit metric rounding, not a spacing choice, so
+secure-terminal already matches gnome's default POLICY. A configurable
+line-spacing setting is not a one-liner: QPlainTextEdit's layout ignores
+line-height, so it needs a hot-path widget change. Full description, measurement,
+options and the resume pointer: `line-spacing.md`.

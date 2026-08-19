@@ -20,8 +20,10 @@ reviewer if a detached run comes back empty.
   the `tui_cell` default-ignorable + combining-run caps, the shared
   `is_bidi_control` / `is_invisible` predicates, `cli.py`'s escape carry,
   `cli_terminfo_dir` freshness + both-entries rule, and the `Cs@/Cr@/rv@/xr@`
-  terminfo cancellations. Re-run once the work is committed:
-  `ai-review --only agy,glm <base>`.
+  terminfo cancellations. Re-run over the same range the other reviewers
+  covered (704e942 = the R-180 base, 936fe62 = the last code commit before
+  the pass was recorded):
+  `ai-review --only agy,glm 704e942..936fe62`.
 - Why pending: both are quota-locked until roughly 2026-08-04 (weekly lockout),
   so they were not attempted -- a NO-RESULT for the two non-Claude, non-OpenAI
   model families, not a clean pass.

@@ -1280,31 +1280,49 @@ class MainWindow(QMainWindow):
         background tab (a deferred multi-tab restore, so the view does not flash)."""
         history = info.get('text') if isinstance(info.get('text'), str) else ''
         cwd = info.get('cwd')
+        # Admin locks win over whatever the saved session carried, exactly as they
+        # do for a freshly-opened tab and for OSC/bell below: a session saved
+        # BEFORE a lock was applied must not reopen bypassing it. For every locked
+        # per-tab setting use the admin default, else the saved value.
+        def _locked(key, saved, default):
+            return default if key in self._locked else saved
         mode = info.get('mode')
+        mode = mode if mode in DISPLAY_MODES else self._default_mode
         # pass the saved display settings to the ctor so the restored scrollback is
         # rendered ONCE in its final mode/colours/markings -- constructing in the
         # default then apply_*-ing the saved values re-rendered the whole history up
         # to three times, flickering the mode and jumping the scrollbar (#78).
         theme = info.get('theme')
         theme = theme if theme in THEMES else self._default_theme
-        term = SecureTerminal(tui=bool(info.get('tui')), history=history,
-                              cwd=cwd if isinstance(cwd, str) and cwd else None,
-                              mode=mode if mode in DISPLAY_MODES else self._default_mode,
-                              colors=bool(info.get('colors')),
-                              line_edits=bool(info.get('line_edits', True)),
-                              markings=bool(info.get('markings', True)),
-                              theme=theme)
+        theme = _locked('theme', theme, self._default_theme)
+        term = SecureTerminal(
+            tui=_locked('tui', bool(info.get('tui')), self._default_tui),
+            history=history,
+            cwd=cwd if isinstance(cwd, str) and cwd else None,
+            mode=_locked('unicode_mode', mode, self._default_mode),
+            colors=_locked('colors', bool(info.get('colors')), self._default_colors),
+            line_edits=_locked('line_edits', bool(info.get('line_edits', True)),
+                               self._default_line_edits),
+            markings=_locked('colored_markings', bool(info.get('markings', True)),
+                             self._default_markings),
+            theme=theme)
         term.apply_theme(theme)          # idempotent (ctor set it): no re-render
         try:
-            term.apply_zoom(int(info.get('zoom', self._default_zoom)))
+            zoom = int(info.get('zoom', self._default_zoom))
         except (TypeError, ValueError):
-            term.apply_zoom(self._default_zoom)
-        term.set_font_family(info.get('font_family') or self._default_font_family)
-        term.set_font_size(info.get('font_size') or self._default_font_size)
+            zoom = self._default_zoom
+        term.apply_zoom(_locked('zoom', zoom, self._default_zoom))
+        term.set_font_family(_locked(
+            'font_family', info.get('font_family') or self._default_font_family,
+            self._default_font_family))
+        term.set_font_size(_locked(
+            'font_size', info.get('font_size') or self._default_font_size,
+            self._default_font_size))
         try:
-            term.apply_scrollback(int(info.get('scrollback', self._scrollback)))
+            scrollback = int(info.get('scrollback', self._scrollback))
         except (TypeError, ValueError):
-            term.apply_scrollback(self._scrollback)
+            scrollback = self._scrollback
+        term.apply_scrollback(_locked('scrollback', scrollback, self._scrollback))
         term.apply_paste_delay(self._paste_delay)
         term.apply_paste_warn(self._paste_warn)
         term.apply_copy_warn(self._copy_warn)
@@ -2694,6 +2712,10 @@ class MainWindow(QMainWindow):
             ('scrollback', list(getattr(self, '_scrollback_actions', {}).values())),
             ('persist_session', [self.act_persist]),
             ('confirm_close', [self.act_confirm_close]),
+            # momentary triggers (no checked state to lie), greyed only so a
+            # locked zoom is un-clickable in the View menu too, matching the
+            # greyed zoom_box spin below.
+            ('zoom', [self.act_zin, self.act_zout, self.act_zreset]),
         ] + [(k, [self._osc_actions[k]]) for k in self._osc_actions]
         # a legacy allow_title lock also greys the granular title + notify controls
         if 'allow_title' in self._locked:
@@ -2921,21 +2943,21 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.act_find)
 
         view_menu = bar.addMenu('&View')
-        act_zin = QAction(QIcon.fromTheme('zoom-in'), 'Zoom &In', self)
-        self._bind(act_zin, 'zoom_in', QKeySequence.StandardKey.ZoomIn)
-        act_zin.triggered.connect(self.zoom_in)
-        view_menu.addAction(act_zin)
+        self.act_zin = QAction(QIcon.fromTheme('zoom-in'), 'Zoom &In', self)
+        self._bind(self.act_zin, 'zoom_in', QKeySequence.StandardKey.ZoomIn)
+        self.act_zin.triggered.connect(self.zoom_in)
+        view_menu.addAction(self.act_zin)
 
-        act_zout = QAction(QIcon.fromTheme('zoom-out'), 'Zoom &Out', self)
-        self._bind(act_zout, 'zoom_out', QKeySequence.StandardKey.ZoomOut)
-        act_zout.triggered.connect(self.zoom_out)
-        view_menu.addAction(act_zout)
+        self.act_zout = QAction(QIcon.fromTheme('zoom-out'), 'Zoom &Out', self)
+        self._bind(self.act_zout, 'zoom_out', QKeySequence.StandardKey.ZoomOut)
+        self.act_zout.triggered.connect(self.zoom_out)
+        view_menu.addAction(self.act_zout)
 
-        act_zreset = QAction(QIcon.fromTheme('zoom-original'),
-                             '&Reset Zoom', self)
-        self._bind(act_zreset, 'zoom_reset', 'Ctrl+0')
-        act_zreset.triggered.connect(self.zoom_reset)
-        view_menu.addAction(act_zreset)
+        self.act_zreset = QAction(QIcon.fromTheme('zoom-original'),
+                                  '&Reset Zoom', self)
+        self._bind(self.act_zreset, 'zoom_reset', 'Ctrl+0')
+        self.act_zreset.triggered.connect(self.zoom_reset)
+        view_menu.addAction(self.act_zreset)
 
         view_menu.addSeparator()
         self.act_full = QAction(QIcon.fromTheme('view-fullscreen'),
@@ -3645,7 +3667,6 @@ class MainWindow(QMainWindow):
             pass                          # allow all families (fixed-pitch fallback holds)
         font_family.setEditable(False)
         font_family.setCurrentFont(QFont(self._default_font_family))
-        font_family.setEnabled('font_family' not in self._locked)
         _tip_row(appearance, 'Font', font_family,
                  'Monospaced font family for the terminal. A fixed-pitch face keeps '
                  'columns aligned; the default (Hack) also disambiguates confusable '
@@ -3704,7 +3725,6 @@ class MainWindow(QMainWindow):
 
         line_edits = QCheckBox()
         line_edits.setChecked(self._default_line_edits)
-        line_edits.setEnabled('line_edits' not in self._locked)
         _tip_row(rendering, 'Line editing', line_edits,
                  'Let the shell rewrite the line you are typing in place -- this '
                  'is what tab completion needs. ON by default. OFF makes output '
@@ -3722,7 +3742,6 @@ class MainWindow(QMainWindow):
 
         tui_autobox_notice = QCheckBox()
         tui_autobox_notice.setChecked(self._tui_autobox_notice)
-        tui_autobox_notice.setEnabled('tui_autobox_notice' not in self._locked)
         _tip_row(rendering, 'Notify on TUI auto-Box', tui_autobox_notice,
                  'Show a dismissible banner when entering TUI mode switches a tab '
                  'from Reveal/Detail to Box (the fixed grid cannot expand a '
@@ -3804,7 +3823,6 @@ class MainWindow(QMainWindow):
         window_box = _section('Window')
         systray = QCheckBox()
         systray.setChecked(self._systray)
-        systray.setEnabled('systray' not in self._locked)
         _tip_row(window_box, 'System tray icon', systray,
                  'Show a system-tray icon with a few fixed actions (Show/Hide '
                  'window, New Tab, Quit) and enable the Tray-popup bell channel. '
@@ -3813,7 +3831,6 @@ class MainWindow(QMainWindow):
                  'through it.')
         auto_tab_colors = QCheckBox()
         auto_tab_colors.setChecked(self._auto_tab_colors)
-        auto_tab_colors.setEnabled('auto_tab_colors' not in self._locked)
         _tip_row(window_box, 'Automatic tab colours', auto_tab_colors,
                  'Give each new tab a colour that differs from its neighbour, so '
                  'tabs are easy to tell apart at a glance. On by default; a colour '
@@ -3826,6 +3843,28 @@ class MainWindow(QMainWindow):
         for _combo in (theme, font_family, scrollback, mode,
                        paste_warn, copy_warn, pdelay):
             _combo.setMaxVisibleItems(max(1, min(_combo.count(), 15)))
+
+        # Every lockable control disables itself when its key is admin-locked: a
+        # locked setting must not be editable into a value _apply_global then
+        # silently discards -- an "edited but ignored" control misleads worse
+        # than a greyed-out one. Table-driven for the same reason _GLOBAL_KEYS
+        # is: a control added later without its guard would silently escape the
+        # lock. (config key, not the dialog field: mode's key is unicode_mode.)
+        for _w, _lock_key in (
+            (theme, 'theme'), (font_family, 'font_family'),
+            (font_size, 'font_size'), (ui_scale, 'ui_scale'), (zoom, 'zoom'),
+            (scrollback, 'scrollback'), (mode, 'unicode_mode'),
+            (colors, 'colors'), (line_edits, 'line_edits'), (tui, 'tui'),
+            (tui_autobox_notice, 'tui_autobox_notice'), (osc, 'osc_notice'),
+            (pdelay, 'paste_delay'), (paste_warn, 'paste_warn'),
+            (copy_warn, 'copy_warn'), (persist, 'persist_session'),
+            (systray, 'systray'), (auto_tab_colors, 'auto_tab_colors'),
+        ):
+            _w.setEnabled(_lock_key not in self._locked)
+        # OSC feature checkboxes: _osc_locked, so a legacy allow_title lock also
+        # greys osc_title/osc_notify (same reason _apply_global uses it).
+        for _key, _cb in osc_checks.items():
+            _cb.setEnabled(not self._osc_locked(_key))
 
         scroll.setWidget(content)           # all sections scroll; buttons pinned below
         outer.addWidget(scroll)
@@ -3842,6 +3881,8 @@ class MainWindow(QMainWindow):
 
         def _live_zoom(direction, _dlg=dialog, _spin=ui_scale):
             # Ctrl+wheel: step the chrome scale and re-apply it to the OPEN dialog.
+            if 'ui_scale' in self._locked:
+                return                      # admin-locked; not user-changeable
             new = max(UI_SCALE_MIN,
                       min(UI_SCALE_MAX, self._ui_scale + direction * UI_SCALE_STEP))
             if new != self._ui_scale:
