@@ -2717,8 +2717,15 @@ class SecureTerminal(QPlainTextEdit):
         # did). Vertical tail-follow is preserved either way.
         hbar = self.horizontalScrollBar()
         if hbar is not None:
-            caret_x = self.cursorRect().x() + hbar.value() - hbar.minimum()
-            if caret_x <= self.viewport().width():
+            # Home only when the WHOLE caret fits at the left, so pinning never clips
+            # it against the right edge -- include the caret WIDTH, not just its left
+            # edge (a caret exactly on the boundary would else be pinned and shaved).
+            # cursorWidth() is reliable even in shot mode, where cursorRect() reports
+            # zero width; cursorRect().x() gives the caret's current viewport x and
+            # the scroll terms map it to where it would sit once homed.
+            caret_right = (self.cursorRect().x() + self.cursorWidth()
+                           + hbar.value() - hbar.minimum())
+            if caret_right <= self.viewport().width():
                 hbar.setValue(hbar.minimum())
 
     def _export_ascii(self, text):
