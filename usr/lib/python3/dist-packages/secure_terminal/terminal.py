@@ -1757,10 +1757,15 @@ class SecureTerminal(QPlainTextEdit):
         columns = screen.columns
         # Trim trailing blank rows BELOW the cursor so the document ends at the
         # prompt/last output; without this the full grid pads ~screen.lines empty
-        # rows below it and you can scroll down into empty space (Bug #64).
+        # rows below it and you can scroll down into empty space (Bug #64). A row
+        # counts as blank only if it RENDERS as empty: test tui_cell, not
+        # cell.data.strip() -- str.strip() drops U+00A0 / tab / ideographic space,
+        # which tui_cell marks as a visible placeholder, so a lone marked space
+        # below the cursor must keep its row rather than be trimmed away and hidden.
         last = screen.cursor.y
         for y in range(screen.lines):
-            if any(cell.data.strip() for cell in screen.buffer[y].values()):
+            if any(tui_cell(cell.data, self._mode) != ' '
+                   for cell in screen.buffer[y].values()):
                 last = y
         last = max(last, screen.cursor.y)
         target = [screen.buffer[y] for y in range(last + 1)]
