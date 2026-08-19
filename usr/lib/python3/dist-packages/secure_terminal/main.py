@@ -1293,7 +1293,10 @@ class MainWindow(QMainWindow):
         # default then apply_*-ing the saved values re-rendered the whole history up
         # to three times, flickering the mode and jumping the scrollbar (#78).
         theme = info.get('theme')
-        theme = theme if theme in THEMES else self._default_theme
+        # THEMES is a dict, so an unhashable saved value (a JSON array/object) would
+        # raise TypeError on the membership test -- guard the type first, like mode
+        # (a tuple) tolerates any type. A non-theme string falls back to the default.
+        theme = theme if isinstance(theme, str) and theme in THEMES else self._default_theme
         theme = _locked('theme', theme, self._default_theme)
         term = SecureTerminal(
             tui=_locked('tui', bool(info.get('tui')), self._default_tui),
@@ -1312,12 +1315,20 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             zoom = self._default_zoom
         term.apply_zoom(_locked('zoom', zoom, self._default_zoom))
-        term.set_font_family(_locked(
-            'font_family', info.get('font_family') or self._default_font_family,
-            self._default_font_family))
-        term.set_font_size(_locked(
-            'font_size', info.get('font_size') or self._default_font_size,
-            self._default_font_size))
+        # font_family/font_size come from the session JSON, like zoom/scrollback, so
+        # a corrupt or hand-edited record must fall back to the default rather than
+        # crash the restore: a non-str family hits .strip() (AttributeError) and a
+        # non-int size hits int() (TypeError/ValueError). (ai-review)
+        font_family = info.get('font_family')
+        if not isinstance(font_family, str) or not font_family:
+            font_family = self._default_font_family
+        term.set_font_family(_locked('font_family', font_family,
+                                     self._default_font_family))
+        try:
+            font_size = int(info.get('font_size', self._default_font_size))
+        except (TypeError, ValueError):
+            font_size = self._default_font_size
+        term.set_font_size(_locked('font_size', font_size, self._default_font_size))
         try:
             scrollback = int(info.get('scrollback', self._scrollback))
         except (TypeError, ValueError):
@@ -1337,7 +1348,17 @@ class MainWindow(QMainWindow):
                 term.apply_osc(_f[0], self._osc_defaults.get(_f[0], False) if locked
                                else bool(osc_state.get(_f[0], False)))
         else:
-            term.apply_allow_title(bool(info.get('allow_title')))
+            # a legacy session carries only the allow_title bool, which maps to
+            # osc_title + osc_notify. Honour a lock on EITHER granular key OR on
+            # allow_title, exactly as the granular branch above does, so a legacy
+            # record cannot re-enable a locked title/notify capability on restore.
+            # (Other OSC features are absent from a legacy record and keep their
+            # constructor defaults, as before.)
+            legacy_title = bool(info.get('allow_title'))
+            for key in ('osc_title', 'osc_notify'):
+                locked = key in self._locked or 'allow_title' in self._locked
+                term.apply_osc(key, self._osc_defaults.get(key, False)
+                               if locked else legacy_title)
         # an admin-locked bell must win over whatever the saved session carried
         term.apply_bell(self._default_bell if 'bell' in self._locked
                         else info.get('bell', self._default_bell))
@@ -2716,6 +2737,10 @@ class MainWindow(QMainWindow):
             # locked zoom is un-clickable in the View menu too, matching the
             # greyed zoom_box spin below.
             ('zoom', [self.act_zin, self.act_zout, self.act_zreset]),
+            # the font picker's setter (set_font_family) refuses a locked change, so
+            # gate its trigger too -- else the dialog opens and silently discards the
+            # pick, a UI that lies about the font.
+            ('font_family', [self.act_font]),
         ] + [(k, [self._osc_actions[k]]) for k in self._osc_actions]
         # a legacy allow_title lock also greys the granular title + notify controls
         if 'allow_title' in self._locked:
