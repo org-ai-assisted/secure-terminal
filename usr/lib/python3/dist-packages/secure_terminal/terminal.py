@@ -1191,7 +1191,8 @@ class SecureTerminal(QPlainTextEdit):
           line/column STABLE across a box<->show toggle (a pixel-width wrap made a
           wide glyph jump lines on the toggle; see the ctor). The child already
           hard-wraps at self._cols, so ordinary output does not overflow; a residual
-          run of wide Show-mode glyphs is left-anchored by _paint_line's home-pin.
+          run of wide Show-mode glyphs is left-anchored by _paint_line's home-pin
+          when that keeps the caret visible (else the caret is followed).
         - Detail / Reveal: each cell expands to a wide <U+XXXX> badge that overflows
           the width the child was told, so wrap the DISPLAY to the viewport --
           otherwise the overflow is reachable only by a horizontal scroll that hides
@@ -2702,18 +2703,23 @@ class SecureTerminal(QPlainTextEdit):
         self._out_cursor = cursor
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
-        # A terminal has no horizontal scroll: column 0 is always the left edge, so
-        # the start of every row stays on screen. Left alone, ensureCursorVisible
-        # follows the caret's DISPLAY column -- far to the right in Detail/Reveal,
-        # where each cell expands to a wide <U+XXXX> badge -- and parks the viewport
-        # mid-line, clipping the start of every row (the codepoint prefix naming the
-        # character) off the left edge, silently hiding content. Detail/Reveal wrap
-        # to the width (see _sync_wrap_mode) so no overflow remains there; pinning
-        # home also keeps the residual Box/Show wide-glyph overflow left-anchored.
-        # Vertical tail-follow (the ensureCursorVisible above) is preserved.
+        # A terminal does not auto-scroll horizontally: anchor the view at the left
+        # so the START of every row stays on screen instead of being clipped off the
+        # left edge. Left alone, ensureCursorVisible follows the caret's DISPLAY
+        # column -- far to the right in Detail/Reveal, where each cell expands to a
+        # wide <U+XXXX> badge -- and parks the viewport mid-line, silently hiding the
+        # codepoint prefix that names the character. Detail/Reveal wrap to the width
+        # (see _sync_wrap_mode) so their caret is always within the viewport and this
+        # simply keeps home. Box/Show are NoWrap (glyph line/column stable across a
+        # box<->show toggle), so a long INTERACTIVE line of wide glyphs can carry the
+        # caret past the right edge -- there the caret must stay visible, so home only
+        # when doing so keeps it on screen (else follow it, as ensureCursorVisible
+        # did). Vertical tail-follow is preserved either way.
         hbar = self.horizontalScrollBar()
         if hbar is not None:
-            hbar.setValue(hbar.minimum())
+            caret_x = self.cursorRect().x() + hbar.value() - hbar.minimum()
+            if caret_x <= self.viewport().width():
+                hbar.setValue(hbar.minimum())
 
     def _export_ascii(self, text):
         """Map the display box (BOX) back to ASCII '_' for any text that LEAVES the
