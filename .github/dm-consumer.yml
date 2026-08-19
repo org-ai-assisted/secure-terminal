@@ -41,5 +41,7 @@ dist-ai-tests:
   ## pyte's own test suite (Part A), and build-essential/libtool-bin/perl/pkg-config
   ## build libvterm's. Without them those stages skip, which is the false-green this
   ## opt-in exists to remove. python3-jsonschema + python3-yaml are the corpus
-  ## schema-validation tooling.
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs python3-regex python3-wcwidth fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config"
+  ## schema-validation tooling. python3-pil backs the shots harness's hero-slider
+## compose step (hero-slider-compose.py) and its regression test; absent, that test
+## exits 77 (SKIP) and the hero-window width-pin guard never runs -- the same false green.
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config"
