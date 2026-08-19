@@ -1337,11 +1337,17 @@ class MainWindow(QMainWindow):
                 term.apply_osc(_f[0], self._osc_defaults.get(_f[0], False) if locked
                                else bool(osc_state.get(_f[0], False)))
         else:
-            # a locked allow_title must win over the legacy saved value too, exactly
-            # as the granular branch above enforces it -- else a pre-lock session with
-            # no 'osc' key re-enables the locked title/notify capability on restore.
-            term.apply_allow_title(self._default_allow_title if 'allow_title' in self._locked
-                                   else bool(info.get('allow_title')))
+            # a legacy session carries only the allow_title bool, which maps to
+            # osc_title + osc_notify. Honour a lock on EITHER granular key OR on
+            # allow_title, exactly as the granular branch above does, so a legacy
+            # record cannot re-enable a locked title/notify capability on restore.
+            # (Other OSC features are absent from a legacy record and keep their
+            # constructor defaults, as before.)
+            legacy_title = bool(info.get('allow_title'))
+            for key in ('osc_title', 'osc_notify'):
+                locked = key in self._locked or 'allow_title' in self._locked
+                term.apply_osc(key, self._osc_defaults.get(key, False)
+                               if locked else legacy_title)
         # an admin-locked bell must win over whatever the saved session carried
         term.apply_bell(self._default_bell if 'bell' in self._locked
                         else info.get('bell', self._default_bell))
@@ -2720,6 +2726,10 @@ class MainWindow(QMainWindow):
             # locked zoom is un-clickable in the View menu too, matching the
             # greyed zoom_box spin below.
             ('zoom', [self.act_zin, self.act_zout, self.act_zreset]),
+            # the font picker's setter (set_font_family) refuses a locked change, so
+            # gate its trigger too -- else the dialog opens and silently discards the
+            # pick, a UI that lies about the font.
+            ('font_family', [self.act_font]),
         ] + [(k, [self._osc_actions[k]]) for k in self._osc_actions]
         # a legacy allow_title lock also greys the granular title + notify controls
         if 'allow_title' in self._locked:
