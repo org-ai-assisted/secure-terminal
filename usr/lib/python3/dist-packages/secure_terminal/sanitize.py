@@ -59,11 +59,13 @@ def describe_codepoint(cp):
     esc = '\\u%04x' % cp if cp <= 0xFFFF else '\\U%08x' % cp
     return 'U+%04X  %s\n%s (%s)   %s' % (cp, name, cat_long, cat, esc)
 
-# name -> (background, foreground). "dark" is white-on-black, "light" is the
-# reverse; both are plain, high-contrast, no syntax coloring.
+# name -> (background, foreground). "dark" is near-white on near-black, "light" is
+# pure black on white; both are plain, high-contrast, no syntax coloring. The light
+# foreground is pure #000000 (not a soft grey): a "black on white" terminal must
+# render actual black -- crisp, maximally legible, matching a standard terminal.
 THEMES = {
     'dark':  ('#14161b', '#e6e6e6'),
-    'light': ('#ffffff', '#1a1a1a'),
+    'light': ('#ffffff', '#000000'),
 }
 BASE_POINT_SIZE = 11
 
