@@ -728,6 +728,16 @@ class SecureTerminal(QPlainTextEdit):
         # at the bottom of the document. Lets each frame re-render only the grid.
         self._top_ids = set()
         self._grid_rows = 0
+        # Per-row incremental grid model: the row objects (by id) currently
+        # rendered as the live grid's blocks, and the (text, format) runs each
+        # one rendered to. A frame re-renders only the rows whose runs changed
+        # and keeps every unchanged block, so a full-viewport truecolour board
+        # (every cell a distinct colour, so runs never coalesce) is not rewritten
+        # cell-by-cell each PTY read. The runs ARE the signature, so any theme /
+        # mode / marking / colour change makes them differ and forces a correct
+        # re-render -- a stale cell can never survive a format change.
+        self._grid_row_ids = []
+        self._grid_row_sig = []
         self._grid_seeded = False     # has this TUI screen been seeded from _raw
         # snapshot of the primary pyte screen (buffer, history, cursor) saved as a
         # full-screen program takes the alternate screen, and restored on exit --
@@ -1447,6 +1457,8 @@ class SecureTerminal(QPlainTextEdit):
         self.clear()
         self._top_ids = set()
         self._grid_rows = 0
+        self._grid_row_ids = []
+        self._grid_row_sig = []
         self._tui_follow = True       # a fresh grid view follows the tail until the user scrolls
 
     def _on_scroll_value(self, value):
@@ -1586,24 +1598,21 @@ class SecureTerminal(QPlainTextEdit):
             if not self._alt_view:
                 self._reset_grid_view()
                 self._alt_view = True
-            self._delete_grid()
-            self._append_grid(screen)
+            # A fixed canvas never scrolls to history, so there is nothing to
+            # promote: reconcile the whole grid in place, re-rendering only the
+            # rows whose runs changed (htop / a full-screen colour app repaints a
+            # small region, not every cell).
+            columns = screen.columns
+            target = [screen.buffer[y] for y in range(screen.lines)]
+            tsig = [self._grid_row_runs(r, columns) for r in target]
+            self._reconcile_grid_tail(target, tsig, columns)
         else:
             # Left the alternate screen: rebuild the scrolling view from a clean
             # document so the restored primary scrollback is shown once.
             if self._alt_view:
                 self._reset_grid_view()
                 self._alt_view = False
-            self._delete_grid()
-            self._append_scrollback(screen)
-            # Trim trailing blank grid rows BELOW the cursor so the document ends at
-            # the prompt/last output; without this the full grid pads ~screen.lines
-            # empty rows below it and you can scroll down into empty space.
-            last = screen.cursor.y
-            for y in range(screen.lines):
-                if any(cell.data.strip() for cell in screen.buffer[y].values()):
-                    last = y
-            self._append_grid(screen, last_row=max(last, screen.cursor.y))
+            self._render_primary_grid(screen)
         self.setUpdatesEnabled(True)
         if self._alt_screen:
             # The alternate screen is a fixed canvas with NO scrollback: its row 0 is the
@@ -1679,8 +1688,16 @@ class SecureTerminal(QPlainTextEdit):
             return _cache_bounded(self._grid_mark_cache, key, fmt)
         return fmt
 
-    def _insert_grid_row(self, cursor, row, columns):
-        """Insert one pyte row (coalescing same-format runs) at the cursor."""
+    def _grid_row_runs(self, row, columns):
+        """The (text, format) runs one pyte row renders to, same-format cells
+        coalesced. This IS both the row's render and its incremental signature:
+        two rows with equal runs render to an identical block, so a block whose
+        stored runs equal the freshly computed runs is reused as-is. Format
+        objects are cached and shared, so an unchanged row's runs hold the SAME
+        format objects and compare equal by identity (fast); a theme / mode /
+        marking / colour change rebuilds the cached formats, so the runs differ
+        and the row is correctly re-rendered."""
+        runs = []
         run_text = ''
         run_fmt = None
         for x in range(columns):
@@ -1691,31 +1708,141 @@ class SecureTerminal(QPlainTextEdit):
                 run_text += ch
             else:
                 if run_text:
-                    cursor.insertText(run_text, run_fmt)
+                    runs.append((run_text, run_fmt))
                 run_text, run_fmt = ch, fmt
         if run_text:
-            cursor.insertText(run_text, run_fmt)
+            runs.append((run_text, run_fmt))
+        return runs
 
-    def _delete_grid(self):
-        """Remove the live grid (the last _grid_rows blocks) plus the newline that
-        joins it to the scrollback, leaving the document ending at the scrollback."""
-        if self._grid_rows <= 0:
+    def _insert_grid_row(self, cursor, row, columns):
+        """Insert one pyte row (coalescing same-format runs) at the cursor."""
+        for text, fmt in self._grid_row_runs(row, columns):
+            cursor.insertText(text, fmt)
+
+    def _delete_grid(self, keep=0):
+        """Remove the live grid down to its first `keep` blocks (default: all of
+        it), plus the newline that joins the removed span to what precedes it, so
+        the document ends at the kept block (or the scrollback) with no trailing
+        empty block."""
+        n = self._grid_rows - keep
+        if n <= 0:
             return
         doc = self.document()
-        first = doc.blockCount() - self._grid_rows
+        first = doc.blockCount() - n
         cur = QTextCursor(doc.findBlockByNumber(max(0, first)))
         cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
-        if first > 0:                     # also eat the newline before the grid:
+        if first > 0:                     # also eat the newline before the span:
             # move the WHOLE cursor (anchor too) back over it, so the End
             # selection below starts before the newline. With KeepAnchor the
             # anchor stayed at the block start and the newline was never
-            # selected, leaving scrollback's last row with a trailing newline --
+            # selected, leaving the preceding row with a trailing newline --
             # a spurious empty block that double-spaced every scrolled row.
             cur.movePosition(QTextCursor.MoveOperation.PreviousCharacter)
         cur.movePosition(QTextCursor.MoveOperation.End,
                          QTextCursor.MoveMode.KeepAnchor)
         cur.removeSelectedText()
-        self._grid_rows = 0
+        self._grid_rows = keep
+
+    def _render_primary_grid(self, screen):
+        """Incrementally reconcile the scrolling (primary-screen) grid.
+
+        Two properties keep this linear in output, not quadratic per PTY read:
+        a row that has scrolled off the top of the live grid into pyte's history
+        is IDENTICAL (same object) to the block already rendered for it, so its
+        block is kept and reclassified as permanent scrollback (promotion)
+        instead of deleted and re-appended; and the still-live grid rows are
+        reconciled by a positional signature diff, so only the changed tail is
+        re-rendered. A distinct-truecolour board therefore renders each row about
+        once as it is drawn, not once per read."""
+        columns = screen.columns
+        # Trim trailing blank rows BELOW the cursor so the document ends at the
+        # prompt/last output; without this the full grid pads ~screen.lines empty
+        # rows below it and you can scroll down into empty space (Bug #64).
+        last = screen.cursor.y
+        for y in range(screen.lines):
+            if any(cell.data.strip() for cell in screen.buffer[y].values()):
+                last = y
+        last = max(last, screen.cursor.y)
+        target = [screen.buffer[y] for y in range(last + 1)]
+        tsig = [self._grid_row_runs(r, columns) for r in target]
+
+        hist = list(screen.history.top)
+        new_hist = [r for r in hist if id(r) not in self._top_ids]
+        # Promote the leading grid rows that have scrolled into history: their
+        # blocks are already in the document, in order, so keep them as permanent
+        # scrollback rather than re-render. Verify BOTH identity and that the
+        # row's rendered runs still match what we stored -- a row mutated between
+        # its last render and the scroll (all within one un-rendered read) is
+        # then NOT promoted, so it can never be kept stale.
+        promote = 0
+        while (promote < len(self._grid_row_ids)
+               and promote < len(new_hist)
+               and self._grid_row_ids[promote] == id(new_hist[promote])
+               and self._grid_row_runs(new_hist[promote], columns)
+                   == self._grid_row_sig[promote]):
+            promote += 1
+        if promote != len(new_hist):
+            # A scrolled-off row is not a promotable leading grid block -- a
+            # screen clear, a cursor-addressed rewrite, or the first render of a
+            # seeded view. Fall back to the correct full rebuild.
+            self._delete_grid()
+            self._append_scrollback(screen)
+            self._append_grid(screen, last_row=last)
+            self._set_grid_model(target, tsig)
+            return
+        self._grid_rows -= promote
+        # The promoted rows are now permanent scrollback. Reset _top_ids to
+        # exactly the current history top (which contains them), as
+        # _append_scrollback does, so a row evicted from the bounded history does
+        # not leak into the set forever.
+        self._top_ids = {id(r) for r in hist}
+        self._reconcile_grid_tail(target, tsig, columns,
+                                  self._grid_row_sig[promote:])
+
+    def _reconcile_grid_tail(self, target, tsig, columns, cur_sig=None):
+        """Bring the live grid to `target` by keeping the longest unchanged
+        leading run of blocks and re-rendering only the divergent tail. `cur_sig`
+        is the signatures of the blocks currently in the grid region (defaults to
+        the whole recorded grid; the primary path passes the post-promotion
+        slice)."""
+        if cur_sig is None:
+            cur_sig = self._grid_row_sig
+        d = 0
+        while d < len(cur_sig) and d < len(tsig) and cur_sig[d] == tsig[d]:
+            d += 1
+        self._delete_grid(keep=d)
+        self._append_grid_rows(target[d:], columns)
+        self._set_grid_model(target, tsig)
+
+    def _append_grid_rows(self, rows, columns):
+        """Append `rows` as new grid blocks at the end of the document."""
+        if not rows:
+            return
+        cur = self.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        have = self.document().characterCount() > 1
+        for row in rows:
+            if have:
+                cur.insertText('\n')
+            self._insert_grid_row(cur, row, columns)
+            have = True
+        # Actual block count, not the row count: a scrollback cap smaller than the
+        # grid makes Qt prune blocks as they are inserted, and an over-counted
+        # _grid_rows would make the next _delete_grid compute a negative start.
+        self._grid_rows = min(self._grid_rows + len(rows),
+                              self.document().blockCount())
+
+    def _set_grid_model(self, target, tsig):
+        """Record which rows now occupy the grid blocks. If the scrollback cap
+        pruned the oldest grid blocks (a scrollback smaller than one screen),
+        only the trailing _grid_rows survive, so keep the model's tail in step."""
+        ids = [id(r) for r in target]
+        n = self._grid_rows
+        if n < len(target):
+            ids = ids[len(ids) - n:]
+            tsig = tsig[len(tsig) - n:]
+        self._grid_row_ids = ids
+        self._grid_row_sig = tsig
 
     def _append_scrollback(self, screen):
         """Append the newly scrolled-off history rows (identified by object id, so
