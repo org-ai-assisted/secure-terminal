@@ -116,20 +116,22 @@ source of truth for behaviour.
 - zsh interactive completion (menu-select) is inherently a TUI-class feature
   (cursor-addressed in-place repaint); the shipped `secure-terminal` terminfo
   cancels those caps so line mode degrades to a plain appended list.
-- **Colour quantization of the truecolour grid render**: rejected for the
-  default. Snapping 24-bit cell colours onto a small fixed set would let
-  same-colour cells coalesce (fewer render runs), but it BANDS the gradient - and
-  the truecolour board exists precisely to show that secure-terminal renders the
-  EXACT 24-bit colour a program asked for, where a 256-colour terminal snaps it to
-  the nearest palette entry. Quantizing our own render would do the very thing the
-  comparison page holds up as the other terminals' failure, and a screenshot would
-  show our board band like theirs. The speed case is also gone: the grid render is
-  a plain-text insert per row with the per-cell formats painted by a
+- **Colour quantization of the truecolour grid render**: rejected outright - not
+  the default AND not an opt-in mode. Snapping 24-bit cell colours onto a small
+  fixed set would let same-colour cells coalesce (fewer render runs), but it BANDS
+  the gradient - and the truecolour board exists precisely to show that
+  secure-terminal renders the EXACT 24-bit colour a program asked for, where a
+  256-colour terminal snaps it to the nearest palette entry. Quantizing our own
+  render does the very thing the comparison page holds up as the other terminals'
+  failure. An opt-in reduced-colour toggle is NOT a compromise worth keeping: it is
+  config surface (a knob this app avoids) for a mode whose only effect is to make
+  the display less truthful - there is no user who benefits from a terminal that
+  lies about colour on request. The speed case is gone anyway: the grid render is a
+  plain-text insert per row with the per-cell formats painted by a
   QSyntaxHighlighter from each block's `_GridRow` (`terminal.py`), which already
   took the pathological full-viewport distinct-colour board from ~15s to ~0.55s
   shot-mode; real program output has runs of near-equal colour that coalesce, so it
-  was never the slow case. The ONLY acceptable form is an explicit,
-  clearly-labelled, off-by-default reduced-colour mode - never the shipped default.
+  was never the slow case.
 
 ## Screenshots (generators already exist - do not hand-roll)
 
