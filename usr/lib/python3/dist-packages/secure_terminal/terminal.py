@@ -1098,15 +1098,30 @@ class SecureTerminal(QPlainTextEdit):
     def apply_scrollback(self, lines):
         """Limit retained scrollback to `lines` blocks (0 = unlimited)."""
         lines = max(0, int(lines))
+        # No change: the cap is already this value, so setMaximumBlockCount would
+        # prune nothing and the grid model stays in sync -- there is nothing to
+        # rebuild. This is the COMMON path: _apply_global re-applies the SAME
+        # scrollback on EVERY global-settings change (theme, font, zoom, ...), and
+        # the rebuild below reconstructs the TUI scrollback from pyte's bounded
+        # history, so an unconditional rebuild here erased every promoted row above
+        # pyte's history cap on any unrelated setting change.
+        if lines == self._scrollback:
+            return
+        before = self.blockCount()
         self._scrollback = lines
         self.setMaximumBlockCount(lines)
-        # setMaximumBlockCount prunes leading blocks IMMEDIATELY, which desyncs the
+        # Only a cap REDUCTION that actually prunes leading blocks desyncs the
         # incremental grid model (grid_rows / row ids / sigs / scrollback tracking)
         # from the surviving document -- a stale grid_rows would make the next
         # _delete_grid compute a wrong (or negative) start and wipe the document,
         # and _place_grid_cursor a wrong grid top. Rebuild the grid view from the
-        # live pyte state so the model matches the document again.
-        if self._grid_mode() and self._screen is not None:
+        # live pyte state ONLY then. A raise (or 0 = unlimited) prunes nothing, so
+        # the model stays in sync and the document -- including promoted scrollback
+        # above pyte's cap -- must be preserved untouched.
+        # NB: the rebuild reconstructs scrollback from pyte's bounded history, so a
+        # reduction still cannot retain document rows older than that cap.
+        if (self._grid_mode() and self._screen is not None
+                and self.blockCount() < before):
             self._reset_grid_view()
             self._render_tui()
 
