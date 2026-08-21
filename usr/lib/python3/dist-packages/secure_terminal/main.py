@@ -620,6 +620,10 @@ class MainWindow(QMainWindow):
         # channel works; when off, no tray icon is ever created.
         self._systray = cfg.get('systray') == 'true'
         self._tray = None             # shared system-tray icon, created on first use
+        # clipboard sanitizer: whether the background watcher warns on ANY non-ASCII
+        # (default off = only deceptive characters). Persisted; the daemon reads it.
+        self._clip_warn_any = cfg.get('clip_warn_any') == 'true'
+        self._clip_reviewer = None    # in-process one-shot ClipboardWatcher (review now)
         # user overrides for window keyboard shortcuts: "ident=Seq ident=Seq ...".
         # Only overrides (bindings differing from the built-in default) are stored;
         # _bind() applies them as each action is created, and the Keyboard
@@ -2507,6 +2511,14 @@ class MainWindow(QMainWindow):
             self._tray = None
         elif enabled:
             self._tray_icon()          # create now, so the effect is immediate
+        if not enabled:
+            # Coupling: the clipboard watcher is a tray app, so turning the tray OFF
+            # also disables its start-on-login -- autostarting it with no tray just
+            # makes it exit (it never runs invisibly). Only touch the override when
+            # it was actually enabled, so this does not write on every toggle.
+            from secure_terminal import clipboard_watch   # noqa: PLC0415
+            if clipboard_watch.autostart_enabled():
+                clipboard_watch.set_autostart(False)
         self._update_bell_tray_action()
         self._persist()
 
@@ -2523,6 +2535,91 @@ class MainWindow(QMainWindow):
             tip += ('\n\nEnable the system tray (View > System tray icon) to use '
                     'this channel.')
         act.setToolTip(tip)
+
+    # -- clipboard sanitizer (controls the tray-only --clipboard-watch daemon) --
+    def _clip_controls_enabled(self):
+        """The clipboard watcher is tray-only, so its Run / Start-on-login controls
+        make sense only when the user wants a tray AND one is available -- the
+        systray <-> autostart coupling. Turning trays off disables them (and clears
+        autostart in set_systray)."""
+        from PyQt6.QtWidgets import QSystemTrayIcon   # noqa: PLC0415
+        return bool(self._systray) and QSystemTrayIcon.isSystemTrayAvailable()
+
+    def _refresh_clipboard_menu(self, menu):
+        menu.clear()
+        self._populate_clipboard_menu(menu)
+
+    def _populate_clipboard_menu(self, menu):
+        """Fill a Clipboard-sanitizer menu with FRESH actions reflecting the live
+        state (is the daemon running, the warn-any setting, autostart). Shared by the
+        View submenu (repopulated on show) and the right-click context menu."""
+        from secure_terminal import clipboard_watch   # noqa: PLC0415
+        enabled = self._clip_controls_enabled()
+        run_act = menu.addAction('Run in the background')
+        run_act.setCheckable(True)
+        run_act.setChecked(clipboard_watch.is_running())
+        run_act.setEnabled(enabled)
+        run_act.setToolTip(
+            'Start / stop the background clipboard watcher: it pops a review only '
+            'when copied text hides deceptive Unicode.' if enabled else
+            'Needs the system tray on -- the watcher is a tray app.')
+        run_act.toggled.connect(self.set_clip_run)
+        warn_act = menu.addAction('Warn on any non-ASCII')
+        warn_act.setCheckable(True)
+        warn_act.setChecked(self._clip_warn_any)
+        warn_act.setToolTip('Off: warn only on hidden/deceptive characters. '
+                            'On: warn on any non-ASCII (accents, CJK, emoji) too.')
+        warn_act.toggled.connect(self.set_clip_warn_any)
+        menu.addAction('Review clipboard now').triggered.connect(self._clip_review_now)
+        menu.addSeparator()
+        auto_act = menu.addAction('Start on login')
+        auto_act.setCheckable(True)
+        auto_act.setChecked(clipboard_watch.autostart_enabled())
+        auto_act.setEnabled(enabled)
+        auto_act.toggled.connect(self.set_clip_autostart)
+
+    def set_clip_run(self, on):
+        """Start or stop the background clipboard-sanitizer daemon (a singleton, so a
+        second start is idempotent)."""
+        from secure_terminal import clipboard_watch   # noqa: PLC0415
+        if on:
+            if not clipboard_watch.is_running():
+                from PyQt6.QtCore import QProcess   # noqa: PLC0415
+                QProcess.startDetached(sys.argv[0], ['--clipboard-watch'])
+        else:
+            clipboard_watch.stop_running()
+
+    def set_clip_warn_any(self, on):
+        self._clip_warn_any = bool(on)
+        self._persist()
+        from secure_terminal import clipboard_watch   # noqa: PLC0415
+        clipboard_watch.push_warn_any(self._clip_warn_any)   # live-update a running daemon
+
+    def _clip_review_now(self):
+        """Review whatever is on the clipboard now, in-process (no daemon needed).
+        Held on self so the popup survives until the user resolves it."""
+        from secure_terminal import clipboard_watch   # noqa: PLC0415
+        self._clip_reviewer = clipboard_watch.ClipboardWatcher(
+            QApplication.instance(), theme=self._default_theme,
+            any_mode=self._clip_warn_any, watch=False)
+        self._clip_reviewer.review_now()
+
+    def set_clip_autostart(self, on):
+        from secure_terminal import clipboard_watch   # noqa: PLC0415
+        if on and not self._clip_controls_enabled():
+            return                      # cannot autostart a tray watcher without a tray
+        clipboard_watch.set_autostart(bool(on))
+
+    def add_terminal_context_actions(self, menu):
+        """Append the app-level toggles (system tray + clipboard sanitizer) to a
+        terminal widget's right-click menu, so they are reachable there too. Called
+        by SecureTerminal._reviewed_context_menu through self.window()."""
+        menu.addSeparator()
+        tray_act = menu.addAction('System tray icon')
+        tray_act.setCheckable(True)
+        tray_act.setChecked(self._systray)
+        tray_act.toggled.connect(self.set_systray)
+        self._populate_clipboard_menu(menu.addMenu('Clipboard sanitizer'))
 
     def _on_cwd_changed(self, term, path):
         # OSC 7 working directory (only when osc_cwd is enabled): show it as the
@@ -2821,6 +2918,7 @@ class MainWindow(QMainWindow):
             'bell': ','.join(sorted(self._default_bell)),
             'bell_sound': self._default_bell_sound,
             'systray': 'true' if self._systray else 'false',
+            'clip_warn_any': 'true' if self._clip_warn_any else 'false',
             'keybindings': ' '.join('%s=%s' % (i, self._keybindings[i])
                                     for i in sorted(self._keybindings)),
             'osc_notice': 'true' if self._osc_notice else 'false',
@@ -3233,6 +3331,13 @@ class MainWindow(QMainWindow):
         self._update_bell_tray_action()
         if self._systray:
             self._tray_icon()          # show the icon at startup when enabled
+
+        # Clipboard sanitizer: discover + control the background watcher (the
+        # tray-only --clipboard-watch daemon) from the terminal. Repopulated on show
+        # so "Run in the background" reflects whether the daemon is actually alive.
+        clip_menu = view_menu.addMenu('Clipboard sanitizer')
+        clip_menu.aboutToShow.connect(lambda: self._refresh_clipboard_menu(clip_menu))
+        self._refresh_clipboard_menu(clip_menu)   # populate once so it is never empty
 
         # act_title stays as a compatibility action (the combined title+notify
         # toggle used by the settings dialog / session), but is NOT shown in the

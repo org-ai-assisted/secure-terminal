@@ -5,28 +5,33 @@
 ## AI-Assisted
 
 """
-Tray-only clipboard sanitizer (`secure-terminal --clipboard-watch`).
+Clipboard sanitizer watcher.
 
 Watches the SYSTEM clipboard and, when copied text carries deceptive Unicode --
 an invisible / bidi / control character, or a homoglyph posing as ASCII -- offers
 to replace it with a safe version, so text later pasted into an editor or any
-program that does not neutralize Unicode is safe. No terminal window is opened.
+program that does not neutralize Unicode is safe.
 
-PRINCIPLE -- flag-and-offer, never auto-swap. The tool NEVER rewrites the
-clipboard on its own: it raises the review bar and the user chooses Keep original
-(the default), Replace (ASCII), or Replace (keep unicode). It stores no clipboard
+PRINCIPLE -- flag-and-offer, never auto-swap. It NEVER rewrites the clipboard on
+its own: it raises the review bar and the user chooses Keep original (the
+default), Replace (ASCII), or Replace (keep unicode). It stores no clipboard
 history; it inspects the current text transiently and forgets it.
 
-SCOPE -- this sanitizes the LOCAL (in-VM) clipboard via Qt, which auto-selects the
-X11 or Wayland backend. It does NOT touch the Qubes inter-VM global clipboard
-(Ctrl+Shift+C / Ctrl+Shift+V) -- that stays Qubes' own mechanism; run this (or the
-sclip CLI) after pasting into the target VM.
+SCOPE -- sanitizes the LOCAL (in-VM) clipboard via Qt (X11 or Wayland). It does
+NOT touch the Qubes inter-VM global clipboard (Ctrl+Shift+C / Ctrl+Shift+V).
 
-Reuses the terminal's own ReviewBar (same look, risk-class colouring and
-click-to-inspect preview) and the Qt-free sanitize core; the only new logic here
-is the clipboard watch and the standalone popup that hosts the bar.
+Two consumers of the same core:
+  * ClipboardWatcher -- the reusable core: watch + review, no tray/IPC. The
+    TERMINAL embeds one (watch=False) for its "Review clipboard now" action.
+  * ClipboardWatchApp -- the standalone tray daemon (`--clipboard-watch`): a
+    continuous ClipboardWatcher + a tray icon + a SINGLETON IPC server, so only
+    one clipboard watcher runs and the terminal can start / stop / query it
+    (the 'clipboard-watch' instance group).
+
+Reuses the terminal's own ReviewBar and the Qt-free sanitize core.
 """
 
+import json
 import os
 import signal
 import sys
@@ -36,7 +41,7 @@ from PyQt6.QtWidgets import (
     QMenu, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from secure_terminal import settings
+from secure_terminal import ipc, settings
 from secure_terminal.review import ReviewBar
 from secure_terminal.sanitize import (
     THEMES, classify_paste, sanitize_clipboard, sanitize_clipboard_unicode,
@@ -44,6 +49,9 @@ from secure_terminal.sanitize import (
 from secure_terminal.unicode_tag import tag_text
 
 _AUTOSTART_BASENAME = 'sclip-clipboard-watch.desktop'
+## The fixed instance group whose owner-only socket makes the watcher a singleton
+## and lets the terminal ping / start / stop it. See ipc.socket_path.
+INSTANCE_GROUP = 'clipboard-watch'
 
 
 def _deceptive(text):
@@ -62,16 +70,29 @@ def _any_nonascii(text):
     return bool(classify_paste(text))
 
 
+def _load_theme():
+    cfg = settings.load()
+    theme = cfg.get('theme')
+    return theme if theme in THEMES else 'light'
+
+
+def warn_any_default():
+    """The persisted 'warn on any non-ASCII' preference (settings key
+    `clip_warn_any`, default off). The terminal persists it; the daemon reads it at
+    startup so an autostarted watcher honours the user's choice."""
+    return settings.load().get('clip_warn_any') == 'true'
+
+
 def _user_autostart_path():
     base = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
     return os.path.join(base, 'autostart', _AUTOSTART_BASENAME)
 
 
 def autostart_enabled():
-    """Whether the tray watcher is set to start on login. The package ships an
-    ENABLED system entry (etc/xdg/autostart), so 'on' is the default; a per-user
-    override file that disables it (X-GNOME-Autostart-enabled=false / Hidden=true)
-    is the only way it is off. No override -> enabled."""
+    """Whether the watcher is set to start on login. The package ships an ENABLED
+    system entry (etc/xdg/autostart), so 'on' is the default; a per-user override
+    file that disables it (X-GNOME-Autostart-enabled=false / Hidden=true) is the
+    only way it is off. No override -> enabled."""
     path = _user_autostart_path()
     if not os.path.isfile(path):
         return True
@@ -108,6 +129,23 @@ def set_autostart(enabled):
     os.replace(tmp, path)        # atomic, so a reader never sees a half-written file
 
 
+def is_running():
+    """True if a clipboard-watch daemon already owns the singleton socket -- a raw
+    CONNECT probe that succeeds the instant it binds (see ipc.socket_is_live)."""
+    return ipc.socket_is_live(INSTANCE_GROUP)
+
+
+def stop_running():
+    """Ask a running daemon to quit; returns True if one answered. `None` (no
+    server) means it was already not running."""
+    return ipc.send_request(INSTANCE_GROUP, {'op': 'quit'}) is not None
+
+
+def push_warn_any(value):
+    """Live-update a running daemon's trigger mode; no-op if none runs."""
+    ipc.send_request(INSTANCE_GROUP, {'op': 'set-warn-any', 'value': bool(value)})
+
+
 class _ClipboardReview:
     """The object ReviewBar dispatches a clipboard choice back to -- not a terminal,
     just the holder of the reviewed text that performs the chosen replacement (the
@@ -139,29 +177,36 @@ class _ReviewPopup(QWidget):
         layout.addWidget(self.bar)
 
 
-class ClipboardWatchApp:
-    """Owns the tray icon, the review popup and the clipboard watch. Runs its own Qt
-    event loop with no terminal window."""
+class ClipboardWatcher:
+    """The reusable clipboard-review core: optionally watch the clipboard, and/or
+    review its current contents once, hosting the shared ReviewBar in a popup. No
+    tray, no IPC, no event loop of its own -- embeddable by the tray daemon
+    (watch=True) and by the terminal's "Review clipboard now" (watch=False)."""
 
-    def __init__(self, app):
-        self._app = app
+    def __init__(self, app, theme=None, any_mode=False, watch=False):
         self._clipboard = app.clipboard()
         self._enabled = True
-        self._any_mode = False             # default trigger: deceptive-only
+        self._any_mode = bool(any_mode)
         self._last_written = None          # feedback-loop guard (our own write)
         self._dismissed = None             # exact text the user chose to keep
-        self._theme = self._load_theme()
+        self._theme = theme if theme in THEMES else _load_theme()
         self._popup = _ReviewPopup()
-        self._tray = None
-        self._clipboard.dataChanged.connect(self._on_change)
+        if watch:
+            self._clipboard.dataChanged.connect(self._on_change)
 
-    @staticmethod
-    def _load_theme():
-        cfg = settings.load()
-        theme = cfg.get('theme')
-        return theme if theme in THEMES else 'light'
+    def set_enabled(self, on):
+        self._enabled = bool(on)
 
-    # -- clipboard watch ------------------------------------------------------
+    def set_any_mode(self, on):
+        self._any_mode = bool(on)
+
+    def review_now(self):
+        """Review whatever is on the clipboard right now (even clean text), so a
+        user can sanitize on demand."""
+        text = self._clipboard.text()
+        if text:
+            self._show_review(text)
+
     def _on_change(self):
         if not self._enabled:
             return
@@ -202,6 +247,84 @@ class ClipboardWatchApp:
         self._popup.bar.hide_review()
         self._popup.hide()
 
+
+class ClipboardWatchApp:
+    """The standalone tray daemon (`--clipboard-watch`): a continuous
+    ClipboardWatcher + a tray icon + a SINGLETON IPC server. Only one runs; the
+    terminal starts / stops / pings it over the 'clipboard-watch' group."""
+
+    def __init__(self, app):
+        self._app = app
+        self._watcher = ClipboardWatcher(app, any_mode=warn_any_default(), watch=True)
+        self._tray = None
+        self._server = None
+
+    # -- singleton IPC server (mirrors MainWindow.start_instance_server) --------
+    def _claim_singleton(self):
+        """Claim the 'clipboard-watch' group's owner-only socket. Returns False if a
+        live watcher already owns it (the caller should exit). socket_is_live gates
+        listen(), which would otherwise STEAL a live peer's socket."""
+        try:
+            ipc.ensure_socket_dir()
+        except OSError:
+            return True                     # no runtime dir -> cannot singleton; proceed
+        if ipc.socket_is_live(INSTANCE_GROUP):
+            return False
+        from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
+        path = ipc.socket_path(INSTANCE_GROUP)
+        QLocalServer.removeServer(path)     # clear a stale socket, if any
+        self._server = QLocalServer(self._app)
+        self._server.setSocketOptions(
+            QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
+        if not self._server.listen(path):   # pragma: no cover - a same-UID path binds after removeServer; a failure is a rare OS fault
+            self._server = None
+            return True
+        self._server.newConnection.connect(self._on_ipc_connection)
+        return True
+
+    def _on_ipc_connection(self):
+        conn = self._server.nextPendingConnection()
+        if conn is None:                    # pragma: no cover - Qt only signals with one pending
+            return
+        conn.disconnected.connect(conn.deleteLater)
+        framer = ipc.Framer()
+
+        def on_ready():
+            try:
+                payload = framer.feed(bytes(conn.readAll()))
+            except ValueError:
+                conn.abort()
+                return
+            if payload is None:             # pragma: no cover - one-shot frame arrives whole locally
+                return
+            reply = self._dispatch(payload)
+            conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
+            conn.flush()
+            conn.disconnectFromServer()
+
+        conn.readyRead.connect(on_ready)
+
+    def _dispatch(self, payload):
+        """Handle one IPC request; return a reply dict. Owner-only socket, but still
+        type-validated. Ops: ping (running probe), quit, set-warn-any (live trigger)."""
+        try:
+            request = json.loads(payload.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            return {'ok': False, 'error': 'malformed request'}
+        if not isinstance(request, dict):
+            return {'ok': False, 'error': 'malformed request'}
+        op = request.get('op')
+        if op == 'ping':
+            return {'ok': True, 'pid': os.getpid()}
+        if op == 'quit':
+            # Reply first, then quit, so the caller gets its acknowledgement.
+            QTimer.singleShot(0, self._app.quit)
+            return {'ok': True}
+        if op == 'set-warn-any':
+            self._watcher.set_any_mode(bool(request.get('value')))
+            return {'ok': True}
+        return {'ok': False, 'error': 'unknown op: %r' % (op,)}
+
     # -- tray -----------------------------------------------------------------
     def _build_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -218,47 +341,34 @@ class ClipboardWatchApp:
         menu = QMenu()
         act_watch = menu.addAction('Watch clipboard')
         act_watch.setCheckable(True)
-        act_watch.setChecked(self._enabled)
-        act_watch.toggled.connect(self._set_enabled)
+        act_watch.setChecked(True)
+        act_watch.toggled.connect(self._watcher.set_enabled)
 
         act_any = menu.addAction('Warn on any non-ASCII')
         act_any.setCheckable(True)
-        act_any.setChecked(self._any_mode)
+        act_any.setChecked(warn_any_default())
         act_any.setToolTip('Off: warn only on hidden/deceptive characters. '
                            'On: warn on any non-ASCII (accents, CJK, emoji) too.')
-        act_any.toggled.connect(self._set_any_mode)
+        act_any.toggled.connect(self._watcher.set_any_mode)
 
         act_autostart = menu.addAction('Start on login')
         act_autostart.setCheckable(True)
         act_autostart.setChecked(autostart_enabled())
-        act_autostart.toggled.connect(self._set_autostart)
+        act_autostart.toggled.connect(lambda on: set_autostart(bool(on)))
 
         menu.addSeparator()
-        menu.addAction('Review clipboard now').triggered.connect(self._review_now)
+        menu.addAction('Review clipboard now').triggered.connect(
+            self._watcher.review_now)
         menu.addSeparator()
         menu.addAction('Quit').triggered.connect(self._app.quit)
         return menu
 
-    def _set_enabled(self, on):
-        self._enabled = bool(on)
-
-    def _set_any_mode(self, on):
-        self._any_mode = bool(on)
-
-    @staticmethod
-    def _set_autostart(on):
-        set_autostart(bool(on))
-
-    def _review_now(self):
-        """Force the review for whatever is on the clipboard right now (even clean
-        text), so a user can sanitize on demand."""
-        text = self._clipboard.text()
-        if text:
-            self._show_review(text)
-
     # -- lifecycle ------------------------------------------------------------
     def run(self):
         self._app.setQuitOnLastWindowClosed(False)   # tray-only: no window closes it
+        if not self._claim_singleton():
+            # Another clipboard watcher already runs -- not an error.
+            return 0
         self._tray = self._build_tray()
         if self._tray is None:
             sys.stderr.write('secure-terminal: no system tray is available; '
