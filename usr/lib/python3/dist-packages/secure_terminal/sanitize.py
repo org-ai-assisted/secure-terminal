@@ -12,6 +12,12 @@ it runs identically under the terminal widget and under a bare Python test
 (dist-ai), the way output-lies keeps its analyzer DOM-free. It decides what is
 safe to display and names the class of anything that is not; the widget layer
 (terminal.py) adds only the interactive cursor handling and, optionally, colour.
+
+DESIGN DECISION -- importing no PyQt here is deliberate, not incidental. This
+module is the reusable engine for headless consumers (the unicode-tag and sclip
+CLIs, AppArmor-confined filters, dist-ai tests); keeping it Qt-free lets them run
+with no display and under the tightest confinement. Do NOT add a Qt import: put
+any widget-only logic in terminal.py instead.
 """
 
 import functools

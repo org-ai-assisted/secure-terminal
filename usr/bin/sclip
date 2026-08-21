@@ -1,0 +1,33 @@
+#!/usr/bin/python3 -Bsu
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## sclip: read text on stdin, write clipboard-safe text on stdout. A pure filter
+## (no files, no display, no clipboard access) so its AppArmor profile can deny
+## all data-file and network access -- the confineable core the st-wl-paste /
+## st-wl-copy / st-xclip drop-ins pipe through. See secure_terminal/clipboard.py.
+
+import os
+import sys
+
+## Run straight from a source checkout, not only when installed (see the GUI
+## launcher for the rationale).
+_dev = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+    'lib', 'python3', 'dist-packages')
+if os.path.isdir(os.path.join(_dev, 'secure_terminal')):
+    sys.path.insert(0, _dev)
+
+## Fail loud on a missing runtime dependency before the app import: the classifier
+## needs \X (regex) and the mixed-script data (confusable_homoglyphs).
+from secure_terminal.preflight import require
+require(('regex', 'python3-regex'),
+        ('confusable_homoglyphs', 'python3-confusable-homoglyphs'))
+
+from secure_terminal.clipboard import main
+
+if __name__ == '__main__':
+    sys.exit(main())

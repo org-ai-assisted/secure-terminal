@@ -1,0 +1,32 @@
+.\" generated with Ronn-NG/v0.10.1
+.\" http://github.com/apjanke/ronn-ng/tree/0.10.1
+.TH "SCLIP" "1" "January 2020" "secure-terminal" "secure-terminal Manual"
+.SH "NAME"
+\fBsclip\fR \- sanitize clipboard\-bound text to safe characters
+.SH "SYNOPSIS"
+\fBsclip\fR [\fB\-\-unicode\fR] [\fB\-\-summary\fR]
+.SH "DESCRIPTION"
+sclip reads text on standard input and writes clipboard\-safe text on standard output\. It is a pure filter \-\- it opens no files, needs no display and never touches the clipboard itself \-\- so it composes with the system clipboard tools and confines tightly under AppArmor:
+.IP "" 4
+.nf
+wl\-paste | sclip | wl\-copy
+xclip \-o | sclip | xclip \-i
+.fi
+.IP "" 0
+.P
+The purpose is to make text safe to paste into an editor, or any program that does not neutralize Unicode: invisible, zero\-width, bidirectional\-control and other control characters are removed\.
+.P
+By default sclip is STRICTEST: it keeps only printable ASCII plus tab and newline, so a cross\-script homoglyph (a look\-alike posing as ASCII) cannot ride out either\.
+.P
+The \fBst\-wl\-paste\fR(1), \fBst\-wl\-copy\fR(1) and \fBst\-xclip\fR(1) drop\-in wrappers run these pipelines for you\.
+.SH "OPTIONS"
+.TP
+\fB\-\-unicode\fR
+Keep printable non\-ASCII characters (accents, CJK, \|\.\|\.\|\.) instead of dropping them\. Note the honest limit: a homoglyph IS printable Unicode, so \fB\-\-unicode\fR does NOT remove look\-alikes; it removes only the invisible, bidirectional and control classes\. Use the default, or the review GUI (\fBsecure\-terminal \-\-clipboard\-watch\fR), when look\-alikes matter\.
+.TP
+\fB\-\-summary\fR
+Write a one\-line, mode\-accurate report of what was removed (and, in \fB\-\-unicode\fR mode, what printable non\-ASCII was kept) to standard error\. Standard output is unchanged\.
+.SH "EXIT STATUS"
+0 on success; 1 on an unreadable input or a closed output pipe; 2 on an unknown option\.
+.SH "SEE ALSO"
+\fBst\-wl\-paste\fR(1), \fBst\-wl\-copy\fR(1), \fBst\-xclip\fR(1), \fBsecure\-terminal\fR(1), \fBunicode\-tag\fR(1)

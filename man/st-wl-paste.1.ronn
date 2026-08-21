@@ -1,0 +1,45 @@
+st-wl-paste(1) -- wl-paste that sanitizes the clipboard on read
+==============================================================
+
+<!--
+# Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+# See the file COPYING for copying conditions.
+-->
+
+## SYNOPSIS
+
+`st-wl-paste` [<WL-PASTE-OPTION>...]
+
+## DESCRIPTION
+
+st-wl-paste is a drop-in replacement for `wl-paste`(1) (Wayland) that filters the
+clipboard text through `sclip`(1) as it is read. Every argument is forwarded
+verbatim to `wl-paste`, so native options such as `--primary` or `--no-newline`
+work unchanged.
+
+By default the strip is strictest (printable ASCII only). Set the environment
+variable `SCLIP_MODE=unicode` to keep printable non-ASCII instead.
+
+`--watch` (`-w`) is REFUSED (exit 2): `wl-paste --watch` feeds the raw clipboard
+to the watched command's standard input rather than to standard output, so it
+would bypass sclip entirely.
+
+Compose it like the original, sanitizing one or both sides:
+
+    st-wl-paste | st-wl-copy
+    st-wl-paste | wl-copy
+
+## ENVIRONMENT
+
+  * `SCLIP_MODE`:
+    When set to `unicode`, keep printable non-ASCII (passes `--unicode` to
+    `sclip`). Any other value (or unset) is the default ASCII-only strip.
+
+## EXIT STATUS
+
+The exit status of the underlying `wl-paste` | `sclip` pipeline; 127 if
+`wl-paste` is not installed.
+
+## SEE ALSO
+
+`st-wl-copy`(1), `st-xclip`(1), `sclip`(1), `wl-paste`(1)

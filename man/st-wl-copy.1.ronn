@@ -1,0 +1,41 @@
+st-wl-copy(1) -- wl-copy that sanitizes the clipboard on write
+=============================================================
+
+<!--
+# Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+# See the file COPYING for copying conditions.
+-->
+
+## SYNOPSIS
+
+`st-wl-copy` [<WL-COPY-OPTION>...]
+
+## DESCRIPTION
+
+st-wl-copy is a drop-in replacement for `wl-copy`(1) (Wayland) that filters
+standard input through `sclip`(1) before it is placed on the clipboard. Every
+argument is forwarded verbatim to `wl-copy`, so native options such as
+`--primary` or `--trim-newline` work unchanged.
+
+By default the strip is strictest (printable ASCII only). Set the environment
+variable `SCLIP_MODE=unicode` to keep printable non-ASCII instead.
+
+A TEXT OPERAND (`wl-copy some text`) is REFUSED (exit 2): wl-copy copies a text
+operand directly and ignores standard input, so the operand would reach the
+clipboard unsanitized. Pipe the text instead
+(`printf %s 'some text' | st-wl-copy`).
+
+## ENVIRONMENT
+
+  * `SCLIP_MODE`:
+    When set to `unicode`, keep printable non-ASCII (passes `--unicode` to
+    `sclip`). Any other value (or unset) is the default ASCII-only strip.
+
+## EXIT STATUS
+
+The exit status of the underlying `sclip` | `wl-copy` pipeline; 127 if `wl-copy`
+is not installed.
+
+## SEE ALSO
+
+`st-wl-paste`(1), `st-xclip`(1), `sclip`(1), `wl-copy`(1)

@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 
 from secure_terminal.sanitize import (
     classify_paste, sanitize_paste, sanitize_paste_unicode,
-    sanitize_clipboard_display, sanitize_clipboard_unicode,
+    sanitize_clipboard, sanitize_clipboard_display, sanitize_clipboard_unicode,
 )
 from secure_terminal.terminal import SecureTerminal
 
@@ -84,6 +84,26 @@ _KINDS = {
         # the display-aware strip, so the "Copy stripped puts" preview matches what
         # dispatch_pending_copy('stripped') actually places (a box -> '_', never gone).
         'strip': sanitize_clipboard_display,
+        'keep': sanitize_clipboard_unicode,
+    },
+    # The standalone clipboard sanitizer (clipboard_watch.py): text already ON the
+    # system clipboard, reviewed before it is pasted elsewhere. Not a terminal
+    # direction -- dispatch_pending_clipboard lives on a small holder object, not a
+    # tab -- but the bar and previews are identical.
+    'clipboard': {
+        'summary': 'This clipboard text hides %s.',
+        'summary_empty': 'Review the clipboard text.',
+        'reject': 'Keep original',
+        'reject_tip': 'Leave the clipboard unchanged (Enter or Esc)',
+        'stripped': 'Replace (ASCII)',
+        'unicode': 'Replace (keep unicode)',
+        'titles': ('Original (as it looks)', 'Detail (what is really there)',
+                   'Replace (ASCII) puts', 'Replace (keep unicode) puts'),
+        'dispatch': 'dispatch_pending_clipboard',
+        # plain ASCII strip -- the text is raw clipboard content, NOT lifted from the
+        # rendered display, so the display-aware strip's box->'_' rewrite does not
+        # apply; this matches what dispatch_pending_clipboard writes back.
+        'strip': sanitize_clipboard,
         'keep': sanitize_clipboard_unicode,
     },
 }

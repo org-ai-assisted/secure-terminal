@@ -1,0 +1,35 @@
+.\" generated with Ronn-NG/v0.10.1
+.\" http://github.com/apjanke/ronn-ng/tree/0.10.1
+.TH "ST\-XCLIP" "1" "January 2020" "secure-terminal" "secure-terminal Manual"
+.SH "NAME"
+\fBst\-xclip\fR \- xclip that sanitizes a clipboard write
+.SH "SYNOPSIS"
+\fBst\-xclip\fR [\fIXCLIP\-OPTION\fR\|\.\|\.\|\.]
+.SH "DESCRIPTION"
+st\-xclip is a drop\-in replacement for \fBxclip\fR(1) (X11) that filters standard input through \fBsclip\fR(1) on a clipboard WRITE\. Every argument is forwarded verbatim to \fBxclip\fR, so native options such as \fB\-selection clipboard\fR work unchanged\.
+.P
+xclip is one command for both directions, so st\-xclip uses a simple, honest rule rather than parsing xclip's option grammar:
+.IP "\(bu" 4
+a READ (\fB\-o\fR / \fB\-out\fR), or \fB\-help\fR / \fB\-version\fR, is passed through unchanged;
+.IP "\(bu" 4
+a piped standard input that is not a read is sanitized through \fBsclip\fR;
+.IP "\(bu" 4
+anything else (standard input is a terminal: a file\-operand write, or an interactive invocation) is passed through unchanged\.
+.IP "" 0
+.P
+So it sanitizes the common \fBecho \|\.\|\.\|\. | st\-xclip \-selection clipboard\fR form\. A FILE OPERAND on a write (\fB\|\.\|\.\|\. | st\-xclip file\fR) is REFUSED (exit 2): xclip would read and copy the file, ignoring the sanitized standard input\. Use the raw pipeline instead:
+.IP "" 4
+.nf
+sclip < file | xclip \-selection clipboard
+.fi
+.IP "" 0
+.P
+By default the strip is strictest (printable ASCII only)\. Set the environment variable \fBSCLIP_MODE=unicode\fR to keep printable non\-ASCII instead\.
+.SH "ENVIRONMENT"
+.TP
+\fBSCLIP_MODE\fR
+When set to \fBunicode\fR, keep printable non\-ASCII (passes \fB\-\-unicode\fR to \fBsclip\fR)\. Any other value (or unset) is the default ASCII\-only strip\.
+.SH "EXIT STATUS"
+The exit status of \fBxclip\fR, or of the \fBsclip\fR | \fBxclip\fR pipeline on a sanitized write; 127 if \fBxclip\fR is not installed\.
+.SH "SEE ALSO"
+\fBst\-wl\-paste\fR(1), \fBst\-wl\-copy\fR(1), \fBsclip\fR(1), \fBxclip\fR(1)

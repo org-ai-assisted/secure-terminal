@@ -1,0 +1,50 @@
+#!/bin/bash
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## st-wl-paste: drop-in for wl-paste that sanitizes on READ. Runs `wl-paste` with
+## every argument forwarded verbatim (so native options such as --primary /
+## --no-newline pass through), then filters its output through sclip. Set
+## SCLIP_MODE=unicode to keep printable non-ASCII (default: ASCII-only, strictest).
+
+## style-ok: no-has -- a standalone tool that must run on plain Debian without the
+## Kicksecure helper-scripts stack, so it uses portable `command -v`, not `has`.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+set -o errtrace
+shopt -s inherit_errexit
+shopt -s shift_verbose
+
+## Resolve the sibling sclip so a source checkout works before installation, the
+## same dev-friendliness the python launchers have.
+dir="$(dirname -- "$(readlink -f -- "$0")")"
+sclip="${dir}/sclip"
+
+if ! command -v wl-paste >/dev/null 2>&1 ; then
+   printf '%s\n' "st-wl-paste: wl-paste not found -- install wl-clipboard" >&2
+   exit 127
+fi
+
+## wl-paste --watch runs a command on every clipboard change and feeds it the RAW
+## clipboard on the command's stdin -- it never writes to the stdout this wrapper
+## sanitizes, so the watched command would receive UNSANITIZED text. Fail closed.
+for arg in "$@"; do
+   case "${arg}" in
+      -w|--watch)
+         printf '%s\n' "st-wl-paste: --watch is not supported (it feeds the RAW clipboard to the command, bypassing sclip)" >&2
+         exit 2
+         ;;
+   esac
+done
+
+mode=()
+if [ "${SCLIP_MODE:-}" = "unicode" ]; then
+   mode=(--unicode)
+fi
+
+wl-paste "$@" | "${sclip}" "${mode[@]}"
