@@ -283,33 +283,33 @@ class ClipboardWatchApp:
         except OSError:
             return True                     # no runtime dir -> cannot singleton; proceed
         path = ipc.socket_path(INSTANCE_GROUP)
+        lock_fd = None
         try:
             lock_fd = os.open(
                 path + '.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
-        except OSError:
-            return True                     # cannot open the lock file -> best effort, proceed
-        try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(lock_fd)
             return False                    # another live watcher holds the lock -> exit
         except OSError:
-            os.close(lock_fd)               # flock unsupported on this fs -> best effort, proceed
-            return True
-        self._lock_fd = lock_fd             # held for process lifetime (releases on exit)
+            if lock_fd is not None:
+                os.close(lock_fd)           # open failed / flock unsupported on this fs
+            lock_fd = None                  # best effort: drop the flock, still claim the socket
         from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
-        # A watcher still running the PRE-flock code holds no lock, so the flock above
-        # cannot see it. Defer to any live incumbent socket (e.g. mid package upgrade)
-        # instead of stealing it; only clear a confirmed-stale socket.
+        # Defer to any live incumbent socket rather than stealing it -- a watcher still
+        # running the PRE-flock code holds no lock, and a best-effort start (no usable
+        # lock file) holds none either, so the flock alone cannot see them; only clear a
+        # confirmed-stale socket. Best effort drops the flock gate, never the socket claim.
         if ipc.socket_is_live(INSTANCE_GROUP):
-            os.close(self._lock_fd)
-            self._lock_fd = None
+            if lock_fd is not None:
+                os.close(lock_fd)
             return False
+        self._lock_fd = lock_fd             # the flock (held for process life), or None (best effort)
         QLocalServer.removeServer(path)     # stale socket from a crashed predecessor
         self._server = QLocalServer(self._app)
         self._server.setSocketOptions(
             QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
-        if not self._server.listen(path):   # pragma: no cover - sole lock holder; a failure is a rare OS fault
+        if not self._server.listen(path):   # pragma: no cover - rare OS fault after clearing the socket
             self._server = None
             return True
         self._server.newConnection.connect(self._on_ipc_connection)
