@@ -31,6 +31,7 @@ Two consumers of the same core:
 Reuses the terminal's own ReviewBar and the Qt-free sanitize core.
 """
 
+import fcntl
 import json
 import os
 import signal
@@ -258,25 +259,44 @@ class ClipboardWatchApp:
         self._watcher = ClipboardWatcher(app, any_mode=warn_any_default(), watch=True)
         self._tray = None
         self._server = None
+        self._lock_fd = None
 
-    # -- singleton IPC server (mirrors MainWindow.start_instance_server) --------
+    # -- singleton IPC server -------------------------------------------------
     def _claim_singleton(self):
-        """Claim the 'clipboard-watch' group's owner-only socket. Returns False if a
-        live watcher already owns it (the caller should exit). socket_is_live gates
-        listen(), which would otherwise STEAL a live peer's socket."""
+        """Claim the 'clipboard-watch' singleton ATOMICALLY. Returns False if another
+        live watcher already holds it (the caller should exit).
+
+        The gate is an flock(LOCK_EX|LOCK_NB) on a lock file: the kernel grants it to
+        exactly one process and releases it automatically when that process dies, so a
+        crashed watcher never wedges the next one. A socket_is_live()+removeServer()+
+        listen() sequence could NOT be the gate -- that check-then-act leaves a window
+        where two watchers both see 'not live' and both bind, each removeServer()
+        unlinking the other's just-bound socket, so BOTH run and race duplicate review
+        bars. Here the QLocalServer socket is bound by the SOLE lock holder, so clearing
+        a crashed predecessor's stale socket cannot race a live peer.
+
+        (MainWindow.start_instance_server keeps the lighter socket_is_live gate on
+        purpose: terminals are meant to coexist, so its residual bind race only orphans
+        a ctl target -- benign. A clipboard watcher must be a true singleton.)"""
         try:
             ipc.ensure_socket_dir()
         except OSError:
             return True                     # no runtime dir -> cannot singleton; proceed
-        if ipc.socket_is_live(INSTANCE_GROUP):
-            return False
-        from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
         path = ipc.socket_path(INSTANCE_GROUP)
-        QLocalServer.removeServer(path)     # clear a stale socket, if any
+        lock_fd = os.open(
+            path + '.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(lock_fd)
+            return False                    # a live watcher holds the lock -> exit
+        self._lock_fd = lock_fd             # held for process lifetime (releases on exit)
+        from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
+        QLocalServer.removeServer(path)     # sole owner: clear a crashed peer's stale socket
         self._server = QLocalServer(self._app)
         self._server.setSocketOptions(
             QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
-        if not self._server.listen(path):   # pragma: no cover - a same-UID path binds after removeServer; a failure is a rare OS fault
+        if not self._server.listen(path):   # pragma: no cover - sole lock holder; a failure is a rare OS fault
             self._server = None
             return True
         self._server.newConnection.connect(self._on_ipc_connection)
