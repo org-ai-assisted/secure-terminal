@@ -89,6 +89,16 @@ dispositions; at most one may be given.
     The instance group whose primary `--reuse` and `ctl` target (default:
     "default"). See INSTANCES.
 
+  * `--clipboard-watch`, `--tray`:
+    Run as a tray-only clipboard sanitizer instead of opening a terminal window.
+    It watches the system clipboard and, when copied text carries deceptive
+    Unicode (an invisible, bidirectional or control character, or a homoglyph
+    posing as ASCII), offers to replace it with a safe version -- flag-and-offer,
+    it never rewrites the clipboard on its own. This protects text later pasted
+    into an editor or any program that does not neutralize Unicode. It sanitizes
+    the LOCAL clipboard only; it does not alter the Qubes inter-VM global
+    clipboard (Ctrl+Shift+C / Ctrl+Shift+V). See also `sclip`(1).
+
   * `--version`:
     Print the version and exit.
 

@@ -1,0 +1,19 @@
+.\" generated with Ronn-NG/v0.10.1
+.\" http://github.com/apjanke/ronn-ng/tree/0.10.1
+.TH "ST\-WL\-COPY" "1" "January 2020" "secure-terminal" "secure-terminal Manual"
+.SH "NAME"
+\fBst\-wl\-copy\fR \- wl\-copy that sanitizes the clipboard on write
+.SH "SYNOPSIS"
+\fBst\-wl\-copy\fR [\fIWL\-COPY\-OPTION\fR\|\.\|\.\|\.]
+.SH "DESCRIPTION"
+st\-wl\-copy is a drop\-in replacement for \fBwl\-copy\fR(1) (Wayland) that filters standard input through \fBsclip\fR(1) before it is placed on the clipboard\. Every argument is forwarded verbatim to \fBwl\-copy\fR, so native options such as \fB\-\-primary\fR or \fB\-\-trim\-newline\fR work unchanged\.
+.P
+By default the strip is strictest (printable ASCII only)\. Set the environment variable \fBSCLIP_MODE=unicode\fR to keep printable non\-ASCII instead\.
+.SH "ENVIRONMENT"
+.TP
+\fBSCLIP_MODE\fR
+When set to \fBunicode\fR, keep printable non\-ASCII (passes \fB\-\-unicode\fR to \fBsclip\fR)\. Any other value (or unset) is the default ASCII\-only strip\.
+.SH "EXIT STATUS"
+The exit status of the underlying \fBsclip\fR | \fBwl\-copy\fR pipeline; 127 if \fBwl\-copy\fR is not installed\.
+.SH "SEE ALSO"
+\fBst\-wl\-paste\fR(1), \fBst\-xclip\fR(1), \fBsclip\fR(1), \fBwl\-copy\fR(1)

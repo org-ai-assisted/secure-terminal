@@ -2,6 +2,10 @@ usr/bin/secure-terminal usr/bin/
 usr/bin/secure-terminal-cli usr/bin/
 usr/bin/unicode-tag usr/bin/
 usr/bin/unicode-tag-stdin usr/bin/
+usr/bin/sclip usr/bin/
+usr/bin/st-wl-paste usr/bin/
+usr/bin/st-wl-copy usr/bin/
+usr/bin/st-xclip usr/bin/
 usr/lib/python3/dist-packages/secure_terminal usr/lib/python3/dist-packages/
 usr/share/applications/secure-terminal.desktop usr/share/applications/
 usr/share/icons/hicolor/scalable/apps/secure-terminal.svg usr/share/icons/hicolor/scalable/apps/
@@ -10,4 +14,6 @@ usr/share/secure-terminal/hooks usr/share/secure-terminal/
 usr/share/secure-terminal/terminfo/secure-terminal.ti usr/share/secure-terminal/terminfo/
 etc/apparmor.d/secure-terminal etc/apparmor.d/
 etc/apparmor.d/unicode-tag-stdin etc/apparmor.d/
+etc/apparmor.d/sclip etc/apparmor.d/
+etc/xdg/autostart/sclip-clipboard-watch.desktop etc/xdg/autostart/
 usr/lib/secure-terminal.d usr/lib/

@@ -1,0 +1,56 @@
+sclip(1) -- sanitize clipboard-bound text to safe characters
+============================================================
+
+<!--
+# Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+# See the file COPYING for copying conditions.
+-->
+
+## SYNOPSIS
+
+`sclip` [`--unicode`] [`--summary`]
+
+## DESCRIPTION
+
+sclip reads text on standard input and writes clipboard-safe text on standard
+output. It is a pure filter -- it opens no files, needs no display and never
+touches the clipboard itself -- so it composes with the system clipboard tools
+and confines tightly under AppArmor:
+
+    wl-paste | sclip | wl-copy
+    xclip -o | sclip | xclip -i
+
+The purpose is to make text safe to paste into an editor, or any program that
+does not neutralize Unicode: invisible, zero-width, bidirectional-control and
+other control characters are removed.
+
+By default sclip is STRICTEST: it keeps only printable ASCII plus tab and
+newline, so a cross-script homoglyph (a look-alike posing as ASCII) cannot ride
+out either.
+
+The `st-wl-paste`(1), `st-wl-copy`(1) and `st-xclip`(1) drop-in wrappers run
+these pipelines for you.
+
+## OPTIONS
+
+  * `--unicode`:
+    Keep printable non-ASCII characters (accents, CJK, ...) instead of dropping
+    them. Note the honest limit: a homoglyph IS printable Unicode, so `--unicode`
+    does NOT remove look-alikes; it removes only the invisible, bidirectional and
+    control classes. Use the default, or the review GUI (`secure-terminal
+    --clipboard-watch`), when look-alikes matter.
+
+  * `--summary`:
+    Write a one-line, mode-accurate report of what was removed (and, in
+    `--unicode` mode, what printable non-ASCII was kept) to standard error.
+    Standard output is unchanged.
+
+## EXIT STATUS
+
+0 on success; 1 on an unreadable input or a closed output pipe; 2 on an unknown
+option.
+
+## SEE ALSO
+
+`st-wl-paste`(1), `st-wl-copy`(1), `st-xclip`(1), `secure-terminal`(1),
+`unicode-tag`(1)

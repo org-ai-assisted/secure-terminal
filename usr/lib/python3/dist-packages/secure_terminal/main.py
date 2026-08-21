@@ -4526,6 +4526,13 @@ def _launch_parser(with_globals):
         p.add_argument('--test-canary', action='store_true',
                        help='fire the safe EICAR-style test canary and exit '
                             '(positive control for security-test harnesses)')
+        # Handled by an early dispatch in main() (before the launch grammar); listed
+        # here only so --help documents it. See _clipboard_watch_main.
+        p.add_argument('--clipboard-watch', '--tray', dest='clipboard_watch',
+                       action='store_true',
+                       help='run as a tray-only clipboard sanitizer: watch the '
+                            'system clipboard and offer to strip deceptive Unicode, '
+                            'opening no terminal window')
     p.add_argument('--title', help='initial tab title')
     p.add_argument('--tui', action='store_true', default=None,
                    help='start this tab in TUI mode')
@@ -4758,6 +4765,22 @@ def _shot_mode():
     return os.environ.get('SECURE_TERMINAL_SHOT') == '1'
 
 
+def _clipboard_watch_main():
+    """Tray-only clipboard-sanitizer mode (secure-terminal --clipboard-watch / --tray):
+    watches the system clipboard and offers to sanitize deceptive Unicode, opening no
+    terminal window. Dispatched early in main() so it needs only a QApplication, not the
+    launch grammar. See secure_terminal.clipboard_watch (flag-and-offer, never auto-swap)."""
+    app = QApplication([sys.argv[0]])
+    if not _require_default_font():
+        return 1
+    app.setApplicationName('secure-terminal')
+    icon = _app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+    from secure_terminal.clipboard_watch import ClipboardWatchApp
+    return ClipboardWatchApp(app).run()
+
+
 def main():
     _quiet_font_warnings()
     if sys.argv[1:2] == ['ctl']:
@@ -4773,6 +4796,12 @@ def main():
         _head = _head[:_head.index('--')]
     if '--test-canary' in _head:
         return _test_canary()
+    # Tray-only clipboard-sanitizer mode: a global option handled here (before the
+    # launch grammar and any instance handoff), because it opens NO terminal window
+    # and needs only a QApplication. A '--clipboard-watch' after '--' belongs to the
+    # child command and is left alone.
+    if '--clipboard-watch' in _head or '--tray' in _head:
+        return _clipboard_watch_main()
     launch = _parse_launch_args(sys.argv[1:])
 
     # New INDEPENDENT instance per launch (konsole/qterminal model): every launch

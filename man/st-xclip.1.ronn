@@ -1,0 +1,49 @@
+st-xclip(1) -- xclip that sanitizes a clipboard write
+=====================================================
+
+<!--
+# Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+# See the file COPYING for copying conditions.
+-->
+
+## SYNOPSIS
+
+`st-xclip` [<XCLIP-OPTION>...]
+
+## DESCRIPTION
+
+st-xclip is a drop-in replacement for `xclip`(1) (X11) that filters standard
+input through `sclip`(1) on a clipboard WRITE. Every argument is forwarded
+verbatim to `xclip`, so native options such as `-selection clipboard` work
+unchanged.
+
+xclip is one command for both directions, so st-xclip uses a simple, honest rule
+rather than parsing xclip's option grammar:
+
+  * a READ (`-o` / `-out`), or `-help` / `-version`, is passed through unchanged;
+  * a piped standard input that is not a read is sanitized through `sclip`;
+  * anything else (standard input is a terminal: a file-operand write, or an
+    interactive invocation) is passed through unchanged.
+
+So it sanitizes the common `echo ... | st-xclip -selection clipboard` form. For a
+file-operand write (`xclip file`) use the raw pipeline instead:
+
+    sclip < file | xclip -selection clipboard
+
+By default the strip is strictest (printable ASCII only). Set the environment
+variable `SCLIP_MODE=unicode` to keep printable non-ASCII instead.
+
+## ENVIRONMENT
+
+  * `SCLIP_MODE`:
+    When set to `unicode`, keep printable non-ASCII (passes `--unicode` to
+    `sclip`). Any other value (or unset) is the default ASCII-only strip.
+
+## EXIT STATUS
+
+The exit status of `xclip`, or of the `sclip` | `xclip` pipeline on a sanitized
+write; 127 if `xclip` is not installed.
+
+## SEE ALSO
+
+`st-wl-paste`(1), `st-wl-copy`(1), `sclip`(1), `xclip`(1)

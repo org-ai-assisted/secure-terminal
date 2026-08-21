@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=secure-terminal clipboard sanitizer
+GenericName=Clipboard sanitizer
+Comment=Watch the clipboard and offer to strip deceptive Unicode
+Exec=secure-terminal --clipboard-watch
+Icon=secure-terminal
+Terminal=false
+Categories=Utility;Security;
+Keywords=clipboard;unicode;sanitize;paste;safe;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

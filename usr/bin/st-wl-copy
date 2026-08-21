@@ -1,0 +1,36 @@
+#!/bin/bash
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## st-wl-copy: drop-in for wl-copy that sanitizes on WRITE. Filters stdin through
+## sclip, then hands the safe text to `wl-copy` with every argument forwarded
+## verbatim (native options such as --primary / --trim-newline pass through). Set
+## SCLIP_MODE=unicode to keep printable non-ASCII (default: ASCII-only, strictest).
+
+## style-ok: no-has -- a standalone tool that must run on plain Debian without the
+## Kicksecure helper-scripts stack, so it uses portable `command -v`, not `has`.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+set -o errtrace
+shopt -s inherit_errexit
+shopt -s shift_verbose
+
+dir="$(dirname -- "$(readlink -f -- "$0")")"
+sclip="${dir}/sclip"
+
+if ! command -v wl-copy >/dev/null 2>&1 ; then
+   printf '%s\n' "st-wl-copy: wl-copy not found -- install wl-clipboard" >&2
+   exit 127
+fi
+
+mode=()
+if [ "${SCLIP_MODE:-}" = "unicode" ]; then
+   mode=(--unicode)
+fi
+
+"${sclip}" "${mode[@]}" | wl-copy "$@"

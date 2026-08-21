@@ -1,0 +1,67 @@
+#!/bin/bash
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## st-xclip: drop-in for xclip that sanitizes a stdin WRITE. xclip is one command
+## for both directions (-i/-in write, -o/-out read), so this uses a simple, honest
+## rule -- NOT an xclip argument parser (which would have to model its value-taking
+## options -selection/-target/-display):
+##
+##   * a READ (-o / -out), or -help / -version   -> pass through unchanged
+##   * stdin is a pipe and not a read             -> sanitize stdin through sclip
+##   * anything else (stdin is a tty: a file-operand write, or interactive)
+##                                                -> pass through unchanged
+##
+## So it sanitizes exactly the common `echo ... | st-xclip -selection clipboard`
+## form. For a file-operand write (`xclip file`) use the raw pipeline instead:
+## `sclip < file | xclip -selection clipboard`. All arguments are forwarded
+## verbatim. Set SCLIP_MODE=unicode to keep printable non-ASCII (default ASCII).
+
+## style-ok: no-has -- a standalone tool that must run on plain Debian without the
+## Kicksecure helper-scripts stack, so it uses portable `command -v`, not `has`.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+set -o errtrace
+shopt -s inherit_errexit
+shopt -s shift_verbose
+
+dir="$(dirname -- "$(readlink -f -- "$0")")"
+sclip="${dir}/sclip"
+
+if ! command -v xclip >/dev/null 2>&1 ; then
+   printf '%s\n' "st-xclip: xclip not found -- install xclip" >&2
+   exit 127
+fi
+
+## Simple token scan: is this a read / help / version invocation? (No attempt to
+## parse option VALUES -- an unrelated argument that merely equals '-o' is not a
+## real-world xclip write.)
+passthrough="false"
+for arg in "$@" ; do
+   case "${arg}" in
+      -o|-out|-h|-help|-version)
+         passthrough="true"
+         break
+         ;;
+   esac
+done
+
+mode=()
+if [ "${SCLIP_MODE:-}" = "unicode" ]; then
+   mode=(--unicode)
+fi
+
+## A tty on stdin means no piped write to sanitize (file-operand or interactive):
+## pass through. Otherwise sanitize the piped write. Run xclip as a CHILD in both
+## branches (no process-replacement exec), so the last command's exit code is
+## forwarded.
+if [ "${passthrough}" = "true" ] || [ -t 0 ]; then
+   xclip "$@"
+else
+   "${sclip}" "${mode[@]}" | xclip "$@"
+fi
