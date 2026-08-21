@@ -49,6 +49,16 @@ from secure_terminal.sanitize import (
 )
 from secure_terminal.unicode_tag import tag_text
 
+
+class _SingletonBindError(Exception):
+    """The singleton flock was taken but the control socket did not bind.
+
+    A startup failure distinct from 'another watcher already runs': the daemon
+    would otherwise run with no stop_running() socket and a held lock that blocks
+    every replacement. The lock and server are released before this is raised.
+    """
+
+
 _AUTOSTART_BASENAME = 'sclip-clipboard-watch.desktop'
 ## The fixed instance group whose owner-only socket makes the watcher a singleton
 ## and lets the terminal ping / start / stop it. See ipc.socket_path.
@@ -317,9 +327,17 @@ class ClipboardWatchApp:
         self._server = QLocalServer(self._app)
         self._server.setSocketOptions(
             QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
-        if not self._server.listen(path):   # pragma: no cover - rare OS fault after clearing the socket
+        if not self._server.listen(path):
+            # The flock is held but the control socket did not bind: the daemon
+            # would run uncontrollable (stop_running() has no socket to reach)
+            # and its held lock would block every replacement. Release both and
+            # fail startup -- never return True (proceed) or False (another
+            # watcher active).
             self._server = None
-            return True
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)
+                self._lock_fd = None
+            raise _SingletonBindError(path)
         self._server.newConnection.connect(self._on_ipc_connection)
         return True
 
@@ -407,7 +425,13 @@ class ClipboardWatchApp:
     # -- lifecycle ------------------------------------------------------------
     def run(self):
         self._app.setQuitOnLastWindowClosed(False)   # tray-only: no window closes it
-        if not self._claim_singleton():
+        try:
+            claimed = self._claim_singleton()
+        except _SingletonBindError as exc:
+            sys.stderr.write('secure-terminal: clipboard-watch could not bind its '
+                             'control socket (%s); not starting.\n' % exc)
+            return 1
+        if not claimed:
             # Another clipboard watcher already runs -- not an error.
             return 0
         self._tray = self._build_tray()
