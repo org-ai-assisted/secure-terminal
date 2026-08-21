@@ -832,6 +832,7 @@ class SecureTerminal(QPlainTextEdit):
         # flipping to TUI mode shows the program's current frame instantly (no
         # restart). Maintained from the output stream (alt-screen enter/leave).
         self._alt_screen = False
+        self._wheel_accum = 0         # accumulated wheel delta for alt-screen scroll
         # True while the grid view is rendering the alternate screen ALONE (grid
         # only, no scrollback above it). Lets _render_tui clear the carried-in
         # scrollback exactly once when a full-screen program takes the alt screen,
@@ -2181,11 +2182,16 @@ class SecureTerminal(QPlainTextEdit):
         # Translate the wheel into arrow-key line scrolls sent to the child, like
         # xterm's alternateScroll, so the wheel scrolls the program as expected.
         if self._alt_screen:
-            delta = event.angleDelta().y()
-            if delta:
-                seq = b'\x1b[A' if delta > 0 else b'\x1b[B'
-                lines = max(1, min(5, abs(delta) // 40))   # ~3 lines per notch, capped
-                self._write(seq * lines)
+            # ACCUMULATE the wheel delta and emit a line only per ~40 units, carrying
+            # the remainder -- a mouse notch (120) is ~3 lines, but a high-resolution
+            # trackpad streams many tiny deltas, so rounding EACH up to a line would
+            # fire an arrow per micro-event (uncontrollable hyperscroll).
+            self._wheel_accum += event.angleDelta().y()
+            lines = int(self._wheel_accum / 40)
+            if lines:
+                self._wheel_accum -= lines * 40
+                seq = b'\x1b[A' if lines > 0 else b'\x1b[B'
+                self._write(seq * min(abs(lines), 8))   # cap a single huge jump
             event.accept()
             return
         super().wheelEvent(event)
