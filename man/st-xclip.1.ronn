@@ -25,8 +25,10 @@ rather than parsing xclip's option grammar:
   * anything else (standard input is a terminal: a file-operand write, or an
     interactive invocation) is passed through unchanged.
 
-So it sanitizes the common `echo ... | st-xclip -selection clipboard` form. For a
-file-operand write (`xclip file`) use the raw pipeline instead:
+So it sanitizes the common `echo ... | st-xclip -selection clipboard` form. A
+FILE OPERAND on a write (`... | st-xclip file`) is REFUSED (exit 2): xclip would
+read and copy the file, ignoring the sanitized standard input. Use the raw
+pipeline instead:
 
     sclip < file | xclip -selection clipboard
 

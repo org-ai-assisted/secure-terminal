@@ -20,6 +20,10 @@ work unchanged.
 By default the strip is strictest (printable ASCII only). Set the environment
 variable `SCLIP_MODE=unicode` to keep printable non-ASCII instead.
 
+`--watch` (`-w`) is REFUSED (exit 2): `wl-paste --watch` feeds the raw clipboard
+to the watched command's standard input rather than to standard output, so it
+would bypass sclip entirely.
+
 Compose it like the original, sanitizing one or both sides:
 
     st-wl-paste | st-wl-copy

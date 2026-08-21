@@ -17,7 +17,7 @@ a piped standard input that is not a read is sanitized through \fBsclip\fR;
 anything else (standard input is a terminal: a file\-operand write, or an interactive invocation) is passed through unchanged\.
 .IP "" 0
 .P
-So it sanitizes the common \fBecho \|\.\|\.\|\. | st\-xclip \-selection clipboard\fR form\. For a file\-operand write (\fBxclip file\fR) use the raw pipeline instead:
+So it sanitizes the common \fBecho \|\.\|\.\|\. | st\-xclip \-selection clipboard\fR form\. A FILE OPERAND on a write (\fB\|\.\|\.\|\. | st\-xclip file\fR) is REFUSED (exit 2): xclip would read and copy the file, ignoring the sanitized standard input\. Use the raw pipeline instead:
 .IP "" 4
 .nf
 sclip < file | xclip \-selection clipboard

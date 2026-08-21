@@ -63,5 +63,22 @@ fi
 if [ "${passthrough}" = "true" ] || [ -t 0 ]; then
    xclip "$@"
 else
+   ## A WRITE: when a FILE OPERAND is present xclip reads the FILE, not stdin, so
+   ## the operand would bypass sclip. A real file operand is a path that EXISTS,
+   ## whereas an option value (clipboard / primary / UTF8_STRING / :0) is not -- so
+   ## a plain `[ -e ]` test detects it with NO xclip option parser (xclip allows
+   ## abbreviated options, which a parser could not reliably match). Fail closed.
+   for arg in "$@"; do
+      case "${arg}" in
+         -*)
+            ;;
+         *)
+            if [ -e "${arg}" ]; then
+               printf '%s\n' "st-xclip: a file operand is not sanitized -- use: sclip < file | xclip ..." >&2
+               exit 2
+            fi
+            ;;
+      esac
+   done
    "${sclip}" "${mode[@]}" | xclip "$@"
 fi

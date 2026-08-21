@@ -191,7 +191,10 @@ class ClipboardWatchApp:
         """Apply the user's choice (called from _ClipboardReview.dispatch)."""
         if action == 'reject':
             self._dismissed = raw          # keep it; do not nag about the same text
-        else:
+        elif self._clipboard.text() == raw:
+            # Replace ONLY while the flagged text is still on the clipboard. If the
+            # user copied something else after the popup opened, that newer content
+            # must not be silently clobbered by the stale review (a TOCTOU write).
             safe = (sanitize_clipboard_unicode if action == 'unicode'
                     else sanitize_clipboard)(raw)
             self._last_written = safe      # so the resulting dataChanged is ignored

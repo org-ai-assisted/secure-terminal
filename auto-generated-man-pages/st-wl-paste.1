@@ -10,6 +10,8 @@ st\-wl\-paste is a drop\-in replacement for \fBwl\-paste\fR(1) (Wayland) that fi
 .P
 By default the strip is strictest (printable ASCII only)\. Set the environment variable \fBSCLIP_MODE=unicode\fR to keep printable non\-ASCII instead\.
 .P
+\fB\-\-watch\fR (\fB\-w\fR) is REFUSED (exit 2): \fBwl\-paste \-\-watch\fR feeds the raw clipboard to the watched command's standard input rather than to standard output, so it would bypass sclip entirely\.
+.P
 Compose it like the original, sanitizing one or both sides:
 .IP "" 4
 .nf

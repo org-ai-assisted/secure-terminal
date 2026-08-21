@@ -30,6 +30,18 @@ if ! command -v wl-paste >/dev/null 2>&1 ; then
    exit 127
 fi
 
+## wl-paste --watch runs a command on every clipboard change and feeds it the RAW
+## clipboard on the command's stdin -- it never writes to the stdout this wrapper
+## sanitizes, so the watched command would receive UNSANITIZED text. Fail closed.
+for arg in "$@"; do
+   case "${arg}" in
+      -w|--watch)
+         printf '%s\n' "st-wl-paste: --watch is not supported (it feeds the RAW clipboard to the command, bypassing sclip)" >&2
+         exit 2
+         ;;
+   esac
+done
+
 mode=()
 if [ "${SCLIP_MODE:-}" = "unicode" ]; then
    mode=(--unicode)

@@ -28,6 +28,31 @@ if ! command -v wl-copy >/dev/null 2>&1 ; then
    exit 127
 fi
 
+## wl-copy copies a TEXT OPERAND directly and then IGNORES stdin, so a text
+## operand would bypass sclip entirely (and, with a pipe, sclip would hang on
+## EOF while the raw operand is copied). This wrapper sanitizes STDIN only, so
+## fail CLOSED on any text operand. Skip the values of wl-copy's value-taking
+## options (-t/--type, -s/--seat) so they are not mistaken for text -- a bounded
+## scan of the known value options, not a general parser.
+skip_next="false"
+for arg in "$@"; do
+   if [ "${skip_next}" = "true" ]; then
+      skip_next="false"
+      continue
+   fi
+   case "${arg}" in
+      -t|--type|-s|--seat)
+         skip_next="true"
+         ;;
+      -*)
+         ;;
+      *)
+         printf '%s\n' "st-wl-copy: a text operand is not sanitized -- pipe the text instead: printf %s ... | st-wl-copy" >&2
+         exit 2
+         ;;
+   esac
+done
+
 mode=()
 if [ "${SCLIP_MODE:-}" = "unicode" ]; then
    mode=(--unicode)

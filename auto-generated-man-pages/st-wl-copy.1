@@ -9,6 +9,8 @@
 st\-wl\-copy is a drop\-in replacement for \fBwl\-copy\fR(1) (Wayland) that filters standard input through \fBsclip\fR(1) before it is placed on the clipboard\. Every argument is forwarded verbatim to \fBwl\-copy\fR, so native options such as \fB\-\-primary\fR or \fB\-\-trim\-newline\fR work unchanged\.
 .P
 By default the strip is strictest (printable ASCII only)\. Set the environment variable \fBSCLIP_MODE=unicode\fR to keep printable non\-ASCII instead\.
+.P
+A TEXT OPERAND (\fBwl\-copy some text\fR) is REFUSED (exit 2): wl\-copy copies a text operand directly and ignores standard input, so the operand would reach the clipboard unsanitized\. Pipe the text instead (\fBprintf %s 'some text' | st\-wl\-copy\fR)\.
 .SH "ENVIRONMENT"
 .TP
 \fBSCLIP_MODE\fR
