@@ -2174,6 +2174,20 @@ class SecureTerminal(QPlainTextEdit):
                 self.zoom_step.emit(1 if delta > 0 else -1)
             event.accept()
             return
+        # Alternate scroll: in the ALTERNATE screen a full-screen program (less, vim,
+        # a TUI) owns the display -- there is no local scrollback to move, and this
+        # terminal does no mouse reporting, so a plain wheel would scroll a dead Qt
+        # document (the reported bug: wheel does nothing while Page Up/Down work).
+        # Translate the wheel into arrow-key line scrolls sent to the child, like
+        # xterm's alternateScroll, so the wheel scrolls the program as expected.
+        if self._alt_screen:
+            delta = event.angleDelta().y()
+            if delta:
+                seq = b'\x1b[A' if delta > 0 else b'\x1b[B'
+                lines = max(1, min(5, abs(delta) // 40))   # ~3 lines per notch, capped
+                self._write(seq * lines)
+            event.accept()
+            return
         super().wheelEvent(event)
 
     def _child_term(self):

@@ -312,6 +312,9 @@ class _ZoomDialog(QDialog):
             super().wheelEvent(event)
 
 
+_QWIDGETSIZE_MAX = (1 << 24) - 1   # Qt's QWIDGETSIZE_MAX (no-maximum sentinel; PyQt does not export it)
+
+
 class InfoTip(QLabel):
     """A persistent, selectable, zoom-aware replacement for the plain tooltip.
     Unlike QToolTip you can move the pointer INTO it to select and copy the text,
@@ -345,12 +348,26 @@ class InfoTip(QLabel):
 
     def show_for(self, widget, text, global_pos, zoom):
         self._source = widget
+        # Release any size lock from a previous tip so this text can size freely
+        # (keep the 340px width cap that drives the word wrap; height unbounded).
+        self.setMaximumSize(340, _QWIDGETSIZE_MAX)
         self.setText(text)
         font = QFont()
         base = font.pointSizeF() if font.pointSizeF() > 0 else 10.0
         font.setPointSizeF(base * max(50, min(400, zoom)) / 100.0)
         self.setFont(font)
         self.adjustSize()
+        # QLabel + wordWrap UNDER-computes its height in adjustSize once the text
+        # wraps at maximumWidth (a long tip at a high zoom), clipping the last
+        # line(s) -- "Applies to..." would vanish. Recompute the height the wrapped
+        # text actually needs at the settled width so the whole tip is visible.
+        self.resize(self.width(), self.heightForWidth(self.width()))
+        # Lock the max size to the content: some window managers decorate this
+        # frameless tool window and let the user MAXIMIZE it full-screen, where the
+        # pointer-leave poll can never fire and the WM close is ignored -- an
+        # un-closable tip. Capping max = content makes maximize a no-op; the poll
+        # then hides the tip normally on leave.
+        self.setMaximumSize(self.size())
         self.move(global_pos + QPoint(12, 18))
         self.show()
         # A frameless stay-on-top tool window can still be painted under a modal
@@ -381,6 +398,13 @@ class InfoTip(QLabel):
             self._poll.stop()
             return
         super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        # If a window manager DOES send a close (it decorated this frameless tool
+        # window), tear the poll down too so no stopped-but-alive tip lingers.
+        self._poll.stop()
+        self._source = None
+        super().closeEvent(event)
 
 
 class _InfoLabel(QLabel):
@@ -3966,6 +3990,22 @@ class MainWindow(QMainWindow):
                  'tabs are easy to tell apart at a glance. On by default; a colour '
                  'you set on a tab (right-click) overrides the automatic one.')
 
+        from secure_terminal import clipboard_watch   # noqa: PLC0415
+        clip_box = _section('Clipboard sanitizer')
+        clip_warn_any = QCheckBox()
+        clip_warn_any.setChecked(self._clip_warn_any)
+        _tip_row(clip_box, 'Warn on any non-ASCII', clip_warn_any,
+                 'The background clipboard sanitizer warns on ANY non-ASCII (accents, '
+                 'CJK, emoji) too, not only hidden/deceptive characters. Off by '
+                 'default. Also on the View > Clipboard sanitizer menu.')
+        clip_autostart = QCheckBox()
+        clip_autostart.setChecked(clipboard_watch.autostart_enabled())
+        clip_autostart.setEnabled(self._clip_controls_enabled())
+        _tip_row(clip_box, 'Start sanitizer on login', clip_autostart,
+                 'Start the tray clipboard sanitizer automatically at login. Needs the '
+                 'system tray on -- it is a tray app, so turning the tray off turns '
+                 'this off too.')
+
         # Size every dropdown to its own item count (capped): a Qt desktop theme
         # that reserves maxVisibleItems rows for the popup would otherwise leave
         # scrollable empty space below a short list -- most visibly the Font list,
@@ -3989,6 +4029,7 @@ class MainWindow(QMainWindow):
             (pdelay, 'paste_delay'), (paste_warn, 'paste_warn'),
             (copy_warn, 'copy_warn'), (persist, 'persist_session'),
             (systray, 'systray'), (auto_tab_colors, 'auto_tab_colors'),
+            (clip_warn_any, 'clip_warn_any'),
         ):
             _w.setEnabled(_lock_key not in self._locked)
         # OSC feature checkboxes: _osc_locked, so a legacy allow_title lock also
@@ -4041,6 +4082,8 @@ class MainWindow(QMainWindow):
             'persist': persist.isChecked(),
             'systray': systray.isChecked(),
             'auto_tab_colors': auto_tab_colors.isChecked(),
+            'clip_warn_any': clip_warn_any.isChecked(),
+            'clip_autostart': clip_autostart.isChecked(),
         })
 
     def _apply_global(self, opts):
@@ -4101,6 +4144,12 @@ class MainWindow(QMainWindow):
             self.set_auto_tab_colors(opts['auto_tab_colors'])
         if 'systray' in opts:
             self.set_systray(opts['systray'])
+        # AFTER set_systray, so its coupling (tray off -> autostart off) settles
+        # first and set_clip_autostart then sees the applied tray state.
+        if 'clip_warn_any' in opts:
+            self.set_clip_warn_any(opts['clip_warn_any'])
+        if 'clip_autostart' in opts:
+            self.set_clip_autostart(opts['clip_autostart'])
         self._sync_paste_delay_menu()   # menu check reflects the applied delay
         self.set_persist_session(opts['persist'])
         self._sync_chrome_to_tab()
