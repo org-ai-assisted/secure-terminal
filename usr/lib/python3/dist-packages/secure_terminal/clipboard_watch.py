@@ -283,16 +283,29 @@ class ClipboardWatchApp:
         except OSError:
             return True                     # no runtime dir -> cannot singleton; proceed
         path = ipc.socket_path(INSTANCE_GROUP)
-        lock_fd = os.open(
-            path + '.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        try:
+            lock_fd = os.open(
+                path + '.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        except OSError:
+            return True                     # cannot open the lock file -> best effort, proceed
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except BlockingIOError:
             os.close(lock_fd)
-            return False                    # a live watcher holds the lock -> exit
+            return False                    # another live watcher holds the lock -> exit
+        except OSError:
+            os.close(lock_fd)               # flock unsupported on this fs -> best effort, proceed
+            return True
         self._lock_fd = lock_fd             # held for process lifetime (releases on exit)
         from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
-        QLocalServer.removeServer(path)     # sole owner: clear a crashed peer's stale socket
+        # A watcher still running the PRE-flock code holds no lock, so the flock above
+        # cannot see it. Defer to any live incumbent socket (e.g. mid package upgrade)
+        # instead of stealing it; only clear a confirmed-stale socket.
+        if ipc.socket_is_live(INSTANCE_GROUP):
+            os.close(self._lock_fd)
+            self._lock_fd = None
+            return False
+        QLocalServer.removeServer(path)     # stale socket from a crashed predecessor
         self._server = QLocalServer(self._app)
         self._server.setSocketOptions(
             QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
