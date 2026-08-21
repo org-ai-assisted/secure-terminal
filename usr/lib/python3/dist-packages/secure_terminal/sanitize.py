@@ -501,45 +501,6 @@ def sanitize_bytes(data, mode='detail'):
     return render_output(data.decode('latin-1'), mode)
 
 
-def apply_line_edits(line, col, text, max_line=0):
-    r"""Resolve the interactive line-editing controls the shell's line editor
-    emits, against one logical line held as a Python string with a cursor column.
-    Pure and O(len(text)), so a flood of control-laden bytes ("cat /dev/random")
-    never reaches the per-character QTextCursor path that crawls.
-
-    Backspace (0x08) moves the cursor one cell left; a bare carriage return
-    (0x0D) moves it to column 0; a printable character OVERWRITES the cell under
-    the cursor (a terminal never inserts-and-shifts) or appends at end of line;
-    '\n' ends the line. `line`/`col` are the current incomplete line and cursor
-    column carried across writes. Returns (completed_lines, line, col): the lines
-    finished by a newline plus the new current line and column. max_line (> 0)
-    hard-wraps an over-long line into its own completed line, so a flood with no
-    newline cannot build one unbounded block. CRLF must already be collapsed."""
-    completed = []
-    buf = list(line)
-    for ch in text:
-        if ch == '\n':
-            completed.append(''.join(buf))
-            buf = []
-            col = 0
-        elif ch == '\r':
-            col = 0
-        elif ch == '\x08':
-            if col > 0:
-                col -= 1
-        else:
-            if col < len(buf):
-                buf[col] = ch
-            else:
-                buf.append(ch)
-            col += 1
-            if max_line and len(buf) >= max_line:
-                completed.append(''.join(buf))
-                buf = []
-                col = 0
-    return completed, ''.join(buf), col
-
-
 # Line-LOCAL cursor/erase escapes the shell's line editor emits, honored in line
 # mode so the display tracks the real command buffer (readline/zle redraw with
 # these under a capable TERM). ONLY these, and only within the current line:
