@@ -3219,6 +3219,12 @@ class SecureTerminal(QPlainTextEdit):
                 except TypeError:
                     pass
                 act.triggered.connect(lambda _checked=False: self.copy())
+        # Let the owning window append its app-level toggles (system tray, clipboard
+        # sanitizer), so they are reachable from the right-click menu too. A preview
+        # pane's window() is not a MainWindow and has no such method -> nothing added.
+        add = getattr(self.window(), 'add_terminal_context_actions', None)
+        if add is not None:
+            add(menu)
         return menu
 
     def contextMenuEvent(self, event):
