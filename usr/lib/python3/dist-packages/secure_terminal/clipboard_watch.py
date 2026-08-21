@@ -283,18 +283,26 @@ class ClipboardWatchApp:
         except OSError:
             return True                     # no runtime dir -> cannot singleton; proceed
         path = ipc.socket_path(INSTANCE_GROUP)
+        # Primary gate: an flock held for process lifetime. If the lock file cannot be
+        # opened, or flock is unsupported on this fs, fall through with no lock -- best
+        # effort drops the flock gate, never the socket claim below. os.open and flock
+        # are separate try blocks so os.close only ever runs on a real fd (an EAGAIN from
+        # os.open itself must not reach os.close(None)).
         lock_fd = None
         try:
             lock_fd = os.open(
                 path + '.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(lock_fd)
-            return False                    # another live watcher holds the lock -> exit
         except OSError:
-            if lock_fd is not None:
-                os.close(lock_fd)           # open failed / flock unsupported on this fs
-            lock_fd = None                  # best effort: drop the flock, still claim the socket
+            pass                            # lock file unusable -> best effort (lock_fd stays None)
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(lock_fd)
+                return False                # another live watcher holds the lock -> exit
+            except OSError:
+                os.close(lock_fd)           # flock unsupported on this fs
+                lock_fd = None              # best effort: drop the flock, still claim the socket
         from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
         # Defer to any live incumbent socket rather than stealing it -- a watcher still
         # running the PRE-flock code holds no lock, and a best-effort start (no usable
