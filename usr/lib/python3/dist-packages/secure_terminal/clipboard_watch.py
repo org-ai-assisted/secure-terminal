@@ -425,15 +425,13 @@ class ClipboardWatchApp:
     def _set_warn_any(self, on):
         ## A tray toggle is a real user choice: live-update this watcher AND
         ## PERSIST it (like 'Start on login'), so it survives a daemon restart --
-        ## warn_any_default() reads clip_warn_any at startup. Mirrors the effective
-        ## settings back with clip_warn_any updated; settings.save drops an
-        ## admin-locked key, so a locked clip_warn_any is never written.
+        ## warn_any_default() reads clip_warn_any at startup. A SINGLE-KEY user-file
+        ## update: it must NOT rewrite the merged config (that would pin a system/
+        ## admin key into user config, overriding a later admin change); set_user_key
+        ## no-ops a locked key.
         on = bool(on)
         self._watcher.set_any_mode(on)
-        cfg = settings.load()
-        values = dict(cfg)
-        values['clip_warn_any'] = 'true' if on else 'false'
-        settings.save(values, locked=cfg.locked)
+        settings.set_user_key('clip_warn_any', 'true' if on else 'false')
 
     # -- lifecycle ------------------------------------------------------------
     def run(self):
