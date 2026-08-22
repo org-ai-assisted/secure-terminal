@@ -36,6 +36,7 @@ Only these drop-in .conf files are read -- there is no legacy single-file config
 
 import os
 import glob
+import fcntl
 
 _APP = 'secure-terminal'
 # where the app writes its own settings. 50 leaves room for a user to drop a
@@ -103,8 +104,8 @@ def _parse_into(path, out):
                 key = key.strip()
                 if key:
                     out[key] = value.strip()
-    except OSError:
-        pass                    # missing/unreadable drop-in -> ignored
+    except (OSError, ValueError):
+        pass                    # missing / unreadable / non-UTF-8 drop-in -> ignored
 
 
 def _load_dir(directory):
@@ -187,27 +188,60 @@ def save(values, locked=()):
         pass                    # a settings write is best-effort, never fatal
 
 
+def _user_write_lock():
+    """Acquire an exclusive advisory lock (flock) on a sidecar of the user file,
+    serializing the read-modify-write in set_user_key / update_user across the
+    terminal and the SEPARATE clipboard-watch daemon (both write clip_warn_any) so
+    a concurrent single-key write is not lost. Returns an open fd -- hold it across
+    the read+save, close it to release -- or None if the lock cannot be taken
+    (best-effort: the write still proceeds, just unserialized). Never raises."""
+    path = user_config_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handle = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        return handle
+    except OSError:
+        return None
+
+
 def set_user_key(key, value):
     """Set ONE key in the app's OWN user config file, preserving the other keys it
     already holds. Reads only that file, never the merged system/admin config, so it
     cannot pin a system/admin value into user config (which would then outrank a
-    later admin change). An admin-locked key is dropped by save (never written).
+    later admin change). An admin-locked key is dropped by save (never written). The
+    read-modify-write is serialized against the other writer (_user_write_lock).
     Never raises."""
     cfg = load()
-    current = {}
-    _parse_into(user_config_file(), current)
-    current[key] = value
-    save(current, locked=cfg.locked)
+    handle = _user_write_lock()
+    try:
+        current = {}
+        _parse_into(user_config_file(), current)
+        current[key] = value
+        save(current, locked=cfg.locked)
+    finally:
+        if handle is not None:
+            os.close(handle)
 
 
-def update_user(values):
+def update_user(values, locked=None):
     """Merge-preserving multi-key update of the app's OWN user file: set each key in
     `values`, keeping the other keys the file already holds -- e.g. a key ANOTHER
     process persisted via set_user_key (clip_warn_any, from the clipboard-watch
-    tray) must not be clobbered by a bulk write here. Admin-locked keys are dropped
-    by save. Never raises."""
-    cfg = load()
-    current = {}
-    _parse_into(user_config_file(), current)
-    current.update(values)
-    save(current, locked=cfg.locked)
+    tray) must not be clobbered by a bulk write here. `locked` is the caller's
+    authoritative lock set: the window passes its STARTUP snapshot, so a key locked
+    at launch is never written back as a user override even if the admin unlocks it
+    while the app is open; when None the current load() locks are used. The
+    read-modify-write is serialized against the other writer (_user_write_lock).
+    Never raises."""
+    if locked is None:
+        locked = load().locked
+    handle = _user_write_lock()
+    try:
+        current = {}
+        _parse_into(user_config_file(), current)
+        current.update(values)
+        save(current, locked=locked)
+    finally:
+        if handle is not None:
+            os.close(handle)

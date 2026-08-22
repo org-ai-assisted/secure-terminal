@@ -2925,8 +2925,9 @@ class MainWindow(QMainWindow):
     def _persist(self):
         # Merge-preserving: a key another process owns (clip_warn_any, set by the
         # clipboard-watch tray via settings.set_user_key) must survive this bulk
-        # write, so update_user updates only these keys and keeps the rest. Admin-
-        # locked keys are dropped, so a locked setting is never written.
+        # write, so update_user updates only these keys and keeps the rest. Pass the
+        # STARTUP lock snapshot (self._locked): a key locked at launch is never
+        # written back as a user override even if the admin unlocks it while open.
         settings.update_user({
             'theme': self._default_theme,
             'zoom': str(self._default_zoom),
@@ -2957,7 +2958,7 @@ class MainWindow(QMainWindow):
             'persist_session': 'true' if self._persist_session else 'false',
             'confirm_close': 'true' if self._confirm_close else 'false',
             **{k: 'true' if v else 'false' for k, v in self._osc_defaults.items()},
-        })
+        }, locked=self._locked)
 
     # -- chrome ---------------------------------------------------------------
     def _build_menu(self):
@@ -4150,7 +4151,11 @@ class MainWindow(QMainWindow):
             self.set_systray(opts['systray'])
         # AFTER set_systray, so its coupling (tray off -> autostart off) settles
         # first and set_clip_autostart then sees the applied tray state.
-        if 'clip_warn_any' in opts:
+        # Only write clip_warn_any when the user actually toggled it in this dialog:
+        # the clipboard-watch daemon may have changed it on disk since the dialog
+        # opened, and re-writing the stale checkbox value would clobber that (and
+        # push the stale value to a running daemon).
+        if 'clip_warn_any' in opts and opts['clip_warn_any'] != self._clip_warn_any:
             self.set_clip_warn_any(opts['clip_warn_any'])
         if 'clip_autostart' in opts:
             self.set_clip_autostart(opts['clip_autostart'])
