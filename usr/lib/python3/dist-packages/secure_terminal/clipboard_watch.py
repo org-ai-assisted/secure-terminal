@@ -408,7 +408,7 @@ class ClipboardWatchApp:
         act_any.setChecked(warn_any_default())
         act_any.setToolTip('Off: warn only on hidden/deceptive characters. '
                            'On: warn on any non-ASCII (accents, CJK, emoji) too.')
-        act_any.toggled.connect(self._watcher.set_any_mode)
+        act_any.toggled.connect(self._set_warn_any)
 
         act_autostart = menu.addAction('Start on login')
         act_autostart.setCheckable(True)
@@ -421,6 +421,19 @@ class ClipboardWatchApp:
         menu.addSeparator()
         menu.addAction('Quit').triggered.connect(self._app.quit)
         return menu
+
+    def _set_warn_any(self, on):
+        ## A tray toggle is a real user choice: live-update this watcher AND
+        ## PERSIST it (like 'Start on login'), so it survives a daemon restart --
+        ## warn_any_default() reads clip_warn_any at startup. Mirrors the effective
+        ## settings back with clip_warn_any updated; settings.save drops an
+        ## admin-locked key, so a locked clip_warn_any is never written.
+        on = bool(on)
+        self._watcher.set_any_mode(on)
+        cfg = settings.load()
+        values = dict(cfg)
+        values['clip_warn_any'] = 'true' if on else 'false'
+        settings.save(values, locked=cfg.locked)
 
     # -- lifecycle ------------------------------------------------------------
     def run(self):
