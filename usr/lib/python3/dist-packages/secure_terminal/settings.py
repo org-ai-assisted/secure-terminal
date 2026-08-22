@@ -93,19 +93,41 @@ def config_path():
     return user_config_file()
 
 
+def _parse_lines(lines, out):
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, _, value = line.partition('=')
+        key = key.strip()
+        if key:
+            out[key] = value.strip()
+
+
 def _parse_into(path, out):
     try:
         with open(path, encoding='utf-8') as handle:
-            for line in handle:
-                line = line.strip()
-                if not line or line.startswith('#') or '=' not in line:
-                    continue
-                key, _, value = line.partition('=')
-                key = key.strip()
-                if key:
-                    out[key] = value.strip()
+            _parse_lines(handle, out)
     except (OSError, ValueError):
         pass                    # missing / unreadable / non-UTF-8 drop-in -> ignored
+
+
+def _read_user_base():
+    """Parse the user file as the base for a REWRITE (set_user_key / update_user).
+    Returns the dict, or None if the file EXISTS but cannot be read as UTF-8 -- the
+    caller then SKIPS the write instead of clobbering unreadable keys: a lossy
+    re-parse of a corrupt file (a single bad byte yields no keys) followed by a
+    rewrite would delete every other setting. A missing file is an empty base (the
+    write creates it). Never raises."""
+    out = {}
+    try:
+        with open(user_config_file(), encoding='utf-8') as handle:
+            _parse_lines(handle, out)
+    except FileNotFoundError:
+        return out              # no file yet -> empty base, the write creates it
+    except (OSError, ValueError):
+        return None             # unreadable / non-UTF-8 -> do NOT clobber
+    return out
 
 
 def _load_dir(directory):
@@ -199,10 +221,14 @@ def _user_write_lock():
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         handle = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        return handle
     except OSError:
         return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    except OSError:
+        os.close(handle)        # flock failed (e.g. EOPNOTSUPP on NFS) -> no fd leak
+        return None
+    return handle
 
 
 def set_user_key(key, value):
@@ -210,13 +236,14 @@ def set_user_key(key, value):
     already holds. Reads only that file, never the merged system/admin config, so it
     cannot pin a system/admin value into user config (which would then outrank a
     later admin change). An admin-locked key is dropped by save (never written). The
-    read-modify-write is serialized against the other writer (_user_write_lock).
-    Never raises."""
+    read-modify-write is serialized against the other writer (_user_write_lock); a
+    non-UTF-8 user file is left untouched (never clobbered). Never raises."""
     cfg = load()
     handle = _user_write_lock()
     try:
-        current = {}
-        _parse_into(user_config_file(), current)
+        current = _read_user_base()
+        if current is None:
+            return              # unreadable base -> skip rather than clobber
         current[key] = value
         save(current, locked=cfg.locked)
     finally:
@@ -224,24 +251,24 @@ def set_user_key(key, value):
             os.close(handle)
 
 
-def update_user(values, locked=None):
+def update_user(values, locked=()):
     """Merge-preserving multi-key update of the app's OWN user file: set each key in
     `values`, keeping the other keys the file already holds -- e.g. a key ANOTHER
     process persisted via set_user_key (clip_warn_any, from the clipboard-watch
-    tray) must not be clobbered by a bulk write here. `locked` is the caller's
-    authoritative lock set: the window passes its STARTUP snapshot, so a key locked
-    at launch is never written back as a user override even if the admin unlocks it
-    while the app is open; when None the current load() locks are used. The
-    read-modify-write is serialized against the other writer (_user_write_lock).
-    Never raises."""
-    if locked is None:
-        locked = load().locked
+    tray) must not be clobbered by a bulk write here. `locked` (the caller's STARTUP
+    snapshot) is UNIONed with the CURRENT load() locks, so a key locked at launch OR
+    now is never written back as a user override -- neither a lock removed nor a lock
+    added while the app is open can pin a stale value. The read-modify-write is
+    serialized against the other writer (_user_write_lock); a non-UTF-8 user file is
+    left untouched (never clobbered). Never raises."""
+    all_locked = load().locked | frozenset(locked)
     handle = _user_write_lock()
     try:
-        current = {}
-        _parse_into(user_config_file(), current)
+        current = _read_user_base()
+        if current is None:
+            return              # unreadable base -> skip rather than clobber
         current.update(values)
-        save(current, locked=locked)
+        save(current, locked=all_locked)
     finally:
         if handle is not None:
             os.close(handle)
