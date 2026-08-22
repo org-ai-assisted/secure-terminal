@@ -2615,7 +2615,10 @@ class MainWindow(QMainWindow):
 
     def set_clip_warn_any(self, on):
         self._clip_warn_any = bool(on)
-        self._persist()
+        ## clip_warn_any is shared with the clipboard-watch daemon; persist it with a
+        ## single-key write (not the bulk _persist) so the two processes do not
+        ## clobber each other's value.
+        settings.set_user_key('clip_warn_any', 'true' if on else 'false')
         from secure_terminal import clipboard_watch   # noqa: PLC0415
         clipboard_watch.push_warn_any(self._clip_warn_any)   # live-update a running daemon
 
@@ -2920,9 +2923,11 @@ class MainWindow(QMainWindow):
     )
 
     def _persist(self):
-        # admin-locked keys are dropped by settings.save, so a locked setting is
-        # never written to (dead) user config.
-        settings.save({
+        # Merge-preserving: a key another process owns (clip_warn_any, set by the
+        # clipboard-watch tray via settings.set_user_key) must survive this bulk
+        # write, so update_user updates only these keys and keeps the rest. Admin-
+        # locked keys are dropped, so a locked setting is never written.
+        settings.update_user({
             'theme': self._default_theme,
             'zoom': str(self._default_zoom),
             'unicode_mode': self._default_mode,
@@ -2942,7 +2947,6 @@ class MainWindow(QMainWindow):
             'bell': ','.join(sorted(self._default_bell)),
             'bell_sound': self._default_bell_sound,
             'systray': 'true' if self._systray else 'false',
-            'clip_warn_any': 'true' if self._clip_warn_any else 'false',
             'keybindings': ' '.join('%s=%s' % (i, self._keybindings[i])
                                     for i in sorted(self._keybindings)),
             'osc_notice': 'true' if self._osc_notice else 'false',
@@ -2953,7 +2957,7 @@ class MainWindow(QMainWindow):
             'persist_session': 'true' if self._persist_session else 'false',
             'confirm_close': 'true' if self._confirm_close else 'false',
             **{k: 'true' if v else 'false' for k, v in self._osc_defaults.items()},
-        }, locked=self._locked)
+        })
 
     # -- chrome ---------------------------------------------------------------
     def _build_menu(self):

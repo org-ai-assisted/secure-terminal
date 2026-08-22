@@ -63,7 +63,13 @@ def _system_dirs():
 
     Any of them may LOCK a key so the unprivileged user config cannot override it
     (corporate / hardened deployments). Vendor defaults live in /usr/lib so a user
-    or admin overrides them in a higher tier without editing a packaged file."""
+    or admin overrides them in a higher tier without editing a packaged file.
+
+    These paths are fixed: a locked key can be set ONLY from a root-writable
+    privileged directory, so it cannot be overridden without root. There is no env
+    relocation hook (that would let an unprivileged user re-point the trusted layer
+    and bypass a lock); a test exercises the lock path by monkeypatching this
+    function in-process, which ships nothing."""
     return [
         os.path.join('/usr/lib', _APP + '.d'),
         os.path.join('/etc', _APP + '.d'),
@@ -191,4 +197,17 @@ def set_user_key(key, value):
     current = {}
     _parse_into(user_config_file(), current)
     current[key] = value
+    save(current, locked=cfg.locked)
+
+
+def update_user(values):
+    """Merge-preserving multi-key update of the app's OWN user file: set each key in
+    `values`, keeping the other keys the file already holds -- e.g. a key ANOTHER
+    process persisted via set_user_key (clip_warn_any, from the clipboard-watch
+    tray) must not be clobbered by a bulk write here. Admin-locked keys are dropped
+    by save. Never raises."""
+    cfg = load()
+    current = {}
+    _parse_into(user_config_file(), current)
+    current.update(values)
     save(current, locked=cfg.locked)
