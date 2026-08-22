@@ -261,7 +261,7 @@ def update_user(values, locked=()):
     added while the app is open can pin a stale value. The read-modify-write is
     serialized against the other writer (_user_write_lock); a non-UTF-8 user file is
     left untouched (never clobbered). Never raises."""
-    all_locked = load().locked | frozenset(locked)
+    all_locked = load().locked | frozenset(locked or ())   # tolerate None: never raises
     handle = _user_write_lock()
     try:
         current = _read_user_base()
