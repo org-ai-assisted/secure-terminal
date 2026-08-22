@@ -179,3 +179,16 @@ def save(values, locked=()):
         os.replace(tmp, path)
     except OSError:
         pass                    # a settings write is best-effort, never fatal
+
+
+def set_user_key(key, value):
+    """Set ONE key in the app's OWN user config file, preserving the other keys it
+    already holds. Reads only that file, never the merged system/admin config, so it
+    cannot pin a system/admin value into user config (which would then outrank a
+    later admin change). An admin-locked key is dropped by save (never written).
+    Never raises."""
+    cfg = load()
+    current = {}
+    _parse_into(user_config_file(), current)
+    current[key] = value
+    save(current, locked=cfg.locked)
