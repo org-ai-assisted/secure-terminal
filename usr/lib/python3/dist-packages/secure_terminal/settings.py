@@ -105,11 +105,16 @@ def _parse_lines(lines, out):
 
 
 def _parse_into(path, out):
+    # Parse into a temp then merge on FULL success: text is decoded in buffers, so a
+    # bad byte after the first ~8 KiB would otherwise leave the lines already read
+    # applied -- a partial drop-in, not the documented "ignored".
+    parsed = {}
     try:
         with open(path, encoding='utf-8') as handle:
-            _parse_lines(handle, out)
+            _parse_lines(handle, parsed)
     except (OSError, ValueError):
-        pass                    # missing / unreadable / non-UTF-8 drop-in -> ignored
+        return                  # missing / unreadable / non-UTF-8 drop-in -> ignored
+    out.update(parsed)
 
 
 def _read_user_base():
