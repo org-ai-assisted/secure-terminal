@@ -36,6 +36,7 @@ Only these drop-in .conf files are read -- there is no legacy single-file config
 
 import os
 import glob
+import fcntl
 
 _APP = 'secure-terminal'
 # where the app writes its own settings. 50 leaves room for a user to drop a
@@ -63,7 +64,13 @@ def _system_dirs():
 
     Any of them may LOCK a key so the unprivileged user config cannot override it
     (corporate / hardened deployments). Vendor defaults live in /usr/lib so a user
-    or admin overrides them in a higher tier without editing a packaged file."""
+    or admin overrides them in a higher tier without editing a packaged file.
+
+    These paths are fixed: a locked key can be set ONLY from a root-writable
+    privileged directory, so it cannot be overridden without root. There is no env
+    relocation hook (that would let an unprivileged user re-point the trusted layer
+    and bypass a lock); a test exercises the lock path by monkeypatching this
+    function in-process, which ships nothing."""
     return [
         os.path.join('/usr/lib', _APP + '.d'),
         os.path.join('/etc', _APP + '.d'),
@@ -86,19 +93,46 @@ def config_path():
     return user_config_file()
 
 
+def _parse_lines(lines, out):
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, _, value = line.partition('=')
+        key = key.strip()
+        if key:
+            out[key] = value.strip()
+
+
 def _parse_into(path, out):
+    # Parse into a temp then merge on FULL success: text is decoded in buffers, so a
+    # bad byte after the first ~8 KiB would otherwise leave the lines already read
+    # applied -- a partial drop-in, not the documented "ignored".
+    parsed = {}
     try:
         with open(path, encoding='utf-8') as handle:
-            for line in handle:
-                line = line.strip()
-                if not line or line.startswith('#') or '=' not in line:
-                    continue
-                key, _, value = line.partition('=')
-                key = key.strip()
-                if key:
-                    out[key] = value.strip()
-    except OSError:
-        pass                    # missing/unreadable drop-in -> ignored
+            _parse_lines(handle, parsed)
+    except (OSError, ValueError):
+        return                  # missing / unreadable / non-UTF-8 drop-in -> ignored
+    out.update(parsed)
+
+
+def _read_user_base():
+    """Parse the user file as the base for a REWRITE (set_user_key / update_user).
+    Returns the dict, or None if the file EXISTS but cannot be read as UTF-8 -- the
+    caller then SKIPS the write instead of clobbering unreadable keys: a lossy
+    re-parse of a corrupt file (a single bad byte yields no keys) followed by a
+    rewrite would delete every other setting. A missing file is an empty base (the
+    write creates it). Never raises."""
+    out = {}
+    try:
+        with open(user_config_file(), encoding='utf-8') as handle:
+            _parse_lines(handle, out)
+    except FileNotFoundError:
+        return out              # no file yet -> empty base, the write creates it
+    except (OSError, ValueError):
+        return None             # unreadable / non-UTF-8 -> do NOT clobber
+    return out
 
 
 def _load_dir(directory):
@@ -181,14 +215,65 @@ def save(values, locked=()):
         pass                    # a settings write is best-effort, never fatal
 
 
+def _user_write_lock():
+    """Acquire an exclusive advisory lock (flock) on a sidecar of the user file,
+    serializing the read-modify-write in set_user_key / update_user across the
+    terminal and the SEPARATE clipboard-watch daemon (both write clip_warn_any) so
+    a concurrent single-key write is not lost. Returns an open fd -- hold it across
+    the read+save, close it to release -- or None if the lock cannot be taken
+    (best-effort: the write still proceeds, just unserialized). Never raises."""
+    path = user_config_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handle = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    except OSError:
+        os.close(handle)        # flock failed (e.g. EOPNOTSUPP on NFS) -> no fd leak
+        return None
+    return handle
+
+
 def set_user_key(key, value):
     """Set ONE key in the app's OWN user config file, preserving the other keys it
     already holds. Reads only that file, never the merged system/admin config, so it
     cannot pin a system/admin value into user config (which would then outrank a
-    later admin change). An admin-locked key is dropped by save (never written).
-    Never raises."""
+    later admin change). An admin-locked key is dropped by save (never written). The
+    read-modify-write is serialized against the other writer (_user_write_lock); a
+    non-UTF-8 user file is left untouched (never clobbered). Never raises."""
     cfg = load()
-    current = {}
-    _parse_into(user_config_file(), current)
-    current[key] = value
-    save(current, locked=cfg.locked)
+    handle = _user_write_lock()
+    try:
+        current = _read_user_base()
+        if current is None:
+            return              # unreadable base -> skip rather than clobber
+        current[key] = value
+        save(current, locked=cfg.locked)
+    finally:
+        if handle is not None:
+            os.close(handle)
+
+
+def update_user(values, locked=()):
+    """Merge-preserving multi-key update of the app's OWN user file: set each key in
+    `values`, keeping the other keys the file already holds -- e.g. a key ANOTHER
+    process persisted via set_user_key (clip_warn_any, from the clipboard-watch
+    tray) must not be clobbered by a bulk write here. `locked` (the caller's STARTUP
+    snapshot) is UNIONed with the CURRENT load() locks, so a key locked at launch OR
+    now is never written back as a user override -- neither a lock removed nor a lock
+    added while the app is open can pin a stale value. The read-modify-write is
+    serialized against the other writer (_user_write_lock); a non-UTF-8 user file is
+    left untouched (never clobbered). Never raises."""
+    all_locked = load().locked | frozenset(locked or ())   # tolerate None: never raises
+    handle = _user_write_lock()
+    try:
+        current = _read_user_base()
+        if current is None:
+            return              # unreadable base -> skip rather than clobber
+        current.update(values)
+        save(current, locked=all_locked)
+    finally:
+        if handle is not None:
+            os.close(handle)

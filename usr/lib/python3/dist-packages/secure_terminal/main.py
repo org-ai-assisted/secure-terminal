@@ -2615,7 +2615,10 @@ class MainWindow(QMainWindow):
 
     def set_clip_warn_any(self, on):
         self._clip_warn_any = bool(on)
-        self._persist()
+        ## clip_warn_any is shared with the clipboard-watch daemon; persist it with a
+        ## single-key write (not the bulk _persist) so the two processes do not
+        ## clobber each other's value.
+        settings.set_user_key('clip_warn_any', 'true' if on else 'false')
         from secure_terminal import clipboard_watch   # noqa: PLC0415
         clipboard_watch.push_warn_any(self._clip_warn_any)   # live-update a running daemon
 
@@ -2920,9 +2923,12 @@ class MainWindow(QMainWindow):
     )
 
     def _persist(self):
-        # admin-locked keys are dropped by settings.save, so a locked setting is
-        # never written to (dead) user config.
-        settings.save({
+        # Merge-preserving: a key another process owns (clip_warn_any, set by the
+        # clipboard-watch tray via settings.set_user_key) must survive this bulk
+        # write, so update_user updates only these keys and keeps the rest. Pass the
+        # STARTUP lock snapshot (self._locked): a key locked at launch is never
+        # written back as a user override even if the admin unlocks it while open.
+        settings.update_user({
             'theme': self._default_theme,
             'zoom': str(self._default_zoom),
             'unicode_mode': self._default_mode,
@@ -2942,7 +2948,6 @@ class MainWindow(QMainWindow):
             'bell': ','.join(sorted(self._default_bell)),
             'bell_sound': self._default_bell_sound,
             'systray': 'true' if self._systray else 'false',
-            'clip_warn_any': 'true' if self._clip_warn_any else 'false',
             'keybindings': ' '.join('%s=%s' % (i, self._keybindings[i])
                                     for i in sorted(self._keybindings)),
             'osc_notice': 'true' if self._osc_notice else 'false',
@@ -4146,7 +4151,11 @@ class MainWindow(QMainWindow):
             self.set_systray(opts['systray'])
         # AFTER set_systray, so its coupling (tray off -> autostart off) settles
         # first and set_clip_autostart then sees the applied tray state.
-        if 'clip_warn_any' in opts:
+        # Only write clip_warn_any when the user actually toggled it in this dialog:
+        # the clipboard-watch daemon may have changed it on disk since the dialog
+        # opened, and re-writing the stale checkbox value would clobber that (and
+        # push the stale value to a running daemon).
+        if 'clip_warn_any' in opts and opts['clip_warn_any'] != self._clip_warn_any:
             self.set_clip_warn_any(opts['clip_warn_any'])
         if 'clip_autostart' in opts:
             self.set_clip_autostart(opts['clip_autostart'])
