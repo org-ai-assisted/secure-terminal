@@ -2343,6 +2343,11 @@ class SecureTerminal(QPlainTextEdit):
             last_enter = max((alt_probe.rfind(s) for s in _ALT_ENTER), default=-1)
             last_leave = max((alt_probe.rfind(s) for s in _ALT_LEAVE), default=-1)
             self._alt_screen = last_enter > last_leave
+            # Drop any stale wheel-scroll remainder at an alt-screen transition:
+            # a leftover sub-line delta must not carry into the next full-screen
+            # session, where the first small wheel event could cross the per-line
+            # threshold and emit a spurious arrow key.
+            self._wheel_accum = 0
             if not self._alt_screen:
                 self._tui_hint_shown = False   # a later full-screen app re-advises
 
