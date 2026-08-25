@@ -256,7 +256,7 @@ from secure_terminal.sanitize import (
     describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
     PROMPT_START,
     feed_chunk_carry, has_bell, OSC_FEATURES,
-    tail_from_escape_boundary,
+    tail_from_escape_boundary, split_trailing_escape, scan_mouse_modes,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 
@@ -833,6 +833,13 @@ class SecureTerminal(QPlainTextEdit):
         # restart). Maintained from the output stream (alt-screen enter/leave).
         self._alt_screen = False
         self._wheel_accum = 0         # accumulated wheel delta for alt-screen scroll
+        # The child's mouse-reporting REQUEST, tracked off the output stream: the
+        # set of active button/motion tracking modes (1000/1002/1003) and whether
+        # SGR (1006) encoding is on. Only the WHEEL is ever honoured from this, and
+        # only in the alt screen -- never clicks/motion -- see wheelEvent.
+        self._mouse_modes = set()
+        self._mouse_sgr = False
+        self._mouse_scan_carry = ''   # incomplete escape carried across a read split
         # True while the grid view is rendering the alternate screen ALONE (grid
         # only, no scrollback above it). Lets _render_tui clear the carried-in
         # scrollback exactly once when a full-screen program takes the alt screen,
@@ -2169,29 +2176,55 @@ class SecureTerminal(QPlainTextEdit):
         return fmt
 
     def wheelEvent(self, event):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.ControlModifier:
             delta = event.angleDelta().y()
             if delta:
                 self.zoom_step.emit(1 if delta > 0 else -1)
             event.accept()
             return
-        # Alternate scroll: in the ALTERNATE screen a full-screen program (less, vim,
-        # a TUI) owns the display -- there is no local scrollback to move, and this
-        # terminal does no mouse reporting, so a plain wheel would scroll a dead Qt
-        # document (the reported bug: wheel does nothing while Page Up/Down work).
-        # Translate the wheel into arrow-key line scrolls sent to the child, like
-        # xterm's alternateScroll, so the wheel scrolls the program as expected.
+        # Shift+wheel ALWAYS scrolls this terminal's OWN scrollback (the Qt
+        # document), even while a full-screen program owns the display -- the
+        # universal override (xterm/VTE/kitty) for reaching local history behind a
+        # TUI. It must precede the application-scroll branches below.
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            super().wheelEvent(event)
+            return
+        # Application scroll: in the ALTERNATE screen a full-screen program (Claude
+        # Code, vim, less, htop) owns the display -- there is no local scrollback to
+        # move, so a plain wheel would scroll a dead Qt document (the reported bug:
+        # wheel does nothing / scrolls outside the TUI while Page Up/Down work). Send
+        # the wheel to the child instead, in the form it expects.
         if self._alt_screen:
-            # ACCUMULATE the wheel delta and emit a line only per ~40 units, carrying
-            # the remainder -- a mouse notch (120) is ~3 lines, but a high-resolution
-            # trackpad streams many tiny deltas, so rounding EACH up to a line would
-            # fire an arrow per micro-event (uncontrollable hyperscroll).
+            # ACCUMULATE the delta and act only past a threshold, carrying the
+            # remainder -- a mouse notch is ~120 units, but a high-resolution
+            # trackpad streams many tiny deltas, so acting on EACH would fire per
+            # micro-event (uncontrollable hyperscroll).
             self._wheel_accum += event.angleDelta().y()
-            lines = int(self._wheel_accum / 40)
-            if lines:
-                self._wheel_accum -= lines * 40
-                seq = b'\x1b[A' if lines > 0 else b'\x1b[B'
-                self._write(seq * min(abs(lines), 8))   # cap a single huge jump
+            if self._mouse_modes and self._mouse_sgr:
+                # The child asked for the mouse (button/motion tracking + SGR
+                # encoding). Honour ONLY the wheel, and ONLY as a discrete scroll
+                # button (SGR 64 up / 65 down) at a PINNED 1;1 cell -- never a click,
+                # drag or motion report, and never the real pointer position. So the
+                # program scrolls NATIVELY (as in xterm/kitty), at its own
+                # granularity, while the coordinate/motion leak that full mouse
+                # reporting carries stays refused. One report per notch (120 units).
+                events = int(self._wheel_accum / 120)
+                if events:
+                    self._wheel_accum -= events * 120
+                    btn = 64 if events > 0 else 65
+                    seq = ('\x1b[<%d;1;1M' % btn).encode('ascii')
+                    self._write(seq * min(abs(events), 8))   # cap a single huge jump
+            else:
+                # A full-screen program that did NOT request the mouse (a plain
+                # pager in the alt screen): translate to arrow-key line scrolls, like
+                # xterm's alternateScroll -- the only surrogate it understands. ~3
+                # lines per notch (per 40 units).
+                lines = int(self._wheel_accum / 40)
+                if lines:
+                    self._wheel_accum -= lines * 40
+                    seq = b'\x1b[A' if lines > 0 else b'\x1b[B'
+                    self._write(seq * min(abs(lines), 8))    # cap a single huge jump
             event.accept()
             return
         super().wheelEvent(event)
@@ -2350,6 +2383,16 @@ class SecureTerminal(QPlainTextEdit):
             self._wheel_accum = 0
             if not self._alt_screen:
                 self._tui_hint_shown = False   # a later full-screen app re-advises
+
+        # Track the child's mouse-reporting request (button/motion tracking + SGR
+        # encoding), carrying an escape split across this read boundary so a divided
+        # DECSET is not missed. Mode-agnostic: a full-screen program requests the
+        # mouse whether or not this terminal is showing its frame. Only the wheel is
+        # ever acted on (wheelEvent), never clicks/motion.
+        mouse_body = self._mouse_scan_carry + text
+        mouse_body, self._mouse_scan_carry = split_trailing_escape(mouse_body)
+        self._mouse_modes, self._mouse_sgr = scan_mouse_modes(
+            mouse_body, self._mouse_modes, self._mouse_sgr)
 
         # Synchronized output (DECSET 2026): resolve the LAST marker, carrying the
         # tail so a marker split across reads is still seen. Apply BEGIN now (drop a

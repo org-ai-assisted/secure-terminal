@@ -59,6 +59,27 @@ source of truth for behaviour.
   for and what turning them off costs: the `line_edits` entry in
   `usr/lib/secure-terminal.d/30_defaults.conf` (the single authoritative copy).
 
+## Wheel scrolling in the alternate screen
+
+- **Problem**: on the alternate screen a full-screen program owns the display and
+  there is no local scrollback to move, so a plain wheel did nothing useful (the
+  reported bug: wheel dead / scrolling outside the TUI while Page Up/Down worked).
+- **Fix (`wheelEvent`)**: route the wheel to the child in the form it expects,
+  mirroring the universal terminal convention:
+  - a program that REQUESTED the mouse (button/motion tracking 1000/1002/1003 with
+    SGR encoding 1006, tracked off the stream by `scan_mouse_modes`) gets a
+    WHEEL-ONLY SGR report (button 64 up / 65 down) -- so a mouse-aware TUI (Claude
+    Code, `vim` with mouse, `htop`) scrolls natively at its own granularity;
+  - a plain alt-screen pager that did NOT request the mouse gets arrow-key line
+    scrolls (xterm's alternateScroll);
+  - Shift+wheel ALWAYS scrolls this terminal's own scrollback, never the child.
+- **Security scope (why this does NOT reintroduce mouse reporting)**: only the
+  WHEEL is ever reported, and always at a PINNED `1;1` cell. Clicks, drags, motion
+  (1003) and focus (1004) are still never reported, and the real pointer coordinate
+  never leaves -- so the coordinate/motion leak that full mouse reporting carries
+  stays refused. secure-terminal reports strictly less than xterm/kitty/VTE (which
+  honour clicks and motion too), while scrolling as usably. Oracle:
+  `test_widget.py` mouse-tracking-reflection block.
 ## Paste review (text coming IN)
 
 - **In-window bar**, not a modal (one window). The preview panes are read-only

@@ -435,6 +435,44 @@ def leaves_full_screen(text):
     return any(seq in text for seq in _ALT_SCREEN_OFF)
 
 
+# Mouse-tracking DEC private modes. A program that sets one is asking the terminal
+# to REPORT the mouse to it: 1000 = button press/release, 1002 = + drag motion,
+# 1003 = any-motion (every move streamed). 1006 selects the SGR report ENCODING --
+# not itself a request for events. secure-terminal refuses to report clicks, drags
+# and motion (the coordinate/motion leak of full mouse reporting); it honours ONLY
+# the scroll WHEEL, and only for a child that asked with SGR encoding -- see
+# SecureTerminal.wheelEvent. This scan tracks that request-state off the stream.
+_MOUSE_TRACK_MODES = frozenset((1000, 1002, 1003))
+_MOUSE_SGR_MODE = 1006
+_DECSET_RE = re.compile(r'\x1b\[\?([0-9;]+)([hl])')
+
+
+def scan_mouse_modes(text, modes, sgr):
+    """Fold the DEC-private mouse-mode transitions in `text` onto running state.
+
+    `modes` is the set of button/motion tracking modes (1000/1002/1003) currently
+    active; `sgr` whether SGR (1006) encoding is on. Returns the updated
+    (modes, sgr). Parameter-aware, so a combined sequence (ESC[?1000;1006h) is
+    honoured, not only standalone ones; the caller carries any escape split across
+    a read() boundary (split_trailing_escape), so a divided sequence is not lost.
+    A partial reset (e.g. clearing 1002 while 1000 stays) leaves the wheel armed as
+    long as ANY tracking mode remains -- matching how a real terminal reports."""
+    modes = set(modes)
+    for params, hl in _DECSET_RE.findall(text):
+        on = hl == 'h'
+        # The regex body is [0-9;]+, so each split field is all-digits or empty (a
+        # stray/leading/trailing ';'); drop the empty ones -- int() then never fails.
+        nums = {int(p) for p in params.split(';') if p}
+        for m in nums & _MOUSE_TRACK_MODES:
+            if on:
+                modes.add(m)
+            else:
+                modes.discard(m)
+        if _MOUSE_SGR_MODE in nums:
+            sgr = on
+    return modes, sgr
+
+
 # In-place VERTICAL repaint that line mode (append-only, horizontal-local only)
 # cannot draw, but which does NOT use the alternate screen -- so wants_full_screen
 # misses it. The classic case is the shell's own line editor drawing an
