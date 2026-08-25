@@ -1054,6 +1054,10 @@ class MainWindow(QMainWindow):
                 term.apply_osc(feat, True)
         self._enforce_tui_autobox(term, notify=False)   # box Reveal/Detail in a TUI tab
         self._add_tab(term)
+        # Carry the launch command ON the term (not a side dict) so it dies with the
+        # tab automatically -- no cleanup path to keep in sync. Read by --if-absent
+        # dedup in _ipc_open.
+        term.launch_command = self._normalize_command(spec.get('command'))
         if spec.get('title'):
             self._user_titles[term] = spec['title']
             self._refresh_tab_label(term)
@@ -1222,22 +1226,61 @@ class MainWindow(QMainWindow):
             return {'ok': True}
         return {'ok': False, 'error': 'unknown ctl op: %r' % (op,)}
 
+    @staticmethod
+    def _normalize_command(command):
+        """Canonical, comparable form of a launch command for --if-absent dedup: a
+        -e STRING and its shell-split argv compare equal. None (a plain shell tab)
+        is never a dedup key -- two shells are distinct tabs."""
+        if isinstance(command, str):
+            try:
+                return tuple(shlex.split(command))
+            except ValueError:
+                return (command,)
+        if isinstance(command, (list, tuple)):
+            return tuple(command)
+        return None
+
+    def _live_commands(self):
+        """Normalized launch commands of the window's current tabs (skips None)."""
+        keys = set()
+        for term in self._tab_ids:
+            if self.tabs.indexOf(term) < 0:
+                continue                    # a stale key not in the bar
+            key = getattr(term, 'launch_command', None)
+            if key is not None:
+                keys.add(key)
+        return keys
+
     def _ipc_open(self, request):
         # Only a --reuse handoff reaches here (an 'open' request). --reuse always
         # asks for a new tab, so a bare reuse (no tab specs) opens a fresh default
         # tab -- 1 tab becomes 2 -- rather than only raising the existing window.
+        # With if_absent, a spec whose command already runs in a tab is skipped, so
+        # a repeated batch is idempotent (this is what claude-rc-session open-all
+        # relies on): opened==0 with skipped>0 must NOT fall through to new_tab().
         tabs = request.get('tabs')
-        opened = 0
+        if_absent = bool(request.get('if_absent'))
+        present = self._live_commands() if if_absent else None
+        opened = skipped = 0
         for spec in (tabs if isinstance(tabs, list) else []):
-            if isinstance(spec, dict):
-                self._open_launch_tab(_sanitize_tab_spec(spec))
-                opened += 1
-        if opened == 0:
+            if not isinstance(spec, dict):
+                continue
+            spec = _sanitize_tab_spec(spec)
+            if if_absent:
+                key = self._normalize_command(spec.get('command'))
+                if key is not None and key in present:
+                    skipped += 1
+                    continue
+                if key is not None:
+                    present.add(key)        # also dedup within this one batch
+            self._open_launch_tab(spec)
+            opened += 1
+        if opened == 0 and skipped == 0:
             self.new_tab()                  # a bare reuse: give the user a new tab
         self.show()
         self.raise_()
         self.activateWindow()
-        return {'ok': True, 'opened': opened}
+        return {'ok': True, 'opened': opened, 'skipped': skipped}
 
     def _add_placeholder_tab(self, info, at):
         """Insert a lightweight placeholder page for a not-yet-restored session tab,
@@ -4640,6 +4683,7 @@ class _Launch:
         self.wm_name = None        # --name   -> WM_CLASS instance (X11)
         self.new_instance = False  # --new-instance -> standalone, never the primary
         self.reuse = False         # --reuse -> hand off to the group's primary
+        self.if_absent = False     # --if-absent -> dedup tabs by command on reuse
         self.instance_group = 'default'   # --instance-group NAME
         self.qt_args = []          # unrecognized args, handed to Qt
         self.tabs = []             # [{title, tui, mode, command}]
@@ -4680,6 +4724,9 @@ def _launch_parser(with_globals):
                                    'default new window, but it never becomes the group '
                                    'primary and answers no ctl/--reuse')
         p.set_defaults(reuse=False)
+        p.add_argument('--if-absent', dest='if_absent', action='store_true',
+                       help='with --reuse: skip any tab whose command already runs '
+                            'in a tab of the target window (idempotent open)')
         p.add_argument('--instance-group', dest='instance_group',
                        metavar='NAME', default='default',
                        help='the instance group whose primary --reuse and ctl target '
@@ -4756,6 +4803,7 @@ def _parse_launch_args(argv):
             launch.wm_name = namespace.wm_name
             launch.new_instance = namespace.new_instance
             launch.reuse = namespace.reuse
+            launch.if_absent = namespace.if_absent
             launch.instance_group = namespace.instance_group
         else:
             namespace = parser.parse_args(group)
@@ -4785,7 +4833,8 @@ def _parse_launch_args(argv):
 
 def _launch_to_request(launch):
     """Serialize a launch spec into an IPC 'open' request for a running instance."""
-    return {'op': 'open', 'wm_class': launch.wm_class, 'tabs': launch.tabs}
+    return {'op': 'open', 'wm_class': launch.wm_class, 'tabs': launch.tabs,
+            'if_absent': launch.if_absent}
 
 
 def _sanitize_tab_spec(spec):

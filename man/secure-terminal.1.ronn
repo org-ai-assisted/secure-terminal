@@ -85,6 +85,13 @@ Each launch opens its own independent window and process (see INSTANCES); pass
 `--reuse`, `--window` and `--new-instance` are three mutually exclusive
 dispositions; at most one may be given.
 
+  * `--if-absent`:
+    With `--reuse`, skip any tab whose command already runs in a tab of the
+    target window, opening only the ones not present. The open request is
+    idempotent: re-sending the same batch adds nothing. Matching is by command
+    (a `-e` STRING and its shell-split argv are equal), so a renamed tab is
+    still matched. No effect without `--reuse`.
+
   * `--instance-group` <NAME>:
     The instance group whose primary `--reuse` and `ctl` target (default:
     "default"). See INSTANCES.
