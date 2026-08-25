@@ -2397,6 +2397,18 @@ class SecureTerminal(QPlainTextEdit):
             # level-triggered notifier on the errored fd spins a core forever.
             data = b''
         if not data:
+            # The child exited. feed_chunk_carry may be holding a trailing run in
+            # _esc_carry that MIGHT have been an incomplete escape awaiting more bytes
+            # (CLI mode). No bytes are coming now, so flush it as the program's final
+            # output rather than drop it silently: the line renderer strips a genuine
+            # dangling control intro and shows the rest (e.g. 'ESC' + text -> the
+            # text). An over-cap discard (_esc_drop) is intentionally-stripped and not
+            # recovered. Empty in TUI mode, so this is a no-op there.
+            if self._esc_carry:
+                tail, self._esc_carry = self._esc_carry, ''
+                self._raw += tail
+                self._cap_raw()
+                self._feed_line(tail, defer=False)
             if self._notifier is not None:
                 self._notifier.setEnabled(False)
             self.shell_exited.emit()
