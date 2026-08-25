@@ -107,8 +107,11 @@ source of truth for behaviour.
   keys, Enter/Esc reject); the choice (stripped / with-unicode / reject) is
   dispatched to the tab, the only path that lets a byte reach the shell.
 - Both send buttons are countdown-gated. Detail pane names each hidden character.
-- Config `paste_warn`: always / unicode (default) / never. Never still sanitises
-  to ASCII silently.
+- Config `paste_warn`: always / unicode (default) / never. `never` does NOT strip
+  the text (so real unicode can be pasted deliberately); risky text crosses
+  UNREVIEWED but a red risk lamp marks the crossing -- not silent. A multi-line
+  paste is still held for review whatever the setting (the pastejacking gate),
+  unless a TUI's bracketed paste (DEC 2004) is active.
 
 ## Copy review (text going OUT)
 
