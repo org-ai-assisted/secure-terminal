@@ -435,28 +435,30 @@ def leaves_full_screen(text):
     return any(seq in text for seq in _ALT_SCREEN_OFF)
 
 
-# Mouse-tracking DEC private modes. A program that sets one is asking the terminal
-# to REPORT the mouse to it: 1000 = button press/release, 1002 = + drag motion,
-# 1003 = any-motion (every move streamed). 1006 selects the SGR report ENCODING --
-# not itself a request for events. secure-terminal refuses to report clicks, drags
-# and motion (the coordinate/motion leak of full mouse reporting); it honours ONLY
-# the scroll WHEEL, and only for a child that asked with SGR encoding -- see
-# SecureTerminal.wheelEvent. This scan tracks that request-state off the stream.
-_MOUSE_TRACK_MODES = frozenset((1000, 1002, 1003))
-_MOUSE_SGR_MODE = 1006
+# Mouse DEC private modes a program enables to have the terminal REPORT input to
+# it (konsole/xterm parity, honoured by SecureTerminal's mouse/wheel handlers):
+#   1000 button press/release   1002 + button-held drag motion
+#   1003 any-motion (every move) 1004 focus in/out   1006 SGR report encoding
+# Tracked as a live set off the output stream; the handlers derive from it whether
+# to report, and in which form. Shift is the local-override key (never forwarded).
+_MOUSE_BUTTON_MODES = frozenset((1000, 1002, 1003))   # any -> report buttons+wheel
+_MOUSE_DRAG_MODE = 1002                                # + motion while a button held
+_MOUSE_MOTION_MODE = 1003                              # + motion with no button
+_MOUSE_FOCUS_MODE = 1004                               # focus in/out reports
+_MOUSE_SGR_MODE = 1006                                 # SGR (1006) report encoding
+_MOUSE_MODES_TRACKED = (_MOUSE_BUTTON_MODES
+                        | frozenset((_MOUSE_FOCUS_MODE, _MOUSE_SGR_MODE)))
 _DECSET_RE = re.compile(r'\x1b\[\?([0-9;]+)([hl])')
 
 
-def scan_mouse_modes(text, modes, sgr):
-    """Fold the DEC-private mouse-mode transitions in `text` onto running state.
-
-    `modes` is the set of button/motion tracking modes (1000/1002/1003) currently
-    active; `sgr` whether SGR (1006) encoding is on. Returns the updated
-    (modes, sgr). Parameter-aware, so a combined sequence (ESC[?1000;1006h) is
-    honoured, not only standalone ones; the caller carries any escape split across
-    a read() boundary (split_trailing_escape), so a divided sequence is not lost.
-    A partial reset (e.g. clearing 1002 while 1000 stays) leaves the wheel armed as
-    long as ANY tracking mode remains -- matching how a real terminal reports."""
+def scan_mouse_modes(text, modes):
+    """Fold the DEC-private mouse-mode transitions in `text` onto `modes` (the set of
+    currently-active modes drawn from _MOUSE_MODES_TRACKED) and return the updated
+    set. Parameter-aware, so a combined sequence (ESC[?1000;1006h) is honoured, not
+    only standalone ones; the caller carries any escape split across a read()
+    boundary (split_trailing_escape), so a divided sequence is not lost. A partial
+    reset (clearing 1002 while 1000 stays) leaves each mode independently tracked --
+    matching how a real terminal routes the mouse."""
     modes = set(modes)
     for params, hl in _DECSET_RE.findall(text):
         on = hl == 'h'
@@ -466,14 +468,21 @@ def scan_mouse_modes(text, modes, sgr):
         # (Python's int-string limit). An out-of-range/empty field maps to 0, which
         # is never a mode we track, so it is harmlessly ignored.
         nums = {_safe_int(p) for p in params.split(';') if p}
-        for m in nums & _MOUSE_TRACK_MODES:
+        for m in nums & _MOUSE_MODES_TRACKED:
             if on:
                 modes.add(m)
             else:
                 modes.discard(m)
-        if _MOUSE_SGR_MODE in nums:
-            sgr = on
-    return modes, sgr
+    return modes
+
+
+def sgr_mouse_report(button, col, row, pressed):
+    """The SGR (1006) mouse-report string for `button` -- already carrying any motion
+    (+32) and keyboard-modifier (+4/+8/+16) bits -- at 1-based on-screen cell
+    (col, row). `pressed` picks the final byte: 'M' for a press / wheel / motion, 'm'
+    for a button release. The only bytes emitted are 'ESC [ < digits ; digits ;
+    digits M|m' -- inert display-wise, and never echoing program-supplied text."""
+    return '\x1b[<%d;%d;%d%s' % (button, col, row, 'M' if pressed else 'm')
 
 
 # In-place VERTICAL repaint that line mode (append-only, horizontal-local only)

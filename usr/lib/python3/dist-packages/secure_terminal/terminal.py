@@ -257,6 +257,9 @@ from secure_terminal.sanitize import (
     PROMPT_START,
     feed_chunk_carry, has_bell, OSC_FEATURES,
     tail_from_escape_boundary, split_trailing_escape, scan_mouse_modes,
+    sgr_mouse_report,
+    _MOUSE_BUTTON_MODES, _MOUSE_DRAG_MODE, _MOUSE_MOTION_MODE,
+    _MOUSE_FOCUS_MODE, _MOUSE_SGR_MODE,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 
@@ -833,13 +836,15 @@ class SecureTerminal(QPlainTextEdit):
         # restart). Maintained from the output stream (alt-screen enter/leave).
         self._alt_screen = False
         self._wheel_accum = 0         # accumulated wheel delta for alt-screen scroll
-        # The child's mouse-reporting REQUEST, tracked off the output stream: the
-        # set of active button/motion tracking modes (1000/1002/1003) and whether
-        # SGR (1006) encoding is on. Only the WHEEL is ever honoured from this, and
-        # only in the alt screen -- never clicks/motion -- see wheelEvent.
+        # The set of mouse DEC modes the child has enabled (1000/1002/1003 tracking,
+        # 1004 focus, 1006 SGR), tracked off the output stream. When it requests
+        # tracking + SGR, the mouse/wheel handlers REPORT to it (konsole/xterm
+        # parity); Shift is the local override. See wheelEvent / mousePressEvent.
         self._mouse_modes = set()
-        self._mouse_sgr = False
         self._mouse_scan_carry = ''   # incomplete escape carried across a read split
+        self._wheel_accum_x = 0       # horizontal wheel delta (vertical: _wheel_accum)
+        self._mouse_report_btn = None  # Qt button whose reported press awaits release
+        self._mouse_report_cell = None  # last cell reported for motion (coalesce 1003)
         # True while the grid view is rendering the alternate screen ALONE (grid
         # only, no scrollback above it). Lets _render_tui clear the carried-in
         # scrollback exactly once when a full-screen program takes the alt screen,
@@ -2175,6 +2180,62 @@ class SecureTerminal(QPlainTextEdit):
             return _cache_bounded(self._line_fmt_cache, key, fmt)
         return fmt
 
+    # -- mouse reporting (konsole/xterm parity) -------------------------------
+    # A child that enables mouse tracking (1000/1002/1003) + SGR encoding (1006) has
+    # its mouse and wheel events REPORTED to it, at the cell under the pointer, so a
+    # mouse-aware UI (Claude Code, vim, htop, tmux) behaves as in konsole. Shift is
+    # the LOCAL override throughout: Shift+wheel scrolls this terminal's scrollback,
+    # Shift+click/drag selects text, Shift+middle pastes -- none of those are
+    # forwarded. Only genuine user events are ever reported; there is no path from
+    # program output to a report except the modes it explicitly set.
+    _SGR_BUTTON = {
+        Qt.MouseButton.LeftButton: 0,
+        Qt.MouseButton.MiddleButton: 1,
+        Qt.MouseButton.RightButton: 2,
+    }
+
+    def _mouse_report_on(self):
+        """True when the child has enabled mouse tracking WITH SGR encoding, so its
+        mouse/wheel events are reported. Shift (the local override) is checked per
+        handler, not here."""
+        return (bool(self._mouse_modes & _MOUSE_BUTTON_MODES)
+                and _MOUSE_SGR_MODE in self._mouse_modes)
+
+    def _event_cell(self, event):
+        """1-based (col, row) of the terminal cell under a mouse/wheel event, for an
+        SGR report -- the on-screen cell coordinate a real terminal sends. Clamped to
+        the grid so a report never names a cell off the left/top edge or past the
+        column count."""
+        metrics = self.fontMetrics()
+        char_w = metrics.horizontalAdvance('M') or 1
+        char_h = metrics.height() or 1
+        off = self.contentOffset()
+        margin = self.document().documentMargin()
+        pos = event.position()
+        col = int((pos.x() - margin - off.x()) // char_w) + 1
+        row = int((pos.y() - margin - off.y()) // char_h) + 1
+        cols = self._cols if self._cols and self._cols > 0 else self._MAX_LINE
+        col = min(col, cols) if col > 1 else 1
+        row = row if row > 1 else 1
+        return col, row
+
+    def _button_code(self, base, mods, motion=False):
+        """The SGR button byte: `base` (0/1/2 button, 3 none, 64+ wheel) plus the
+        motion flag (+32) and the Ctrl (+16) / Alt (+8) modifier bits. Shift is NEVER
+        encoded -- it is the local-selection override and never reaches a report."""
+        if motion:
+            base += 32
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            base += 16
+        if mods & Qt.KeyboardModifier.AltModifier:
+            base += 8
+        return base
+
+    def _report_mouse(self, base, event, pressed, motion=False):
+        col, row = self._event_cell(event)
+        code = self._button_code(base, event.modifiers(), motion)
+        self._write(sgr_mouse_report(code, col, row, pressed).encode('ascii'))
+
     def wheelEvent(self, event):
         mods = event.modifiers()
         if mods & Qt.KeyboardModifier.ControlModifier:
@@ -2183,48 +2244,44 @@ class SecureTerminal(QPlainTextEdit):
                 self.zoom_step.emit(1 if delta > 0 else -1)
             event.accept()
             return
-        # Shift+wheel ALWAYS scrolls this terminal's OWN scrollback (the Qt
-        # document), even while a full-screen program owns the display -- the
-        # universal override (xterm/VTE/kitty) for reaching local history behind a
-        # TUI. It must precede the application-scroll branches below.
+        # Shift+wheel is the LOCAL override: it scrolls this terminal's own Qt
+        # document instead of reporting to / scrolling the child, and so must precede
+        # the reporting/application branches below. In CLI/normal mode that is the
+        # scrollback. In the alt screen the document holds only the pinned grid
+        # (primary scrollback behind a full-screen app is not yet exposed -- a konsole-
+        # parity follow-up), so there it is a no-op rather than reaching history.
         if mods & Qt.KeyboardModifier.ShiftModifier:
             super().wheelEvent(event)
             return
-        # Application scroll: in the ALTERNATE screen a full-screen program (Claude
-        # Code, vim, less, htop) owns the display -- there is no local scrollback to
-        # move, so a plain wheel would scroll a dead Qt document (the reported bug:
-        # wheel does nothing / scrolls outside the TUI while Page Up/Down work). Send
-        # the wheel to the child instead, in the form it expects.
-        if self._alt_screen:
-            # ACCUMULATE the delta and act only past a threshold, carrying the
-            # remainder -- a mouse notch is ~120 units, but a high-resolution
-            # trackpad streams many tiny deltas, so acting on EACH would fire per
-            # micro-event (uncontrollable hyperscroll).
-            self._wheel_accum += event.angleDelta().y()
-            if self._mouse_modes and self._mouse_sgr:
-                # The child asked for the mouse (button/motion tracking + SGR
-                # encoding). Honour ONLY the wheel, and ONLY as a discrete scroll
-                # button (SGR 64 up / 65 down) at a PINNED 1;1 cell -- never a click,
-                # drag or motion report, and never the real pointer position. So the
-                # program scrolls NATIVELY (as in xterm/kitty), at its own
-                # granularity, while the coordinate/motion leak that full mouse
-                # reporting carries stays refused. One report per notch (120 units).
-                events = int(self._wheel_accum / 120)
+        # ACCUMULATE the delta and act only past a notch (~120 units), carrying the
+        # remainder -- a high-resolution trackpad streams many tiny deltas, so acting
+        # on EACH would fire per micro-event (uncontrollable hyperscroll).
+        self._wheel_accum += event.angleDelta().y()
+        self._wheel_accum_x += event.angleDelta().x()
+        if self._mouse_report_on():
+            # Report the wheel as a real SGR wheel event at the cell under the pointer
+            # (konsole/xterm): 64 up / 65 down, 66 left / 67 right. One event per notch
+            # so the program scrolls line-by-line at its own granularity.
+            for accum_attr, pos_btn, neg_btn in (
+                    ('_wheel_accum', 64, 65), ('_wheel_accum_x', 67, 66)):
+                accum = getattr(self, accum_attr)
+                events = int(accum / 120)
                 if events:
-                    self._wheel_accum -= events * 120
-                    btn = 64 if events > 0 else 65
-                    seq = ('\x1b[<%d;1;1M' % btn).encode('ascii')
-                    self._write(seq * min(abs(events), 8))   # cap a single huge jump
-            else:
-                # A full-screen program that did NOT request the mouse (a plain
-                # pager in the alt screen): translate to arrow-key line scrolls, like
-                # xterm's alternateScroll -- the only surrogate it understands. ~3
-                # lines per notch (per 40 units).
-                lines = int(self._wheel_accum / 40)
-                if lines:
-                    self._wheel_accum -= lines * 40
-                    seq = b'\x1b[A' if lines > 0 else b'\x1b[B'
-                    self._write(seq * min(abs(lines), 8))    # cap a single huge jump
+                    setattr(self, accum_attr, accum - events * 120)
+                    base = pos_btn if events > 0 else neg_btn
+                    for _ in range(min(abs(events), 8)):   # cap a single huge jump
+                        self._report_mouse(base, event, pressed=True)
+            event.accept()
+            return
+        # A full-screen program that did NOT request the mouse (a plain pager in the
+        # alt screen): translate the wheel to arrow-key line scrolls, like xterm's
+        # alternateScroll -- the surrogate it understands. ~3 lines per notch.
+        if self._alt_screen:
+            lines = int(self._wheel_accum / 40)
+            if lines:
+                self._wheel_accum -= lines * 40
+                seq = b'\x1b[A' if lines > 0 else b'\x1b[B'
+                self._write(seq * min(abs(lines), 8))    # cap a single huge jump
             event.accept()
             return
         super().wheelEvent(event)
@@ -2391,8 +2448,11 @@ class SecureTerminal(QPlainTextEdit):
         # ever acted on (wheelEvent), never clicks/motion.
         mouse_body = self._mouse_scan_carry + text
         mouse_body, self._mouse_scan_carry = split_trailing_escape(mouse_body)
-        self._mouse_modes, self._mouse_sgr = scan_mouse_modes(
-            mouse_body, self._mouse_modes, self._mouse_sgr)
+        self._mouse_modes = scan_mouse_modes(mouse_body, self._mouse_modes)
+        # Any-event tracking (1003) needs button-less pointer motion, which Qt only
+        # delivers when the widget has mouse tracking on. Enable it exactly while the
+        # child asks, so no motion is watched otherwise.
+        self.setMouseTracking(_MOUSE_MOTION_MODE in self._mouse_modes)
 
         # Synchronized output (DECSET 2026): resolve the LAST marker, carrying the
         # tail so a marker split across reads is still seen. Apply BEGIN now (drop a
@@ -3929,6 +3989,16 @@ class SecureTerminal(QPlainTextEdit):
         return super().event(e)
 
     def mouseDoubleClickEvent(self, event):
+        # When the child grabs the mouse, a double-click is REPORTED as another press
+        # (its release follows via mouseReleaseEvent), not used for a local word-select
+        # or the character popup; Shift is the local override.
+        if self._mouse_report_on() and not self._shift(event):
+            base = self._SGR_BUTTON.get(event.button())
+            if base is not None:
+                self._report_mouse(base, event, pressed=True)
+                self._mouse_report_btn = event.button()
+                event.accept()
+                return
         # Double-clicking a neutralized/revealed character opens an ACTIVE popup
         # (unlike the passive hover tooltip): its text can be selected and copied,
         # and it stays open while you work. A double-click elsewhere selects a word
@@ -4003,7 +4073,19 @@ class SecureTerminal(QPlainTextEdit):
             tc.movePosition(QTextCursor.MoveOperation.End)
             self.setTextCursor(tc)
 
+    def _shift(self, event):
+        return bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+
     def mousePressEvent(self, event):
+        # When the child grabs the mouse (tracking + SGR), a plain press is REPORTED
+        # to it rather than starting a local selection; Shift is the local override.
+        if self._mouse_report_on() and not self._shift(event):
+            base = self._SGR_BUTTON.get(event.button())
+            if base is not None:
+                self._report_mouse(base, event, pressed=True)
+                self._mouse_report_btn = event.button()
+                event.accept()
+                return
         # Mark a drag-selection in progress so _render_tui freezes the grid rebuild while
         # the user selects (a left-button press begins a possible drag).
         if event.button() == Qt.MouseButton.LeftButton:
@@ -4011,6 +4093,15 @@ class SecureTerminal(QPlainTextEdit):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # Balance a reported press with its release (report it even if Shift toggled
+        # mid-drag, so the child never sees an unmatched press).
+        if self._mouse_report_btn is not None:
+            base = self._SGR_BUTTON.get(self._mouse_report_btn, 0)
+            self._report_mouse(base, event, pressed=False)
+            self._mouse_report_btn = None
+            self._mouse_report_cell = None
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
         self._mouse_selecting = False
         # The drag is over: re-arm a grid render so the view catches up once the selection
@@ -4026,6 +4117,43 @@ class SecureTerminal(QPlainTextEdit):
         if self.textCursor().hasSelection():
             return
         self.reset_caret()
+
+    def mouseMoveEvent(self, event):
+        # Report motion to a child that asked: a drag (button held) under 1002/1003,
+        # or button-less motion under 1003. Coalesce to one report per CELL so any-
+        # motion (1003) does not flood. Shift keeps motion local (text selection).
+        if self._mouse_report_on() and not self._shift(event):
+            buttons = event.buttons()
+            held = buttons != Qt.MouseButton.NoButton
+            report = ((held and (_MOUSE_DRAG_MODE in self._mouse_modes
+                                 or _MOUSE_MOTION_MODE in self._mouse_modes))
+                      or (not held and _MOUSE_MOTION_MODE in self._mouse_modes))
+            if report:
+                cell = self._event_cell(event)
+                if cell != self._mouse_report_cell:
+                    self._mouse_report_cell = cell
+                    if buttons & Qt.MouseButton.LeftButton:
+                        base = 0
+                    elif buttons & Qt.MouseButton.MiddleButton:
+                        base = 1
+                    elif buttons & Qt.MouseButton.RightButton:
+                        base = 2
+                    else:
+                        base = 3            # motion with no button
+                    self._report_mouse(base, event, pressed=True, motion=True)
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def focusInEvent(self, event):
+        if _MOUSE_FOCUS_MODE in self._mouse_modes:
+            self._write(b'\x1b[I')          # DEC 1004 focus-in report
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):
+        if _MOUSE_FOCUS_MODE in self._mouse_modes:
+            self._write(b'\x1b[O')          # DEC 1004 focus-out report
+        super().focusOutEvent(event)
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
     def _bracketed_paste_active(self):
