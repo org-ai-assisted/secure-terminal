@@ -461,8 +461,11 @@ def scan_mouse_modes(text, modes, sgr):
     for params, hl in _DECSET_RE.findall(text):
         on = hl == 'h'
         # The regex body is [0-9;]+, so each split field is all-digits or empty (a
-        # stray/leading/trailing ';'); drop the empty ones -- int() then never fails.
-        nums = {int(p) for p in params.split(';') if p}
+        # stray/leading/trailing ';'). Parse via _safe_int, NOT int(): a hostile
+        # 4300+-digit parameter would else raise ValueError and crash the read loop
+        # (Python's int-string limit). An out-of-range/empty field maps to 0, which
+        # is never a mode we track, so it is harmlessly ignored.
+        nums = {_safe_int(p) for p in params.split(';') if p}
         for m in nums & _MOUSE_TRACK_MODES:
             if on:
                 modes.add(m)
