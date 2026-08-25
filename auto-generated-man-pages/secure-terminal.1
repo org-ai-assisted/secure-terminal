@@ -56,6 +56,9 @@ Force a standalone, server\-less process: like the default new window, but it ne
 .P
 \fB\-\-reuse\fR, \fB\-\-window\fR and \fB\-\-new\-instance\fR are three mutually exclusive dispositions; at most one may be given\.
 .TP
+\fB\-\-if\-absent\fR
+With \fB\-\-reuse\fR, skip any tab whose command already runs in a tab of the target window, opening only the ones not present\. The open request is idempotent: re\-sending the same batch adds nothing\. Matching is by command (a \fB\-e\fR STRING and its shell\-split argv are equal), so a renamed tab is still matched\. No effect without \fB\-\-reuse\fR\.
+.TP
 \fB\-\-instance\-group\fR \fINAME\fR
 The instance group whose primary \fB\-\-reuse\fR and \fBctl\fR target (default: "default")\. See INSTANCES\.
 .TP
