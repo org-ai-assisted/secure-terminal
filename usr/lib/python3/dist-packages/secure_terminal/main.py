@@ -1237,7 +1237,10 @@ class MainWindow(QMainWindow):
             except ValueError:
                 return (command,)
         if isinstance(command, (list, tuple)):
-            return tuple(command)
+            # str() each element (as the terminal.py exec path does) so the key is
+            # ALWAYS hashable -- an IPC command list may carry a non-str/unhashable
+            # element, and a raw tuple of it would crash the set op in _ipc_open.
+            return tuple(str(part) for part in command)
         return None
 
     def _live_commands(self):
@@ -1260,7 +1263,7 @@ class MainWindow(QMainWindow):
         # relies on): opened==0 with skipped>0 must NOT fall through to new_tab().
         tabs = request.get('tabs')
         if_absent = bool(request.get('if_absent'))
-        present = self._live_commands() if if_absent else None
+        present = self._live_commands() if if_absent else set()
         opened = skipped = 0
         for spec in (tabs if isinstance(tabs, list) else []):
             if not isinstance(spec, dict):
