@@ -595,6 +595,11 @@ class SecureTerminal(QPlainTextEdit):
     # (see OSC_FEATURES; 'osc_other' for an unrecognized code) so the window can
     # notice each TYPE at most once per tab.
     osc_used = pyqtSignal(str)
+    # an unterminated / over-long string sequence (OSC/DCS/...) has silently
+    # suppressed a lot of CLI-mode output (the escape_limit threshold). The
+    # suppression is NOT lifted (no escape byte is rendered); the window shows a
+    # one-time notice so a frozen-looking terminal is explained, not mysterious.
+    escape_suppressed = pyqtSignal()
     # a program set the title / sent a notification (only when allowed)
     title_changed = pyqtSignal(str)
     notified = pyqtSignal(str)
@@ -879,6 +884,15 @@ class SecureTerminal(QPlainTextEdit):
         # cap, this holds its introducer byte and the feed discards bytes until the
         # terminator, so a huge chunk-split escape is stripped in O(1) memory.
         self._esc_drop = ''
+        # Characters swallowed so far in the current discard run (a long unterminated
+        # string sequence). Watched against self._escape_limit to fire a one-time
+        # notice; the suppression itself is never lifted.
+        self._esc_dropped = 0
+        self._esc_notified = False   # the suppression notice fired for this run
+        # Characters an unterminated string sequence may silently suppress before a
+        # one-time notice (0 = never notify). Output stays suppressed regardless.
+        # Set from the escape_limit config.
+        self._escape_limit = 4096
         # TUI OSC action path: bytes of an incomplete trailing OSC held from the
         # previous read, so an enabled OSC (clipboard/notify/...) split across PTY
         # reads is still acted on. Bounded a little above the clipboard cap.
@@ -1147,6 +1161,15 @@ class SecureTerminal(QPlainTextEdit):
     def current_paste_delay(self):
         return self._paste_delay
 
+    def apply_escape_limit(self, limit):
+        # Only the notice THRESHOLD; changing it cannot alter what is on screen, so
+        # no _rerender. Suppression is unaffected -- this only tunes when the
+        # one-time "output suppressed" notice fires.
+        self._escape_limit = max(0, int(limit))
+
+    def current_escape_limit(self):
+        return self._escape_limit
+
     def apply_paste_warn(self, mode):
         self._paste_warn = mode if mode in ('always', 'unicode', 'never') else 'unicode'
 
@@ -1192,6 +1215,8 @@ class SecureTerminal(QPlainTextEdit):
         # or discard would corrupt the first bytes rendered after switching back.
         self._esc_carry = ''
         self._esc_drop = ''
+        self._esc_dropped = 0
+        self._esc_notified = False
         self._osc_carry = b''
         # re-advertise the mode's terminfo to the running shell (no restart). ONLY
         # for the default login shell (self._command is None): a tab launched with
@@ -2537,8 +2562,18 @@ class SecureTerminal(QPlainTextEdit):
         # sequence (a Sixel image is the worst case) switches to a discard state so
         # it is stripped whatever its length, without buffering it unbounded.
         drop_before = self._esc_drop
-        text, self._esc_carry, self._esc_drop = feed_chunk_carry(
-            text, self._esc_carry, self._esc_drop)
+        text, self._esc_carry, self._esc_drop, self._esc_dropped = feed_chunk_carry(
+            text, self._esc_carry, self._esc_drop, self._esc_dropped)
+        # A long unterminated string sequence keeps suppressing output (nothing is
+        # rendered, so no escape byte leaks). That is safe but LOOKS like a freeze,
+        # so once the suppressed run passes the configured threshold, fire a one-time
+        # notice (the window de-dups per tab). Re-arm when the run ends.
+        if not self._esc_drop:
+            self._esc_notified = False
+        elif (self._escape_limit and not self._esc_notified
+              and self._esc_dropped >= self._escape_limit):
+            self._esc_notified = True
+            self.escape_suppressed.emit()
         # Ring on a standalone BEL (a real bell) in the carry-reassembled text.
         # feed_chunk_carry has rejoined a split sequence, so has_bell() -- which
         # strips complete OSC/DCS sequences before looking for a BEL -- never

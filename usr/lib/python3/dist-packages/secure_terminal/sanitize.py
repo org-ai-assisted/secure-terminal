@@ -245,6 +245,10 @@ def split_trailing_escape(text, cap=4096):
 # incomplete string sequence outgrows the carry cap we switch to a DISCARD state:
 # subsequent bytes are swallowed until the terminator, then rendering resumes.
 # This keeps "strip every escape" true for a sequence of ANY length in O(1) memory.
+# A sequence that NEVER terminates keeps suppressing output (no escape byte is ever
+# leaked as text -- the property this machinery exists to hold), so the discard
+# count is tracked and RETURNED: the caller surfaces a one-time notice when the
+# silent suppression has grown large, rather than lifting it.
 _STRING_INTRO = ']PX^_'                 # 2nd byte of ESC-<x> string introducers
 _STRING_TERMINATOR = {
     ']': re.compile(r'\x07|\x1b\\'),    # OSC ends on BEL or ST
@@ -255,36 +259,47 @@ _STRING_TERMINATOR = {
 }
 
 
-def feed_chunk_carry(text, carry, drop, cap=4096):
+def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
     """CLI-mode incremental escape handling across read() chunks. Given the new
-    `text`, the short `carry` held from the previous chunk (str), and `drop` (the
-    introducer byte of an over-long string sequence being discarded, or ''),
-    return (renderable_text, new_carry, new_drop). Guarantees every escape --
+    `text`, the short `carry` held from the previous chunk (str), `drop` (the
+    introducer byte of an over-long string sequence being discarded, or ''), and
+    `dropped` (characters swallowed so far in the current discard run), return
+    (renderable_text, new_carry, new_drop, new_dropped). Guarantees every escape --
     including an arbitrarily long, chunk-split string sequence -- is fully removed
     with O(1) memory: an incomplete string sequence past `cap` switches to a
     discard state that swallows bytes until its terminator (handling a terminator
-    itself split across the boundary via a one-byte ESC carry)."""
+    itself split across the boundary via a one-byte ESC carry).
+
+    `dropped` accumulates the characters suppressed while hunting a terminator that
+    may never arrive, and resets when the sequence ends. It is REPORTED, never acted
+    on here: no escape byte is ever rendered as text (the property the formal proofs
+    verify). The caller watches it to surface a one-time notice when an unterminated
+    sequence has silently suppressed a lot of output, without lifting the
+    suppression."""
     text = carry + text
     carry = ''
     if drop:
         m = _STRING_TERMINATOR[drop].search(text)
         if not m:
+            dropped += len(text)
             # still inside the sequence; a lone trailing ESC may be a split ST
-            return '', ('\x1b' if text.endswith('\x1b') else ''), drop
+            return '', ('\x1b' if text.endswith('\x1b') else ''), drop, dropped
         text = text[m.end():]
         drop = ''
+        dropped = 0
     m = _TRAILING_ESCAPE.search(text)
     if m and m.group():
         g = m.group()
         if len(g) >= 2 and g[1] in _STRING_INTRO and len(g) > cap:
             drop = g[1]                 # too long to hold -> swallow to terminator
+            dropped = len(g)
             text = text[:m.start()]
         elif len(g) <= cap:
             carry = g                   # short incomplete escape -> hold for next chunk
             text = text[:m.start()]
         # else: an over-cap NON-string tail (a pathological unterminated CSI, which
         # a real program never emits) is let through, bounded -- as before.
-    return text, carry, drop
+    return text, carry, drop, dropped
 
 
 # --- OSC features -------------------------------------------------------------

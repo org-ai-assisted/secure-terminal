@@ -195,6 +195,18 @@ PASTE_DELAY_CHOICES = [
     ('5 seconds', 5),
 ]
 
+# menu label -> escape-suppression notice threshold, in characters (0 = never
+# notify). An unterminated / over-long OSC/DCS string sequence silently suppresses
+# CLI-mode output (safe: no escape byte is ever rendered). Once it has suppressed
+# this many characters, a one-time notice explains the otherwise-mysterious freeze.
+# The output stays suppressed either way; this only tunes when the notice fires.
+ESCAPE_LIMIT_CHOICES = [
+    ('After 4,096 characters', 4096),
+    ('After 65,536 characters', 65536),
+    ('After 1,048,576 characters', 1048576),
+    ('Never', 0),
+]
+
 
 def _letter_icon(letter, color):
     """A small rounded-square icon with a single ASCII letter, used as the drawn
@@ -588,6 +600,10 @@ class MainWindow(QMainWindow):
             self._paste_delay = max(0, min(60, int(cfg['paste_delay'])))
         except (KeyError, ValueError):
             self._paste_delay = 3
+        try:
+            self._escape_limit = max(0, int(cfg['escape_limit']))
+        except (KeyError, ValueError):
+            self._escape_limit = 4096
         self._paste_warn = cfg.get('paste_warn') \
             if cfg.get('paste_warn') in ('always', 'unicode', 'never') else 'unicode'
         self._copy_warn = cfg.get('copy_warn') \
@@ -720,6 +736,7 @@ class MainWindow(QMainWindow):
         self._tab_colors = {}        # term -> tab colour name (for persistence)
         self._advisories = {}        # term -> (kind, banner text); kind tui|osc|autobox
         self._osc_notified = set()   # (term, key) pairs already shown the OSC notice
+        self._esc_notified = set()   # terms already shown the escape-suppressed notice
         self._syncing = False        # guard: programmatic chip sync vs user click
         # toolbar chip buttons, populated by _build_toolbar; empty here so a
         # _sync during _build_menu (which runs first) is a harmless no-op.
@@ -812,6 +829,8 @@ class MainWindow(QMainWindow):
             lambda t=term: self._on_clipboard_read_requested(t))
         term.advise_signal.connect(lambda msg, t=term: self._on_advise(t, msg))
         term.osc_used.connect(lambda key, t=term: self._on_osc_used(t, key))
+        term.escape_suppressed.connect(
+            lambda t=term: self._on_escape_suppressed(t))
         term.unreviewed_risk.connect(self._on_unreviewed_risk)
         term.paste_review_requested.connect(
             lambda raw, delay, t=term: self._show_review(t, raw, delay, 'paste'))
@@ -904,6 +923,15 @@ class MainWindow(QMainWindow):
             return
         if (term, key) in self._osc_notified:
             return
+        # An over-cap unterminated OSC fires BOTH escape_suppressed (first) and this
+        # osc_used('osc_other') in one read. The suppression notice is the actionable
+        # diagnosis (the program is misbehaving); "an application used an OSC escape --
+        # enable it under View > OSC features" is a MISdiagnosis there (enabling the
+        # feature does not end the discard). So the freeze notice wins: skip clobbering
+        # an active 'escape' advisory, and leave this type un-marked so a later, real
+        # OSC use in the same tab can still notice.
+        if self._advisories.get(term, (None,))[0] == 'escape':
+            return
         self._osc_notified.add((term, key))
         entry = OSC_FEATURE_BY_KEY.get(key)
         label = entry[0].lower() if entry else 'an escape'
@@ -912,6 +940,22 @@ class MainWindow(QMainWindow):
                         'View > OSC features if you trust the source; turn this '
                         'notice off (all or per type) in View > Notify on OSC use.',
                         'osc')
+
+    def _on_escape_suppressed(self, term):
+        """A long unterminated / over-long string sequence (OSC/DCS/...) is silently
+        suppressing this tab's output. The suppression is SAFE (no escape byte is
+        rendered) but looks like a freeze, so surface a dismissible notice at most
+        once per tab, so the user knows the program is misbehaving rather than
+        staring at a dead terminal. Gated by the escape_limit threshold in the
+        terminal, so a 0 (never) setting never reaches here."""
+        if term in self._esc_notified:
+            return
+        self._esc_notified.add(term)
+        self._on_advise(term, 'Output is being suppressed: a program emitted an '
+                        'over-long or unterminated escape sequence, so the safe CLI '
+                        'mode is discarding it (nothing after it can be shown until '
+                        'it ends). The program may be misbehaving -- open a new tab '
+                        'if this persists.', 'escape')
 
     def _on_unreviewed_risk(self):
         """Risky text crossed the boundary with review off: light the red review
@@ -993,6 +1037,7 @@ class MainWindow(QMainWindow):
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
+        term.apply_escape_limit(self._escape_limit)
         term.apply_paste_warn(self._paste_warn)
         term.apply_copy_warn(self._copy_warn)
         term.apply_bell(self._default_bell)
@@ -1038,6 +1083,7 @@ class MainWindow(QMainWindow):
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
+        term.apply_escape_limit(self._escape_limit)
         term.apply_paste_warn(self._paste_warn)
         term.apply_copy_warn(self._copy_warn)
         bell = self._default_bell
@@ -1162,8 +1208,12 @@ class MainWindow(QMainWindow):
         to a terminal, or None. The first title match wins."""
         if not isinstance(match, str):
             return None
-        kind, _, value = match.partition(':')
-        if not value:
+        kind, sep, value = match.partition(':')
+        # Only 'id:' / 'title:' are matcher prefixes; anything else (including a
+        # bare title that itself contains a colon, e.g. 'prod:server' or a
+        # 'host:port') is a bare title, matched whole. An explicit 'title:' prefix
+        # still forces title mode for a title that starts with 'id:'.
+        if not sep or kind not in ('id', 'title'):
             kind, value = 'title', match
         for term, tid in self._tab_ids.items():
             index = self.tabs.indexOf(term)
@@ -1409,6 +1459,7 @@ class MainWindow(QMainWindow):
             scrollback = self._scrollback
         term.apply_scrollback(_locked('scrollback', scrollback, self._scrollback))
         term.apply_paste_delay(self._paste_delay)
+        term.apply_escape_limit(self._escape_limit)
         term.apply_paste_warn(self._paste_warn)
         term.apply_copy_warn(self._copy_warn)
         # restore the full per-feature OSC map when present; fall back to the legacy
@@ -1493,6 +1544,7 @@ class MainWindow(QMainWindow):
         self._advisories.pop(term, None)
         self._pre_tui_mode.pop(term, None)   # else a closed auto-boxed tab lingers
         self._osc_notified = {p for p in self._osc_notified if p[0] is not term}
+        self._esc_notified.discard(term)
         self._tab_ids.pop(term, None)
         self.tabs.removeTab(index)
         term.deleteLater()
@@ -2792,6 +2844,14 @@ class MainWindow(QMainWindow):
         self._sync_paste_delay_menu()
         self._persist()
 
+    def set_escape_limit(self, limit):
+        if 'escape_limit' in self._locked:
+            return                        # admin-locked; not user-changeable
+        self._escape_limit = max(0, int(limit))
+        for t in self._real_terms():
+            t.apply_escape_limit(self._escape_limit)
+        self._persist()
+
     def _sync_paste_delay_menu(self):
         """Reflect the current paste delay in the View -> Paste delay check-marks.
         The menu is built once, so a change via the settings dialog (or a custom
@@ -2964,6 +3024,7 @@ class MainWindow(QMainWindow):
         ('tui_autobox_notice', 'tui_autobox_notice', '_tui_autobox_notice'),
         ('scrollback', 'scrollback', '_scrollback'),
         ('paste_delay', 'paste_delay', '_paste_delay'),
+        ('escape_limit', 'escape_limit', '_escape_limit'),
         ('paste_warn', 'paste_warn', '_paste_warn'),
         ('copy_warn', 'copy_warn', '_copy_warn'),
     )
@@ -2987,6 +3048,7 @@ class MainWindow(QMainWindow):
             'auto_tab_colors': 'true' if self._auto_tab_colors else 'false',
             'scrollback': str(self._scrollback),
             'paste_delay': str(self._paste_delay),
+            'escape_limit': str(self._escape_limit),
             'paste_warn': self._paste_warn,
             'copy_warn': self._copy_warn,
             'tui': 'true' if self._default_tui else 'false',
@@ -3775,6 +3837,7 @@ class MainWindow(QMainWindow):
         '  /zoom <25-400>\n'
         '  /scrollback <lines, 0 = unlimited>\n'
         '  /paste-delay <seconds>\n'
+        '  /escape-limit <chars suppressed before a notice, 0 = never>\n'
         '  /help')
 
     def show_command_palette(self):
@@ -3812,6 +3875,8 @@ class MainWindow(QMainWindow):
             self.set_scrollback(int(arg))
         elif cmd == 'paste-delay' and arg.isdigit():
             self.set_paste_delay(int(arg))
+        elif cmd == 'escape-limit' and arg.isdigit():
+            self.set_escape_limit(int(arg))
         else:
             self.statusBar().showMessage(
                 'Unknown or invalid command: ' + line.strip() + '  (try /help)',
@@ -3996,6 +4061,24 @@ class MainWindow(QMainWindow):
                  'How long a pasted multi-line block is held for review before it '
                  'can run, so a hidden command cannot execute the instant you paste.')
 
+        esc_limit = QComboBox()
+        for label, nbytes in ESCAPE_LIMIT_CHOICES:
+            esc_limit.addItem(label, nbytes)
+        eidx = esc_limit.findData(self._escape_limit)
+        if eidx < 0:
+            # a custom config value (escape_limit allows any 0+) is not a preset;
+            # add it so the combo shows the real current value, not a blank.
+            esc_limit.addItem('After %d characters' % self._escape_limit,
+                              self._escape_limit)
+            eidx = esc_limit.count() - 1
+        esc_limit.setCurrentIndex(eidx)
+        _tip_row(session_box, 'Suppressed-output notice', esc_limit,
+                 'An unterminated or over-long escape sequence makes the safe CLI '
+                 'mode discard output (nothing after it shows until it ends) -- safe, '
+                 'but it looks like a freeze. After this many characters are '
+                 'suppressed, a one-time notice explains it. The output stays '
+                 'suppressed either way; Never hides the notice.')
+
         _WARN_CHOICES = (('Always review', 'always'),
                          ('Only unicode / control', 'unicode'),
                          ('Never review', 'never'))
@@ -4062,7 +4145,7 @@ class MainWindow(QMainWindow):
         # scrollable empty space below a short list -- most visibly the Font list,
         # which rarely has as many monospaced faces as the default cap.
         for _combo in (theme, font_family, scrollback, mode,
-                       paste_warn, copy_warn, pdelay):
+                       paste_warn, copy_warn, pdelay, esc_limit):
             _combo.setMaxVisibleItems(max(1, min(_combo.count(), 15)))
 
         # Every lockable control disables itself when its key is admin-locked: a
@@ -4077,7 +4160,8 @@ class MainWindow(QMainWindow):
             (scrollback, 'scrollback'), (mode, 'unicode_mode'),
             (colors, 'colors'), (line_edits, 'line_edits'), (tui, 'tui'),
             (tui_autobox_notice, 'tui_autobox_notice'), (osc, 'osc_notice'),
-            (pdelay, 'paste_delay'), (paste_warn, 'paste_warn'),
+            (pdelay, 'paste_delay'), (esc_limit, 'escape_limit'),
+            (paste_warn, 'paste_warn'),
             (copy_warn, 'copy_warn'), (persist, 'persist_session'),
             (systray, 'systray'), (auto_tab_colors, 'auto_tab_colors'),
             (clip_warn_any, 'clip_warn_any'),
@@ -4129,6 +4213,7 @@ class MainWindow(QMainWindow):
             'osc_notice': osc.isChecked(),
             'tui_autobox_notice': tui_autobox_notice.isChecked(),
             'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
+            'escape_limit': esc_limit.currentData(),
             'paste_warn': paste_warn.currentData(), 'copy_warn': copy_warn.currentData(),
             'persist': persist.isChecked(),
             'systray': systray.isChecked(),
@@ -4186,6 +4271,7 @@ class MainWindow(QMainWindow):
                 term.apply_osc(key, value)
             term.apply_scrollback(opts['scrollback'])
             term.apply_paste_delay(opts['paste_delay'])
+            term.apply_escape_limit(opts['escape_limit'])
             term.apply_paste_warn(self._paste_warn)
             term.apply_copy_warn(self._copy_warn)
             # NB: bell is intentionally NOT applied here. This global-settings
