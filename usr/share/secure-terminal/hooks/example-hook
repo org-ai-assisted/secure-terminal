@@ -81,6 +81,10 @@ _RULES = _load_rules()
 
 
 def decide(command):
+    # A trailing `\` continues the command on the next line (the shell joins them), so join
+    # backslash-continuations FIRST -- else a pipeline split across lines (`curl x |\` then
+    # `sudo sh`) would be judged as two lines and slip past a single-line pipeline rule.
+    command = command.replace('\\\n', '')
     # Judge EACH line and take the MOST RESTRICTIVE verdict (block > ask > allow): an
     # `allow` matching one line must not mask a `block`/`ask` matching another (searching
     # the whole multi-line string with first-match-wins would fail open). Per line the
