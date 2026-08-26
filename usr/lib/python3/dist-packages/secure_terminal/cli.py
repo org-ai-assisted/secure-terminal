@@ -54,7 +54,7 @@ import termios
 import argparse
 
 from secure_terminal.sanitize import (
-    render_output, feed_chunk_carry, DISPLAY_MODES, sanitize_paste)
+    render_output, cap_zalgo_show, feed_chunk_carry, DISPLAY_MODES, sanitize_paste)
 
 # Bracketed-paste framing the OUTER terminal wraps a paste in once DECSET 2004 is
 # enabled. Stripped before the child sees it (the child runs TERM=dumb and never
@@ -213,6 +213,7 @@ def _run(argv, mode):
     esc_drop = ''               # introducer of an over-cap string sequence
     esc_dropped = 0             # chars suppressed in the current discard run
     esc_notified = False        # the suppression notice printed for this run
+    zalgo_carry = 0             # trailing show-mode combining-mark run, capped across reads
     stdin_fd = sys.stdin.fileno()
     out_fd = sys.stdout.fileno()
     old_attr = None
@@ -283,6 +284,11 @@ def _run(argv, mode):
                         'unterminated escape sequence is being discarded.\n')
                     sys.stderr.flush()
                 safe = render_output(text, mode)
+                if mode == 'show':
+                    # render_output keeps every combining mark (it is a per-char
+                    # homomorphism, per the T1 proof), so a Zalgo flood would reach the
+                    # real terminal here. Cap the run at the CLI boundary instead.
+                    safe, zalgo_carry = cap_zalgo_show(safe, zalgo_carry)
                 os.write(out_fd, safe.encode('utf-8', 'replace'))
             if stdin_fd in readable:
                 try:
