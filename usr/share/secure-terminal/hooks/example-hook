@@ -69,15 +69,11 @@ def _load_rules():
     compiled = []
     for verdict, pattern, message, suggestion in source:
         try:
-            # re.MULTILINE so a per-line-anchored rule (e.g. `^\s*sudo`) matches ANY
-            # line of a multi-line `script` payload, not just the first.
-            compiled.append(
-                (verdict, re.compile(pattern, re.MULTILINE), message, suggestion))
+            compiled.append((verdict, re.compile(pattern), message, suggestion))
         except re.error:
             continue                 # skip a malformed custom pattern
     if not compiled:                 # a wholly-bad file -> fall back to defaults
-        compiled = [(v, re.compile(p, re.MULTILINE), m, s)
-                    for v, p, m, s in _DEFAULT_RULES]
+        compiled = [(v, re.compile(p), m, s) for v, p, m, s in _DEFAULT_RULES]
     return compiled
 
 
@@ -85,11 +81,20 @@ _RULES = _load_rules()
 
 
 def decide(command):
-    for verdict, pattern, message, suggestion in _RULES:
-        if pattern.search(command):
-            return {'verdict': verdict, 'message': message,
-                    'suggestion': suggestion}
-    return {'verdict': 'allow'}
+    # Judge EACH line and take the MOST RESTRICTIVE verdict (block > ask > allow): an
+    # `allow` matching one line must not mask a `block`/`ask` matching another (searching
+    # the whole multi-line string with first-match-wins would fail open). Per line the
+    # FIRST matching rule wins, exactly the ordered-rule model for a single line.
+    rank = {'allow': 0, 'ask': 1, 'block': 2}
+    best = {'verdict': 'allow', 'message': '', 'suggestion': ''}
+    for line in command.split('\n'):
+        for verdict, pattern, message, suggestion in _RULES:
+            if pattern.search(line):
+                if rank[verdict] > rank[best['verdict']]:
+                    best = {'verdict': verdict, 'message': message,
+                            'suggestion': suggestion}
+                break                # first matching rule wins for THIS line
+    return best
 
 
 def main():
@@ -105,12 +110,12 @@ def main():
     is_script = isinstance(request, dict) and request.get('script') is not None
     command = ((request.get('script') or request.get('command', ''))
                if isinstance(request, dict) else '')
-    verdict = decide(command)
-    if is_script:
-        # Confirm we reviewed the WHOLE multi-line script (rules run re.MULTILINE), so
-        # secure-terminal trusts an ALLOW; without this ack a batch fails closed.
-        verdict['multiline_reviewed'] = True
-    print(json.dumps(verdict))
+    result = decide(command)
+    # Confirm we reviewed the WHOLE multi-line script (each line judged), so secure-terminal
+    # trusts an ALLOW; without this ack a batch fails closed. A fresh dict keeps the bool
+    # from fighting decide()'s str-valued return type.
+    out = {**result, 'multiline_reviewed': True} if is_script else result
+    print(json.dumps(out))
     return 0
 
 
