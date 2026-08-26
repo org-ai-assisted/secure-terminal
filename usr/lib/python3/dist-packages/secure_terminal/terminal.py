@@ -2240,13 +2240,14 @@ class SecureTerminal(QPlainTextEdit):
     _CANCEL_UNKNOWN_LINE = b'\x03'
 
     def _clear_typed_line(self, command):
-        """Erase a line whose exact content is mirrored (cursor at end, not dirty)
-        with one Backspace per character. Unlike SIGINT this sends no signal (so it
-        never kills a foreground program) and triggers no tcflush TCIFLUSH (so a
-        suggestion written immediately after is not swallowed), and unlike a
-        kill-line key it needs no shell keymap. len() counts the logical characters
-        readline/zle delete one-per-Backspace. The caller only reaches here with a
-        non-empty command (the empty line returns earlier)."""
+        """BEST-EFFORT visual erase of a mirrored line: one Backspace (^?) per
+        character. It is NOT reliable and the caller must NOT treat the line as
+        cleared: ^? is the erase key only until `stty erase` rebinds it (then these
+        DELs are inserted as text), and a cooked ICANON editor deletes BYTES while
+        len(command) counts code points, so multibyte content can leave bytes
+        behind. The security against submitting the un-erased line comes from the
+        caller keeping _line_dirty set, not from this erase. The caller only reaches
+        here with a non-empty command (the empty line returns earlier)."""
         self._write(b'\x7f' * len(command))
 
     def _mouse_report_on(self):
@@ -2744,8 +2745,17 @@ class SecureTerminal(QPlainTextEdit):
             return
         try:
             self._stream.feed(chunk)
-        except Exception:  # noqa: BLE001  # pragma: no cover - defensive: the filtered byte stream does not make pyte raise
-            pass
+        except Exception:  # noqa: BLE001
+            # pyte parses untrusted output: a version quirk (private SGR) or a
+            # HOSTILE CSI parameter longer than sys.get_int_max_str_digits() (4300
+            # on 3.11+, which pyte's `int(param)` raises ValueError on) must never
+            # crash us. But a generator that raised is EXHAUSTED -- every later
+            # feed() would then raise StopIteration and be swallowed too, silently
+            # and PERMANENTLY desyncing this tab's TUI screen (all further cursor /
+            # SGR / clear / text updates dropped). Rebuild the parser so rendering
+            # recovers on the next feed; the screen state lives on self._screen and
+            # is untouched, so only the crashing byte's in-flight parse is lost.
+            self._stream = _Utf8CharsetByteStream(self._screen)
 
     def _alt_enter(self):
         """A full-screen program took the alternate screen: snapshot the primary
@@ -3880,17 +3890,23 @@ class SecureTerminal(QPlainTextEdit):
             self._line_buffer = ''
             self._write(b'\r')
             return True
-        # Content is mirrored (not dirty), so erase it deterministically: no SIGINT
-        # (would kill nothing here but flush the tty input queue via tcflush and
-        # swallow the suggestion written next) and no keymap dependence.
+        # Best-effort erase of the rejected line -- but the erase is NOT reliable:
+        # ^? (DEL) is the erase key only until `stty erase` rebinds it (then the DELs
+        # are INSERTED as text), and a cooked ICANON editor deletes BYTES while
+        # len(command) counts code points, so multibyte padding can leave bytes
+        # behind. So the SECURITY comes from KEEPING _line_dirty set (as the SIGINT
+        # path above does), NOT from the erase: the next Enter then re-asks via the
+        # dirty branch instead of reaching the empty-buffer shortcut and submitting
+        # the un-erased command UNJUDGED. The write is still made so the common case
+        # (^? is the erase key) visibly clears the line / shows the suggestion.
         self._clear_typed_line(command)
         self._line_buffer = ''
+        self._line_dirty = True
         if action == 'suggest' and result['suggestion']:
-            # insert the suggested command for review -- never with a newline, so
-            # it never auto-runs; the user presses Enter (and is re-judged). The
-            # hook layer already single-lines a suggestion, but strip CR/LF HERE
-            # too so the no-auto-run invariant is enforced at the point of the
-            # write, not only upstream.
+            # insert the suggested command for review -- never with a newline, so it
+            # never auto-runs; the user's Enter is re-judged via the dirty branch.
+            # The hook layer already single-lines a suggestion, but strip CR/LF HERE
+            # too so the no-auto-run invariant holds at the write site.
             suggestion = result['suggestion'].replace('\r', ' ').replace('\n', ' ')
             self._write(suggestion.encode('ascii', 'ignore'))
             self._line_buffer = suggestion
