@@ -3810,6 +3810,12 @@ class SecureTerminal(QPlainTextEdit):
             if key == Qt.Key.Key_Backslash:
                 self._write(b'\x1c')          # Ctrl+\ -> SIGQUIT (cooked)
                 self._echo_caret('^\\')       # make the signal visible
+                # SIGQUIT (VQUIT) flushes the tty input queue like SIGINT, so the pending
+                # line is discarded -- clear the mirror too, or _hook_intercept would later
+                # judge a stale prefix plus the next keystrokes as one command (a real
+                # hook bypass, same class as the #34/#35 fixes).
+                self._line_buffer = ''
+                self._line_dirty = False
                 return
             if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
                 byte = key & 0x1f                  # Ctrl+C -> 0x03, Ctrl+L -> 0x0c

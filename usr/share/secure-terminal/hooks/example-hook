@@ -101,6 +101,22 @@ def decide(command):
     return best
 
 
+def _has_line_continuation(command):
+    """True if the batch cannot be judged line-by-line because a line runs ONTO the next --
+    a trailing pipe / and-or list operator (`|`, `&&`, `||`, `&`), or an unbalanced quote or
+    paren -- so the shell would run a command the per-line rules never saw whole (e.g.
+    `curl x |` then `sh` executes `curl x | sh`). We do NOT reinvent a shell parser (never
+    do); we conservatively refuse on any such signal. A trailing backslash is JOINED in
+    decide(), so it is resolved here first, not a refusal."""
+    joined = command.replace('\\\n', '')
+    for line in joined.split('\n')[:-1]:
+        if line.rstrip().endswith(('|', '&')):
+            return True
+    if any(joined.count(q) % 2 for q in ('"', "'", '`')):
+        return True
+    return joined.count('(') != joined.count(')')
+
+
 def main():
     try:
         request = json.load(sys.stdin)
@@ -114,6 +130,14 @@ def main():
     is_script = isinstance(request, dict) and request.get('script') is not None
     command = ((request.get('script') or request.get('command', ''))
                if isinstance(request, dict) else '')
+    if is_script and _has_line_continuation(command):
+        # A line runs onto the next, so the shell executes a command the per-line rules
+        # never saw whole. Rather than reinvent a shell parser, FAIL CLOSED: ask, and do
+        # NOT claim review (no multiline_reviewed) -- an unconfirmed batch is refused.
+        print(json.dumps({'verdict': 'ask',
+                          'message': 'multi-line batch has an unresolved line '
+                                     'continuation; review it before it runs'}))
+        return 0
     result = decide(command)
     # Confirm we reviewed the WHOLE multi-line script (each line judged), so secure-terminal
     # trusts an ALLOW; without this ack a batch fails closed. A fresh dict keeps the bool
