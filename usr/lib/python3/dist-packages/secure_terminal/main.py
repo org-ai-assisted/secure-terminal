@@ -877,7 +877,9 @@ class MainWindow(QMainWindow):
             lambda raw, delay, t=term: self._show_review(t, raw, delay, 'copy'))
         term.paste_review_resolved.connect(
             lambda t=term: self._hide_paste_review(t))
-        label = term.cwd_basename() or 'shell'
+        # sanitize_title like every other tab-label source: cwd_basename is a raw
+        # filesystem name and could carry bidi/control/homoglyph into the tab bar.
+        label = sanitize_title(term.cwd_basename() or '') or 'shell'
         # `at` places a background-restored tab at its saved position around the
         # already-shown active tab, which stays current across the insert (Qt keeps
         # the current WIDGET), so nothing flashes.
@@ -1417,8 +1419,9 @@ class MainWindow(QMainWindow):
         if safe_name:
             label = safe_name
         elif isinstance(cwd, str) and cwd:
-            label = '~' if cwd == os.path.expanduser('~') \
+            base = '~' if cwd == os.path.expanduser('~') \
                 else (os.path.basename(cwd.rstrip('/')) or '/')
+            label = sanitize_title(base) or 'shell'   # raw fs name -> neutralize bidi/control
         else:
             label = 'shell'
         index = self.tabs.insertTab(min(at, self.tabs.count()), ph, label)
@@ -1653,7 +1656,9 @@ class MainWindow(QMainWindow):
         # plain text only; setTabText does not interpret markup. The default is
         # the working-directory name (tracked live by the fg poll), which says far
         # more than a static "shell"; fall back to "shell" only if it is unreadable.
-        default = term.cwd_basename() or 'shell'
+        # sanitize_title like every other label source: the live cwd basename is a raw
+        # filesystem name and could carry bidi/control/homoglyph into the tab bar.
+        default = sanitize_title(term.cwd_basename() or '') or 'shell'
         self.tabs.setTabText(index, user or program or default)
         parts = []
         if user:
