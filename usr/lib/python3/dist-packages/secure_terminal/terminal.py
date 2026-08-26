@@ -2219,16 +2219,29 @@ class SecureTerminal(QPlainTextEdit):
         Qt.MouseButton.RightButton: 2,
     }
 
-    # Discard the WHOLE typed line the hook rejected, regardless of cursor position or
-    # shell editing mode. Ctrl+C (SIGINT to the foreground pgrp), NOT a kill-line key
-    # sequence: any End/Ctrl+E/Ctrl+U combination depends on the shell's keymap and
-    # SILENTLY LEAVES the command in some of them (bash vi-insert needed End-then-U;
-    # zsh vi-insert has ESC[F unbound and left the line; xterm's End is ESC O F, not
-    # ESC [ F). The hook only fires at a bare prompt (no foreground child), so SIGINT
-    # there just cancels the line editor and gives a fresh prompt in EVERY shell and
-    # editing mode -- the one line-cancel that does not depend on a key binding. It
-    # prints a visible ^C, which honestly signals the command was cancelled.
-    _DISCARD_LINE = b'\x03'
+    # Cancel a line of UNKNOWN content (recalled from history / cursor-edited, so
+    # neither its text nor the cursor column is mirrored). Ctrl+C (SIGINT), NOT a
+    # kill-line key sequence: any End/Ctrl+E/Ctrl+U combination depends on the
+    # shell's keymap and SILENTLY LEAVES the command in some of them (bash vi-insert
+    # needed End-then-U; zsh vi-insert has ESC[F unbound; xterm's End is ESC O F).
+    # The hook only fires at a bare prompt (no foreground child -- enforced by the
+    # has_foreground_program() guard at every _hook_intercept call site), so SIGINT
+    # there cancels the line editor and gives a fresh prompt in EVERY shell and
+    # editing mode. It is best-effort: a user who ran `stty intr undef` disarms it,
+    # so the caller marks _line_dirty afterward to FAIL SAFE (re-ask, never submit
+    # a line the cancel may have left behind). A line whose content IS mirrored is
+    # cleared deterministically by _clear_typed_line instead (no signal, no tcflush).
+    _CANCEL_UNKNOWN_LINE = b'\x03'
+
+    def _clear_typed_line(self, command):
+        """Erase a line whose exact content is mirrored (cursor at end, not dirty)
+        with one Backspace per character. Unlike SIGINT this sends no signal (so it
+        never kills a foreground program) and triggers no tcflush TCIFLUSH (so a
+        suggestion written immediately after is not swallowed), and unlike a
+        kill-line key it needs no shell keymap. len() counts the logical characters
+        readline/zle delete one-per-Backspace. The caller only reaches here with a
+        non-empty command (the empty line returns earlier)."""
+        self._write(b'\x7f' * len(command))
 
     def _mouse_report_on(self):
         """True when the child has enabled mouse tracking WITH SGR encoding, so its
@@ -3649,8 +3662,13 @@ class SecureTerminal(QPlainTextEdit):
                     # Ctrl+J (LF) and Ctrl+M (CR) are accept-line: readline/zle
                     # submit the line exactly like Enter, so route them through the
                     # hook and reset the line state -- else the command runs unjudged
-                    # and a stale dirty flag would poison the next prompt.
-                    if self._hook is not None and self._hook_intercept():
+                    # and a stale dirty flag would poison the next prompt. Judge only
+                    # at a bare prompt: with a foreground program the keystrokes are
+                    # ITS input (a password at sudo/ssh, text in cat), not a shell
+                    # command -- feeding them to the hook would leak them and the
+                    # discard would signal/disrupt that program (matches the TUI path).
+                    if (self._hook is not None and not self.has_foreground_program()
+                            and self._hook_intercept()):
                         return
                     self._line_buffer = ''
                     self._line_dirty = False
@@ -3695,8 +3713,11 @@ class SecureTerminal(QPlainTextEdit):
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             # The command hook (if configured) judges the typed line before Enter
-            # submits it; it may block, ask, or offer a safer command.
-            if self._hook is not None and self._hook_intercept():
+            # submits it; it may block, ask, or offer a safer command. Only at a
+            # bare prompt: with a foreground program in place the line is ITS input
+            # (a sudo/ssh password), not a shell command (matches the TUI path).
+            if (self._hook is not None and not self.has_foreground_program()
+                    and self._hook_intercept()):
                 return
             self._line_buffer = ''
             self._line_dirty = False
@@ -3823,11 +3844,15 @@ class SecureTerminal(QPlainTextEdit):
                            'it before it runs.',
                 'suggestion': ''})
             self._line_buffer = ''
-            self._line_dirty = False
             if action == 'run':
+                self._line_dirty = False
                 self._write(b'\r')
             else:
-                self._write(self._DISCARD_LINE)   # clear the WHOLE line (see const)
+                # Best-effort cancel of a line we cannot see. Its content is unknown
+                # so a counted erase is impossible; SIGINT is the only keymap-free
+                # cancel. It can be disarmed (`stty intr undef`), so KEEP _line_dirty
+                # set -- the next Enter re-asks instead of submitting a retained line.
+                self._write(self._CANCEL_UNKNOWN_LINE)
             return True
         command = self._line_buffer
         if not command.strip():
@@ -3848,7 +3873,10 @@ class SecureTerminal(QPlainTextEdit):
             self._line_buffer = ''
             self._write(b'\r')
             return True
-        self._write(self._DISCARD_LINE)   # clear the WHOLE line (see const)
+        # Content is mirrored (not dirty), so erase it deterministically: no SIGINT
+        # (would kill nothing here but flush the tty input queue via tcflush and
+        # swallow the suggestion written next) and no keymap dependence.
+        self._clear_typed_line(command)
         self._line_buffer = ''
         if action == 'suggest' and result['suggestion']:
             # insert the suggested command for review -- never with a newline, so
