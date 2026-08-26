@@ -3256,13 +3256,14 @@ class SecureTerminal(QPlainTextEdit):
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 handle.write(text)
             os.replace(tmp, path)          # atomic: a reader never sees a half-write
-            tmp = None                     # consumed by replace; nothing to clean up
         except OSError:  # pragma: no cover - defensive: a transcript write failure is ignored
+            # A failure BEFORE the replace leaves the temp behind (a success renames it
+            # away, and nothing after replace can raise), so unlink it if it was created.
             if tmp is not None:
                 try:
-                    os.unlink(tmp)         # do not leak the temp on a mid-write failure
+                    os.unlink(tmp)
                 except OSError:
-                    pass
+                    pass               # the temp is already gone; nothing to clean up
 
     def _doc_runs(self, block):
         """Yield (doc_start, doc_end, cp) for each run of a block in document
@@ -4498,6 +4499,13 @@ class SecureTerminal(QPlainTextEdit):
         for i, line in enumerate(pieces):
             if line:
                 self._write(line.encode('utf-8'))     # "type" the line (the shell echoes it)
+            if '\t' in line:
+                # A Tab triggers the shell's completion, so it runs a DIFFERENT command
+                # than the hook would judge from the literal bytes (`/bin/ech\t` -> the
+                # completed `/bin/echo`). Mark the line unverifiable, exactly as a typed
+                # Tab does, so _hook_intercept ASKS rather than auto-submitting the
+                # pre-completion text. (sanitize_paste keeps only \t and \r among C0.)
+                self._line_dirty = True
             # The next Enter submits (whatever the prompt already held) + this piece,
             # so FOLD any mirrored prefix into the judged command -- the hook must see
             # exactly what will run, or a pending typed line (or an injected bare
