@@ -52,6 +52,17 @@ def _forwarded_keys():
     and a key added to either table is reserved the same day."""
     return frozenset(_build_tui_keys()) | frozenset(_build_line_edit_keys())
 
+
+@functools.lru_cache(maxsize=1)
+def _modifiable_forwarded_keys():
+    """The subset of forwarded keys the widget re-encodes WITH a modifier (the xterm
+    ESC[1;<p><final> cursor / Home / End form), so a MODIFIED combo on one -- Ctrl+End,
+    Shift+Home, even Ctrl+Shift+End -- still reaches the program and must stay reserved.
+    Derived from the SAME table + final-byte test _tui_key uses, so the two cannot drift
+    (the bare tilde-form keys and F1-F4 take no modifier encoding and are excluded)."""
+    return frozenset(key for key, seq in _build_tui_keys().items()
+                     if len(seq) == 3 and seq[:2] == b'\x1b[' and 0x41 <= seq[2] <= 0x5a)
+
 TUI_TOOLTIP = (
     'TUI mode runs full-screen programs (ssh, vim, htop, tmux) by '
     'interpreting the terminal escape sequences the strict cli mode refuses. '
@@ -178,6 +189,11 @@ def _app_icon():
 
 # cap on a `ctl dump-tab` reply so it stays under the IPC frame limit.
 _DUMP_MAX = 512 * 1024
+
+# cap on tabs opened by a single --reuse/open IPC frame. A handoff opens a handful
+# (claude-rc-session open-all); ~58k tiny specs fit in the 1 MiB frame and would
+# exhaust fds/memory, so a frame past this is a runaway, refused whole.
+_MAX_OPEN_TABS = 64
 
 # menu label -> scrollback limit in lines (0 = unlimited)
 SCROLLBACK_CHOICES = [
@@ -1338,6 +1354,12 @@ class MainWindow(QMainWindow):
         # a repeated batch is idempotent (this is what claude-rc-session open-all
         # relies on): opened==0 with skipped>0 must NOT fall through to new_tab().
         tabs = request.get('tabs')
+        if isinstance(tabs, list) and len(tabs) > _MAX_OPEN_TABS:
+            # A frame opening more tabs than any real handoff needs is a runaway (a
+            # 1 MiB frame holds ~58k tiny specs -> fd/memory exhaustion). Refuse the
+            # whole frame rather than open a flood.
+            return {'ok': False,
+                    'error': 'too many tabs requested (max %d)' % _MAX_OPEN_TABS}
         if_absent = bool(request.get('if_absent'))
         present = self._live_commands() if if_absent else set()
         opened = skipped = 0
@@ -2994,6 +3016,10 @@ class MainWindow(QMainWindow):
             ('colored_markings', [self.act_markings]),
             ('auto_tab_colors', [self.act_auto_tab_colors]),
             ('osc_notice', [self.act_osc_notice]),
+            # the per-TYPE notice toggles: set_osc_notice_type refuses a locked
+            # osc_notice_off change, so they must be greyed too -- else each sits
+            # clickable, showing a tick the click never applies (a UI that lies).
+            ('osc_notice_off', list(self._osc_notice_actions.values())),
             ('tui_autobox_notice', [self.act_tui_autobox_notice]),
             ('osc_clipboard_read_always', [self.act_clip_read_always]),
             ('tui', [self.act_tui]),
@@ -3704,13 +3730,25 @@ class MainWindow(QMainWindow):
         mods = combo.keyboardModifiers()
         key = combo.key()
         ctrl = Qt.KeyboardModifier.ControlModifier
-        if mods == ctrl and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+        # Ctrl+<letter> and Ctrl+<@ [ \ ] ^ _> / Ctrl+Space all become a C0 control byte
+        # the terminal forwards (Ctrl+[ -> ESC, Ctrl+_ -> 0x1F, Ctrl+Space -> NUL), so a
+        # window shortcut on one would shadow it. Key_At..Key_Underscore is 0x40..0x5F,
+        # the contiguous @ A-Z [ \ ] ^ _ block.
+        if mods == ctrl and (Qt.Key.Key_At <= key <= Qt.Key.Key_Underscore
+                             or key == Qt.Key.Key_Space):
             return True
         if mods == Qt.KeyboardModifier.NoModifier and 0x20 <= key <= 0x7E:
             return True
         # A bare key the terminal forwards to the running program: the cursor keys,
         # Home/End, PageUp/Down, Insert/Delete and every function key.
         if mods == Qt.KeyboardModifier.NoModifier and key in _forwarded_keys():
+            return True
+        # A cursor / Home / End key WITH any modifier is still forwarded -- re-encoded
+        # as the xterm CSI ESC[1;<p><final> (Ctrl+End -> ESC[1;5F, even Ctrl+Shift+End ->
+        # ESC[1;6F), or sent bare for a modifier the widget does not encode -- so a
+        # rebound shortcut on one shadows the key for a TUI program. The bare (no
+        # modifier) form is already reserved above, so reaching here means a modifier.
+        if key in _modifiable_forwarded_keys():
             return True
         # Ctrl+PageUp/Down (switch tab) and Ctrl+Shift+PageUp/Down (move tab) are
         # consumed by the widget itself, so a window shortcut there never fires.
@@ -4778,12 +4816,18 @@ def _install_signal_quit(app):
     wake.start(200)
 
 
-def _is_font_noise(category, message):
+def _is_font_noise(_category, message):
     """True for the harmless 'qt.text.font.db: OpenType support missing for ...'
     warnings Qt logs when show mode renders a codepoint from a complex script
     whose installed monospace font lacks shaping tables. A flood of decoded
-    random bytes ("cat /dev/random" in show mode) emits thousands of these."""
-    return category == 'qt.text.font.db' or 'OpenType support missing' in message
+    random bytes ("cat /dev/random" in show mode) emits thousands of these.
+
+    Matched by the SPECIFIC message, not its whole category: a bare
+    `category == 'qt.text.font.db'` also swallowed a font-SUBSTITUTION warning (Qt
+    reaching for a fallback that may reintroduce the confusable glyphs Hack avoids) --
+    exactly the kind of warning that must still reach stderr. (The category is unused
+    now, but the handler still supplies it as the first positional argument.)"""
+    return 'OpenType support missing' in message
 
 
 def _quiet_font_warnings():
@@ -4795,6 +4839,13 @@ def _quiet_font_warnings():
             return
         sys.stderr.write(message + '\n')
     qInstallMessageHandler(handler)
+
+
+def _reap_pty_children(_signum, _frame):
+    """SIGCHLD handler: reap our exited pty shells (SecureTerminal owns the pid
+    registry). Only our own children are touched, so a subprocess.run child keeps a
+    truthful returncode rather than reading 0 under a blanket SIGCHLD=SIG_IGN."""
+    SecureTerminal.reap_pty_children()
 
 
 def _require_default_font():
@@ -5192,12 +5243,13 @@ def main():
         app.setDesktopFileName(launch.wm_class)
 
     # Auto-reap exited shells so closing a tab (which hangs up the child
-    # asynchronously) cannot leave a defunct process behind: on Linux, ignoring
-    # SIGCHLD makes the kernel reap children itself. We never wait() on a child
-    # for its status; a tab notices its shell ended from EOF on the pty, not a
-    # wait, so this does not race with anything.
+    # asynchronously) cannot leave a defunct process behind. A TARGETED handler reaps
+    # only OUR pty children (SecureTerminal tracks their pids); a blanket
+    # SIGCHLD=SIG_IGN would auto-reap EVERY child, making each subprocess.run return
+    # code read 0 -- a fail-open (e.g. terminfo `tic ... check=True` would never raise).
+    # Delivery rides the same wake QTimer _install_signal_quit uses for its handlers.
     try:
-        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        signal.signal(signal.SIGCHLD, _reap_pty_children)
     except (OSError, ValueError, AttributeError):
         pass            # if we cannot auto-reap, tabs simply reap on exit
 
