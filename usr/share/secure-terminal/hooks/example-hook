@@ -102,9 +102,15 @@ def main():
         return 0
     # Version 2 sends the whole multi-line payload as `script`; judge it as a unit.
     # `command` mirrors `script` for version-1 handlers, so either key yields content.
+    is_script = isinstance(request, dict) and request.get('script') is not None
     command = ((request.get('script') or request.get('command', ''))
                if isinstance(request, dict) else '')
-    print(json.dumps(decide(command)))
+    verdict = decide(command)
+    if is_script:
+        # Confirm we reviewed the WHOLE multi-line script (rules run re.MULTILINE), so
+        # secure-terminal trusts an ALLOW; without this ack a batch fails closed.
+        verdict['multiline_reviewed'] = True
+    print(json.dumps(verdict))
     return 0
 
 

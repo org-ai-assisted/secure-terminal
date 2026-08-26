@@ -153,7 +153,12 @@ def main():
     except (ValueError, OSError):
         print(json.dumps({'verdict': 'allow'}))
         return 0
-    print(json.dumps(decide(request)))
+    verdict = decide(request)
+    if isinstance(request, dict) and request.get('script') is not None:
+        # Confirm we judged the WHOLE multi-line script (never the trivial shortcut), so
+        # secure-terminal trusts an ALLOW; without this ack a batch fails closed.
+        verdict['multiline_reviewed'] = True
+    print(json.dumps(verdict))
     return 0
 
 

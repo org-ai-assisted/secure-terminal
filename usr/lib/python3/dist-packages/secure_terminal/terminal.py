@@ -4552,7 +4552,14 @@ class SecureTerminal(QPlainTextEdit):
         # newline so the hook judges the whole script exactly as it will run.
         script = self._line_buffer + '\n'.join(submits)
         if not script.strip():
-            return 'run'                  # only blank lines -> nothing to judge
+            # Only blank lines: at a shell CONTINUATION prompt (an unclosed quote, or a
+            # backslash-continued line the widget's mirror does not track) a blank line
+            # COMPLETES and runs the pending command. The widget cannot see that state,
+            # so an all-blank injected batch is UNVERIFIABLE -> refuse (fail closed).
+            self.hook_notice.emit(
+                'Injected blank-only payload could not be reviewed (a blank line may '
+                'complete a pending shell command); refused.')
+            return ''
         cfg = self._hook or {}
         result = hook.evaluate(
             cfg['argv'], script,
