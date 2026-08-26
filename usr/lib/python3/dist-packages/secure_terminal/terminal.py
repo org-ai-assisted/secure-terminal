@@ -71,6 +71,7 @@ import re
 import copy
 import select
 import subprocess
+import tempfile
 import time
 import base64
 import urllib.parse
@@ -1650,8 +1651,10 @@ class SecureTerminal(QPlainTextEdit):
             fmt.setFontWeight(QFont.Weight.Bold)
         if cell.underscore:
             fmt.setFontUnderline(True)
-        self._fmt_cache[key] = fmt
-        return fmt
+        # Keyed by (fg, bg, ...) with truecolor fg/bg, so untrusted SGR spam would grow
+        # this toward the 2^48 colour space -- admission-cap it like the sibling marking
+        # caches so a flood cannot leak formats without bound.
+        return _cache_bounded(self._fmt_cache, key, fmt)
 
     def _end_sync_update(self):
         """End a synchronized-output hold (its ESC[?2026l arrived, or the watchdog
@@ -2438,6 +2441,7 @@ class SecureTerminal(QPlainTextEdit):
             except OSError:
                 os._exit(127)
         self._pid = pid
+        SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
         self._fd = fd
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -2956,9 +2960,15 @@ class SecureTerminal(QPlainTextEdit):
         if board is None:  # pragma: no cover - clipboard() is non-None under a running QApplication
             return
         raw = (board.text() or '').encode('utf-8', 'replace')[:_OSC_CLIP_MAX]
-        # _write handles the whole (~87 KiB) reply incl. partial writes, so the
-        # client never sees a truncated, unterminated OSC sequence.
-        self._write(b'\x1b]52;c;' + base64.b64encode(raw) + b'\x07')
+        reply = b'\x1b]52;c;' + base64.b64encode(raw) + b'\x07'
+        if self._write(reply) is False:
+            # A slow/gone child left the ~87 KiB reply truncated -- its buffered prefix
+            # then lacks the OSC terminator, so a draining reader's own next output
+            # would be swallowed into the unterminated string. Best-effort close it
+            # (a fully wedged child receives neither, which is correct -- it is not
+            # reading). The payload is base64 (no control/newline bytes) and only a
+            # user-granted tab ever replies, so a truncated prefix stays contained.
+            self._write(b'\x07')
 
     def _osc_clipboard(self, params):
         """OSC 52 WRITE: <selection>;<base64>. The decoded text is filtered to
@@ -3027,16 +3037,18 @@ class SecureTerminal(QPlainTextEdit):
                 os.kill(self._pid, signal.SIGHUP)
             except OSError:
                 pass        # child already gone -> nothing to hang up
-            # SIGHUP is asynchronous, so the child may still be alive here; a
-            # one-shot waitpid would return (0, 0) and reap nothing. Reaping is
-            # therefore left to the process-wide SIGCHLD=SIG_IGN handler (see
-            # main.main), which the kernel honors whenever the child does exit.
-            # The WNOHANG call only mops up a child that has already died, e.g.
-            # when the widget is used without that handler installed.
+            # SIGHUP is asynchronous, so the child may still be alive here; a one-shot
+            # WNOHANG only mops up a child that has ALREADY died (e.g. the widget used
+            # without the app's SIGCHLD handler). A child still alive stays in
+            # _LIVE_PTY_PIDS, and the app's reap_pty_children handler collects it when it
+            # exits -- so it never lingers defunct, without a blanket SIGCHLD=SIG_IGN that
+            # would defang subprocess returncodes.
             try:
-                os.waitpid(self._pid, os.WNOHANG)
+                reaped = os.waitpid(self._pid, os.WNOHANG)[0]
             except (OSError, ChildProcessError):
-                pass        # not yet dead / already reaped -> nothing to do
+                reaped = self._pid   # already reaped -> drop it from the registry
+            if reaped:
+                SecureTerminal._LIVE_PTY_PIDS.discard(self._pid)
             self._pid = None
 
     def _append(self, text):
@@ -3219,18 +3231,28 @@ class SecureTerminal(QPlainTextEdit):
         if self._grid_mode() and self._render_timer.isActive():
             self._render_timer.stop()
             self._render_tui()
+        tmp = None
         try:
             text = self.transcript_text()
-            tmp = path + '.tmp'
-            # O_NOFOLLOW + owner-only: the target may be a user-chosen path in a shared dir,
-            # so never write THROUGH a pre-planted symlink at <path>.tmp (would let a local
-            # attacker redirect the write); a symlink there raises and is ignored below.
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-            with os.fdopen(os.open(tmp, flags, 0o600), 'w', encoding='utf-8') as handle:
+            # A UNIQUE temp in the target's own dir, created O_CREAT|O_EXCL + 0o600 by
+            # mkstemp: the target may be a user-chosen path in a shared dir, so a
+            # co-resident attacker must not be able to pre-plant a world-readable file
+            # (a fixed <path>.tmp with only O_TRUNC would be REUSED, keeping the
+            # attacker's mode and leaking the transcript) NOR a symlink to redirect the
+            # write. An unguessable name created O_EXCL defeats both.
+            directory = os.path.dirname(path) or '.'
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix='.st-transcript-',
+                                       suffix='.tmp')
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 handle.write(text)
             os.replace(tmp, path)          # atomic: a reader never sees a half-write
+            tmp = None                     # consumed by replace; nothing to clean up
         except OSError:  # pragma: no cover - defensive: a transcript write failure is ignored
-            pass
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)         # do not leak the temp on a mid-write failure
+                except OSError:
+                    pass
 
     def _doc_runs(self, block):
         """Yield (doc_start, doc_end, cp) for each run of a block in document
@@ -3467,9 +3489,11 @@ class SecureTerminal(QPlainTextEdit):
         is the choke point the reflection-oracle test spies. Retries a partial write
         / EAGAIN on the non-blocking fd (a large clipboard reply is ~87 KiB, more
         than one os.write may accept), bounded so a program that never drains its
-        input cannot hang us."""
+        input cannot hang us. Returns True when every byte was written, False when a
+        wedged/gone child left some unwritten -- the OSC-52 reply path uses that to
+        avoid leaving a dangling, unterminated escape."""
         if self._fd is None:
-            return
+            return False
         view = memoryview(data if isinstance(data, (bytes, bytearray)) else bytes(data))
         deadline = time.monotonic() + 2.0
         while view:
@@ -3477,10 +3501,11 @@ class SecureTerminal(QPlainTextEdit):
                 view = view[os.write(self._fd, view):]
             except BlockingIOError:
                 if time.monotonic() > deadline:
-                    return
+                    return False
                 select.select([], [self._fd], [], 0.05)
             except OSError:
-                return          # child gone / pty closed -> input is dropped
+                return False    # child gone / pty closed -> input is dropped
+        return True
 
     # -- signalling the foreground program ------------------------------------
     def _foreground_pgrp(self):
@@ -3605,6 +3630,27 @@ class SecureTerminal(QPlainTextEdit):
                 pass        # exited between the check and the kill -> fine
         QTimer.singleShot(2000, _kill_survivor)
         return True
+
+    # Pids of OUR pty shells. The app's SIGCHLD handler reaps ONLY these, never a
+    # subprocess.run child -- a blanket SIGCHLD=SIG_IGN would auto-reap those too and make
+    # their returncode read 0 (a fail-open: e.g. terminfo `tic ... check=True` would never
+    # raise on a real failure).
+    _LIVE_PTY_PIDS = set()
+
+    @classmethod
+    def reap_pty_children(cls):
+        """WNOHANG-reap any of our exited pty shells, so a closed tab whose child dies
+        asynchronously leaves no defunct process. Driven by the app's SIGCHLD handler
+        (main.main). Touches only our registered pids; a subprocess child is left for
+        subprocess to reap, keeping its returncode truthful."""
+        for pid in list(cls._LIVE_PTY_PIDS):
+            try:
+                reaped = os.waitpid(pid, os.WNOHANG)[0]
+            except (OSError, ChildProcessError):
+                cls._LIVE_PTY_PIDS.discard(pid)   # vanished / not ours -> forget it
+                continue
+            if reaped:
+                cls._LIVE_PTY_PIDS.discard(pid)   # reaped -> forget it
 
     # -- input: printable ASCII + signal-key allowlist ------------------------
     _TUI_KEYS = None      # built lazily below (needs Qt.Key at call time)
@@ -3925,6 +3971,10 @@ class SecureTerminal(QPlainTextEdit):
         text = ('The command hook flagged this command:\n\n  ' + command
                 + (('\n\n' + result['message']) if result['message'] else ''))
         box = QMessageBox(QMessageBox.Icon.Warning, 'Command hook', text, parent=self)
+        # The command + hook message are untrusted (program- / config-supplied), so pin
+        # PlainText: QMessageBox auto-detects rich text, and HTML-like content would else
+        # render as markup (hiding or restyling the very command being reviewed).
+        box.setTextFormat(Qt.TextFormat.PlainText)
         run_btn = None
         if result['verdict'] == 'ask':
             run_btn = box.addButton('Run as typed',
