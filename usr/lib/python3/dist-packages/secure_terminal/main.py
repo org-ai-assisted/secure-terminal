@@ -256,6 +256,12 @@ def _read_hook_config(cfg):
         timeout = int(cfg.get('command_hook_timeout') or 10)
     except ValueError:
         timeout = 10
+    if timeout <= 0:
+        # A non-positive timeout makes subprocess.run raise TimeoutExpired INSTANTLY,
+        # before the handler can answer -- with on_error=allow (the default) that fails
+        # OPEN, auto-approving every command while the UI still shows the hook enabled.
+        # Reject it (the setting is a positive number of seconds).
+        timeout = 10
     return {
         'argv': argv,
         'transcript': cfg.get('command_hook_transcript') or 'none',
@@ -1348,7 +1354,11 @@ class MainWindow(QMainWindow):
         # label does not visibly change when the real shell swaps in.
         name = info.get('name')
         cwd = info.get('cwd')
-        if name:
+        # isinstance, not a bare truth test: a crafted/hand-edited session with a
+        # non-string name (a JSON array/object/number) would else become the tab
+        # label and crash insertTab at startup -- an unrecoverable restore crash.
+        # (matches the guard _restore_tab already applies to the real tab.)
+        if isinstance(name, str) and name:
             label = name
         elif isinstance(cwd, str) and cwd:
             label = '~' if cwd == os.path.expanduser('~') \
@@ -2400,7 +2410,11 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def set_allow_title(self, enabled):
-        if 'allow_title' in self._locked:
+        # allow_title is the LEGACY combined control for osc_title + osc_notify, so a
+        # lock on EITHER granular key (or on allow_title itself) must refuse it -- else
+        # this control bypasses a granular osc_title/osc_notify lock (set_osc guards
+        # both directions; this is the reverse gap).
+        if self._locked & {'allow_title', 'osc_title', 'osc_notify'}:
             return                        # admin-locked; not user-changeable
         term = self.current()
         if term is not None:
@@ -2587,8 +2601,12 @@ class MainWindow(QMainWindow):
         if not self._persist_session:
             return
         blob = session.load_window()
-        if blob:
-            self.restoreGeometry(QByteArray.fromBase64(blob.encode('ascii')))
+        if isinstance(blob, str) and blob:
+            # base64 is ASCII; a non-str or non-ASCII blob in a corrupt / hand-edited
+            # session would crash .encode('ascii') and abort startup. Coerce with
+            # 'ignore' -- a mangled blob then yields invalid base64, a harmless no-op
+            # restore (keeps the default geometry), never an exception.
+            self.restoreGeometry(QByteArray.fromBase64(blob.encode('ascii', 'ignore')))
 
     def _connect_bell_tray(self, term):
         term.bell_tray.connect(lambda label: self._on_bell_tray(term, label))
@@ -2691,6 +2709,10 @@ class MainWindow(QMainWindow):
         warn_act.setChecked(self._clip_warn_any)
         warn_act.setToolTip('Off: warn only on hidden/deceptive characters. '
                             'On: warn on any non-ASCII (accents, CJK, emoji) too.')
+        # this ephemeral tray action is rebuilt each menu open, so it is gated HERE
+        # rather than in _apply_locks: a locked clip_warn_any must be un-clickable from
+        # the tray too, not only refused by set_clip_warn_any (the #6 bypass gap).
+        warn_act.setEnabled('clip_warn_any' not in self._locked)
         warn_act.toggled.connect(self.set_clip_warn_any)
         menu.addAction('Review clipboard now').triggered.connect(self._clip_review_now)
         menu.addSeparator()
@@ -2712,6 +2734,8 @@ class MainWindow(QMainWindow):
             clipboard_watch.stop_running()
 
     def set_clip_warn_any(self, on):
+        if 'clip_warn_any' in self._locked:
+            return                        # admin-locked; not user-changeable
         self._clip_warn_any = bool(on)
         ## clip_warn_any is shared with the clipboard-watch daemon; persist it with a
         ## single-key write (not the bulk _persist) so the two processes do not
@@ -2976,6 +3000,10 @@ class MainWindow(QMainWindow):
         if 'allow_title' in self._locked:
             gated += [('allow_title', [self._osc_actions[k]])
                       for k in ('osc_title', 'osc_notify') if k in self._osc_actions]
+        # the REVERSE: a granular osc_title/osc_notify lock greys the legacy combined
+        # "Allow title" control, which set_allow_title now refuses -- so it must not sit
+        # clickable-but-inert (the #3 bypass gap).
+        gated += [('osc_title', [self.act_title]), ('osc_notify', [self.act_title])]
         for key, actions in gated:
             if key in self._locked:
                 for act in actions:

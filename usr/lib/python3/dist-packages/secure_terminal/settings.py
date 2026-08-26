@@ -48,6 +48,13 @@ _USER_FILE = '50_user.conf'
 # is the injection surface, so only an admin may enable it.
 PRIVILEGED_ONLY = frozenset({'remote_control'})
 
+# Locking command_hook must lock these too: each steers the hook's SECURITY
+# behaviour -- a non-positive command_hook_timeout or command_hook_on_error=allow
+# fails OPEN, and command_hook_transcript decides what the handler sees -- so leaving
+# them user-settable would let a home config defeat an admin-locked hook.
+_HOOK_COMPANION_KEYS = frozenset({
+    'command_hook_timeout', 'command_hook_on_error', 'command_hook_transcript'})
+
 
 def _user_config_dir():
     base = os.environ.get('XDG_CONFIG_HOME') or os.path.join(
@@ -175,6 +182,8 @@ def load():
         for key in layer.pop('lock', '').replace(',', ' ').split():
             locked.add(key)
         system.update(layer)
+    if 'command_hook' in locked:
+        locked.update(_HOOK_COMPANION_KEYS)   # its companions steer hook security
     user = _load_dir(_user_config_dir())
     user.pop('lock', None)                 # locking is privileged-only
     merged = dict(system)

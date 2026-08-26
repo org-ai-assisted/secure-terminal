@@ -2219,6 +2219,13 @@ class SecureTerminal(QPlainTextEdit):
         Qt.MouseButton.RightButton: 2,
     }
 
+    # Discard the WHOLE typed line regardless of cursor position: Ctrl+E (end-of-line)
+    # then Ctrl+U (kill). A bare Ctrl+U is unix-line-discard in bash -- it kills only
+    # cursor-to-start, so a mid-line Enter that the hook then discards would leave the
+    # tail behind to run unjudged; moving to end first kills everything. (zsh's Ctrl+U
+    # already kills the whole line; the leading Ctrl+E is then a harmless no-op.)
+    _DISCARD_LINE = b'\x05\x15'
+
     def _mouse_report_on(self):
         """True when the child has enabled mouse tracking WITH SGR encoding, so its
         mouse/wheel events are reported. Shift (the local override) is checked per
@@ -3648,9 +3655,19 @@ class SecureTerminal(QPlainTextEdit):
                 self._write(bytes([byte]))
                 if key == Qt.Key.Key_C:
                     self._echo_caret('^C')    # make the interrupt visible
-                if key in (Qt.Key.Key_C, Qt.Key.Key_U):
-                    self._line_buffer = ''    # SIGINT / kill-line discards the line
+                if key == Qt.Key.Key_C:
+                    self._line_buffer = ''    # SIGINT discards the whole line
                     self._line_dirty = False
+                elif key == Qt.Key.Key_U:
+                    # Ctrl+U (kill-line) reaches cursor-to-start (bash unix-line-discard)
+                    # or the whole line (zsh kill-whole-line) -- its extent depends on
+                    # the cursor position, which we do not track. So clear the mirror but
+                    # PRESERVE _line_dirty: only a clean mirror (cursor at end, not dirty)
+                    # truly killed the whole line. If the cursor had already moved, the
+                    # survivor is unknown and the next Enter must fail safe (ask), not
+                    # submit it unjudged. Regression: resetting the flag let Home then
+                    # Ctrl+U bypass the command hook.
+                    self._line_buffer = ''
                 else:
                     # any OTHER readline control edit (Ctrl+A/E/B/F move, Ctrl+K/W
                     # kill, Ctrl+Y yank, Ctrl+T transpose, Ctrl+D delete, Ctrl+R
@@ -3806,7 +3823,7 @@ class SecureTerminal(QPlainTextEdit):
             if action == 'run':
                 self._write(b'\r')
             else:
-                self._write(b'\x15')          # Ctrl+U: discard the line
+                self._write(self._DISCARD_LINE)   # clear the WHOLE line (see const)
             return True
         command = self._line_buffer
         if not command.strip():
@@ -3827,7 +3844,7 @@ class SecureTerminal(QPlainTextEdit):
             self._line_buffer = ''
             self._write(b'\r')
             return True
-        self._write(b'\x15')          # Ctrl+U: discard the typed line in the shell
+        self._write(self._DISCARD_LINE)   # clear the WHOLE line (see const)
         self._line_buffer = ''
         if action == 'suggest' and result['suggestion']:
             # insert the suggested command for review -- never with a newline, so
@@ -3922,7 +3939,12 @@ class SecureTerminal(QPlainTextEdit):
             return
         if submit_or_discard:
             self._line_buffer = ''
-            self._line_dirty = False
+            # accept-line and Ctrl+C settle the line (judged, or SIGINT-discarded), so
+            # the flag clears. Ctrl+U does NOT: its reach is cursor-dependent (untracked),
+            # so a survivor must keep the next accept-line failing safe -- same reason as
+            # the CLI path. Regression: clearing it let Home then Ctrl+U bypass the hook.
+            if not (ctrl and key == Qt.Key.Key_U):
+                self._line_dirty = False
 
         seq = SecureTerminal._TUI_KEYS.get(key)
         text = event.text()
