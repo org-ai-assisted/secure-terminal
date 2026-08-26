@@ -249,7 +249,8 @@ from secure_terminal.sanitize import (
     sanitize_clipboard_display,
     paste_findings, paste_is_multiline, paste_no_autosubmit, tui_cell,
     sanitize_title,
-    feed_line_edits, cells_to_runs, cells_display_col, MARK_KEY, WRAP_NL, BOX,
+    feed_line_edits, cells_to_runs, cells_display_col, display_len,
+    MARK_KEY, WRAP_NL, BOX,
     SPACE_MARK,
     render_output,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
@@ -2035,7 +2036,16 @@ class SecureTerminal(QPlainTextEdit):
         block = doc.findBlockByNumber(
             min(grid_top + screen.cursor.y, doc.blockCount() - 1))
         if block.isValid():
-            pos = block.position() + min(screen.cursor.x, screen.columns)
+            # The caret's document offset is the WIDTH of the rendered cells left of
+            # it, not the cell column: a cell that renders to more than one UTF-16 unit
+            # (an astral glyph in show mode, a multi-codepoint placeholder) advances the
+            # document by more than one position, so `+ cursor.x` drifts the caret left.
+            # Sum each left cell's render width exactly as _insert_grid_row records it.
+            col = min(screen.cursor.x, screen.columns)
+            row = screen.buffer[screen.cursor.y]
+            offset = sum(display_len(tui_cell(row[x].data, self._mode))
+                         for x in range(col))
+            pos = block.position() + offset
             tc = self.textCursor()
             tc.setPosition(min(pos, doc.characterCount() - 1))
             self.setTextCursor(tc)
