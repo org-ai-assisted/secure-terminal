@@ -739,6 +739,10 @@ class SecureTerminal(QPlainTextEdit):
         # showing spurious trailing lines after a file with no final newline.
         # Updated by _set_winsize; falls back to _MAX_LINE until first sized.
         self._cols = 0
+        # Rows we report to the child (winsize height). Kept so a mouse report can
+        # clamp its row to the child's actual screen, symmetric with _cols -- a click
+        # in the sub-row strip below the last row must not name a row past the grid.
+        self._rows = 0
 
         # seconds the paste-warning "Allow" button stays disabled.
         self._paste_delay = 3
@@ -1515,9 +1519,11 @@ class SecureTerminal(QPlainTextEdit):
         return cols, rows
 
     def _set_winsize(self, cols, rows):
-        # Remember the width we tell the child, so line-mode output wraps at the
-        # same column the shell formats to (see self._cols / _feed_line).
+        # Remember the size we tell the child: the width so line-mode output wraps
+        # at the same column the shell formats to (see self._cols / _feed_line), and
+        # the height so a mouse report clamps its row to the child's screen.
         self._cols = cols
+        self._rows = rows
         if self._fd is None:
             return
         try:
@@ -2264,8 +2270,9 @@ class SecureTerminal(QPlainTextEdit):
         col = int((pos.x() - margin - off.x()) // char_w) + 1
         row = int((pos.y() - margin - off.y()) // char_h) + 1
         cols = self._cols if self._cols and self._cols > 0 else self._MAX_LINE
+        rows = self._rows if self._rows and self._rows > 0 else self._MAX_LINE
         col = min(col, cols) if col > 1 else 1
-        row = row if row > 1 else 1
+        row = min(row, rows) if row > 1 else 1
         return col, row
 
     def _button_code(self, base, mods, motion=False):
