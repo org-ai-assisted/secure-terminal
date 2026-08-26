@@ -272,7 +272,10 @@ def _run(argv, mode):
                 # after _EOF_NUDGE_MAX tries: a shell exits within a nudge or two, but a program
                 # that reads ^D as DATA never exits on it and must not be fed it forever.
                 if eof_nudges_left > 0:
-                    if select.select([], [fd], [], 0)[1]:
+                    # no branch: the not-writable path is a defensive deadlock-guard (skip the
+                    # nudge if the pty won't take a write); a bounded <=_EOF_NUDGE_MAX nudge to a
+                    # fresh child never fills the pty buffer, so it cannot be driven in a test.
+                    if select.select([], [fd], [], 0)[1]:  # pragma: no branch
                         os.write(fd, b'\x04')
                     eof_nudges_left -= 1
                     eof_nudge = time.monotonic() + _EOF_NUDGE_INTERVAL
