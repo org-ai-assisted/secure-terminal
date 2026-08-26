@@ -80,6 +80,12 @@ _PASTE_MAX = 1 << 20
 # Escape (vim) responsive, large enough to reassemble any split marker.
 _ESC_HOLD_TIMEOUT = 0.05
 
+# After OUR stdin closes we nudge the child with EOF (Ctrl-D) at this slow cadence until
+# it exits -- one ^D can be lost to a shell that flushes type-ahead before its prompt (zsh),
+# and re-reading a closed fd every loop would busy-spin. A slow, best-effort re-send delivers
+# EOF reliably without pegging the CPU.
+_EOF_NUDGE_INTERVAL = 0.2
+
 # Characters an unterminated / over-long string sequence may silently suppress
 # before a one-time stderr notice. A sequence that survives a whole 64 KiB read
 # without terminating is almost certainly stuck (a real one is shorter and ends),
@@ -229,6 +235,8 @@ def _run(argv, mode):
             # so a failed setraw / enable still hits the finally that restores termios.
             os.write(out_fd, _BP_ENABLE)
         esc_deadline = None     # monotonic time to flush a held partial paste-start marker
+        read_fds = [fd, stdin_fd]   # stdin_fd is dropped from this on its EOF (below)
+        eof_nudge = None        # monotonic time to re-send the child EOF after stdin closed
         while True:
             # A held partial paste-start marker (a lone ESC, or ESC[.. prefix) is carried in
             # paste_state[2] while NOT already in a paste. It is flushed to the child as a real
@@ -244,10 +252,20 @@ def _run(argv, mode):
             else:
                 esc_deadline = None
                 timeout = None
+            if eof_nudge is not None:
+                # wake in time for the next EOF nudge (never busy-wait on a closed stdin)
+                due = max(0.0, eof_nudge - time.monotonic())
+                timeout = due if timeout is None else min(timeout, due)
             try:
-                readable, _, _ = select.select([fd, stdin_fd], [], [], timeout)
+                readable, _, _ = select.select(read_fds, [], [], timeout)
             except (OSError, select.error):  # pragma: no cover - PEP 475 retries EINTR
                 continue            # EINTR from SIGWINCH etc. -> retry
+            if eof_nudge is not None and time.monotonic() >= eof_nudge:
+                # re-send EOF, best-effort: skip when the pty won't take a write (a child not
+                # reading its input), so a full input buffer can never block the reader.
+                if select.select([], [fd], [], 0)[1]:
+                    os.write(fd, b'\x04')
+                eof_nudge = time.monotonic() + _EOF_NUDGE_INTERVAL
             if hold and time.monotonic() >= esc_deadline:
                 # deadline reached (even if the child fd is readable) -> the held prefix got no
                 # paste continuation; forward it verbatim and clear the hold, then service any
@@ -296,7 +314,14 @@ def _run(argv, mode):
                 except OSError:  # pragma: no cover - defensive stdin read-error guard
                     break
                 if not keys:
-                    os.write(fd, b'\x04')   # our EOF -> send the child EOF
+                    # stdin hit EOF (closed pipe / /dev/null). Send the child an EOF, then
+                    # STOP selecting on stdin_fd: a closed fd stays readable, so leaving it in
+                    # read_fds spins the loop hammering ^D at 100% CPU. A slow best-effort
+                    # re-send (eof_nudge) then keeps delivering EOF -- one ^D can be flushed by
+                    # a shell that clears type-ahead before its prompt -- until the child exits.
+                    os.write(fd, b'\x04')
+                    read_fds.remove(stdin_fd)
+                    eof_nudge = time.monotonic() + _EOF_NUDGE_INTERVAL
                 elif old_attr is None:
                     # Non-tty stdin: bracketed paste was never enabled, so nothing
                     # is framed -- forward the bytes verbatim.

@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
 
 from secure_terminal import settings, session, ipc
 from secure_terminal.sanitize import (
-    OSC_FEATURES, OSC_FEATURE_BY_KEY, luminance)
+    OSC_FEATURES, OSC_FEATURE_BY_KEY, luminance, sanitize_title)
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
@@ -1144,7 +1144,10 @@ class MainWindow(QMainWindow):
         # dedup in _ipc_open.
         term.launch_command = self._normalize_command(spec.get('command'))
         if spec.get('title'):
-            self._user_titles[term] = spec['title']
+            # User/IPC-set titles bypass the program-title sanitizer, so sanitize HERE
+            # (one choke for every sink: tab text/tooltip, bell notification, OSC-52
+            # consent dialog) -- else a bidi/RLO or homoglyph title spoofs those.
+            self._user_titles[term] = sanitize_title(spec['title'])
             self._refresh_tab_label(term)
 
     # -- single-instance IPC server (owner-only socket) -----------------------
@@ -1297,8 +1300,12 @@ class MainWindow(QMainWindow):
                 # it is exactly what is on screen), for drive-and-assert E2E tests.
                 text = term.toPlainText()
                 lines = request.get('lines')
-                if isinstance(lines, int) and lines > 0:
-                    text = '\n'.join(text.split('\n')[-lines:])
+                if isinstance(lines, int) and lines >= 0:
+                    # Slice by an explicit START index: parts[-lines:] is the WHOLE list
+                    # for lines==0 (negative-zero slice), which would dump everything
+                    # instead of the zero lines asked for. A start past the end yields [].
+                    parts = text.split('\n')
+                    text = '\n'.join(parts[len(parts) - lines:])
                 if len(text) > _DUMP_MAX:
                     text = text[-_DUMP_MAX:]     # fast tail-cap by character count
                 # A character cap is not enough: json.dumps (ensure_ascii) expands
@@ -1314,7 +1321,7 @@ class MainWindow(QMainWindow):
             title = request.get('title')
             if not isinstance(title, str):
                 return {'ok': False, 'error': 'title must be a string'}
-            self._user_titles[term] = title
+            self._user_titles[term] = sanitize_title(title)   # ctl surface: strip bidi/homoglyph
             self._refresh_tab_label(term)
             return {'ok': True}
         return {'ok': False, 'error': 'unknown ctl op: %r' % (op,)}
@@ -1555,7 +1562,7 @@ class MainWindow(QMainWindow):
         index = self._add_tab(term, activate=activate, at=at)
         name = info.get('name')
         if isinstance(name, str) and name:
-            self._user_titles[term] = name
+            self._user_titles[term] = sanitize_title(name)   # restored session: untrusted file
         color = info.get('color')
         if isinstance(color, str) and color:
             self.set_tab_color(index, QColor(color))
@@ -1628,7 +1635,7 @@ class MainWindow(QMainWindow):
         if ok:
             # a user name takes precedence over any program-set title, and is
             # not lost when a program later sets its own title.
-            self._user_titles[term] = name.strip()
+            self._user_titles[term] = sanitize_title(name.strip())   # ASCII-only, like every title
             self._refresh_tab_label(term)
 
     def _refresh_tab_label(self, term):
@@ -1664,6 +1671,15 @@ class MainWindow(QMainWindow):
         # the colour swatch also carries the tab's number, so refresh every tab
         # (a colour change does not move tabs, but this keeps one code path).
         self._renumber_tabs()
+
+    def _pick_custom_tab_color(self, index):
+        # QColorDialog.getColor returns an INVALID QColor on Cancel; set_tab_color folds
+        # invalid into its Clear path (correct for a bad spec/session colour string), so
+        # passing the dialog result straight through would ERASE the tab's colour on
+        # Cancel. Only apply a real pick here -- Cancel is a no-op.
+        color = QColorDialog.getColor(parent=self)
+        if color.isValid():
+            self.set_tab_color(index, color)
 
     # -- find in scrollback: per-tab and across all tabs ----------------------
     _FIND_FMT = None
@@ -1877,9 +1893,7 @@ class MainWindow(QMainWindow):
                             ('Purple', '#8b5cf6')):
             color_menu.addAction(
                 name, lambda v=value: self.set_tab_color(index, QColor(v)))
-        color_menu.addAction(
-            'Custom...',
-            lambda: self.set_tab_color(index, QColorDialog.getColor(parent=self)))
+        color_menu.addAction('Custom...', lambda: self._pick_custom_tab_color(index))
         color_menu.addAction('Clear', lambda: self.set_tab_color(index, None))
         menu.addSeparator()
         menu.addAction('Close Tab', lambda: self.close_tab(index))
@@ -2824,11 +2838,13 @@ class MainWindow(QMainWindow):
         self._populate_clipboard_menu(menu.addMenu('Clipboard sanitizer'))
 
     def _on_cwd_changed(self, term, path):
-        # OSC 7 working directory (only when osc_cwd is enabled): show it as the
-        # tab's tooltip (non-intrusive; the path is already sanitized).
+        # OSC 7 working directory (only when osc_cwd is enabled): show it as the tab's
+        # tooltip. The path is sanitize_title'd upstream (no control/bidi/homoglyph) but
+        # that keeps < > & verbatim, and setTabToolTip renders rich text -- so escape it,
+        # like _refresh_tab_label does, or an OSC-7 path could inject markup.
         index = self.tabs.indexOf(term)
         if index != -1:
-            self.tabs.setTabToolTip(index, path)
+            self.tabs.setTabToolTip(index, html.escape(path))
 
     def _on_clipboard_read_requested(self, term):
         """A program in `term` asked to READ the clipboard (OSC 52). Ask the user
@@ -5080,7 +5096,7 @@ def _ctl_main(argv):
                           help="print a tab's current rendered text (for tests)")
     dump.add_argument('--tab', required=True, metavar='MATCH')
     dump.add_argument('--lines', type=int, metavar='N',
-                      help='only the last N lines')
+                      help='only the last N lines (0 = none)')
     args = parser.parse_args(argv)
 
     request = {'op': 'ctl-' + args.cmd}
@@ -5090,8 +5106,8 @@ def _ctl_main(argv):
         request['text'] = args.text
     if args.cmd == 'set-tab-title':
         request['title'] = args.title
-    if args.cmd == 'dump-tab' and args.lines:
-        request['lines'] = args.lines
+    if args.cmd == 'dump-tab' and args.lines is not None:
+        request['lines'] = args.lines      # forward 0 too (falsy): 0 means zero lines
 
     reply = ipc.send_request(args.instance_group, request)
     if reply is None:
@@ -5158,6 +5174,11 @@ def _test_canary():
     so a harness can tell a real machinery fault from a clean run."""
     marker = canary_marker_path()
     try:
+        # ensure_socket_dir owns the socket dir's 0700 mode. os.makedirs applies `mode`
+        # to the LEAF only, so letting it create socket_dir() as an intermediate here
+        # would leave that control-socket dir at umask (0755), breaking the same-UID-only
+        # invariant ipc.ensure_socket_dir enforces. Create it there, then the leaf.
+        ipc.ensure_socket_dir()
         os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
         with open(marker, 'w', encoding='ascii') as handle:
             handle.write(CANARY_TOKEN + '\n')

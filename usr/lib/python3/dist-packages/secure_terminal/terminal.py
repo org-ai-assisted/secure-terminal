@@ -84,6 +84,7 @@ import shlex
 import unicodedata
 
 import pyte
+import pyte.graphics
 # pyte's own hard dependency, so no new package: it is what pyte's draw() uses to
 # decide a character's cell width, and _SafeHistoryScreen.draw has to agree with
 # that decision to know which characters pyte would silently drop.
@@ -107,7 +108,29 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
     def select_graphic_rendition(self, *attrs, private=False, **kwargs):
         if private:
             return
-        super().select_graphic_rendition(*attrs)
+        # pyte encodes AIXTERM bright BACKGROUND (SGR 100-107) as a base-name bg PLUS
+        # bold=True, conflating a bright bg with bold: the bg then renders DIM (the base
+        # palette index, not the +8 bright entry) and the phantom bold both brightens the
+        # fg (see _pyte_format's bright=cell.bold) and bolds the font. Handle bright-bg
+        # here: strip it from what pyte parses (so no phantom bold is set) and point the
+        # bg at the matching BRIGHT palette name, which _pyte_qcolor renders from
+        # ANSI_PALETTE[8..15] -- OSC-palette aware, exactly like bright fg. Scan in order
+        # so a later reset / normal-bg / 256-bg still wins over an earlier bright-bg.
+        passthrough = []
+        bright_bg = None
+        for attr in attrs:
+            if attr in _BG_AIXTERM_BRIGHT:
+                bright_bg = _BG_AIXTERM_BRIGHT[attr]
+            else:
+                passthrough.append(attr)
+                if attr in _BG_OVERRIDE_CODES:
+                    bright_bg = None
+        # Skip super when the ONLY codes were bright-bg: an empty *passthrough would hit
+        # pyte's reset-all fast path. A genuine ESC[m (no attrs) must still reach it.
+        if passthrough or not attrs:
+            super().select_graphic_rendition(*passthrough)
+        if bright_bg is not None:
+            self.cursor.attrs = self.cursor.attrs._replace(bg=bright_bg)
 
     def linefeed(self):
         # A line that fills the EXACT width leaves the cursor "past" the last column (pyte's
@@ -139,10 +162,14 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         # in O(n^2) and freezes the render for seconds. Drop a mark once its
         # TARGET cell already holds the Unicode stream-safe maximum: cell-accurate,
         # so neither read boundaries nor cursor moves can bypass it. Lossless for
-        # real decomposed text (never nears the cap). Fast path: an all-ASCII
+        # real decomposed text (never nears the cap). Fast path: a printable-ASCII
         # chunk (the common case) batches through at C speed, since ASCII can
-        # never be a combining mark.
-        if data.isascii():
+        # never be a combining mark. It must ALSO be printable: stock pyte draw
+        # breaks its whole batch on the first wcwidth==-1 byte (screens.py `else:
+        # break`), so a C0 control in an all-ASCII chunk would drop the C0 AND the
+        # rest of the chunk unmarked -- the per-char loop below instead marks the
+        # C0 (via _merge_invisible/_mark_own_cell) and keeps going.
+        if data.isascii() and data.isprintable():
             super().draw(data)
             return
         for ch in data:
@@ -504,11 +531,23 @@ def _rgb(color):
     return (color.red(), color.green(), color.blue())
 
 
-# pyte colour name -> ANSI_PALETTE index (bold promotes to the bright variant).
+# pyte colour name -> ANSI_PALETTE index (base 0-7; bold promotes to the +8 bright
+# variant). The bright NAMES map straight to 8-15 so a bright background (set by
+# _SafeHistoryScreen from an AIXTERM SGR 100-107) renders from the bright palette
+# without the bold flag pyte otherwise overloads for it.
 _PYTE_COLOR = {
     'black': 0, 'red': 1, 'green': 2, 'brown': 3,
     'blue': 4, 'magenta': 5, 'cyan': 6, 'white': 7,
+    'brightblack': 8, 'brightred': 9, 'brightgreen': 10, 'brightbrown': 11,
+    'brightblue': 12, 'brightmagenta': 13, 'brightcyan': 14, 'brightwhite': 15,
 }
+
+# AIXTERM bright-background SGR code (100-107) -> the bright palette name above.
+_BG_AIXTERM_BRIGHT = {code: 'bright' + name
+                      for code, name in pyte.graphics.BG_AIXTERM.items()}
+# Codes that re-select or reset the background; any AFTER a bright-bg code overrides it:
+# normal/default bg (40-47/49), the 256/truecolor bg selector (48), and reset-all (0).
+_BG_OVERRIDE_CODES = frozenset(pyte.graphics.BG) | {0, 48}
 
 
 def _build_tui_keys():
@@ -1384,6 +1423,12 @@ class SecureTerminal(QPlainTextEdit):
             if key == 'osc_colors' and not enabled and self._osc_palette:
                 self._osc_palette.clear()
                 self.apply_theme(self._theme)  # restore the theme palette + repaint
+            if key == 'osc_clipboard_read' and not enabled \
+                    and self._clipboard_read == 'pending':
+                # Disabling the feature abandons any in-flight consent: drop the pending
+                # state so a still-open dialog's grant answers no stale READ query and
+                # the next request (should the feature be re-enabled) asks afresh.
+                self._clipboard_read = None
 
     def osc_enabled(self, key):
         return self._osc.get(key, False)
@@ -1602,7 +1647,9 @@ class SecureTerminal(QPlainTextEdit):
             return QColor(default) if default is not None else None
         idx = _PYTE_COLOR.get(color)
         if idx is not None:
-            real = idx + 8 if bright else idx
+            # bold promotes a BASE colour (0-7) to its bright variant; a name that is
+            # ALREADY bright (8-15, e.g. a bright bg) must not promote past the palette.
+            real = idx + 8 if bright and idx < 8 else idx
             return QColor(self._osc_palette.get(real, ANSI_PALETTE[real]))
         col = QColor('#' + color)          # 256/truecolor as a 6-hex string
         if col.isValid():
@@ -2950,7 +2997,12 @@ class SecureTerminal(QPlainTextEdit):
         # remember -> persist the tab decision; once -> reset to None so the next
         # request asks again.
         self._clipboard_read = allow if remember else None
-        if allow and was_pending:
+        # Re-check the feature flag: osc_clipboard_read can be disabled WHILE this
+        # consent dialog is open (TOCTOU). The in-flight READ query must not be
+        # answered once the feature is off, or an allow click would exfiltrate the
+        # clipboard the disable was meant to stop. A recorded allow still stands for a
+        # later re-enable; only the stale reply is withheld.
+        if allow and was_pending and self._osc.get('osc_clipboard_read'):
             self._reply_clipboard()
 
     def set_clipboard_read_always(self, on):
@@ -3675,12 +3727,18 @@ class SecureTerminal(QPlainTextEdit):
             super().keyPressEvent(event)
             return
         if self._review_active:
-            # A pasted text is held for review: input is suspended so a stray key
-            # can never leak into the shell or fire the paste. Enter or Esc rejects
-            # (the safe default); everything else is swallowed until a choice.
+            # A pasted OR copied text is held for review: input is suspended so a
+            # stray key can never leak into the shell, fire the paste, or release the
+            # copy. Enter or Esc rejects (the safe default); everything else is
+            # swallowed until a choice. Route to whichever review is actually pending
+            # -- a copy review rejected through the paste dispatcher would clear the
+            # paste state and strand _pending_copy set (a later copy dispatch no-ops).
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter,
                                Qt.Key.Key_Escape):
-                self.dispatch_pending_paste('reject')
+                if self._pending_copy is not None:
+                    self.dispatch_pending_copy('reject')
+                else:
+                    self.dispatch_pending_paste('reject')
             return
         key = event.key()
         mods = event.modifiers()
