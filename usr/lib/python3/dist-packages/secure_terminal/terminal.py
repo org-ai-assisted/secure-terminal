@@ -4421,10 +4421,14 @@ class SecureTerminal(QPlainTextEdit):
         a command hook, judge EACH complete line through the hook exactly as a typed
         Enter would (block / ask / allow), so an injected multi-line payload cannot
         auto-run an UNREVIEWED command -- a plain paste would let an embedded newline
-        submit the earlier line with no verdict. The trailing partial line (no final
-        newline) is left at the prompt marked unverifiable, never auto-submitted. With
-        no hook configured, or when a foreground program owns the input, fall back to
-        the safe paste path (the bytes are that program's data, not shell commands)."""
+        submit the earlier line with no verdict. Content the prompt ALREADY holds is
+        folded into the first judged line (an injection cannot submit a pending typed
+        line the hook never saw), and once the hook leaves a line dirty (a block whose
+        erase is unreliable) the injection stops rather than submitting onto leftover
+        bytes. The trailing partial line (no final newline) is left at the prompt
+        marked unverifiable, never auto-submitted. With no hook configured, or when a
+        foreground program owns the input, fall back to the safe paste path (the bytes
+        are that program's data, not shell commands)."""
         if self._hook is None or self.has_foreground_program():
             self._dispatch_paste(text, 'stripped')
             return
@@ -4434,14 +4438,30 @@ class SecureTerminal(QPlainTextEdit):
         for i, line in enumerate(pieces):
             if line:
                 self._write(line.encode('utf-8'))     # "type" the line (the shell echoes it)
-            self._line_buffer = line
-            self._line_dirty = False
+            # The next Enter submits (whatever the prompt already held) + this piece,
+            # so FOLD any mirrored prefix into the judged command -- the hook must see
+            # exactly what will run, or a pending typed line (or an injected bare
+            # newline onto one) would submit unreviewed. When the prefix is
+            # UNMIRRORABLE (_line_dirty: a recalled / cursor-edited line) the fold is
+            # impossible, so _line_dirty stays set and _hook_intercept's dirty branch
+            # ASKS instead of auto-submitting. Never reset _line_dirty here: a prior
+            # piece the hook left dirty must stay dirty.
+            if not self._line_dirty:
+                self._line_buffer = self._line_buffer + line
             if i == len(pieces) - 1:
                 # a final piece with NO trailing newline: leave it for the user's own
                 # Enter (which re-judges via the hook), never auto-submit it.
-                self._line_dirty = bool(line)
+                self._line_dirty = self._line_dirty or bool(self._line_buffer)
                 return
             if self._hook_intercept():
-                continue          # blocked / asked / suggested -- the hook owns the line
+                # The hook handled the Enter. An approved 'run' submitted a clean line
+                # (_line_dirty cleared, buffer empty) so we may keep going; a block /
+                # ask left the line dirty because the best-effort erase is UNRELIABLE
+                # (stty erase rebind / multibyte). STOP there -- a later piece must not
+                # send a bare CR onto un-erased rejected bytes. The user's own Enter
+                # re-judges the leftover via the dirty branch.
+                if self._line_dirty:
+                    return
+                continue
             self._line_buffer = ''
             self._write(b'\r')    # allowed (or an empty line) -> submit it
