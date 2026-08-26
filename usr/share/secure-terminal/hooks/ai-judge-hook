@@ -127,7 +127,18 @@ def _ask_ai(command, transcript):
 
 
 def decide(request):
-    command = request.get('command', '') if isinstance(request, dict) else ''
+    request = request if isinstance(request, dict) else {}
+    script = request.get('script')
+    if script is not None:
+        # A version-2 multi-line batch: judge the WHOLE script with the AI. Never take
+        # the trivial-allowlist shortcut here -- its first-line match could wave through
+        # a dangerous later line. Keep the cheap-then-escalate transcript step.
+        if not script.strip():
+            return {'verdict': 'allow'}
+        if 'transcript' not in request and _CONTEXTUAL.search(script):
+            return {'verdict': 'need_transcript'}
+        return _ask_ai(script, request.get('transcript', ''))
+    command = request.get('command', '')
     if not command.strip() or _TRIVIAL.search(command):
         return {'verdict': 'allow'}
     have_transcript = 'transcript' in request

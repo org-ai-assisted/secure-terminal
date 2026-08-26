@@ -17,8 +17,17 @@ a confused or hostile handler cannot inject escape sequences or auto-run a
 command.
 
 Request (stdin): {"version":1,"command":..,"cwd":..,"tab":..,"transcript":..?}
+  or, for a multi-line injected payload judged as ONE unit (ctl-send-text):
+                 {"version":2,"command":..,"script":..,"cwd":..,"tab":..,
+                  "transcript":..?}
 Reply (stdout):  {"verdict":"allow|block|ask|need_transcript",
                   "message":..?,"suggestion":..?}
+
+Version 2 adds `script`: the WHOLE multi-line payload, judged once against the
+state at injection time (no per-line stale-state race). `command` mirrors `script`
+so a version-1 handler that ignores `script` still SEES the content and cannot fail
+open on an empty command; a version-2 handler should read `script` and reason over
+the whole thing.
 
 A reply of need_transcript triggers a second call with the transcript attached
 (the cheap-then-escalate pass), so the expensive/long/injection-prone transcript
@@ -78,12 +87,18 @@ def _error(on_error, why) -> HookResult:
 
 
 def evaluate(handler_argv, command, timeout=10, on_error='allow',
-             cwd='', tab='', transcript_provider=None) -> HookResult:
+             cwd='', tab='', script=False, transcript_provider=None) -> HookResult:
     """Run the handler for `command` and return a decision:
     {'verdict': 'allow'|'block'|'ask', 'message': str, 'suggestion': str,
      'error': bool}. transcript_provider, if given, is called only when the
-    handler replies need_transcript."""
-    payload = {'version': 1, 'command': command, 'cwd': cwd, 'tab': tab}
+    handler replies need_transcript. With script=True, `command` is a MULTI-LINE
+    payload judged as one unit: the request is version 2 with an explicit `script`
+    field (and `command` mirrors it, so a version-1 handler still sees the content
+    and cannot fail open on an empty command)."""
+    payload = {'version': 2 if script else 1, 'command': command,
+               'cwd': cwd, 'tab': tab}
+    if script:
+        payload['script'] = command
     try:
         reply = _invoke(handler_argv, payload, timeout)
         if isinstance(reply, dict) and reply.get('verdict') == 'need_transcript':

@@ -4535,25 +4535,77 @@ class SecureTerminal(QPlainTextEdit):
             data = b'\x1b[200~' + data + b'\x1b[201~'
         self._write(data)
 
+    def _inject_judge_script(self, submits):
+        """Judge a MULTI-LINE injected batch (its submitted lines) as ONE script,
+        once, against the state at injection time. Returns 'run' to deliver the whole
+        batch or '' to refuse it (nothing runs). Fails closed: an unmirrorable prompt
+        line, a Tab in any submitted line (shell completion would run something other
+        than the judged bytes), or a block / ask-cancel verdict all refuse the batch."""
+        from secure_terminal import hook
+        if self._line_dirty or any('\t' in line for line in submits):
+            self.hook_notice.emit(
+                'Injected multi-line payload could not be reviewed as one unit '
+                '(recalled/edited line or Tab completion); refused.')
+            return ''
+        # The first submitted line runs together with whatever the prompt already
+        # holds (mirrored in _line_buffer); the rest are separate commands. Join with
+        # newline so the hook judges the whole script exactly as it will run.
+        script = self._line_buffer + '\n'.join(submits)
+        if not script.strip():
+            return 'run'                  # only blank lines -> nothing to judge
+        cfg = self._hook or {}
+        result = hook.evaluate(
+            cfg['argv'], script,
+            timeout=cfg.get('timeout', 10),
+            on_error=cfg.get('on_error', 'allow'),
+            cwd=self._foreground_cwd(),
+            script=True,
+            transcript_provider=self._hook_transcript)
+        if result['message']:
+            self.hook_notice.emit(result['message'])
+        if result['verdict'] == 'allow':
+            return 'run'
+        # block / ask: reuse the same modal the per-line path uses. A suggestion is not
+        # auto-applied to a batch (the per-line suggest-insert does not generalize to a
+        # multi-line script), so anything but an explicit 'run' refuses the whole batch.
+        return 'run' if self._hook_ask(script, result) == 'run' else ''
+
     def _inject_text_reviewed(self, text):
-        """Deliver remote-control-injected text (ctl-send-text). At a bare prompt with
-        a command hook, judge EACH complete line through the hook exactly as a typed
-        Enter would (block / ask / allow), so an injected multi-line payload cannot
-        auto-run an UNREVIEWED command -- a plain paste would let an embedded newline
-        submit the earlier line with no verdict. Content the prompt ALREADY holds is
-        folded into the first judged line (an injection cannot submit a pending typed
-        line the hook never saw), and once the hook leaves a line dirty (a block whose
-        erase is unreliable) the injection stops rather than submitting onto leftover
-        bytes. The trailing partial line (no final newline) is left at the prompt
-        marked unverifiable, never auto-submitted. With no hook configured, or when a
-        foreground program owns the input, fall back to the safe paste path (the bytes
-        are that program's data, not shell commands)."""
+        """Deliver remote-control-injected text (ctl-send-text). At a bare prompt with a
+        command hook, judge the injected command(s) before they run, so an injected
+        payload cannot auto-run an UNREVIEWED command -- a plain paste would let an
+        embedded newline submit a line with no verdict.
+
+        A MULTI-LINE payload (>=2 submitted lines) is judged as ONE script, ONCE,
+        against the state (cwd/env/umask/...) at injection time, then -- if allowed --
+        delivered without re-judging. This removes the stale-state TOCTOU of judging
+        line i before line i-1 has actually executed (e.g. a `cd /tmp` on line 1 else
+        moves the cwd the hook reads when judging line 2). It fails closed: a block, an
+        unmirrorable prompt line, or a Tab (completion would run other than the judged
+        bytes) refuses the WHOLE batch before anything runs.
+
+        A SINGLE submitted line keeps the per-line path (no interleaved-judge window):
+        content the prompt ALREADY holds is folded into the judged line (an injection
+        cannot submit a pending typed line the hook never saw), and once the hook leaves
+        a line dirty (a block whose erase is unreliable) the injection stops rather than
+        submitting onto leftover bytes. The trailing partial line (no final newline) is
+        left at the prompt marked unverifiable, never auto-submitted. With no hook
+        configured, or when a foreground program owns the input, fall back to the safe
+        paste path (the bytes are that program's data, not shell commands)."""
         if self._hook is None or self.has_foreground_program():
             self._dispatch_paste(text, 'stripped')
             return
         # sanitize_paste maps every newline to CR, so the CR-separated pieces are the
         # lines; a trailing newline yields a final '' piece (nothing left un-judged).
         pieces = sanitize_paste(text).split('\r')
+        submits = pieces[:-1]         # each submitted with CR; pieces[-1] left at prompt
+        prejudged = False
+        if len(submits) >= 2:
+            # Multi-line: judge the whole script ONCE, atomically. Refuse the batch
+            # (deliver nothing) on anything but an approving verdict.
+            if self._inject_judge_script(submits) != 'run':
+                return
+            prejudged = True
         for i, line in enumerate(pieces):
             if line:
                 self._write(line.encode('utf-8'))     # "type" the line (the shell echoes it)
@@ -4563,6 +4615,8 @@ class SecureTerminal(QPlainTextEdit):
                 # completed `/bin/echo`). Mark the line unverifiable, exactly as a typed
                 # Tab does, so _hook_intercept ASKS rather than auto-submitting the
                 # pre-completion text. (sanitize_paste keeps only \t and \r among C0.)
+                # The atomic pre-judge already refused a batch with a Tab in any
+                # SUBMITTED line, so on that path this only marks the trailing piece.
                 self._line_dirty = True
             # The next Enter submits (whatever the prompt already held) + this piece,
             # so FOLD any mirrored prefix into the judged command -- the hook must see
@@ -4579,6 +4633,12 @@ class SecureTerminal(QPlainTextEdit):
                 # Enter (which re-judges via the hook), never auto-submit it.
                 self._line_dirty = self._line_dirty or bool(self._line_buffer)
                 return
+            if prejudged:
+                # The whole batch was approved as one unit; submit each line without a
+                # second, race-prone judgment.
+                self._line_buffer = ''
+                self._write(b'\r')
+                continue
             if self._hook_intercept():
                 # The hook handled the Enter. An approved 'run' submitted a clean line
                 # (_line_dirty cleared, buffer empty) so we may keep going; a block /

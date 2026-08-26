@@ -69,11 +69,15 @@ def _load_rules():
     compiled = []
     for verdict, pattern, message, suggestion in source:
         try:
-            compiled.append((verdict, re.compile(pattern), message, suggestion))
+            # re.MULTILINE so a per-line-anchored rule (e.g. `^\s*sudo`) matches ANY
+            # line of a multi-line `script` payload, not just the first.
+            compiled.append(
+                (verdict, re.compile(pattern, re.MULTILINE), message, suggestion))
         except re.error:
             continue                 # skip a malformed custom pattern
     if not compiled:                 # a wholly-bad file -> fall back to defaults
-        compiled = [(v, re.compile(p), m, s) for v, p, m, s in _DEFAULT_RULES]
+        compiled = [(v, re.compile(p, re.MULTILINE), m, s)
+                    for v, p, m, s in _DEFAULT_RULES]
     return compiled
 
 
@@ -96,7 +100,10 @@ def main():
         # default); never crash, never block the user's terminal on a bug here.
         print(json.dumps({'verdict': 'allow'}))
         return 0
-    command = request.get('command', '') if isinstance(request, dict) else ''
+    # Version 2 sends the whole multi-line payload as `script`; judge it as a unit.
+    # `command` mirrors `script` for version-1 handlers, so either key yields content.
+    command = ((request.get('script') or request.get('command', ''))
+               if isinstance(request, dict) else '')
     print(json.dumps(decide(command)))
     return 0
 
