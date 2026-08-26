@@ -1301,11 +1301,12 @@ class MainWindow(QMainWindow):
                 text = term.toPlainText()
                 lines = request.get('lines')
                 if isinstance(lines, int) and lines >= 0:
-                    # Slice by an explicit START index: parts[-lines:] is the WHOLE list
-                    # for lines==0 (negative-zero slice), which would dump everything
-                    # instead of the zero lines asked for. A start past the end yields [].
+                    # Slice by an explicit START index: parts[-lines:] is the WHOLE list for
+                    # lines==0 (negative-zero slice), which would dump everything instead of the
+                    # zero asked for. Clamp the start at 0 so lines > available returns ALL lines
+                    # (a negative start would instead return only the last `lines % len`).
                     parts = text.split('\n')
-                    text = '\n'.join(parts[len(parts) - lines:])
+                    text = '\n'.join(parts[max(0, len(parts) - lines):])
                 if len(text) > _DUMP_MAX:
                     text = text[-_DUMP_MAX:]     # fast tail-cap by character count
                 # A character cap is not enough: json.dumps (ensure_ascii) expands

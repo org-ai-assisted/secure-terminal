@@ -118,7 +118,25 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         # so a later reset / normal-bg / 256-bg still wins over an earlier bright-bg.
         passthrough = []
         bright_bg = None
-        for attr in attrs:
+        it = iter(attrs)
+        for attr in it:
+            if attr in (38, 48):
+                # 38/48 introduce an EXTENDED colour (5;<idx> or 2;<r>;<g>;<b>); the params
+                # that follow are colour DATA, not opcodes, so CONSUME them -- else a component
+                # in 100-107 (e.g. the index in 38;5;101) is misread as a bright-bg code and
+                # corrupts the 256/truecolour sequence.
+                passthrough.append(attr)
+                mode = next(it, None)
+                if mode is not None:
+                    passthrough.append(mode)
+                    for _ in range(3 if mode == 2 else 1 if mode == 5 else 0):
+                        comp = next(it, None)
+                        if comp is None:
+                            break
+                        passthrough.append(comp)
+                if attr == 48:
+                    bright_bg = None       # a 256/truecolour bg overrides an earlier bright-bg
+                continue
             if attr in _BG_AIXTERM_BRIGHT:
                 bright_bg = _BG_AIXTERM_BRIGHT[attr]
             else:
@@ -546,8 +564,9 @@ _PYTE_COLOR = {
 _BG_AIXTERM_BRIGHT = {code: 'bright' + name
                       for code, name in pyte.graphics.BG_AIXTERM.items()}
 # Codes that re-select or reset the background; any AFTER a bright-bg code overrides it:
-# normal/default bg (40-47/49), the 256/truecolor bg selector (48), and reset-all (0).
-_BG_OVERRIDE_CODES = frozenset(pyte.graphics.BG) | {0, 48}
+# normal/default bg (40-47/49) and reset-all (0). The 256/truecolor bg selector (48) is
+# handled in select_graphic_rendition (it consumes its own colour params there).
+_BG_OVERRIDE_CODES = frozenset(pyte.graphics.BG) | {0}
 
 
 def _build_tui_keys():
