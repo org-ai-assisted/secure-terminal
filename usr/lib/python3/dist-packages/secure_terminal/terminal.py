@@ -1526,11 +1526,15 @@ class SecureTerminal(QPlainTextEdit):
         self._rows = rows
         if self._fd is None:
             return
+        # The winsize fields are unsigned short: clamp so an extreme viewport (rows
+        # or cols > 65535, from a huge/hostile window geometry) cannot raise an
+        # UNCAUGHT struct.error and crash the resize. struct.error is caught too, as
+        # belt-and-suspenders for any other pack failure.
         try:
             fcntl.ioctl(self._fd, termios.TIOCSWINSZ,
-                        struct.pack('HHHH', rows, cols, 0, 0))
-        except OSError:
-            pass            # a closed/invalid pty just misses this resize
+                        struct.pack('HHHH', min(rows, 0xFFFF), min(cols, 0xFFFF), 0, 0))
+        except (OSError, struct.error):
+            pass            # a closed/invalid pty or bad size just misses this resize
 
     def _history_size(self):
         """Depth of the pyte scrollback. Bounded so that entering the grid view

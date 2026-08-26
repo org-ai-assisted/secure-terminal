@@ -1440,6 +1440,12 @@ class MainWindow(QMainWindow):
         # per-tab setting use the admin default, else the saved value.
         def _locked(key, saved, default):
             return default if key in self._locked else saved
+
+        def _saved_bool(value, default):
+            # A saved flag is honored only when it is a REAL bool. A tampered
+            # session.json value like "false"/"off"/0 would coerce truthy through
+            # bool() and fail OPEN (re-enabling a feature the user disabled).
+            return value if isinstance(value, bool) else default
         mode = info.get('mode')
         mode = mode if mode in DISPLAY_MODES else self._default_mode
         # pass the saved display settings to the ctor so the restored scrollback is
@@ -1453,14 +1459,14 @@ class MainWindow(QMainWindow):
         theme = theme if isinstance(theme, str) and theme in THEMES else self._default_theme
         theme = _locked('theme', theme, self._default_theme)
         term = SecureTerminal(
-            tui=_locked('tui', bool(info.get('tui')), self._default_tui),
+            tui=_locked('tui', _saved_bool(info.get('tui'), False), self._default_tui),
             history=history,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
             mode=_locked('unicode_mode', mode, self._default_mode),
-            colors=_locked('colors', bool(info.get('colors')), self._default_colors),
-            line_edits=_locked('line_edits', bool(info.get('line_edits', True)),
+            colors=_locked('colors', _saved_bool(info.get('colors'), False), self._default_colors),
+            line_edits=_locked('line_edits', _saved_bool(info.get('line_edits', True), True),
                                self._default_line_edits),
-            markings=_locked('colored_markings', bool(info.get('markings', True)),
+            markings=_locked('colored_markings', _saved_bool(info.get('markings', True), True),
                              self._default_markings),
             theme=theme)
         term.apply_theme(theme)          # idempotent (ctor set it): no re-render
@@ -1509,7 +1515,7 @@ class MainWindow(QMainWindow):
             # record cannot re-enable a locked title/notify capability on restore.
             # (Other OSC features are absent from a legacy record and keep their
             # constructor defaults, as before.)
-            legacy_title = bool(info.get('allow_title'))
+            legacy_title = _saved_bool(info.get('allow_title'), False)
             for key in ('osc_title', 'osc_notify'):
                 locked = key in self._locked or 'allow_title' in self._locked
                 term.apply_osc(key, self._osc_defaults.get(key, False)
