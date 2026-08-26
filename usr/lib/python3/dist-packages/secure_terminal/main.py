@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 
 from secure_terminal import settings, session, ipc
 from secure_terminal.sanitize import (
-    sanitize_paste, OSC_FEATURES, OSC_FEATURE_BY_KEY, luminance)
+    OSC_FEATURES, OSC_FEATURE_BY_KEY, luminance)
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
@@ -1267,9 +1267,16 @@ class MainWindow(QMainWindow):
                 text = request.get('text')
                 if not isinstance(text, str):
                     return {'ok': False, 'error': 'text must be a string'}
-                # route through the paste sanitizer: injected text can no more
-                # smuggle an escape/control than a paste can.
-                term._write(sanitize_paste(text).encode('utf-8'))
+                # Deliver as a PASTE, not a raw write: this is a remote-control
+                # injection surface, so it must get the FULL paste contract, not
+                # only escape/control stripping. _dispatch_paste additionally strips
+                # the trailing submit (paste_no_autosubmit) so a `send-text $'cmd\n'`
+                # cannot auto-run cmd, and marks the line unverifiable so the command
+                # hook fails safe on the user's Enter. A raw _write of
+                # sanitize_paste(text) did neither -- the newline became CR and ran
+                # the command with no hook verdict (the 30_defaults.conf remote_control
+                # note promises injected text is "sanitized like a paste").
+                term._dispatch_paste(text, 'stripped')
                 return {'ok': True}
             if op == 'ctl-dump-tab':
                 # read back the tab's CURRENT rendered text (already sanitized --
