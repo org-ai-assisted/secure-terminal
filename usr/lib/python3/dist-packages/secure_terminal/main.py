@@ -1267,16 +1267,13 @@ class MainWindow(QMainWindow):
                 text = request.get('text')
                 if not isinstance(text, str):
                     return {'ok': False, 'error': 'text must be a string'}
-                # Deliver as a PASTE, not a raw write: this is a remote-control
-                # injection surface, so it must get the FULL paste contract, not
-                # only escape/control stripping. _dispatch_paste additionally strips
-                # the trailing submit (paste_no_autosubmit) so a `send-text $'cmd\n'`
-                # cannot auto-run cmd, and marks the line unverifiable so the command
-                # hook fails safe on the user's Enter. A raw _write of
-                # sanitize_paste(text) did neither -- the newline became CR and ran
-                # the command with no hook verdict (the 30_defaults.conf remote_control
-                # note promises injected text is "sanitized like a paste").
-                term._dispatch_paste(text, 'stripped')
+                # Review EACH injected line through the command hook, exactly as a
+                # typed Enter would: this is a remote-control injection surface, so an
+                # embedded newline must not auto-run the earlier line with no verdict.
+                # (A plain paste only strips the TRAILING submit; `send-text $'id\nx\n'`
+                # would still run `id` unreviewed.) Falls back to the safe paste path
+                # when no hook is configured or a foreground program owns the input.
+                term._inject_text_reviewed(text)
                 return {'ok': True}
             if op == 'ctl-dump-tab':
                 # read back the tab's CURRENT rendered text (already sanitized --

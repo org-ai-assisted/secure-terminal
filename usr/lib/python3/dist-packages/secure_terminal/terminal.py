@@ -4411,3 +4411,33 @@ class SecureTerminal(QPlainTextEdit):
         if bracketed:
             data = b'\x1b[200~' + data + b'\x1b[201~'
         self._write(data)
+
+    def _inject_text_reviewed(self, text):
+        """Deliver remote-control-injected text (ctl-send-text). At a bare prompt with
+        a command hook, judge EACH complete line through the hook exactly as a typed
+        Enter would (block / ask / allow), so an injected multi-line payload cannot
+        auto-run an UNREVIEWED command -- a plain paste would let an embedded newline
+        submit the earlier line with no verdict. The trailing partial line (no final
+        newline) is left at the prompt marked unverifiable, never auto-submitted. With
+        no hook configured, or when a foreground program owns the input, fall back to
+        the safe paste path (the bytes are that program's data, not shell commands)."""
+        if self._hook is None or self.has_foreground_program():
+            self._dispatch_paste(text, 'stripped')
+            return
+        # sanitize_paste maps every newline to CR, so the CR-separated pieces are the
+        # lines; a trailing newline yields a final '' piece (nothing left un-judged).
+        pieces = sanitize_paste(text).split('\r')
+        for i, line in enumerate(pieces):
+            if line:
+                self._write(line.encode('utf-8'))     # "type" the line (the shell echoes it)
+            self._line_buffer = line
+            self._line_dirty = False
+            if i == len(pieces) - 1:
+                # a final piece with NO trailing newline: leave it for the user's own
+                # Enter (which re-judges via the hook), never auto-submit it.
+                self._line_dirty = bool(line)
+                return
+            if self._hook_intercept():
+                continue          # blocked / asked / suggested -- the hook owns the line
+            self._line_buffer = ''
+            self._write(b'\r')    # allowed (or an empty line) -> submit it
