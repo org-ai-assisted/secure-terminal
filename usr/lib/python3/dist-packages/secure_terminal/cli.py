@@ -80,11 +80,16 @@ _PASTE_MAX = 1 << 20
 # Escape (vim) responsive, large enough to reassemble any split marker.
 _ESC_HOLD_TIMEOUT = 0.05
 
-# After OUR stdin closes we nudge the child with EOF (Ctrl-D) at this slow cadence until
-# it exits -- one ^D can be lost to a shell that flushes type-ahead before its prompt (zsh),
-# and re-reading a closed fd every loop would busy-spin. A slow, best-effort re-send delivers
-# EOF reliably without pegging the CPU.
+# After OUR stdin closes we nudge the child with EOF (Ctrl-D) at this slow cadence until it
+# exits -- one ^D can be lost to a shell that flushes type-ahead before its prompt (zsh), and
+# re-reading a closed fd every loop would busy-spin. A slow, best-effort re-send delivers EOF
+# reliably without pegging the CPU. BOUNDED (_EOF_NUDGE_MAX): a shell -- even a raw-mode ZLE /
+# readline line editor -- reads ^D as end-of-input and exits within a nudge or two, but a
+# full-screen program where ^D is DATA never exits on it, so cap the re-sends rather than feed
+# it ^D forever (the pty mode cannot tell a raw shell from a raw full-screen reader). 2s of
+# nudges covers any shell's startup; a non-exiting reader then gets at most a few stray bytes.
 _EOF_NUDGE_INTERVAL = 0.2
+_EOF_NUDGE_MAX = 10
 
 # Characters an unterminated / over-long string sequence may silently suppress
 # before a one-time stderr notice. A sequence that survives a whole 64 KiB read
@@ -237,6 +242,7 @@ def _run(argv, mode):
         esc_deadline = None     # monotonic time to flush a held partial paste-start marker
         read_fds = [fd, stdin_fd]   # stdin_fd is dropped from this on its EOF (below)
         eof_nudge = None        # monotonic time to re-send the child EOF after stdin closed
+        eof_nudges_left = 0     # remaining bounded EOF re-sends (see _EOF_NUDGE_MAX)
         while True:
             # A held partial paste-start marker (a lone ESC, or ESC[.. prefix) is carried in
             # paste_state[2] while NOT already in a paste. It is flushed to the child as a real
@@ -261,11 +267,17 @@ def _run(argv, mode):
             except (OSError, select.error):  # pragma: no cover - PEP 475 retries EINTR
                 continue            # EINTR from SIGWINCH etc. -> retry
             if eof_nudge is not None and time.monotonic() >= eof_nudge:
-                # re-send EOF, best-effort: skip when the pty won't take a write (a child not
-                # reading its input), so a full input buffer can never block the reader.
-                if select.select([], [fd], [], 0)[1]:
-                    os.write(fd, b'\x04')
-                eof_nudge = time.monotonic() + _EOF_NUDGE_INTERVAL
+                # Re-send EOF (^D), best-effort. Skip a re-send the pty won't accept (a child
+                # not reading its input), so a full input buffer cannot block the reader. Stop
+                # after _EOF_NUDGE_MAX tries: a shell exits within a nudge or two, but a program
+                # that reads ^D as DATA never exits on it and must not be fed it forever.
+                if eof_nudges_left > 0:
+                    if select.select([], [fd], [], 0)[1]:
+                        os.write(fd, b'\x04')
+                    eof_nudges_left -= 1
+                    eof_nudge = time.monotonic() + _EOF_NUDGE_INTERVAL
+                else:
+                    eof_nudge = None
             if hold and time.monotonic() >= esc_deadline:
                 # deadline reached (even if the child fd is readable) -> the held prefix got no
                 # paste continuation; forward it verbatim and clear the hold, then service any
@@ -314,14 +326,14 @@ def _run(argv, mode):
                 except OSError:  # pragma: no cover - defensive stdin read-error guard
                     break
                 if not keys:
-                    # stdin hit EOF (closed pipe / /dev/null). Send the child an EOF, then
-                    # STOP selecting on stdin_fd: a closed fd stays readable, so leaving it in
-                    # read_fds spins the loop hammering ^D at 100% CPU. A slow best-effort
-                    # re-send (eof_nudge) then keeps delivering EOF -- one ^D can be flushed by
-                    # a shell that clears type-ahead before its prompt -- until the child exits.
-                    os.write(fd, b'\x04')
+                    # stdin hit EOF (closed pipe / /dev/null). STOP selecting on stdin_fd: a
+                    # closed fd stays readable, so leaving it in read_fds spins the loop at 100%
+                    # CPU. Arm the bounded EOF nudge (due now): the nudge block delivers ^D at a
+                    # slow cadence -- one ^D can be flushed by a shell that clears type-ahead
+                    # before its prompt -- until the child exits or the re-send budget runs out.
                     read_fds.remove(stdin_fd)
-                    eof_nudge = time.monotonic() + _EOF_NUDGE_INTERVAL
+                    eof_nudge = time.monotonic()
+                    eof_nudges_left = _EOF_NUDGE_MAX
                 elif old_attr is None:
                     # Non-tty stdin: bracketed paste was never enabled, so nothing
                     # is framed -- forward the bytes verbatim.
