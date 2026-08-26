@@ -7,6 +7,7 @@
 """Application entry point and main window for secure-terminal."""
 
 import functools
+import html
 import os
 import signal
 import sys
@@ -1646,7 +1647,11 @@ class MainWindow(QMainWindow):
             parts.append('name: ' + user)
         if program:
             parts.append('program: ' + program)
-        self.tabs.setTabToolTip(index, '\n'.join(parts))
+        # setTabToolTip renders rich text (unlike setTabText), so an OSC-set program
+        # title with HTML-like content would render as markup in the tab chrome. Escape
+        # each part and join with an explicit <br>, so the untrusted title is shown
+        # literally -- the same PlainText guarantee the command-hook dialog enforces.
+        self.tabs.setTabToolTip(index, '<br>'.join(html.escape(p) for p in parts))
 
     def set_tab_color(self, index, color):
         if index < 0:
@@ -3730,6 +3735,7 @@ class MainWindow(QMainWindow):
         mods = combo.keyboardModifiers()
         key = combo.key()
         ctrl = Qt.KeyboardModifier.ControlModifier
+        shift = Qt.KeyboardModifier.ShiftModifier
         # Ctrl+<letter> and Ctrl+<@ [ \ ] ^ _> / Ctrl+Space all become a C0 control byte
         # the terminal forwards (Ctrl+[ -> ESC, Ctrl+_ -> 0x1F, Ctrl+Space -> NUL), so a
         # window shortcut on one would shadow it. Key_At..Key_Underscore is 0x40..0x5F,
@@ -3743,12 +3749,13 @@ class MainWindow(QMainWindow):
         # Home/End, PageUp/Down, Insert/Delete and every function key.
         if mods == Qt.KeyboardModifier.NoModifier and key in _forwarded_keys():
             return True
-        # A cursor / Home / End key WITH any modifier is still forwarded -- re-encoded
-        # as the xterm CSI ESC[1;<p><final> (Ctrl+End -> ESC[1;5F, even Ctrl+Shift+End ->
-        # ESC[1;6F), or sent bare for a modifier the widget does not encode -- so a
-        # rebound shortcut on one shadows the key for a TUI program. The bare (no
-        # modifier) form is already reserved above, so reaching here means a modifier.
-        if key in _modifiable_forwarded_keys():
+        # A cursor / Home / End key WITH a modifier is forwarded to the program (re-encoded
+        # as the xterm CSI ESC[1;<p><final>, e.g. Ctrl+End -> ESC[1;5F), so a rebound
+        # shortcut on one would shadow it. EXCEPT Ctrl+Shift+<nav>: keyPressEvent routes
+        # every Ctrl+Shift combo to the window shortcuts, never the child (tui_active and
+        # `not (ctrl and shift)`), so it stays available to rebind. The bare (no modifier)
+        # form is already reserved above, so reaching here means a modifier.
+        if key in _modifiable_forwarded_keys() and not (mods & ctrl and mods & shift):
             return True
         # Ctrl+PageUp/Down (switch tab) and Ctrl+Shift+PageUp/Down (move tab) are
         # consumed by the widget itself, so a window shortcut there never fires.
