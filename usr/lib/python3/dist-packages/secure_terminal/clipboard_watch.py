@@ -380,6 +380,13 @@ class ClipboardWatchApp:
             QTimer.singleShot(0, self._app.quit)
             return {'ok': True}
         if op == 'set-warn-any':
+            # honour an admin lock over IPC too: clip_warn_any is an admin POLICY the
+            # user must not override through ANY path. The main window already refuses
+            # a locked change before it push_warn_any's here, but a direct same-UID
+            # set-warn-any request must be refused as well (the tray + main-window
+            # guards' sibling), or the lock is enforced only at the UI, not the daemon.
+            if 'clip_warn_any' in settings.load().locked:
+                return {'ok': False, 'error': 'clip_warn_any is admin-locked'}
             self._watcher.set_any_mode(bool(request.get('value')))
             return {'ok': True}
         return {'ok': False, 'error': 'unknown op: %r' % (op,)}
@@ -408,6 +415,9 @@ class ClipboardWatchApp:
         act_any.setChecked(warn_any_default())
         act_any.setToolTip('Off: warn only on hidden/deceptive characters. '
                            'On: warn on any non-ASCII (accents, CJK, emoji) too.')
+        # greyed when admin-locked, so it is not clickable-but-inert (the setter also
+        # refuses a locked change, but a disabled control does not lie about it).
+        act_any.setEnabled('clip_warn_any' not in settings.load().locked)
         act_any.toggled.connect(self._set_warn_any)
 
         act_autostart = menu.addAction('Start on login')
@@ -430,6 +440,12 @@ class ClipboardWatchApp:
         ## admin key into user config, overriding a later admin change); set_user_key
         ## no-ops a locked key.
         on = bool(on)
+        # Honour an admin lock on clip_warn_any for the LIVE watcher, not only the
+        # persisted write: set_user_key already no-ops a locked key, but set_any_mode
+        # would still change the running session, so the daemon's tray toggle bypassed
+        # the lock. Gate the live change on the lock too (main-window guard's sibling).
+        if 'clip_warn_any' in settings.load().locked:
+            return
         self._watcher.set_any_mode(on)
         settings.set_user_key('clip_warn_any', 'true' if on else 'false')
 

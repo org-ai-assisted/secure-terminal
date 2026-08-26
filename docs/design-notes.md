@@ -59,6 +59,44 @@ source of truth for behaviour.
   for and what turning them off costs: the `line_edits` entry in
   `usr/lib/secure-terminal.d/30_defaults.conf` (the single authoritative copy).
 
+## Mouse reporting (konsole/xterm parity)
+
+- **Problem**: on the alternate screen a full-screen program owns the display, but
+  secure-terminal reported no mouse events, so a mouse-aware UI (Claude Code, `vim`
+  with mouse, `htop`, `tmux`) could not be scrolled by the wheel or driven by
+  clicks -- the wheel scrolled outside the TUI, and its buttons (a "jump to bottom"
+  affordance, a menu) were dead.
+- **Decision**: implement standard SGR mouse reporting, matching konsole, at the
+  explicit request of the maintainer. This is a deliberate reversal of the earlier
+  "no mouse reporting" hardening (see the trade below).
+- **Behaviour (`wheelEvent` / `mousePressEvent` / `mouseReleaseEvent` /
+  `mouseMoveEvent` / `focusInEvent` / `focusOutEvent`)**: when the child has enabled
+  mouse tracking (1000/1002/1003) with SGR encoding (1006) -- tracked off the output
+  stream by `scan_mouse_modes` -- its events are reported as `ESC[<b;col;rowM/m` at
+  the cell UNDER THE POINTER (`_event_cell`), so it scrolls line-by-line and its UI
+  is clickable exactly as in konsole:
+  - wheel: 64 up / 65 down, 66 left / 67 right (one event per notch);
+  - buttons: left/middle/right press (`M`) + release (`m`), codes 0/1/2;
+  - motion: drag (button held, +32) under 1002; any-motion (code 35) under 1003,
+    coalesced to one report per CELL so it does not flood (widget mouse tracking is
+    enabled only while 1003 is set);
+  - keyboard modifiers encoded into the button byte (Ctrl +16, Alt +8);
+  - focus in/out (`ESC[I` / `ESC[O`) under 1004.
+  - A plain alt-screen pager that did NOT request the mouse still gets arrow-key
+    line scrolls on the wheel (xterm's alternateScroll).
+- **Shift is the LOCAL override** throughout (konsole convention): Shift+wheel
+  scrolls local scrollback, Shift+click/drag selects text, Shift+middle pastes
+  PRIMARY -- none of those are forwarded, so text selection and paste stay reachable
+  while a program grabs the mouse. (Reaching primary scrollback BEHIND an alt-screen
+  app via Shift+wheel is a known follow-up; the alt grid is pinned there today.)
+- **Security trade (recorded)**: this drops the mouse-tracking-reflection hardening
+  -- secure-terminal now reflects mouse reports like every mainstream terminal, so a
+  program whose output you merely display can, by enabling 1003, learn your pointer
+  motion while it is shown. The invariant that REMAINS, and that the oracle guards:
+  a program's OUTPUT never fabricates input -- enabling the modes writes nothing
+  back; only a genuine user event, of a mode the program requested, produces a
+  report, and Shift keeps any event local. Oracle: `test_widget.py` mouse-reporting
+  block + the konsole-parity block.
 ## Paste review (text coming IN)
 
 - **In-window bar**, not a modal (one window). The preview panes are read-only
@@ -69,8 +107,11 @@ source of truth for behaviour.
   keys, Enter/Esc reject); the choice (stripped / with-unicode / reject) is
   dispatched to the tab, the only path that lets a byte reach the shell.
 - Both send buttons are countdown-gated. Detail pane names each hidden character.
-- Config `paste_warn`: always / unicode (default) / never. Never still sanitises
-  to ASCII silently.
+- Config `paste_warn`: always / unicode (default) / never. `never` does NOT strip
+  the text (so real unicode can be pasted deliberately); risky text crosses
+  UNREVIEWED but a red risk lamp marks the crossing -- not silent. A multi-line
+  paste is still held for review whatever the setting (the pastejacking gate),
+  unless a TUI's bracketed paste (DEC 2004) is active.
 
 ## Copy review (text going OUT)
 

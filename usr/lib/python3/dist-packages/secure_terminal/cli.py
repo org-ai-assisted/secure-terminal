@@ -80,6 +80,13 @@ _PASTE_MAX = 1 << 20
 # Escape (vim) responsive, large enough to reassemble any split marker.
 _ESC_HOLD_TIMEOUT = 0.05
 
+# Characters an unterminated / over-long string sequence may silently suppress
+# before a one-time stderr notice. A sequence that survives a whole 64 KiB read
+# without terminating is almost certainly stuck (a real one is shorter and ends),
+# so this catches the "output silently blanks forever" freeze without lifting the
+# suppression (no escape byte is ever written to the outer terminal).
+_ESC_SUPPRESS_NOTICE_CHARS = 65536
+
 
 def feed_stdin_paste(data, state):
     r"""Stdin-side bracketed-paste state machine: the input mirror of the
@@ -204,6 +211,8 @@ def _run(argv, mode):
     decoder = codecs.getincrementaldecoder('utf-8')('replace')
     esc_carry = ''              # incomplete escape held from the previous read
     esc_drop = ''               # introducer of an over-cap string sequence
+    esc_dropped = 0             # chars suppressed in the current discard run
+    esc_notified = False        # the suppression notice printed for this run
     stdin_fd = sys.stdin.fileno()
     out_fd = sys.stdout.fileno()
     old_attr = None
@@ -259,8 +268,20 @@ def _run(argv, mode):
                 # a read boundary lost its introducer and the REMAINDER printed as
                 # text -- straight onto the outer terminal, `\r` and all, which is
                 # a prompt-spoofing primitive that needs no escape to survive.
-                text, esc_carry, esc_drop = feed_chunk_carry(
-                    decoder.decode(data), esc_carry, esc_drop)
+                text, esc_carry, esc_drop, esc_dropped = feed_chunk_carry(
+                    decoder.decode(data), esc_carry, esc_drop, esc_dropped)
+                # A long unterminated string sequence keeps suppressing output (no
+                # escape byte reaches the outer terminal -- safe), but looks like a
+                # hang. Warn ONCE on stderr so the blank is explained; re-arm when the
+                # run ends. stderr, never stdout, so the sanitized stream stays clean.
+                if not esc_drop:
+                    esc_notified = False
+                elif not esc_notified and esc_dropped >= _ESC_SUPPRESS_NOTICE_CHARS:
+                    esc_notified = True
+                    sys.stderr.write(
+                        'secure-terminal-cli: suppressing output -- an over-long or '
+                        'unterminated escape sequence is being discarded.\n')
+                    sys.stderr.flush()
                 safe = render_output(text, mode)
                 os.write(out_fd, safe.encode('utf-8', 'replace'))
             if stdin_fd in readable:

@@ -256,7 +256,10 @@ from secure_terminal.sanitize import (
     describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
     PROMPT_START,
     feed_chunk_carry, has_bell, OSC_FEATURES,
-    tail_from_escape_boundary,
+    tail_from_escape_boundary, split_trailing_escape, scan_mouse_modes,
+    sgr_mouse_report,
+    _MOUSE_BUTTON_MODES, _MOUSE_DRAG_MODE, _MOUSE_MOTION_MODE,
+    _MOUSE_FOCUS_MODE, _MOUSE_SGR_MODE,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 
@@ -592,6 +595,11 @@ class SecureTerminal(QPlainTextEdit):
     # (see OSC_FEATURES; 'osc_other' for an unrecognized code) so the window can
     # notice each TYPE at most once per tab.
     osc_used = pyqtSignal(str)
+    # an unterminated / over-long string sequence (OSC/DCS/...) has silently
+    # suppressed a lot of CLI-mode output (the escape_limit threshold). The
+    # suppression is NOT lifted (no escape byte is rendered); the window shows a
+    # one-time notice so a frozen-looking terminal is explained, not mysterious.
+    escape_suppressed = pyqtSignal()
     # a program set the title / sent a notification (only when allowed)
     title_changed = pyqtSignal(str)
     notified = pyqtSignal(str)
@@ -731,6 +739,10 @@ class SecureTerminal(QPlainTextEdit):
         # showing spurious trailing lines after a file with no final newline.
         # Updated by _set_winsize; falls back to _MAX_LINE until first sized.
         self._cols = 0
+        # Rows we report to the child (winsize height). Kept so a mouse report can
+        # clamp its row to the child's actual screen, symmetric with _cols -- a click
+        # in the sub-row strip below the last row must not name a row past the grid.
+        self._rows = 0
 
         # seconds the paste-warning "Allow" button stays disabled.
         self._paste_delay = 3
@@ -833,6 +845,15 @@ class SecureTerminal(QPlainTextEdit):
         # restart). Maintained from the output stream (alt-screen enter/leave).
         self._alt_screen = False
         self._wheel_accum = 0         # accumulated wheel delta for alt-screen scroll
+        # The set of mouse DEC modes the child has enabled (1000/1002/1003 tracking,
+        # 1004 focus, 1006 SGR), tracked off the output stream. When it requests
+        # tracking + SGR, the mouse/wheel handlers REPORT to it (konsole/xterm
+        # parity); Shift is the local override. See wheelEvent / mousePressEvent.
+        self._mouse_modes = set()
+        self._mouse_scan_carry = ''   # incomplete escape carried across a read split
+        self._wheel_accum_x = 0       # horizontal wheel delta (vertical: _wheel_accum)
+        self._mouse_report_btns = set()  # Qt buttons whose reported press awaits release
+        self._mouse_report_cell = None  # last cell reported for motion (coalesce 1003)
         # True while the grid view is rendering the alternate screen ALONE (grid
         # only, no scrollback above it). Lets _render_tui clear the carried-in
         # scrollback exactly once when a full-screen program takes the alt screen,
@@ -867,6 +888,15 @@ class SecureTerminal(QPlainTextEdit):
         # cap, this holds its introducer byte and the feed discards bytes until the
         # terminator, so a huge chunk-split escape is stripped in O(1) memory.
         self._esc_drop = ''
+        # Characters swallowed so far in the current discard run (a long unterminated
+        # string sequence). Watched against self._escape_limit to fire a one-time
+        # notice; the suppression itself is never lifted.
+        self._esc_dropped = 0
+        self._esc_notified = False   # the suppression notice fired for this run
+        # Characters an unterminated string sequence may silently suppress before a
+        # one-time notice (0 = never notify). Output stays suppressed regardless.
+        # Set from the escape_limit config.
+        self._escape_limit = 4096
         # TUI OSC action path: bytes of an incomplete trailing OSC held from the
         # previous read, so an enabled OSC (clipboard/notify/...) split across PTY
         # reads is still acted on. Bounded a little above the clipboard cap.
@@ -1135,6 +1165,15 @@ class SecureTerminal(QPlainTextEdit):
     def current_paste_delay(self):
         return self._paste_delay
 
+    def apply_escape_limit(self, limit):
+        # Only the notice THRESHOLD; changing it cannot alter what is on screen, so
+        # no _rerender. Suppression is unaffected -- this only tunes when the
+        # one-time "output suppressed" notice fires.
+        self._escape_limit = max(0, int(limit))
+
+    def current_escape_limit(self):
+        return self._escape_limit
+
     def apply_paste_warn(self, mode):
         self._paste_warn = mode if mode in ('always', 'unicode', 'never') else 'unicode'
 
@@ -1180,6 +1219,8 @@ class SecureTerminal(QPlainTextEdit):
         # or discard would corrupt the first bytes rendered after switching back.
         self._esc_carry = ''
         self._esc_drop = ''
+        self._esc_dropped = 0
+        self._esc_notified = False
         self._osc_carry = b''
         # re-advertise the mode's terminfo to the running shell (no restart). ONLY
         # for the default login shell (self._command is None): a tab launched with
@@ -1478,9 +1519,11 @@ class SecureTerminal(QPlainTextEdit):
         return cols, rows
 
     def _set_winsize(self, cols, rows):
-        # Remember the width we tell the child, so line-mode output wraps at the
-        # same column the shell formats to (see self._cols / _feed_line).
+        # Remember the size we tell the child: the width so line-mode output wraps
+        # at the same column the shell formats to (see self._cols / _feed_line), and
+        # the height so a mouse report clamps its row to the child's screen.
         self._cols = cols
+        self._rows = rows
         if self._fd is None:
             return
         try:
@@ -2168,30 +2211,144 @@ class SecureTerminal(QPlainTextEdit):
             return _cache_bounded(self._line_fmt_cache, key, fmt)
         return fmt
 
+    # -- mouse reporting (konsole/xterm parity) -------------------------------
+    # A child that enables mouse tracking (1000/1002/1003) + SGR encoding (1006) has
+    # its mouse and wheel events REPORTED to it, at the cell under the pointer, so a
+    # mouse-aware UI (Claude Code, vim, htop, tmux) behaves as in konsole. Shift is
+    # the LOCAL override throughout: Shift+wheel scrolls this terminal's scrollback,
+    # Shift+click/drag selects text, Shift+middle pastes -- none of those are
+    # forwarded. Only genuine user events are ever reported; there is no path from
+    # program output to a report except the modes it explicitly set.
+    _SGR_BUTTON = {
+        Qt.MouseButton.LeftButton: 0,
+        Qt.MouseButton.MiddleButton: 1,
+        Qt.MouseButton.RightButton: 2,
+    }
+
+    # Cancel a line of UNKNOWN content (recalled from history / cursor-edited, so
+    # neither its text nor the cursor column is mirrored). Ctrl+C (SIGINT), NOT a
+    # kill-line key sequence: any End/Ctrl+E/Ctrl+U combination depends on the
+    # shell's keymap and SILENTLY LEAVES the command in some of them (bash vi-insert
+    # needed End-then-U; zsh vi-insert has ESC[F unbound; xterm's End is ESC O F).
+    # The hook only fires at a bare prompt (no foreground child -- enforced by the
+    # has_foreground_program() guard at every _hook_intercept call site), so SIGINT
+    # there cancels the line editor and gives a fresh prompt in EVERY shell and
+    # editing mode. It is best-effort: a user who ran `stty intr undef` disarms it,
+    # so the caller marks _line_dirty afterward to FAIL SAFE (re-ask, never submit
+    # a line the cancel may have left behind). A line whose content IS mirrored is
+    # cleared deterministically by _clear_typed_line instead (no signal, no tcflush).
+    _CANCEL_UNKNOWN_LINE = b'\x03'
+
+    def _clear_typed_line(self, command):
+        """Erase a line whose exact content is mirrored (cursor at end, not dirty)
+        with one Backspace per character. Unlike SIGINT this sends no signal (so it
+        never kills a foreground program) and triggers no tcflush TCIFLUSH (so a
+        suggestion written immediately after is not swallowed), and unlike a
+        kill-line key it needs no shell keymap. len() counts the logical characters
+        readline/zle delete one-per-Backspace. The caller only reaches here with a
+        non-empty command (the empty line returns earlier)."""
+        self._write(b'\x7f' * len(command))
+
+    def _mouse_report_on(self):
+        """True when the child has enabled mouse tracking WITH SGR encoding, so its
+        mouse/wheel events are reported. Shift (the local override) is checked per
+        handler, not here."""
+        return (bool(self._mouse_modes & _MOUSE_BUTTON_MODES)
+                and _MOUSE_SGR_MODE in self._mouse_modes)
+
+    def _event_cell(self, event):
+        """1-based (col, row) of the terminal cell under a mouse/wheel event, for an
+        SGR report -- the on-screen cell coordinate a real terminal sends. Clamped to
+        the grid so a report never names a cell off the left/top edge or past the
+        column count."""
+        metrics = self.fontMetrics()
+        char_w = metrics.horizontalAdvance('M') or 1
+        char_h = metrics.height() or 1
+        off = self.contentOffset()
+        margin = self.document().documentMargin()
+        pos = event.position()
+        col = int((pos.x() - margin - off.x()) // char_w) + 1
+        row = int((pos.y() - margin - off.y()) // char_h) + 1
+        cols = self._cols if self._cols and self._cols > 0 else self._MAX_LINE
+        rows = self._rows if self._rows and self._rows > 0 else self._MAX_LINE
+        col = min(col, cols) if col > 1 else 1
+        row = min(row, rows) if row > 1 else 1
+        return col, row
+
+    def _button_code(self, base, mods, motion=False):
+        """The SGR button byte: `base` (0/1/2 button, 3 none, 64+ wheel) plus the
+        motion flag (+32) and the Ctrl (+16) / Alt (+8) modifier bits. Shift is NEVER
+        encoded -- it is the local-selection override and never reaches a report."""
+        if motion:
+            base += 32
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            base += 16
+        if mods & Qt.KeyboardModifier.AltModifier:
+            base += 8
+        return base
+
+    def _report_mouse(self, base, event, pressed, motion=False):
+        col, row = self._event_cell(event)
+        code = self._button_code(base, event.modifiers(), motion)
+        self._write(sgr_mouse_report(code, col, row, pressed).encode('ascii'))
+
+    def _mouse_reporting(self):
+        """True when a press/motion/wheel must be REPORTED to the child: tracking +
+        SGR are on AND no paste/copy review is up. Input to the child is suspended
+        during a review (as keyPressEvent refuses keys), so the report paths -- which
+        also TRACK the pressed button -- must not fire, or a press reported (or a
+        button tracked) mid-review leaves the child an unmatched event."""
+        return self._mouse_report_on() and not self._review_active
+
     def wheelEvent(self, event):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.ControlModifier:
             delta = event.angleDelta().y()
             if delta:
                 self.zoom_step.emit(1 if delta > 0 else -1)
             event.accept()
             return
-        # Alternate scroll: in the ALTERNATE screen a full-screen program (less, vim,
-        # a TUI) owns the display -- there is no local scrollback to move, and this
-        # terminal does no mouse reporting, so a plain wheel would scroll a dead Qt
-        # document (the reported bug: wheel does nothing while Page Up/Down work).
-        # Translate the wheel into arrow-key line scrolls sent to the child, like
-        # xterm's alternateScroll, so the wheel scrolls the program as expected.
+        # Shift+wheel is the LOCAL override: it scrolls this terminal's own Qt
+        # document instead of reporting to / scrolling the child, and so must precede
+        # the reporting/application branches below. In CLI/normal mode that is the
+        # scrollback. In the alt screen the document holds only the pinned grid
+        # (primary scrollback behind a full-screen app is not yet exposed -- a konsole-
+        # parity follow-up), so there it is a no-op rather than reaching history.
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            super().wheelEvent(event)
+            return
+        # ACCUMULATE the delta and act only past a notch (~120 units), carrying the
+        # remainder -- a high-resolution trackpad streams many tiny deltas, so acting
+        # on EACH would fire per micro-event (uncontrollable hyperscroll).
+        self._wheel_accum += event.angleDelta().y()
+        self._wheel_accum_x += event.angleDelta().x()
+        if self._mouse_reporting():
+            # Report the wheel as a real SGR wheel event at the cell under the pointer
+            # (konsole/xterm): 64 up / 65 down, 66 left / 67 right. One event per notch
+            # so the program scrolls line-by-line at its own granularity.
+            for accum_attr, pos_btn, neg_btn in (
+                    ('_wheel_accum', 64, 65), ('_wheel_accum_x', 67, 66)):
+                accum = getattr(self, accum_attr)
+                events = int(accum / 120)
+                if events:
+                    setattr(self, accum_attr, accum - events * 120)
+                    base = pos_btn if events > 0 else neg_btn
+                    for _ in range(min(abs(events), 8)):   # cap a single huge jump
+                        self._report_mouse(base, event, pressed=True)
+            event.accept()
+            return
+        # A full-screen program that did NOT request the mouse (a plain pager in the
+        # alt screen): translate the wheel to arrow-key line scrolls, like xterm's
+        # alternateScroll -- the surrogate it understands. ~3 lines per notch.
         if self._alt_screen:
-            # ACCUMULATE the wheel delta and emit a line only per ~40 units, carrying
-            # the remainder -- a mouse notch (120) is ~3 lines, but a high-resolution
-            # trackpad streams many tiny deltas, so rounding EACH up to a line would
-            # fire an arrow per micro-event (uncontrollable hyperscroll).
-            self._wheel_accum += event.angleDelta().y()
             lines = int(self._wheel_accum / 40)
             if lines:
                 self._wheel_accum -= lines * 40
-                seq = b'\x1b[A' if lines > 0 else b'\x1b[B'
-                self._write(seq * min(abs(lines), 8))   # cap a single huge jump
+                # input suspended during a paste/copy review (as in _report_mouse):
+                # drain the accumulator but do not write the arrow surrogate.
+                if not self._review_active:
+                    seq = b'\x1b[A' if lines > 0 else b'\x1b[B'
+                    self._write(seq * min(abs(lines), 8))    # cap a single huge jump
             event.accept()
             return
         super().wheelEvent(event)
@@ -2307,6 +2464,18 @@ class SecureTerminal(QPlainTextEdit):
             # level-triggered notifier on the errored fd spins a core forever.
             data = b''
         if not data:
+            # The child exited. feed_chunk_carry may be holding a trailing run in
+            # _esc_carry that MIGHT have been an incomplete escape awaiting more bytes
+            # (CLI mode). No bytes are coming now, so flush it as the program's final
+            # output rather than drop it silently: the line renderer strips a genuine
+            # dangling control intro and shows the rest (e.g. 'ESC' + text -> the
+            # text). An over-cap discard (_esc_drop) is intentionally-stripped and not
+            # recovered. Empty in TUI mode, so this is a no-op there.
+            if self._esc_carry:
+                tail, self._esc_carry = self._esc_carry, ''
+                self._raw += tail
+                self._cap_raw()
+                self._feed_line(tail, defer=False)
             if self._notifier is not None:
                 self._notifier.setEnabled(False)
             self.shell_exited.emit()
@@ -2350,6 +2519,19 @@ class SecureTerminal(QPlainTextEdit):
             self._wheel_accum = 0
             if not self._alt_screen:
                 self._tui_hint_shown = False   # a later full-screen app re-advises
+
+        # Track the child's mouse-reporting request (button/motion tracking + SGR
+        # encoding), carrying an escape split across this read boundary so a divided
+        # DECSET is not missed. Mode-agnostic: a full-screen program requests the
+        # mouse whether or not this terminal is showing its frame. Only the wheel is
+        # ever acted on (wheelEvent), never clicks/motion.
+        mouse_body = self._mouse_scan_carry + text
+        mouse_body, self._mouse_scan_carry = split_trailing_escape(mouse_body)
+        self._mouse_modes = scan_mouse_modes(mouse_body, self._mouse_modes)
+        # Any-event tracking (1003) needs button-less pointer motion, which Qt only
+        # delivers when the widget has mouse tracking on. Enable it exactly while the
+        # child asks, so no motion is watched otherwise.
+        self.setMouseTracking(_MOUSE_MOTION_MODE in self._mouse_modes)
 
         # Synchronized output (DECSET 2026): resolve the LAST marker, carrying the
         # tail so a marker split across reads is still seen. Apply BEGIN now (drop a
@@ -2422,8 +2604,18 @@ class SecureTerminal(QPlainTextEdit):
         # sequence (a Sixel image is the worst case) switches to a discard state so
         # it is stripped whatever its length, without buffering it unbounded.
         drop_before = self._esc_drop
-        text, self._esc_carry, self._esc_drop = feed_chunk_carry(
-            text, self._esc_carry, self._esc_drop)
+        text, self._esc_carry, self._esc_drop, self._esc_dropped = feed_chunk_carry(
+            text, self._esc_carry, self._esc_drop, self._esc_dropped)
+        # A long unterminated string sequence keeps suppressing output (nothing is
+        # rendered, so no escape byte leaks). That is safe but LOOKS like a freeze,
+        # so once the suppressed run passes the configured threshold, fire a one-time
+        # notice (the window de-dups per tab). Re-arm when the run ends.
+        if not self._esc_drop:
+            self._esc_notified = False
+        elif (self._escape_limit and not self._esc_notified
+              and self._esc_dropped >= self._escape_limit):
+            self._esc_notified = True
+            self.escape_suppressed.emit()
         # Ring on a standalone BEL (a real bell) in the carry-reassembled text.
         # feed_chunk_carry has rejoined a split sequence, so has_bell() -- which
         # strips complete OSC/DCS sequences before looking for a BEL -- never
@@ -3477,8 +3669,13 @@ class SecureTerminal(QPlainTextEdit):
                     # Ctrl+J (LF) and Ctrl+M (CR) are accept-line: readline/zle
                     # submit the line exactly like Enter, so route them through the
                     # hook and reset the line state -- else the command runs unjudged
-                    # and a stale dirty flag would poison the next prompt.
-                    if self._hook is not None and self._hook_intercept():
+                    # and a stale dirty flag would poison the next prompt. Judge only
+                    # at a bare prompt: with a foreground program the keystrokes are
+                    # ITS input (a password at sudo/ssh, text in cat), not a shell
+                    # command -- feeding them to the hook would leak them and the
+                    # discard would signal/disrupt that program (matches the TUI path).
+                    if (self._hook is not None and not self.has_foreground_program()
+                            and self._hook_intercept()):
                         return
                     self._line_buffer = ''
                     self._line_dirty = False
@@ -3487,9 +3684,19 @@ class SecureTerminal(QPlainTextEdit):
                 self._write(bytes([byte]))
                 if key == Qt.Key.Key_C:
                     self._echo_caret('^C')    # make the interrupt visible
-                if key in (Qt.Key.Key_C, Qt.Key.Key_U):
-                    self._line_buffer = ''    # SIGINT / kill-line discards the line
+                if key == Qt.Key.Key_C:
+                    self._line_buffer = ''    # SIGINT discards the whole line
                     self._line_dirty = False
+                elif key == Qt.Key.Key_U:
+                    # Ctrl+U (kill-line) reaches cursor-to-start (bash unix-line-discard)
+                    # or the whole line (zsh kill-whole-line) -- its extent depends on
+                    # the cursor position, which we do not track. So clear the mirror but
+                    # PRESERVE _line_dirty: only a clean mirror (cursor at end, not dirty)
+                    # truly killed the whole line. If the cursor had already moved, the
+                    # survivor is unknown and the next Enter must fail safe (ask), not
+                    # submit it unjudged. Regression: resetting the flag let Home then
+                    # Ctrl+U bypass the command hook.
+                    self._line_buffer = ''
                 else:
                     # any OTHER readline control edit (Ctrl+A/E/B/F move, Ctrl+K/W
                     # kill, Ctrl+Y yank, Ctrl+T transpose, Ctrl+D delete, Ctrl+R
@@ -3513,8 +3720,11 @@ class SecureTerminal(QPlainTextEdit):
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             # The command hook (if configured) judges the typed line before Enter
-            # submits it; it may block, ask, or offer a safer command.
-            if self._hook is not None and self._hook_intercept():
+            # submits it; it may block, ask, or offer a safer command. Only at a
+            # bare prompt: with a foreground program in place the line is ITS input
+            # (a sudo/ssh password), not a shell command (matches the TUI path).
+            if (self._hook is not None and not self.has_foreground_program()
+                    and self._hook_intercept()):
                 return
             self._line_buffer = ''
             self._line_dirty = False
@@ -3641,11 +3851,15 @@ class SecureTerminal(QPlainTextEdit):
                            'it before it runs.',
                 'suggestion': ''})
             self._line_buffer = ''
-            self._line_dirty = False
             if action == 'run':
+                self._line_dirty = False
                 self._write(b'\r')
             else:
-                self._write(b'\x15')          # Ctrl+U: discard the line
+                # Best-effort cancel of a line we cannot see. Its content is unknown
+                # so a counted erase is impossible; SIGINT is the only keymap-free
+                # cancel. It can be disarmed (`stty intr undef`), so KEEP _line_dirty
+                # set -- the next Enter re-asks instead of submitting a retained line.
+                self._write(self._CANCEL_UNKNOWN_LINE)
             return True
         command = self._line_buffer
         if not command.strip():
@@ -3666,7 +3880,10 @@ class SecureTerminal(QPlainTextEdit):
             self._line_buffer = ''
             self._write(b'\r')
             return True
-        self._write(b'\x15')          # Ctrl+U: discard the typed line in the shell
+        # Content is mirrored (not dirty), so erase it deterministically: no SIGINT
+        # (would kill nothing here but flush the tty input queue via tcflush and
+        # swallow the suggestion written next) and no keymap dependence.
+        self._clear_typed_line(command)
         self._line_buffer = ''
         if action == 'suggest' and result['suggestion']:
             # insert the suggested command for review -- never with a newline, so
@@ -3761,7 +3978,12 @@ class SecureTerminal(QPlainTextEdit):
             return
         if submit_or_discard:
             self._line_buffer = ''
-            self._line_dirty = False
+            # accept-line and Ctrl+C settle the line (judged, or SIGINT-discarded), so
+            # the flag clears. Ctrl+U does NOT: its reach is cursor-dependent (untracked),
+            # so a survivor must keep the next accept-line failing safe -- same reason as
+            # the CLI path. Regression: clearing it let Home then Ctrl+U bypass the hook.
+            if not (ctrl and key == Qt.Key.Key_U):
+                self._line_dirty = False
 
         seq = SecureTerminal._TUI_KEYS.get(key)
         text = event.text()
@@ -3886,6 +4108,16 @@ class SecureTerminal(QPlainTextEdit):
         return super().event(e)
 
     def mouseDoubleClickEvent(self, event):
+        # When the child grabs the mouse, a double-click is REPORTED as another press
+        # (its release follows via mouseReleaseEvent), not used for a local word-select
+        # or the character popup; Shift is the local override.
+        if self._mouse_reporting() and not self._shift(event):
+            base = self._SGR_BUTTON.get(event.button())
+            if base is not None:
+                self._report_mouse(base, event, pressed=True)
+                self._mouse_report_btns.add(event.button())
+                event.accept()
+                return
         # Double-clicking a neutralized/revealed character opens an ACTIVE popup
         # (unlike the passive hover tooltip): its text can be selected and copied,
         # and it stays open while you work. A double-click elsewhere selects a word
@@ -3960,7 +4192,19 @@ class SecureTerminal(QPlainTextEdit):
             tc.movePosition(QTextCursor.MoveOperation.End)
             self.setTextCursor(tc)
 
+    def _shift(self, event):
+        return bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+
     def mousePressEvent(self, event):
+        # When the child grabs the mouse (tracking + SGR), a plain press is REPORTED
+        # to it rather than starting a local selection; Shift is the local override.
+        if self._mouse_reporting() and not self._shift(event):
+            base = self._SGR_BUTTON.get(event.button())
+            if base is not None:
+                self._report_mouse(base, event, pressed=True)
+                self._mouse_report_btns.add(event.button())
+                event.accept()
+                return
         # Mark a drag-selection in progress so _render_tui freezes the grid rebuild while
         # the user selects (a left-button press begins a possible drag).
         if event.button() == Qt.MouseButton.LeftButton:
@@ -3968,6 +4212,20 @@ class SecureTerminal(QPlainTextEdit):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # Balance EACH reported press with the release of THAT button (report it even if
+        # Shift toggled mid-drag, so the child never sees an unmatched press). A set,
+        # not one button: a left+right chord reports two presses, so each release must
+        # match its own button -- tracking a single button left the first one logically
+        # stuck in the child (no protocol release).
+        btn = event.button()
+        if btn in self._mouse_report_btns:
+            base = self._SGR_BUTTON.get(btn, 0)
+            self._report_mouse(base, event, pressed=False)
+            self._mouse_report_btns.discard(btn)
+            if not self._mouse_report_btns:
+                self._mouse_report_cell = None
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
         self._mouse_selecting = False
         # The drag is over: re-arm a grid render so the view catches up once the selection
@@ -3983,6 +4241,45 @@ class SecureTerminal(QPlainTextEdit):
         if self.textCursor().hasSelection():
             return
         self.reset_caret()
+
+    def mouseMoveEvent(self, event):
+        # Report motion to a child that asked: a drag (button held) under 1002/1003,
+        # or button-less motion under 1003. Coalesce to one report per CELL so any-
+        # motion (1003) does not flood. Shift keeps motion local (text selection).
+        if self._mouse_reporting() and not self._shift(event):
+            buttons = event.buttons()
+            held = buttons != Qt.MouseButton.NoButton
+            report = ((held and (_MOUSE_DRAG_MODE in self._mouse_modes
+                                 or _MOUSE_MOTION_MODE in self._mouse_modes))
+                      or (not held and _MOUSE_MOTION_MODE in self._mouse_modes))
+            if report:
+                cell = self._event_cell(event)
+                if cell != self._mouse_report_cell:
+                    self._mouse_report_cell = cell
+                    if buttons & Qt.MouseButton.LeftButton:
+                        base = 0
+                    elif buttons & Qt.MouseButton.MiddleButton:
+                        base = 1
+                    elif buttons & Qt.MouseButton.RightButton:
+                        base = 2
+                    else:
+                        base = 3            # motion with no button
+                    self._report_mouse(base, event, pressed=True, motion=True)
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def focusInEvent(self, event):
+        # not while a paste/copy review is up: input to the child is suspended (as in
+        # _report_mouse / keyPressEvent), so a focus report must not leak either.
+        if _MOUSE_FOCUS_MODE in self._mouse_modes and not self._review_active:
+            self._write(b'\x1b[I')          # DEC 1004 focus-in report
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):
+        if _MOUSE_FOCUS_MODE in self._mouse_modes and not self._review_active:
+            self._write(b'\x1b[O')          # DEC 1004 focus-out report
+        super().focusOutEvent(event)
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
     def _bracketed_paste_active(self):

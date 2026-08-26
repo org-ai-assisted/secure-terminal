@@ -245,6 +245,10 @@ def split_trailing_escape(text, cap=4096):
 # incomplete string sequence outgrows the carry cap we switch to a DISCARD state:
 # subsequent bytes are swallowed until the terminator, then rendering resumes.
 # This keeps "strip every escape" true for a sequence of ANY length in O(1) memory.
+# A sequence that NEVER terminates keeps suppressing output (no escape byte is ever
+# leaked as text -- the property this machinery exists to hold), so the discard
+# count is tracked and RETURNED: the caller surfaces a one-time notice when the
+# silent suppression has grown large, rather than lifting it.
 _STRING_INTRO = ']PX^_'                 # 2nd byte of ESC-<x> string introducers
 _STRING_TERMINATOR = {
     ']': re.compile(r'\x07|\x1b\\'),    # OSC ends on BEL or ST
@@ -255,36 +259,47 @@ _STRING_TERMINATOR = {
 }
 
 
-def feed_chunk_carry(text, carry, drop, cap=4096):
+def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
     """CLI-mode incremental escape handling across read() chunks. Given the new
-    `text`, the short `carry` held from the previous chunk (str), and `drop` (the
-    introducer byte of an over-long string sequence being discarded, or ''),
-    return (renderable_text, new_carry, new_drop). Guarantees every escape --
+    `text`, the short `carry` held from the previous chunk (str), `drop` (the
+    introducer byte of an over-long string sequence being discarded, or ''), and
+    `dropped` (characters swallowed so far in the current discard run), return
+    (renderable_text, new_carry, new_drop, new_dropped). Guarantees every escape --
     including an arbitrarily long, chunk-split string sequence -- is fully removed
     with O(1) memory: an incomplete string sequence past `cap` switches to a
     discard state that swallows bytes until its terminator (handling a terminator
-    itself split across the boundary via a one-byte ESC carry)."""
+    itself split across the boundary via a one-byte ESC carry).
+
+    `dropped` accumulates the characters suppressed while hunting a terminator that
+    may never arrive, and resets when the sequence ends. It is REPORTED, never acted
+    on here: no escape byte is ever rendered as text (the property the formal proofs
+    verify). The caller watches it to surface a one-time notice when an unterminated
+    sequence has silently suppressed a lot of output, without lifting the
+    suppression."""
     text = carry + text
     carry = ''
     if drop:
         m = _STRING_TERMINATOR[drop].search(text)
         if not m:
+            dropped += len(text)
             # still inside the sequence; a lone trailing ESC may be a split ST
-            return '', ('\x1b' if text.endswith('\x1b') else ''), drop
+            return '', ('\x1b' if text.endswith('\x1b') else ''), drop, dropped
         text = text[m.end():]
         drop = ''
+        dropped = 0
     m = _TRAILING_ESCAPE.search(text)
     if m and m.group():
         g = m.group()
         if len(g) >= 2 and g[1] in _STRING_INTRO and len(g) > cap:
             drop = g[1]                 # too long to hold -> swallow to terminator
+            dropped = len(g)
             text = text[:m.start()]
         elif len(g) <= cap:
             carry = g                   # short incomplete escape -> hold for next chunk
             text = text[:m.start()]
         # else: an over-cap NON-string tail (a pathological unterminated CSI, which
         # a real program never emits) is let through, bounded -- as before.
-    return text, carry, drop
+    return text, carry, drop, dropped
 
 
 # --- OSC features -------------------------------------------------------------
@@ -433,6 +448,67 @@ def leaves_full_screen(text):
     """True when the output leaves the alternate screen buffer -- the full-screen
     program (htop, vim) has exited and the shell's primary screen is back."""
     return any(seq in text for seq in _ALT_SCREEN_OFF)
+
+
+# Mouse DEC private modes a program enables to have the terminal REPORT input to
+# it (konsole/xterm parity, honoured by SecureTerminal's mouse/wheel handlers):
+#   1000 button press/release   1002 + button-held drag motion
+#   1003 any-motion (every move) 1004 focus in/out   1006 SGR report encoding
+# Tracked as a live set off the output stream; the handlers derive from it whether
+# to report, and in which form. Shift is the local-override key (never forwarded).
+_MOUSE_BUTTON_MODES = frozenset((1000, 1002, 1003))   # any -> report buttons+wheel
+_MOUSE_DRAG_MODE = 1002                                # + motion while a button held
+_MOUSE_MOTION_MODE = 1003                              # + motion with no button
+_MOUSE_FOCUS_MODE = 1004                               # focus in/out reports
+_MOUSE_SGR_MODE = 1006                                 # SGR (1006) report encoding
+_MOUSE_MODES_TRACKED = (_MOUSE_BUTTON_MODES
+                        | frozenset((_MOUSE_FOCUS_MODE, _MOUSE_SGR_MODE)))
+# DECSET/DECRST (group 1 = params, group 2 = h|l), OR a full reset -- RIS (ESC c)
+# or DECSTR (ESC [ ! p) -- which has no params group and clears all tracked modes.
+_MOUSE_SCAN_RE = re.compile(r'\x1b\[\?([0-9;]+)([hl])|\x1bc|\x1b\[!p')
+
+
+def scan_mouse_modes(text, modes):
+    """Fold the DEC-private mouse-mode transitions in `text` onto `modes` (the set of
+    currently-active modes drawn from _MOUSE_MODES_TRACKED) and return the updated
+    set. Parameter-aware, so a combined sequence (ESC[?1000;1006h) is honoured, not
+    only standalone ones; the caller carries any escape split across a read()
+    boundary (split_trailing_escape), so a divided sequence is not lost. A partial
+    reset (clearing 1002 while 1000 stays) leaves each mode independently tracked --
+    matching how a real terminal routes the mouse.
+
+    A FULL reset -- RIS (ESC c) or DECSTR (ESC [ ! p) -- clears every tracked mode, so
+    running `reset` (or a program's soft reset) disables mouse tracking that untrusted
+    output turned on: the usual recovery. Transitions are folded in ORDER, so a reset
+    followed by a re-enable in the same text leaves only the re-enabled modes."""
+    modes = set(modes)
+    for m in _MOUSE_SCAN_RE.finditer(text):
+        params = m.group(1)
+        if params is None:
+            modes.clear()               # RIS / DECSTR: full reset disables tracking
+            continue
+        on = m.group(2) == 'h'
+        # The params body is [0-9;]+, so each split field is all-digits or empty (a
+        # stray/leading/trailing ';'). Parse via _safe_int, NOT int(): a hostile
+        # 4300+-digit parameter would else raise ValueError and crash the read loop
+        # (Python's int-string limit). An out-of-range/empty field maps to 0, which
+        # is never a mode we track, so it is harmlessly ignored.
+        nums = {_safe_int(p) for p in params.split(';') if p}
+        for mode in nums & _MOUSE_MODES_TRACKED:
+            if on:
+                modes.add(mode)
+            else:
+                modes.discard(mode)
+    return modes
+
+
+def sgr_mouse_report(button, col, row, pressed):
+    """The SGR (1006) mouse-report string for `button` -- already carrying any motion
+    (+32) and keyboard-modifier (+4/+8/+16) bits -- at 1-based on-screen cell
+    (col, row). `pressed` picks the final byte: 'M' for a press / wheel / motion, 'm'
+    for a button release. The only bytes emitted are 'ESC [ < digits ; digits ;
+    digits M|m' -- inert display-wise, and never echoing program-supplied text."""
+    return '\x1b[<%d;%d;%d%s' % (button, col, row, 'M' if pressed else 'm')
 
 
 # In-place VERTICAL repaint that line mode (append-only, horizontal-local only)

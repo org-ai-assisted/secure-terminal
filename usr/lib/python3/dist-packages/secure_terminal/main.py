@@ -195,6 +195,18 @@ PASTE_DELAY_CHOICES = [
     ('5 seconds', 5),
 ]
 
+# menu label -> escape-suppression notice threshold, in characters (0 = never
+# notify). An unterminated / over-long OSC/DCS string sequence silently suppresses
+# CLI-mode output (safe: no escape byte is ever rendered). Once it has suppressed
+# this many characters, a one-time notice explains the otherwise-mysterious freeze.
+# The output stays suppressed either way; this only tunes when the notice fires.
+ESCAPE_LIMIT_CHOICES = [
+    ('After 4,096 characters', 4096),
+    ('After 65,536 characters', 65536),
+    ('After 1,048,576 characters', 1048576),
+    ('Never', 0),
+]
+
 
 def _letter_icon(letter, color):
     """A small rounded-square icon with a single ASCII letter, used as the drawn
@@ -226,6 +238,12 @@ def _toggle_icon(theme_name, letter, color):
     return _letter_icon(letter, color)
 
 
+# Upper bound for command_hook_timeout (seconds). No legitimate per-command hook
+# needs longer than an hour, and a huge value (e.g. 2**63) overflows subprocess's C
+# PyTime_t with an uncaught OverflowError -- so anything above this is clamped away.
+_HOOK_TIMEOUT_MAX = 3600
+
+
 def _read_hook_config(cfg):
     """Build the opt-in command-hook config from a settings drop-in, or None when
     no handler is configured. Keys: command_hook (the handler command line, empty
@@ -244,12 +262,28 @@ def _read_hook_config(cfg):
         timeout = int(cfg.get('command_hook_timeout') or 10)
     except ValueError:
         timeout = 10
+    if not 0 < timeout <= _HOOK_TIMEOUT_MAX:
+        # Out of range -> the default. A NON-POSITIVE timeout makes subprocess.run
+        # raise TimeoutExpired INSTANTLY (before the handler answers) and, with
+        # on_error=allow, fails OPEN; an ABSURDLY LARGE one (e.g. 2**63) overflows the
+        # C PyTime_t and raises OverflowError, which the hook error path does not catch.
+        # Either way the enforced hook is defeated, so clamp to a sane positive bound.
+        timeout = 10
+    # on_error default: an ADMIN-LOCKED (enforced) hook fails CLOSED -- a gate that
+    # fails open on error is no gate. An opt-in (unlocked) hook keeps the historical
+    # fail-open default. An explicit value always wins. (Locking auto-locks this key,
+    # so a user cannot then downgrade a locked block to allow; and because the default
+    # is now block, an admin who locks the hook without setting on_error still gets
+    # fail-closed rather than the old fail-open.)
+    on_error = cfg.get('command_hook_on_error')
+    if on_error not in ('allow', 'block'):
+        locked = getattr(cfg, 'locked', frozenset())
+        on_error = 'block' if 'command_hook' in locked else 'allow'
     return {
         'argv': argv,
         'transcript': cfg.get('command_hook_transcript') or 'none',
         'timeout': timeout,
-        'on_error': 'block' if cfg.get('command_hook_on_error') == 'block'
-                    else 'allow',
+        'on_error': on_error,
     }
 
 
@@ -588,6 +622,10 @@ class MainWindow(QMainWindow):
             self._paste_delay = max(0, min(60, int(cfg['paste_delay'])))
         except (KeyError, ValueError):
             self._paste_delay = 3
+        try:
+            self._escape_limit = max(0, int(cfg['escape_limit']))
+        except (KeyError, ValueError):
+            self._escape_limit = 4096
         self._paste_warn = cfg.get('paste_warn') \
             if cfg.get('paste_warn') in ('always', 'unicode', 'never') else 'unicode'
         self._copy_warn = cfg.get('copy_warn') \
@@ -720,6 +758,7 @@ class MainWindow(QMainWindow):
         self._tab_colors = {}        # term -> tab colour name (for persistence)
         self._advisories = {}        # term -> (kind, banner text); kind tui|osc|autobox
         self._osc_notified = set()   # (term, key) pairs already shown the OSC notice
+        self._esc_notified = set()   # terms already shown the escape-suppressed notice
         self._syncing = False        # guard: programmatic chip sync vs user click
         # toolbar chip buttons, populated by _build_toolbar; empty here so a
         # _sync during _build_menu (which runs first) is a harmless no-op.
@@ -812,6 +851,8 @@ class MainWindow(QMainWindow):
             lambda t=term: self._on_clipboard_read_requested(t))
         term.advise_signal.connect(lambda msg, t=term: self._on_advise(t, msg))
         term.osc_used.connect(lambda key, t=term: self._on_osc_used(t, key))
+        term.escape_suppressed.connect(
+            lambda t=term: self._on_escape_suppressed(t))
         term.unreviewed_risk.connect(self._on_unreviewed_risk)
         term.paste_review_requested.connect(
             lambda raw, delay, t=term: self._show_review(t, raw, delay, 'paste'))
@@ -904,6 +945,15 @@ class MainWindow(QMainWindow):
             return
         if (term, key) in self._osc_notified:
             return
+        # An over-cap unterminated OSC fires BOTH escape_suppressed (first) and this
+        # osc_used('osc_other') in one read. The suppression notice is the actionable
+        # diagnosis (the program is misbehaving); "an application used an OSC escape --
+        # enable it under View > OSC features" is a MISdiagnosis there (enabling the
+        # feature does not end the discard). So the freeze notice wins: skip clobbering
+        # an active 'escape' advisory, and leave this type un-marked so a later, real
+        # OSC use in the same tab can still notice.
+        if self._advisories.get(term, (None,))[0] == 'escape':
+            return
         self._osc_notified.add((term, key))
         entry = OSC_FEATURE_BY_KEY.get(key)
         label = entry[0].lower() if entry else 'an escape'
@@ -912,6 +962,22 @@ class MainWindow(QMainWindow):
                         'View > OSC features if you trust the source; turn this '
                         'notice off (all or per type) in View > Notify on OSC use.',
                         'osc')
+
+    def _on_escape_suppressed(self, term):
+        """A long unterminated / over-long string sequence (OSC/DCS/...) is silently
+        suppressing this tab's output. The suppression is SAFE (no escape byte is
+        rendered) but looks like a freeze, so surface a dismissible notice at most
+        once per tab, so the user knows the program is misbehaving rather than
+        staring at a dead terminal. Gated by the escape_limit threshold in the
+        terminal, so a 0 (never) setting never reaches here."""
+        if term in self._esc_notified:
+            return
+        self._esc_notified.add(term)
+        self._on_advise(term, 'Output is being suppressed: a program emitted an '
+                        'over-long or unterminated escape sequence, so the safe CLI '
+                        'mode is discarding it (nothing after it can be shown until '
+                        'it ends). The program may be misbehaving -- open a new tab '
+                        'if this persists.', 'escape')
 
     def _on_unreviewed_risk(self):
         """Risky text crossed the boundary with review off: light the red review
@@ -993,6 +1059,7 @@ class MainWindow(QMainWindow):
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
+        term.apply_escape_limit(self._escape_limit)
         term.apply_paste_warn(self._paste_warn)
         term.apply_copy_warn(self._copy_warn)
         term.apply_bell(self._default_bell)
@@ -1038,6 +1105,7 @@ class MainWindow(QMainWindow):
         term.apply_markings(self._default_markings)
         term.apply_scrollback(self._scrollback)
         term.apply_paste_delay(self._paste_delay)
+        term.apply_escape_limit(self._escape_limit)
         term.apply_paste_warn(self._paste_warn)
         term.apply_copy_warn(self._copy_warn)
         bell = self._default_bell
@@ -1054,6 +1122,10 @@ class MainWindow(QMainWindow):
                 term.apply_osc(feat, True)
         self._enforce_tui_autobox(term, notify=False)   # box Reveal/Detail in a TUI tab
         self._add_tab(term)
+        # Carry the launch command ON the term (not a side dict) so it dies with the
+        # tab automatically -- no cleanup path to keep in sync. Read by --if-absent
+        # dedup in _ipc_open.
+        term.launch_command = self._normalize_command(spec.get('command'))
         if spec.get('title'):
             self._user_titles[term] = spec['title']
             self._refresh_tab_label(term)
@@ -1158,8 +1230,12 @@ class MainWindow(QMainWindow):
         to a terminal, or None. The first title match wins."""
         if not isinstance(match, str):
             return None
-        kind, _, value = match.partition(':')
-        if not value:
+        kind, sep, value = match.partition(':')
+        # Only 'id:' / 'title:' are matcher prefixes; anything else (including a
+        # bare title that itself contains a colon, e.g. 'prod:server' or a
+        # 'host:port') is a bare title, matched whole. An explicit 'title:' prefix
+        # still forces title mode for a title that starts with 'id:'.
+        if not sep or kind not in ('id', 'title'):
             kind, value = 'title', match
         for term, tid in self._tab_ids.items():
             index = self.tabs.indexOf(term)
@@ -1222,22 +1298,64 @@ class MainWindow(QMainWindow):
             return {'ok': True}
         return {'ok': False, 'error': 'unknown ctl op: %r' % (op,)}
 
+    @staticmethod
+    def _normalize_command(command):
+        """Canonical, comparable form of a launch command for --if-absent dedup: a
+        -e STRING and its shell-split argv compare equal. None (a plain shell tab)
+        is never a dedup key -- two shells are distinct tabs."""
+        if isinstance(command, str):
+            try:
+                return tuple(shlex.split(command))
+            except ValueError:
+                return (command,)
+        if isinstance(command, (list, tuple)):
+            # str() each element (as the terminal.py exec path does) so the key is
+            # ALWAYS hashable -- an IPC command list may carry a non-str/unhashable
+            # element, and a raw tuple of it would crash the set op in _ipc_open.
+            return tuple(str(part) for part in command)
+        return None
+
+    def _live_commands(self):
+        """Normalized launch commands of the window's current tabs (skips None)."""
+        keys = set()
+        for term in self._tab_ids:
+            if self.tabs.indexOf(term) < 0:
+                continue                    # a stale key not in the bar
+            key = getattr(term, 'launch_command', None)
+            if key is not None:
+                keys.add(key)
+        return keys
+
     def _ipc_open(self, request):
         # Only a --reuse handoff reaches here (an 'open' request). --reuse always
         # asks for a new tab, so a bare reuse (no tab specs) opens a fresh default
         # tab -- 1 tab becomes 2 -- rather than only raising the existing window.
+        # With if_absent, a spec whose command already runs in a tab is skipped, so
+        # a repeated batch is idempotent (this is what claude-rc-session open-all
+        # relies on): opened==0 with skipped>0 must NOT fall through to new_tab().
         tabs = request.get('tabs')
-        opened = 0
+        if_absent = bool(request.get('if_absent'))
+        present = self._live_commands() if if_absent else set()
+        opened = skipped = 0
         for spec in (tabs if isinstance(tabs, list) else []):
-            if isinstance(spec, dict):
-                self._open_launch_tab(_sanitize_tab_spec(spec))
-                opened += 1
-        if opened == 0:
+            if not isinstance(spec, dict):
+                continue
+            spec = _sanitize_tab_spec(spec)
+            if if_absent:
+                key = self._normalize_command(spec.get('command'))
+                if key is not None and key in present:
+                    skipped += 1
+                    continue
+                if key is not None:
+                    present.add(key)        # also dedup within this one batch
+            self._open_launch_tab(spec)
+            opened += 1
+        if opened == 0 and skipped == 0:
             self.new_tab()                  # a bare reuse: give the user a new tab
         self.show()
         self.raise_()
         self.activateWindow()
-        return {'ok': True, 'opened': opened}
+        return {'ok': True, 'opened': opened, 'skipped': skipped}
 
     def _add_placeholder_tab(self, info, at):
         """Insert a lightweight placeholder page for a not-yet-restored session tab,
@@ -1252,7 +1370,11 @@ class MainWindow(QMainWindow):
         # label does not visibly change when the real shell swaps in.
         name = info.get('name')
         cwd = info.get('cwd')
-        if name:
+        # isinstance, not a bare truth test: a crafted/hand-edited session with a
+        # non-string name (a JSON array/object/number) would else become the tab
+        # label and crash insertTab at startup -- an unrecoverable restore crash.
+        # (matches the guard _restore_tab already applies to the real tab.)
+        if isinstance(name, str) and name:
             label = name
         elif isinstance(cwd, str) and cwd:
             label = '~' if cwd == os.path.expanduser('~') \
@@ -1363,6 +1485,7 @@ class MainWindow(QMainWindow):
             scrollback = self._scrollback
         term.apply_scrollback(_locked('scrollback', scrollback, self._scrollback))
         term.apply_paste_delay(self._paste_delay)
+        term.apply_escape_limit(self._escape_limit)
         term.apply_paste_warn(self._paste_warn)
         term.apply_copy_warn(self._copy_warn)
         # restore the full per-feature OSC map when present; fall back to the legacy
@@ -1447,6 +1570,7 @@ class MainWindow(QMainWindow):
         self._advisories.pop(term, None)
         self._pre_tui_mode.pop(term, None)   # else a closed auto-boxed tab lingers
         self._osc_notified = {p for p in self._osc_notified if p[0] is not term}
+        self._esc_notified.discard(term)
         self._tab_ids.pop(term, None)
         self.tabs.removeTab(index)
         term.deleteLater()
@@ -2302,7 +2426,11 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def set_allow_title(self, enabled):
-        if 'allow_title' in self._locked:
+        # allow_title is the LEGACY combined control for osc_title + osc_notify, so a
+        # lock on EITHER granular key (or on allow_title itself) must refuse it -- else
+        # this control bypasses a granular osc_title/osc_notify lock (set_osc guards
+        # both directions; this is the reverse gap).
+        if self._locked & {'allow_title', 'osc_title', 'osc_notify'}:
             return                        # admin-locked; not user-changeable
         term = self.current()
         if term is not None:
@@ -2489,8 +2617,12 @@ class MainWindow(QMainWindow):
         if not self._persist_session:
             return
         blob = session.load_window()
-        if blob:
-            self.restoreGeometry(QByteArray.fromBase64(blob.encode('ascii')))
+        if isinstance(blob, str) and blob:
+            # base64 is ASCII; a non-str or non-ASCII blob in a corrupt / hand-edited
+            # session would crash .encode('ascii') and abort startup. Coerce with
+            # 'ignore' -- a mangled blob then yields invalid base64, a harmless no-op
+            # restore (keeps the default geometry), never an exception.
+            self.restoreGeometry(QByteArray.fromBase64(blob.encode('ascii', 'ignore')))
 
     def _connect_bell_tray(self, term):
         term.bell_tray.connect(lambda label: self._on_bell_tray(term, label))
@@ -2593,6 +2725,10 @@ class MainWindow(QMainWindow):
         warn_act.setChecked(self._clip_warn_any)
         warn_act.setToolTip('Off: warn only on hidden/deceptive characters. '
                             'On: warn on any non-ASCII (accents, CJK, emoji) too.')
+        # this ephemeral tray action is rebuilt each menu open, so it is gated HERE
+        # rather than in _apply_locks: a locked clip_warn_any must be un-clickable from
+        # the tray too, not only refused by set_clip_warn_any (the #6 bypass gap).
+        warn_act.setEnabled('clip_warn_any' not in self._locked)
         warn_act.toggled.connect(self.set_clip_warn_any)
         menu.addAction('Review clipboard now').triggered.connect(self._clip_review_now)
         menu.addSeparator()
@@ -2614,6 +2750,8 @@ class MainWindow(QMainWindow):
             clipboard_watch.stop_running()
 
     def set_clip_warn_any(self, on):
+        if 'clip_warn_any' in self._locked:
+            return                        # admin-locked; not user-changeable
         self._clip_warn_any = bool(on)
         ## clip_warn_any is shared with the clipboard-watch daemon; persist it with a
         ## single-key write (not the bulk _persist) so the two processes do not
@@ -2746,6 +2884,14 @@ class MainWindow(QMainWindow):
         self._sync_paste_delay_menu()
         self._persist()
 
+    def set_escape_limit(self, limit):
+        if 'escape_limit' in self._locked:
+            return                        # admin-locked; not user-changeable
+        self._escape_limit = max(0, int(limit))
+        for t in self._real_terms():
+            t.apply_escape_limit(self._escape_limit)
+        self._persist()
+
     def _sync_paste_delay_menu(self):
         """Reflect the current paste delay in the View -> Paste delay check-marks.
         The menu is built once, so a change via the settings dialog (or a custom
@@ -2870,6 +3016,10 @@ class MainWindow(QMainWindow):
         if 'allow_title' in self._locked:
             gated += [('allow_title', [self._osc_actions[k]])
                       for k in ('osc_title', 'osc_notify') if k in self._osc_actions]
+        # the REVERSE: a granular osc_title/osc_notify lock greys the legacy combined
+        # "Allow title" control, which set_allow_title now refuses -- so it must not sit
+        # clickable-but-inert (the #3 bypass gap).
+        gated += [('osc_title', [self.act_title]), ('osc_notify', [self.act_title])]
         for key, actions in gated:
             if key in self._locked:
                 for act in actions:
@@ -2918,6 +3068,7 @@ class MainWindow(QMainWindow):
         ('tui_autobox_notice', 'tui_autobox_notice', '_tui_autobox_notice'),
         ('scrollback', 'scrollback', '_scrollback'),
         ('paste_delay', 'paste_delay', '_paste_delay'),
+        ('escape_limit', 'escape_limit', '_escape_limit'),
         ('paste_warn', 'paste_warn', '_paste_warn'),
         ('copy_warn', 'copy_warn', '_copy_warn'),
     )
@@ -2941,6 +3092,7 @@ class MainWindow(QMainWindow):
             'auto_tab_colors': 'true' if self._auto_tab_colors else 'false',
             'scrollback': str(self._scrollback),
             'paste_delay': str(self._paste_delay),
+            'escape_limit': str(self._escape_limit),
             'paste_warn': self._paste_warn,
             'copy_warn': self._copy_warn,
             'tui': 'true' if self._default_tui else 'false',
@@ -3729,6 +3881,7 @@ class MainWindow(QMainWindow):
         '  /zoom <25-400>\n'
         '  /scrollback <lines, 0 = unlimited>\n'
         '  /paste-delay <seconds>\n'
+        '  /escape-limit <chars suppressed before a notice, 0 = never>\n'
         '  /help')
 
     def show_command_palette(self):
@@ -3766,6 +3919,8 @@ class MainWindow(QMainWindow):
             self.set_scrollback(int(arg))
         elif cmd == 'paste-delay' and arg.isdigit():
             self.set_paste_delay(int(arg))
+        elif cmd == 'escape-limit' and arg.isdigit():
+            self.set_escape_limit(int(arg))
         else:
             self.statusBar().showMessage(
                 'Unknown or invalid command: ' + line.strip() + '  (try /help)',
@@ -3950,6 +4105,24 @@ class MainWindow(QMainWindow):
                  'How long a pasted multi-line block is held for review before it '
                  'can run, so a hidden command cannot execute the instant you paste.')
 
+        esc_limit = QComboBox()
+        for label, nbytes in ESCAPE_LIMIT_CHOICES:
+            esc_limit.addItem(label, nbytes)
+        eidx = esc_limit.findData(self._escape_limit)
+        if eidx < 0:
+            # a custom config value (escape_limit allows any 0+) is not a preset;
+            # add it so the combo shows the real current value, not a blank.
+            esc_limit.addItem('After %d characters' % self._escape_limit,
+                              self._escape_limit)
+            eidx = esc_limit.count() - 1
+        esc_limit.setCurrentIndex(eidx)
+        _tip_row(session_box, 'Suppressed-output notice', esc_limit,
+                 'An unterminated or over-long escape sequence makes the safe CLI '
+                 'mode discard output (nothing after it shows until it ends) -- safe, '
+                 'but it looks like a freeze. After this many characters are '
+                 'suppressed, a one-time notice explains it. The output stays '
+                 'suppressed either way; Never hides the notice.')
+
         _WARN_CHOICES = (('Always review', 'always'),
                          ('Only unicode / control', 'unicode'),
                          ('Never review', 'never'))
@@ -4016,7 +4189,7 @@ class MainWindow(QMainWindow):
         # scrollable empty space below a short list -- most visibly the Font list,
         # which rarely has as many monospaced faces as the default cap.
         for _combo in (theme, font_family, scrollback, mode,
-                       paste_warn, copy_warn, pdelay):
+                       paste_warn, copy_warn, pdelay, esc_limit):
             _combo.setMaxVisibleItems(max(1, min(_combo.count(), 15)))
 
         # Every lockable control disables itself when its key is admin-locked: a
@@ -4031,7 +4204,8 @@ class MainWindow(QMainWindow):
             (scrollback, 'scrollback'), (mode, 'unicode_mode'),
             (colors, 'colors'), (line_edits, 'line_edits'), (tui, 'tui'),
             (tui_autobox_notice, 'tui_autobox_notice'), (osc, 'osc_notice'),
-            (pdelay, 'paste_delay'), (paste_warn, 'paste_warn'),
+            (pdelay, 'paste_delay'), (esc_limit, 'escape_limit'),
+            (paste_warn, 'paste_warn'),
             (copy_warn, 'copy_warn'), (persist, 'persist_session'),
             (systray, 'systray'), (auto_tab_colors, 'auto_tab_colors'),
             (clip_warn_any, 'clip_warn_any'),
@@ -4083,6 +4257,7 @@ class MainWindow(QMainWindow):
             'osc_notice': osc.isChecked(),
             'tui_autobox_notice': tui_autobox_notice.isChecked(),
             'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
+            'escape_limit': esc_limit.currentData(),
             'paste_warn': paste_warn.currentData(), 'copy_warn': copy_warn.currentData(),
             'persist': persist.isChecked(),
             'systray': systray.isChecked(),
@@ -4140,6 +4315,7 @@ class MainWindow(QMainWindow):
                 term.apply_osc(key, value)
             term.apply_scrollback(opts['scrollback'])
             term.apply_paste_delay(opts['paste_delay'])
+            term.apply_escape_limit(opts['escape_limit'])
             term.apply_paste_warn(self._paste_warn)
             term.apply_copy_warn(self._copy_warn)
             # NB: bell is intentionally NOT applied here. This global-settings
@@ -4640,6 +4816,7 @@ class _Launch:
         self.wm_name = None        # --name   -> WM_CLASS instance (X11)
         self.new_instance = False  # --new-instance -> standalone, never the primary
         self.reuse = False         # --reuse -> hand off to the group's primary
+        self.if_absent = False     # --if-absent -> dedup tabs by command on reuse
         self.instance_group = 'default'   # --instance-group NAME
         self.qt_args = []          # unrecognized args, handed to Qt
         self.tabs = []             # [{title, tui, mode, command}]
@@ -4680,6 +4857,9 @@ def _launch_parser(with_globals):
                                    'default new window, but it never becomes the group '
                                    'primary and answers no ctl/--reuse')
         p.set_defaults(reuse=False)
+        p.add_argument('--if-absent', dest='if_absent', action='store_true',
+                       help='with --reuse: skip any tab whose command already runs '
+                            'in a tab of the target window (idempotent open)')
         p.add_argument('--instance-group', dest='instance_group',
                        metavar='NAME', default='default',
                        help='the instance group whose primary --reuse and ctl target '
@@ -4756,6 +4936,7 @@ def _parse_launch_args(argv):
             launch.wm_name = namespace.wm_name
             launch.new_instance = namespace.new_instance
             launch.reuse = namespace.reuse
+            launch.if_absent = namespace.if_absent
             launch.instance_group = namespace.instance_group
         else:
             namespace = parser.parse_args(group)
@@ -4785,7 +4966,8 @@ def _parse_launch_args(argv):
 
 def _launch_to_request(launch):
     """Serialize a launch spec into an IPC 'open' request for a running instance."""
-    return {'op': 'open', 'wm_class': launch.wm_class, 'tabs': launch.tabs}
+    return {'op': 'open', 'wm_class': launch.wm_class, 'tabs': launch.tabs,
+            'if_absent': launch.if_absent}
 
 
 def _sanitize_tab_spec(spec):
