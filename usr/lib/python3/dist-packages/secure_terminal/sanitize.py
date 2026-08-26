@@ -648,6 +648,29 @@ def _combining_count(ch):
     return sum(1 for c in ch if ord(c) >= 0x0300 and _is_mark(c))
 
 
+def cap_zalgo_show(text, carry=0):
+    """Cap each run of combining marks in SHOW-mode CLI output at _ZALGO_MARK_MAX, dropping
+    the excess so a Zalgo flood ('a' + thousands of U+0301) cannot reach the real terminal
+    via `cli --mode show`. render_output must stay a per-CHARACTER homomorphism (the T1
+    proof), so this RUN-level cap lives at the CLI boundary rather than inside render_output.
+    `carry` is the count of marks already emitted at the tail of the previous chunk, so a run
+    split across reads stays bounded; returns (capped_text, trailing_marks) to thread on.
+    Legit decomposed text (<= the cap marks per base) is returned byte-for-byte unchanged."""
+    out = []
+    run = carry
+    for ch in text:
+        if ord(ch) >= 0x0300 and _is_mark(ch):
+            if run < _ZALGO_MARK_MAX:
+                run += 1
+                out.append(ch)
+            # else: run is at the cap -> drop the excess mark (the Zalgo fringe), and the
+            # count stays put so the carry across chunks stays bounded
+        else:
+            run = 0
+            out.append(ch)
+    return ''.join(out), run
+
+
 def _collapse_zalgo_runs(cellline):
     """Merge a base cell plus a run of MORE than _ZALGO_MARK_MAX combining-mark cells into ONE
     multi-cp cell, so the SHOW-mode line renderer boxes it (its risk band then fills the whole
