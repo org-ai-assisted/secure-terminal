@@ -2219,14 +2219,16 @@ class SecureTerminal(QPlainTextEdit):
         Qt.MouseButton.RightButton: 2,
     }
 
-    # Discard the WHOLE typed line regardless of cursor position: the End KEY
-    # (ESC [ F) then Ctrl+U (kill-to-start). A bare Ctrl+U kills only cursor-to-start
-    # in bash, so a mid-line Enter that the hook then discards would leave the tail to
-    # run unjudged. Moving to end first kills everything -- and it must be the End KEY,
-    # not Ctrl+E: in bash/zsh VI-INSERT mode Ctrl+E is self-insert (it would type a ^E
-    # and leave the command), whereas the End key stays bound to end-of-line in both
-    # emacs and vi editing modes.
-    _DISCARD_LINE = b'\x1b[F\x15'
+    # Discard the WHOLE typed line the hook rejected, regardless of cursor position or
+    # shell editing mode. Ctrl+C (SIGINT to the foreground pgrp), NOT a kill-line key
+    # sequence: any End/Ctrl+E/Ctrl+U combination depends on the shell's keymap and
+    # SILENTLY LEAVES the command in some of them (bash vi-insert needed End-then-U;
+    # zsh vi-insert has ESC[F unbound and left the line; xterm's End is ESC O F, not
+    # ESC [ F). The hook only fires at a bare prompt (no foreground child), so SIGINT
+    # there just cancels the line editor and gives a fresh prompt in EVERY shell and
+    # editing mode -- the one line-cancel that does not depend on a key binding. It
+    # prints a visible ^C, which honestly signals the command was cancelled.
+    _DISCARD_LINE = b'\x03'
 
     def _mouse_report_on(self):
         """True when the child has enabled mouse tracking WITH SGR encoding, so its

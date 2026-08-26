@@ -380,6 +380,13 @@ class ClipboardWatchApp:
             QTimer.singleShot(0, self._app.quit)
             return {'ok': True}
         if op == 'set-warn-any':
+            # honour an admin lock over IPC too: clip_warn_any is an admin POLICY the
+            # user must not override through ANY path. The main window already refuses
+            # a locked change before it push_warn_any's here, but a direct same-UID
+            # set-warn-any request must be refused as well (the tray + main-window
+            # guards' sibling), or the lock is enforced only at the UI, not the daemon.
+            if 'clip_warn_any' in settings.load().locked:
+                return {'ok': False, 'error': 'clip_warn_any is admin-locked'}
             self._watcher.set_any_mode(bool(request.get('value')))
             return {'ok': True}
         return {'ok': False, 'error': 'unknown op: %r' % (op,)}
