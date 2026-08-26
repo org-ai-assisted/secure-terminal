@@ -3001,28 +3001,27 @@ class SecureTerminal(QPlainTextEdit):
     CLIP_DENY_ALWAYS = 'deny_always'
 
     def grant_clipboard_read(self, decision):
-        """Record the user's clipboard-read decision from the dialog. Four choices:
-        allow/deny, each ONCE (this request only, re-ask next time) or ALWAYS
-        (remembered for the tab's life). A bool is accepted for compatibility
-        (True -> allow-always, False -> deny-always). When the answer allows, reply
-        to the query that opened the dialog now -- it was consumed when the prompt
-        went up, so a one-shot client would otherwise wait forever."""
-        if decision is True:
-            decision = self.CLIP_ALLOW_ALWAYS
-        elif decision is False:
-            decision = self.CLIP_DENY_ALWAYS
-        was_pending = self._clipboard_read == 'pending'
+        """Record the user's clipboard-read decision from the dialog -- one of the four
+        CLIP_* choices: allow/deny, each ONCE (this request only, re-ask next time) or
+        ALWAYS (remembered for the tab's life). When the answer allows, reply to the
+        query that opened the dialog now -- it was consumed when the prompt went up, so a
+        one-shot client would otherwise wait forever."""
+        if self._clipboard_read != 'pending':
+            # Stale dialog: its request was abandoned (osc_clipboard_read toggled off, or it
+            # was already resolved), so a late click must NOT establish a tab decision -- a
+            # disable + re-enable + stale allow-always would otherwise grant the tab and let
+            # the next read reply with no fresh prompt. Drop it; the next read re-asks.
+            return
         allow = decision in (self.CLIP_ALLOW_ONCE, self.CLIP_ALLOW_ALWAYS)
         remember = decision in (self.CLIP_ALLOW_ALWAYS, self.CLIP_DENY_ALWAYS)
         # remember -> persist the tab decision; once -> reset to None so the next
         # request asks again.
         self._clipboard_read = allow if remember else None
-        # Re-check the feature flag: osc_clipboard_read can be disabled WHILE this
-        # consent dialog is open (TOCTOU). The in-flight READ query must not be
-        # answered once the feature is off, or an allow click would exfiltrate the
-        # clipboard the disable was meant to stop. A recorded allow still stands for a
-        # later re-enable; only the stale reply is withheld.
-        if allow and was_pending and self._osc.get('osc_clipboard_read'):
+        # Re-check the feature flag: osc_clipboard_read can be disabled WHILE this consent
+        # dialog is open (TOCTOU). The in-flight READ query must not be answered once the
+        # feature is off, or an allow click would exfiltrate the clipboard the disable was
+        # meant to stop. A recorded allow still stands for a later re-enable.
+        if allow and self._osc.get('osc_clipboard_read'):
             self._reply_clipboard()
 
     def set_clipboard_read_always(self, on):

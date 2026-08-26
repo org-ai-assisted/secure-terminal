@@ -1300,7 +1300,9 @@ class MainWindow(QMainWindow):
                 # it is exactly what is on screen), for drive-and-assert E2E tests.
                 text = term.toPlainText()
                 lines = request.get('lines')
-                if isinstance(lines, int) and lines >= 0:
+                # not a bool: bool is an int subclass, so a request with lines=true would
+                # else slice as lines=1 instead of being ignored.
+                if isinstance(lines, int) and not isinstance(lines, bool) and lines >= 0:
                     # Slice by an explicit START index: parts[-lines:] is the WHOLE list for
                     # lines==0 (negative-zero slice), which would dump everything instead of the
                     # zero asked for. Clamp the start at 0 so lines > available returns ALL lines
@@ -1408,9 +1410,12 @@ class MainWindow(QMainWindow):
         # isinstance, not a bare truth test: a crafted/hand-edited session with a
         # non-string name (a JSON array/object/number) would else become the tab
         # label and crash insertTab at startup -- an unrecoverable restore crash.
-        # (matches the guard _restore_tab already applies to the real tab.)
-        if isinstance(name, str) and name:
-            label = name
+        # sanitize_title too (empty -> fall through): the placeholder shows this label
+        # in the tab bar BEFORE the real tab swaps in, so a crafted session name must not
+        # flash control/bidi/homoglyph there either.
+        safe_name = sanitize_title(name) if isinstance(name, str) else ''
+        if safe_name:
+            label = safe_name
         elif isinstance(cwd, str) and cwd:
             label = '~' if cwd == os.path.expanduser('~') \
                 else (os.path.basename(cwd.rstrip('/')) or '/')
