@@ -848,7 +848,7 @@ class SecureTerminal(QPlainTextEdit):
         self._mouse_modes = set()
         self._mouse_scan_carry = ''   # incomplete escape carried across a read split
         self._wheel_accum_x = 0       # horizontal wheel delta (vertical: _wheel_accum)
-        self._mouse_report_btn = None  # Qt button whose reported press awaits release
+        self._mouse_report_btns = set()  # Qt buttons whose reported press awaits release
         self._mouse_report_cell = None  # last cell reported for motion (coalesce 1003)
         # True while the grid view is rendering the alternate screen ALONE (grid
         # only, no scrollback above it). Lets _render_tui clear the carried-in
@@ -2261,6 +2261,14 @@ class SecureTerminal(QPlainTextEdit):
         code = self._button_code(base, event.modifiers(), motion)
         self._write(sgr_mouse_report(code, col, row, pressed).encode('ascii'))
 
+    def _mouse_reporting(self):
+        """True when a press/motion/wheel must be REPORTED to the child: tracking +
+        SGR are on AND no paste/copy review is up. Input to the child is suspended
+        during a review (as keyPressEvent refuses keys), so the report paths -- which
+        also TRACK the pressed button -- must not fire, or a press reported (or a
+        button tracked) mid-review leaves the child an unmatched event."""
+        return self._mouse_report_on() and not self._review_active
+
     def wheelEvent(self, event):
         mods = event.modifiers()
         if mods & Qt.KeyboardModifier.ControlModifier:
@@ -2283,7 +2291,7 @@ class SecureTerminal(QPlainTextEdit):
         # on EACH would fire per micro-event (uncontrollable hyperscroll).
         self._wheel_accum += event.angleDelta().y()
         self._wheel_accum_x += event.angleDelta().x()
-        if self._mouse_report_on():
+        if self._mouse_reporting():
             # Report the wheel as a real SGR wheel event at the cell under the pointer
             # (konsole/xterm): 64 up / 65 down, 66 left / 67 right. One event per notch
             # so the program scrolls line-by-line at its own granularity.
@@ -2305,8 +2313,11 @@ class SecureTerminal(QPlainTextEdit):
             lines = int(self._wheel_accum / 40)
             if lines:
                 self._wheel_accum -= lines * 40
-                seq = b'\x1b[A' if lines > 0 else b'\x1b[B'
-                self._write(seq * min(abs(lines), 8))    # cap a single huge jump
+                # input suspended during a paste/copy review (as in _report_mouse):
+                # drain the accumulator but do not write the arrow surrogate.
+                if not self._review_active:
+                    seq = b'\x1b[A' if lines > 0 else b'\x1b[B'
+                    self._write(seq * min(abs(lines), 8))    # cap a single huge jump
             event.accept()
             return
         super().wheelEvent(event)
@@ -4039,11 +4050,11 @@ class SecureTerminal(QPlainTextEdit):
         # When the child grabs the mouse, a double-click is REPORTED as another press
         # (its release follows via mouseReleaseEvent), not used for a local word-select
         # or the character popup; Shift is the local override.
-        if self._mouse_report_on() and not self._shift(event):
+        if self._mouse_reporting() and not self._shift(event):
             base = self._SGR_BUTTON.get(event.button())
             if base is not None:
                 self._report_mouse(base, event, pressed=True)
-                self._mouse_report_btn = event.button()
+                self._mouse_report_btns.add(event.button())
                 event.accept()
                 return
         # Double-clicking a neutralized/revealed character opens an ACTIVE popup
@@ -4126,11 +4137,11 @@ class SecureTerminal(QPlainTextEdit):
     def mousePressEvent(self, event):
         # When the child grabs the mouse (tracking + SGR), a plain press is REPORTED
         # to it rather than starting a local selection; Shift is the local override.
-        if self._mouse_report_on() and not self._shift(event):
+        if self._mouse_reporting() and not self._shift(event):
             base = self._SGR_BUTTON.get(event.button())
             if base is not None:
                 self._report_mouse(base, event, pressed=True)
-                self._mouse_report_btn = event.button()
+                self._mouse_report_btns.add(event.button())
                 event.accept()
                 return
         # Mark a drag-selection in progress so _render_tui freezes the grid rebuild while
@@ -4140,13 +4151,18 @@ class SecureTerminal(QPlainTextEdit):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
-        # Balance a reported press with its release (report it even if Shift toggled
-        # mid-drag, so the child never sees an unmatched press).
-        if self._mouse_report_btn is not None:
-            base = self._SGR_BUTTON.get(self._mouse_report_btn, 0)
+        # Balance EACH reported press with the release of THAT button (report it even if
+        # Shift toggled mid-drag, so the child never sees an unmatched press). A set,
+        # not one button: a left+right chord reports two presses, so each release must
+        # match its own button -- tracking a single button left the first one logically
+        # stuck in the child (no protocol release).
+        btn = event.button()
+        if btn in self._mouse_report_btns:
+            base = self._SGR_BUTTON.get(btn, 0)
             self._report_mouse(base, event, pressed=False)
-            self._mouse_report_btn = None
-            self._mouse_report_cell = None
+            self._mouse_report_btns.discard(btn)
+            if not self._mouse_report_btns:
+                self._mouse_report_cell = None
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -4169,7 +4185,7 @@ class SecureTerminal(QPlainTextEdit):
         # Report motion to a child that asked: a drag (button held) under 1002/1003,
         # or button-less motion under 1003. Coalesce to one report per CELL so any-
         # motion (1003) does not flood. Shift keeps motion local (text selection).
-        if self._mouse_report_on() and not self._shift(event):
+        if self._mouse_reporting() and not self._shift(event):
             buttons = event.buttons()
             held = buttons != Qt.MouseButton.NoButton
             report = ((held and (_MOUSE_DRAG_MODE in self._mouse_modes
@@ -4193,12 +4209,14 @@ class SecureTerminal(QPlainTextEdit):
         super().mouseMoveEvent(event)
 
     def focusInEvent(self, event):
-        if _MOUSE_FOCUS_MODE in self._mouse_modes:
+        # not while a paste/copy review is up: input to the child is suspended (as in
+        # _report_mouse / keyPressEvent), so a focus report must not leak either.
+        if _MOUSE_FOCUS_MODE in self._mouse_modes and not self._review_active:
             self._write(b'\x1b[I')          # DEC 1004 focus-in report
         super().focusInEvent(event)
 
     def focusOutEvent(self, event):
-        if _MOUSE_FOCUS_MODE in self._mouse_modes:
+        if _MOUSE_FOCUS_MODE in self._mouse_modes and not self._review_active:
             self._write(b'\x1b[O')          # DEC 1004 focus-out report
         super().focusOutEvent(event)
 

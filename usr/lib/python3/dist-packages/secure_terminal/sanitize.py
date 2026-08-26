@@ -463,7 +463,9 @@ _MOUSE_FOCUS_MODE = 1004                               # focus in/out reports
 _MOUSE_SGR_MODE = 1006                                 # SGR (1006) report encoding
 _MOUSE_MODES_TRACKED = (_MOUSE_BUTTON_MODES
                         | frozenset((_MOUSE_FOCUS_MODE, _MOUSE_SGR_MODE)))
-_DECSET_RE = re.compile(r'\x1b\[\?([0-9;]+)([hl])')
+# DECSET/DECRST (group 1 = params, group 2 = h|l), OR a full reset -- RIS (ESC c)
+# or DECSTR (ESC [ ! p) -- which has no params group and clears all tracked modes.
+_MOUSE_SCAN_RE = re.compile(r'\x1b\[\?([0-9;]+)([hl])|\x1bc|\x1b\[!p')
 
 
 def scan_mouse_modes(text, modes):
@@ -473,21 +475,30 @@ def scan_mouse_modes(text, modes):
     only standalone ones; the caller carries any escape split across a read()
     boundary (split_trailing_escape), so a divided sequence is not lost. A partial
     reset (clearing 1002 while 1000 stays) leaves each mode independently tracked --
-    matching how a real terminal routes the mouse."""
+    matching how a real terminal routes the mouse.
+
+    A FULL reset -- RIS (ESC c) or DECSTR (ESC [ ! p) -- clears every tracked mode, so
+    running `reset` (or a program's soft reset) disables mouse tracking that untrusted
+    output turned on: the usual recovery. Transitions are folded in ORDER, so a reset
+    followed by a re-enable in the same text leaves only the re-enabled modes."""
     modes = set(modes)
-    for params, hl in _DECSET_RE.findall(text):
-        on = hl == 'h'
-        # The regex body is [0-9;]+, so each split field is all-digits or empty (a
+    for m in _MOUSE_SCAN_RE.finditer(text):
+        params = m.group(1)
+        if params is None:
+            modes.clear()               # RIS / DECSTR: full reset disables tracking
+            continue
+        on = m.group(2) == 'h'
+        # The params body is [0-9;]+, so each split field is all-digits or empty (a
         # stray/leading/trailing ';'). Parse via _safe_int, NOT int(): a hostile
         # 4300+-digit parameter would else raise ValueError and crash the read loop
         # (Python's int-string limit). An out-of-range/empty field maps to 0, which
         # is never a mode we track, so it is harmlessly ignored.
         nums = {_safe_int(p) for p in params.split(';') if p}
-        for m in nums & _MOUSE_MODES_TRACKED:
+        for mode in nums & _MOUSE_MODES_TRACKED:
             if on:
-                modes.add(m)
+                modes.add(mode)
             else:
-                modes.discard(m)
+                modes.discard(mode)
     return modes
 
 
