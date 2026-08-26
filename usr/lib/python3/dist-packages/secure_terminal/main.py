@@ -238,6 +238,12 @@ def _toggle_icon(theme_name, letter, color):
     return _letter_icon(letter, color)
 
 
+# Upper bound for command_hook_timeout (seconds). No legitimate per-command hook
+# needs longer than an hour, and a huge value (e.g. 2**63) overflows subprocess's C
+# PyTime_t with an uncaught OverflowError -- so anything above this is clamped away.
+_HOOK_TIMEOUT_MAX = 3600
+
+
 def _read_hook_config(cfg):
     """Build the opt-in command-hook config from a settings drop-in, or None when
     no handler is configured. Keys: command_hook (the handler command line, empty
@@ -256,18 +262,28 @@ def _read_hook_config(cfg):
         timeout = int(cfg.get('command_hook_timeout') or 10)
     except ValueError:
         timeout = 10
-    if timeout <= 0:
-        # A non-positive timeout makes subprocess.run raise TimeoutExpired INSTANTLY,
-        # before the handler can answer -- with on_error=allow (the default) that fails
-        # OPEN, auto-approving every command while the UI still shows the hook enabled.
-        # Reject it (the setting is a positive number of seconds).
+    if not 0 < timeout <= _HOOK_TIMEOUT_MAX:
+        # Out of range -> the default. A NON-POSITIVE timeout makes subprocess.run
+        # raise TimeoutExpired INSTANTLY (before the handler answers) and, with
+        # on_error=allow, fails OPEN; an ABSURDLY LARGE one (e.g. 2**63) overflows the
+        # C PyTime_t and raises OverflowError, which the hook error path does not catch.
+        # Either way the enforced hook is defeated, so clamp to a sane positive bound.
         timeout = 10
+    # on_error default: an ADMIN-LOCKED (enforced) hook fails CLOSED -- a gate that
+    # fails open on error is no gate. An opt-in (unlocked) hook keeps the historical
+    # fail-open default. An explicit value always wins. (Locking auto-locks this key,
+    # so a user cannot then downgrade a locked block to allow; and because the default
+    # is now block, an admin who locks the hook without setting on_error still gets
+    # fail-closed rather than the old fail-open.)
+    on_error = cfg.get('command_hook_on_error')
+    if on_error not in ('allow', 'block'):
+        locked = getattr(cfg, 'locked', frozenset())
+        on_error = 'block' if 'command_hook' in locked else 'allow'
     return {
         'argv': argv,
         'transcript': cfg.get('command_hook_transcript') or 'none',
         'timeout': timeout,
-        'on_error': 'block' if cfg.get('command_hook_on_error') == 'block'
-                    else 'allow',
+        'on_error': on_error,
     }
 
 

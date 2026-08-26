@@ -2219,12 +2219,14 @@ class SecureTerminal(QPlainTextEdit):
         Qt.MouseButton.RightButton: 2,
     }
 
-    # Discard the WHOLE typed line regardless of cursor position: Ctrl+E (end-of-line)
-    # then Ctrl+U (kill). A bare Ctrl+U is unix-line-discard in bash -- it kills only
-    # cursor-to-start, so a mid-line Enter that the hook then discards would leave the
-    # tail behind to run unjudged; moving to end first kills everything. (zsh's Ctrl+U
-    # already kills the whole line; the leading Ctrl+E is then a harmless no-op.)
-    _DISCARD_LINE = b'\x05\x15'
+    # Discard the WHOLE typed line regardless of cursor position: the End KEY
+    # (ESC [ F) then Ctrl+U (kill-to-start). A bare Ctrl+U kills only cursor-to-start
+    # in bash, so a mid-line Enter that the hook then discards would leave the tail to
+    # run unjudged. Moving to end first kills everything -- and it must be the End KEY,
+    # not Ctrl+E: in bash/zsh VI-INSERT mode Ctrl+E is self-insert (it would type a ^E
+    # and leave the command), whereas the End key stays bound to end-of-line in both
+    # emacs and vi editing modes.
+    _DISCARD_LINE = b'\x1b[F\x15'
 
     def _mouse_report_on(self):
         """True when the child has enabled mouse tracking WITH SGR encoding, so its
