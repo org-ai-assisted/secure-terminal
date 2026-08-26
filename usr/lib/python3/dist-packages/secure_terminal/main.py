@@ -4667,7 +4667,9 @@ class MainWindow(QMainWindow):
 
     def _set_toolbar_tier(self, tier):
         self._toolbar_tier = tier
-        self._toolbar.setToolButtonStyle(
+        # _toolbar is a QToolBar by the time a tier is applied (pyrefly types it Optional
+        # from its None default in __init__).
+        self._toolbar.setToolButtonStyle(  # pyrefly: ignore[missing-attribute]
             Qt.ToolButtonStyle.ToolButtonTextBesideIcon if tier == 'full'
             else Qt.ToolButtonStyle.ToolButtonIconOnly)
         for label in self._compact_hide:

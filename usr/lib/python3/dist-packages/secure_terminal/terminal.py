@@ -1908,7 +1908,8 @@ class SecureTerminal(QPlainTextEdit):
         offset = 0
         for text, fmt in self._grid_row_runs(row, columns):
             length = len(text) + sum(ord(ch) > 0xFFFF for ch in text)   # UTF-16 units
-            cp = fmt.property(_CP_PROP)
+            # _grid_row_runs always yields a real QTextCharFormat (pyrefly types it Optional).
+            cp = fmt.property(_CP_PROP)  # pyrefly: ignore[missing-attribute]
             runs.append((offset, length, fmt, None if cp is None else int(cp)))
             parts.append(text)
             offset += length

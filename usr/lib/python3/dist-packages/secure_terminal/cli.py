@@ -278,7 +278,9 @@ def _run(argv, mode):
                     eof_nudge = time.monotonic() + _EOF_NUDGE_INTERVAL
                 else:
                     eof_nudge = None
-            if hold and time.monotonic() >= esc_deadline:
+            # esc_deadline is set to a float whenever `hold` is True (above), so the compare
+            # is float-vs-float; pyrefly cannot see that correlation.
+            if hold and time.monotonic() >= esc_deadline:  # pyrefly: ignore[unsupported-operation]
                 # deadline reached (even if the child fd is readable) -> the held prefix got no
                 # paste continuation; forward it verbatim and clear the hold, then service any
                 # readable fd this iteration.
