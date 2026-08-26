@@ -127,15 +127,24 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                 # corrupts the 256/truecolour sequence.
                 passthrough.append(attr)
                 mode = next(it, None)
+                complete = False
                 if mode is not None:
                     passthrough.append(mode)
-                    for _ in range(3 if mode == 2 else 1 if mode == 5 else 0):
+                    need = 3 if mode == 2 else 1 if mode == 5 else 0
+                    got = 0
+                    for _ in range(need):
                         comp = next(it, None)
                         if comp is None:
                             break
                         passthrough.append(comp)
-                if attr == 48:
-                    bright_bg = None       # a 256/truecolour bg overrides an earlier bright-bg
+                        got += 1
+                    complete = need > 0 and got == need
+                if attr == 48 and complete:
+                    # a COMPLETE 256/truecolour bg (48;5;N or 48;2;R;G;B) overrides an earlier
+                    # bright-bg. An INCOMPLETE/malformed 48 (bare, bad mode, or missing
+                    # components) is ignored and must NOT clear a preceding valid bright-bg --
+                    # e.g. `101;48` keeps the bright-red bg.
+                    bright_bg = None
                 continue
             if attr in _BG_AIXTERM_BRIGHT:
                 bright_bg = _BG_AIXTERM_BRIGHT[attr]
