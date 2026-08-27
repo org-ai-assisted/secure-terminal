@@ -728,6 +728,7 @@ class MainWindow(QMainWindow):
         self._advisories = {}        # term -> (kind, banner text); kind tui|osc|autobox
         self._osc_notified = set()   # (term, key) pairs already shown the OSC notice
         self._esc_notified = set()   # terms already shown the escape-suppressed notice
+        self._closing_tabs = set()   # terms mid-close (reentrancy guard across the modal)
         self._syncing = False        # guard: programmatic chip sync vs user click
         # toolbar chip buttons, populated by _build_toolbar; empty here so a
         # _sync during _build_menu (which runs first) is a harmless no-op.
@@ -1600,30 +1601,46 @@ class MainWindow(QMainWindow):
             if self.tabs.count() == 0:
                 self.close()
             return
-        if not self._confirm_running_close(
-                'Close tab?',
-                'A program is still running in this tab. Close it anyway?',
-                [term]):
+        # Reentrancy guard: _confirm_running_close spins a NESTED modal loop, during which
+        # _on_shell_exited (the program exiting, driven by the pty notifier) or a second
+        # tabCloseRequested for THIS term can re-enter close_tab. Both invocations would
+        # then run shutdown()+removeTab()+deleteLater() on the same term, and the second
+        # deleteLater frees an already-freed C++ object -> crash. Skip a term already
+        # mid-close; clear the mark however this exits.
+        if term in self._closing_tabs:
             return
-        # If this tab holds a paste/copy review, hide the bar first -- otherwise it
-        # keeps the about-to-be-destroyed terminal and its buttons would dispatch
-        # onto a deleted C++ object (RuntimeError). F2.
-        if self._review_bar.reviewed_term() is term:
-            self._review_bar.hide_review()
-        term.shutdown()
-        self._user_titles.pop(term, None)
-        self._prog_titles.pop(term, None)
-        self._tab_colors.pop(term, None)
-        self._advisories.pop(term, None)
-        self._pre_tui_mode.pop(term, None)   # else a closed auto-boxed tab lingers
-        self._osc_notified = {p for p in self._osc_notified if p[0] is not term}
-        self._esc_notified.discard(term)
-        self._tab_ids.pop(term, None)
-        self.tabs.removeTab(index)
-        term.deleteLater()
-        self._renumber_tabs()          # numbers shift left after a close
-        if self.tabs.count() == 0:
-            self.close()
+        self._closing_tabs.add(term)
+        try:
+            if not self._confirm_running_close(
+                    'Close tab?',
+                    'A program is still running in this tab. Close it anyway?',
+                    [term]):
+                return
+            # If this tab holds a paste/copy review, hide the bar first -- otherwise it
+            # keeps the about-to-be-destroyed terminal and its buttons would dispatch
+            # onto a deleted C++ object (RuntimeError). F2.
+            if self._review_bar.reviewed_term() is term:
+                self._review_bar.hide_review()
+            term.shutdown()
+            self._user_titles.pop(term, None)
+            self._prog_titles.pop(term, None)
+            self._tab_colors.pop(term, None)
+            self._advisories.pop(term, None)
+            self._pre_tui_mode.pop(term, None)   # else a closed auto-boxed tab lingers
+            self._osc_notified = {p for p in self._osc_notified if p[0] is not term}
+            self._esc_notified.discard(term)
+            self._tab_ids.pop(term, None)
+            # Re-resolve the index: closing ANOTHER tab during the modal shifts indices,
+            # so the `index` captured at entry may now point at a different tab.
+            index = self.tabs.indexOf(term)
+            if index != -1:
+                self.tabs.removeTab(index)
+            term.deleteLater()
+            self._renumber_tabs()          # numbers shift left after a close
+            if self.tabs.count() == 0:
+                self.close()
+        finally:
+            self._closing_tabs.discard(term)
 
     def _on_shell_exited(self, term):
         index = self.tabs.indexOf(term)
