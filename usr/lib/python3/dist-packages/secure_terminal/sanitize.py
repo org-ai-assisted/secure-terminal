@@ -706,6 +706,14 @@ def _cell_display(ch, mode):
     in show mode is the box; every other cell is render_output."""
     if mode == 'show' and _combining_count(ch) > _ZALGO_MARK_MAX:
         return BOX
+    # Fast path: render_output returns 0x20-0x7E and the four line-local control bytes
+    # (BS/TAB/LF/CR) VERBATIM, ahead of any mode branch, so a single such cell is its own display
+    # in every mode. Returning it directly is behaviour-identical and skips the per-cell regex /
+    # loop overhead for the overwhelmingly common case (plain text).
+    if len(ch) == 1:
+        cp = ord(ch)
+        if 0x20 <= cp <= 0x7E or cp in (0x08, 0x09, 0x0A, 0x0D):
+            return ch
     return render_output(ch, mode)
 
 
@@ -735,6 +743,15 @@ def _is_mark(ch):
     (Callers fast-reject ord(ch) < 0x0300 first; no code point below that
     extends -- asserted in the test suite, not assumed.)"""
     return len(_CLUSTER_RE.findall('a' + ch)) == 1
+
+
+# A run of characters the per-byte loop stores verbatim as overwrite cells: everything EXCEPT the
+# bytes it handles specially (BEL/BS/LF/CR/ESC) and the combining / high range (>= U+0300, which is
+# subject to the Zalgo cap + grapheme reshaping). Batching such a run into one slice assignment
+# replaces the per-character store -- the dominant hot path for ordinary output. The stored cells
+# still render through _cell_display / render_output, so sanitization is unchanged; this only
+# changes HOW the logical cell buffer is built, not what each cell is.
+_SAFE_RUN_RE = regex.compile(r'[^\x07\x08\n\r\x1b\u0300-\U0010ffff]+')
 
 
 def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
@@ -769,6 +786,31 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
     state = tuple(sorted(sgr.items()))
     i, n = 0, len(raw)
     while i < n:
+        # Fast path: store a whole run of ordinary characters (see _SAFE_RUN_RE) in one slice
+        # assignment instead of the per-character store below. Equivalent to running the `else`
+        # branch for each char in the run -- same cells, same SGR state, same deferred autowrap --
+        # but O(run) work becomes O(1) Python-level operations. Escapes/CR/BS/LF/BEL and the
+        # combining range fall through to the per-character handling as before.
+        m = _SAFE_RUN_RE.match(raw, i)
+        if m:
+            if max_line and col >= max_line:
+                # deferred autowrap: a filled line wraps before the next char lands
+                completed.append(cells)
+                wraps.append(True)
+                cells, col = [], 0
+            run = m.group(0)
+            if max_line:
+                avail = max_line - col
+                if len(run) > avail:
+                    run = run[:avail]           # the rest is re-matched next iteration -> wraps there
+            new_cells = [(c, state) for c in run]
+            if col == len(cells):
+                cells.extend(new_cells)          # appending at the end of the line
+            else:
+                cells[col:col + len(run)] = new_cells   # overwrite in place (extends if past the end)
+            col += len(run)
+            i += len(run)
+            continue
         ch = raw[i]
         if ch == '\x1b':
             # When line editing is off, do NOT match here: control falls through to
