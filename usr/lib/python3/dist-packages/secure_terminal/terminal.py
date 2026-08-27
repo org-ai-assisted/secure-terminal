@@ -232,11 +232,21 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             super().draw(ch)
 
     def _mark_own_cell(self, ch):
-        """Store a zero-width character in the cell AT the cursor and step past it.
-        Used only when nothing precedes it, so there is no cell to merge into.
-        tui_cell renders any cell whose data is not purely printable as the
+        """Mark a zero-width character in the cell AT the cursor. Reached only at
+        the screen origin, where there is no preceding cell to merge into. If the
+        cell already holds a character (the cursor was repositioned back onto an
+        already-drawn cell), APPEND the invisible to that cell's data so the base
+        character is preserved and merely marked -- NEVER overwritten: only-mark-
+        never-destroy holds even here. An empty cell is occupied outright and the
+        cursor steps past it. tui_cell renders any non-purely-printable cell as the
         placeholder, so the character is marked rather than silently dropped."""
         row = self.buffer[self.cursor.y]
+        existing = row.get(self.cursor.x)
+        if existing is not None:
+            if len(existing.data) <= _TUI_COMBINE_CAP:
+                row[self.cursor.x] = existing._replace(data=existing.data + ch)
+                self.dirty.add(self.cursor.y)
+            return                       # merged (or at the cap): the cell is not re-occupied
         row[self.cursor.x] = self.cursor.attrs._replace(data=ch)
         self.dirty.add(self.cursor.y)
         self.cursor.x = min(self.cursor.x + 1, self.columns)
