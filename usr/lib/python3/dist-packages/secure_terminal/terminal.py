@@ -4696,7 +4696,11 @@ class SecureTerminal(QPlainTextEdit):
                 self._line_buffer = ''
                 self._write(b'\r')
                 continue
-            if self._hook_intercept():
+            # Co-locate the no-foreground guard with the call (formal INV-LEAK): the
+            # 4652 early-return covers today's single-line path, but the gate pins the
+            # guard AT every _hook_intercept site so a future multi-line reach (a prior
+            # submitted line having launched a program) cannot fire the hook mid-batch.
+            if not self.has_foreground_program() and self._hook_intercept():
                 # The hook handled the Enter. An approved 'run' submitted a clean line
                 # (_line_dirty cleared, buffer empty) so we may keep going; a block /
                 # ask left the line dirty because the best-effort erase is UNRELIABLE
