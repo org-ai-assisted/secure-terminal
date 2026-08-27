@@ -1655,6 +1655,15 @@ class MainWindow(QMainWindow):
             self.close_tab(index)
 
     # -- tab label: user name + program title kept separately -----------------
+    def _tab_is_live(self, term):
+        """True if `term` is still one of our tab widgets. A function that holds a term
+        across a MODAL (rename/save dialog) must re-check this after it returns: the
+        tab's shell can exit during the modal, whose _on_shell_exited -> close_tab
+        deleteLater()s the term, and any later method call on that freed C++ object
+        (indexOf, transcript_text, ...) RuntimeErrors. Compares by IDENTITY, which never
+        enters C++, so it is safe to call even on an already-deleted term."""
+        return any(self.tabs.widget(i) is term for i in range(self.tabs.count()))
+
     def rename_tab(self, index):
         if index < 0:
             return
@@ -1663,7 +1672,9 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(
             self, 'Rename Tab', 'Tab name:',
             text=current or self.tabs.tabText(index))
-        if ok:
+        # The tab's shell may have exited during the modal, deleting term; a stale
+        # _refresh_tab_label(term) would indexOf() a freed C++ object and crash.
+        if ok and self._tab_is_live(term):
             # a user name takes precedence over any program-set title, and is
             # not lost when a program later sets its own title.
             self._user_titles[term] = sanitize_title(name.strip())   # ASCII-only, like every title
@@ -3066,6 +3077,10 @@ class MainWindow(QMainWindow):
             'Text files (*.txt);;All files (*)')
         if not path:
             return
+        # The tab's shell may have exited during the save dialog, deleting term;
+        # term.transcript_text() on the freed C++ object would then crash.
+        if not self._tab_is_live(term):
+            return
         # transcript_text() is lossless -- Box mode names each neutralized
         # character inline (<U+XXXX NAME>) rather than collapsing it to '_' -- and
         # pure ASCII except the real glyphs Show mode keeps. So the saved file is
@@ -4063,17 +4078,24 @@ class MainWindow(QMainWindow):
             self.set_tui(on)
         elif cmd == 'title' and (on or off):
             self.set_allow_title(on)
-        # str.isdigit() accepts non-ASCII digit-likes (superscripts, etc.) that int()
-        # rejects, so a bare int() raised an uncaught ValueError out of the Qt slot;
-        # require ASCII digits so an odd arg falls to the "invalid command" branch below.
-        elif cmd == 'zoom' and arg.isascii() and arg.isdigit():
-            self.set_zoom(int(arg))
-        elif cmd == 'scrollback' and arg.isascii() and arg.isdigit():
-            self.set_scrollback(int(arg))
-        elif cmd == 'paste-delay' and arg.isascii() and arg.isdigit():
-            self.set_paste_delay(int(arg))
-        elif cmd == 'escape-limit' and arg.isascii() and arg.isdigit():
-            self.set_escape_limit(int(arg))
+        # All-ASCII digits AND a bounded length: str.isdigit() also accepts non-ASCII
+        # digit-likes (superscripts) that int() rejects, and an all-ASCII-digit string
+        # over CPython's int_max_str_digits (~4300) makes int() ITSELF raise ValueError
+        # -- both would escape the Qt slot uncaught and abort. The bound is generous (20
+        # digits dwarfs any real setting -- even int64 is 19 -- yet is far under that
+        # limit, so int() cannot raise); a >int32 value is fine, the sinks clamp it. An
+        # over-long or odd arg falls through to the invalid-command branch below.
+        elif cmd in ('zoom', 'scrollback', 'paste-delay', 'escape-limit') \
+                and arg.isascii() and arg.isdigit() and len(arg) <= 20:
+            value = int(arg)
+            if cmd == 'zoom':
+                self.set_zoom(value)
+            elif cmd == 'scrollback':
+                self.set_scrollback(value)
+            elif cmd == 'paste-delay':
+                self.set_paste_delay(value)
+            else:
+                self.set_escape_limit(value)
         else:
             self.statusBar().showMessage(
                 'Unknown or invalid command: ' + line.strip() + '  (try /help)',
