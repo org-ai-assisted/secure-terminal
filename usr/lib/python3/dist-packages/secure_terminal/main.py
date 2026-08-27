@@ -1278,10 +1278,14 @@ class MainWindow(QMainWindow):
                 text = request.get('text')
                 if not isinstance(text, str):
                     return {'ok': False, 'error': 'text must be a string'}
-                # Deliver through the safe paste path: sanitized, and the trailing
-                # submit stripped so a final line waits at the prompt for the user's
-                # own Enter rather than auto-running.
-                term._dispatch_paste(text, 'stripped')
+                # Route through the terminal's ctl guard: a single-line payload is
+                # sanitized and left waiting at the prompt (trailing submit stripped);
+                # a MULTILINE payload whose embedded newline would auto-run a hidden
+                # command is REFUSED, mirroring the GUI's forced multiline-paste review
+                # (a bracketed-paste TUI child, which buffers it inert, is exempt).
+                err = term.ctl_send_text(text)
+                if err:
+                    return {'ok': False, 'error': err}
                 return {'ok': True}
             if op == 'ctl-dump-tab':
                 # read back the tab's CURRENT rendered text (already sanitized --

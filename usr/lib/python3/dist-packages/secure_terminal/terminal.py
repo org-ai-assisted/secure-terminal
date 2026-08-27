@@ -4649,6 +4649,24 @@ class SecureTerminal(QPlainTextEdit):
         """True while a pasted text is held awaiting the user's review choice."""
         return self._review_active
 
+    def ctl_send_text(self, text):
+        """Deliver text from the ctl socket as if typed, preserving the terminal's
+        never-auto-run guarantee. A MULTILINE payload (an embedded newline before the
+        final byte) would auto-execute every line but the last the instant it lands --
+        the GUI holds such a paste for a forced review, which the headless ctl path
+        has no user to prompt, so REFUSE it rather than auto-run a hidden command.
+        The lone exemption mirrors the paste gate: a TUI child with bracketed paste
+        active buffers the payload as inert data, so an embedded newline cannot run.
+        A single-line payload is made safe by _dispatch_paste (its trailing submit is
+        stripped, so it waits at the prompt for the user's own Enter). Returns None on
+        success, or an error string to relay to the caller."""
+        if paste_is_multiline(text) and not self._bracketed_paste_active():
+            return ('multiline text would auto-execute; send one line at a time '
+                    '(an embedded newline is held for GUI review, which ctl cannot '
+                    'prompt)')
+        self._dispatch_paste(text, 'stripped')
+        return None
+
     def _dispatch_paste(self, raw, action):
         # 'unicode' keeps printable non-ASCII (still no control/bidi/zero-width);
         # 'stripped' is ASCII only. Both are safe to send as UTF-8.
