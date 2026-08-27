@@ -420,8 +420,12 @@ _OSC_TERMINATED = re.compile(rb'\x07|\x1b\\')
 # OSC 8 hyperlink: ESC ] 8 ; <params> ; <URI> BEL <text> ESC ] 8 ; ; BEL. Captures
 # the real target URI and the visible text, so the true destination can be shown
 # (the display text can differ from the target -- the phishing risk).
+# The visible text is BOUNDED ({0,8192}): an unbounded lazy `.*?` backtracks O(n^2)
+# scanning to end-of-buffer for every unclosed OSC 8 opener a hostile stream plants
+# (~1s per 64KB), a main-thread DoS. A real hyperlink label is short; a longer one just
+# does not get the phishing-notice treatment (the sequence is still stripped by ANSI_RE).
 _OSC8 = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)'
-                   rb'(.*?)\x1b\]8;;(?:\x07|\x1b\\)', re.DOTALL)
+                   rb'(.{0,8192}?)\x1b\]8;;(?:\x07|\x1b\\)', re.DOTALL)
 # OSC numeric code -> feature key, so a CLI-mode notice can name the exact type.
 _OSC_CODE_KEY = {}
 for _k, _lbl, _codes, *_rest in OSC_FEATURES:
@@ -4638,8 +4642,20 @@ class SecureTerminal(QPlainTextEdit):
         self._pending_paste = None
         self._review_active = False
         self.paste_review_resolved.emit()
-        if raw is not None and action != 'reject':
-            self._dispatch_paste(raw, action)
+        if raw is None or action == 'reject':
+            return
+        # A held paste is multi-line (that is why it was force-reviewed). At a bare prompt
+        # with a command hook, its embedded newlines are REAL submits, so _dispatch_paste
+        # would auto-run every line but the last WITHOUT the hook judging them (only the
+        # trailing line, left at the prompt, is caught on the next Enter). Route it through
+        # the SAME atomic whole-batch review the injected-text path uses: judge the whole
+        # script once, deliver only on an approving verdict. No hook, or a foreground
+        # program (the paste is that program's data, buffered), delivers as before.
+        if (self._hook is not None and not self.has_foreground_program()
+                and paste_is_multiline(raw) and not self._bracketed_paste_active()):
+            self._inject_text_reviewed(raw)
+            return
+        self._dispatch_paste(raw, action)
 
     def review_pending(self):
         """True while a pasted text is held awaiting the user's review choice."""
