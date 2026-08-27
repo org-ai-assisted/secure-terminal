@@ -902,6 +902,13 @@ class MainWindow(QMainWindow):
         otherwise the hint would hang over an unrelated terminal. kind is 'tui' for
         a full-screen hint (auto-dismissed when TUI is enabled), 'osc', or 'autobox'
         (Reveal/Detail auto-switched to Box on entering TUI)."""
+        # The banner slot is one-per-tab, and the 'escape' freeze notice is the most
+        # actionable (output is actively being discarded) AND de-duped (it never
+        # re-raises), so a lower-priority notice must not overwrite it -- only another
+        # 'escape' may. Autobox is conveyed by the greyed Reveal/Detail controls and a
+        # 'tui'/'osc' hint is lesser, so they wait until the freeze notice is dismissed.
+        if kind != 'escape' and self._advisories.get(term, (None,))[0] == 'escape':
+            return
         self._advisories[term] = (kind, message)
         if term is self.current():
             self._refresh_banner()
@@ -1648,6 +1655,15 @@ class MainWindow(QMainWindow):
             self.close_tab(index)
 
     # -- tab label: user name + program title kept separately -----------------
+    def _tab_is_live(self, term):
+        """True if `term` is still one of our tab widgets. A function that holds a term
+        across a MODAL (rename/save dialog) must re-check this after it returns: the
+        tab's shell can exit during the modal, whose _on_shell_exited -> close_tab
+        deleteLater()s the term, and any later method call on that freed C++ object
+        (indexOf, transcript_text, ...) RuntimeErrors. Compares by IDENTITY, which never
+        enters C++, so it is safe to call even on an already-deleted term."""
+        return any(self.tabs.widget(i) is term for i in range(self.tabs.count()))
+
     def rename_tab(self, index):
         if index < 0:
             return
@@ -1656,7 +1672,9 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(
             self, 'Rename Tab', 'Tab name:',
             text=current or self.tabs.tabText(index))
-        if ok:
+        # The tab's shell may have exited during the modal, deleting term; a stale
+        # _refresh_tab_label(term) would indexOf() a freed C++ object and crash.
+        if ok and self._tab_is_live(term):
             # a user name takes precedence over any program-set title, and is
             # not lost when a program later sets its own title.
             self._user_titles[term] = sanitize_title(name.strip())   # ASCII-only, like every title
@@ -3059,6 +3077,10 @@ class MainWindow(QMainWindow):
             'Text files (*.txt);;All files (*)')
         if not path:
             return
+        # The tab's shell may have exited during the save dialog, deleting term;
+        # term.transcript_text() on the freed C++ object would then crash.
+        if not self._tab_is_live(term):
+            return
         # transcript_text() is lossless -- Box mode names each neutralized
         # character inline (<U+XXXX NAME>) rather than collapsing it to '_' -- and
         # pure ASCII except the real glyphs Show mode keeps. So the saved file is
@@ -4056,17 +4078,24 @@ class MainWindow(QMainWindow):
             self.set_tui(on)
         elif cmd == 'title' and (on or off):
             self.set_allow_title(on)
-        # str.isdigit() accepts non-ASCII digit-likes (superscripts, etc.) that int()
-        # rejects, so a bare int() raised an uncaught ValueError out of the Qt slot;
-        # require ASCII digits so an odd arg falls to the "invalid command" branch below.
-        elif cmd == 'zoom' and arg.isascii() and arg.isdigit():
-            self.set_zoom(int(arg))
-        elif cmd == 'scrollback' and arg.isascii() and arg.isdigit():
-            self.set_scrollback(int(arg))
-        elif cmd == 'paste-delay' and arg.isascii() and arg.isdigit():
-            self.set_paste_delay(int(arg))
-        elif cmd == 'escape-limit' and arg.isascii() and arg.isdigit():
-            self.set_escape_limit(int(arg))
+        # All-ASCII digits AND a bounded length: str.isdigit() also accepts non-ASCII
+        # digit-likes (superscripts) that int() rejects, and an all-ASCII-digit string
+        # over CPython's int_max_str_digits (~4300) makes int() ITSELF raise ValueError
+        # -- both would escape the Qt slot uncaught and abort. The bound is generous (20
+        # digits dwarfs any real setting -- even int64 is 19 -- yet is far under that
+        # limit, so int() cannot raise); a >int32 value is fine, the sinks clamp it. An
+        # over-long or odd arg falls through to the invalid-command branch below.
+        elif cmd in ('zoom', 'scrollback', 'paste-delay', 'escape-limit') \
+                and arg.isascii() and arg.isdigit() and len(arg) <= 20:
+            value = int(arg)
+            if cmd == 'zoom':
+                self.set_zoom(value)
+            elif cmd == 'scrollback':
+                self.set_scrollback(value)
+            elif cmd == 'paste-delay':
+                self.set_paste_delay(value)
+            else:
+                self.set_escape_limit(value)
         else:
             self.statusBar().showMessage(
                 'Unknown or invalid command: ' + line.strip() + '  (try /help)',
@@ -4983,6 +5012,8 @@ class _Launch:
         self.instance_group = 'default'   # --instance-group NAME
         self.qt_args = []          # unrecognized args, handed to Qt
         self.tabs = []             # [{title, tui, mode, command}]
+        self.test_canary = False   # --test-canary -> headless positive control, exit
+        self.clipboard_watch = False  # --clipboard-watch/--tray -> tray sanitizer, no window
 
 
 def _launch_parser(with_globals):
@@ -5027,8 +5058,9 @@ def _launch_parser(with_globals):
                        metavar='NAME', default='default',
                        help='the instance group whose primary --reuse and ctl target '
                             '(default: "default")')
-        # Handled by an early headless dispatch in main() (before Qt); listed here
-        # only so --help documents it. See CANARY_TOKEN / _test_canary.
+        # Read from this parser's namespace and dispatched in main() before Qt: the
+        # grammar (not a raw argv scan) decides when it is the flag vs an option value.
+        # See CANARY_TOKEN / _test_canary.
         p.add_argument('--test-canary', action='store_true',
                        help='fire the safe EICAR-style test canary and exit '
                             '(positive control for security-test harnesses)')
@@ -5101,6 +5133,11 @@ def _parse_launch_args(argv):
             launch.reuse = namespace.reuse
             launch.if_absent = namespace.if_absent
             launch.instance_group = namespace.instance_group
+            # Global headless modes, resolved by the grammar (so '--test-canary' as a
+            # VALUE to --title/-e does not set them, and an argparse abbreviation still
+            # does); dispatched from main() before Qt.
+            launch.test_canary = namespace.test_canary
+            launch.clipboard_watch = namespace.clipboard_watch
         else:
             namespace = parser.parse_args(group)
         launch.tabs.append({
@@ -5307,24 +5344,21 @@ def main():
     _quiet_font_warnings()
     if sys.argv[1:2] == ['ctl']:
         return _ctl_main(sys.argv[2:])
-    # Headless positive control for security-test harnesses; handled before Qt so
-    # it needs no display. It is a global option, so fire whenever --test-canary
-    # appears anywhere among the global args (before any child-command '--'), not
-    # only as the very first token -- a wrapper may prefix another global such as
-    # --new-instance. A '--test-canary' after '--' belongs to the child command
-    # and is left alone. See CANARY_TOKEN.
-    _head = sys.argv[1:]
-    if '--' in _head:
-        _head = _head[:_head.index('--')]
-    if '--test-canary' in _head:
-        return _test_canary()
-    # Tray-only clipboard-sanitizer mode: a global option handled here (before the
-    # launch grammar and any instance handoff), because it opens NO terminal window
-    # and needs only a QApplication. A '--clipboard-watch' after '--' belongs to the
-    # child command and is left alone.
-    if '--clipboard-watch' in _head or '--tray' in _head:
-        return _clipboard_watch_main()
+    # Parse the launch grammar FIRST (pure argparse, no display), then dispatch the
+    # headless global modes from the RESOLVED namespace. A raw '--test-canary' in argv
+    # scan cannot tell the FLAG from '--test-canary' sitting as the VALUE of --title/-e
+    # (a false fire), and misses an argparse abbreviation like '--test-can' (a
+    # security-test harness's positive control would then silently no-op). Anything
+    # after a '--' is the child's argv and never sets a global flag.
     launch = _parse_launch_args(sys.argv[1:])
+    # Headless positive control for security-test harnesses; before Qt (no display).
+    # See CANARY_TOKEN.
+    if launch.test_canary:
+        return _test_canary()
+    # Tray-only clipboard-sanitizer mode: opens NO terminal window, needs only a
+    # QApplication, so it runs before the instance handoff and the window build.
+    if launch.clipboard_watch:
+        return _clipboard_watch_main()
 
     # New INDEPENDENT instance per launch (konsole/qterminal model): every launch
     # opens its own window+process. Reuse is opt-IN via --reuse, which hands the

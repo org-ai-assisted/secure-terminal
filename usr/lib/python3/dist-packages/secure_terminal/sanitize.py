@@ -1479,6 +1479,11 @@ def paste_is_multiline(text):
     line with a trailing newline is NOT flagged (that is one command). Used to hold
     a multi-line paste for review even when it is pure ASCII, so a hidden second
     command in a pastejacking payload cannot execute the instant you paste."""
+    # Collapse the CRLF PAIR to one LF first: a Windows-style single line "cmd\r\n"
+    # is ONE command, but the bare check would see the '\r' sitting before the final
+    # '\n' and misflag it multiline (a needless forced review). A LONE '\r' (old-Mac
+    # ending, or an injected mid-string submit) is left intact, so it still counts.
+    text = text.replace('\r\n', '\n')
     return '\n' in text[:-1] or '\r' in text[:-1]
 
 
