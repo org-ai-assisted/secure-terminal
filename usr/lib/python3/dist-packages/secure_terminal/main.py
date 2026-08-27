@@ -1260,7 +1260,10 @@ class MainWindow(QMainWindow):
                 else:
                     try:
                         target = int(level)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
+                        # OverflowError: `level` is raw JSON off the ctl socket, so a
+                        # number like 1e400 arrives as float('inf') and int(inf) raises
+                        # OverflowError -- uncaught it escapes into the Qt loop and aborts.
                         return {'ok': False,
                                 'error': 'zoom level must be in|out|reset|<percent>'}
                 target = max(ZOOM_MIN, min(ZOOM_MAX, target))
