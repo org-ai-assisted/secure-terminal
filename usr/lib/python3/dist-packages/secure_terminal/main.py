@@ -3007,7 +3007,13 @@ class MainWindow(QMainWindow):
         countdown.start(1000)
         _select_labels(dialog, self._ui_scale)
         dialog.exec()
-        term.grant_clipboard_read(result['decision'])
+        # The tab's shell can exit DURING this modal (an OSC 52 read request then
+        # `exit`), whose _on_shell_exited->close_tab deletes term; grant_clipboard_read
+        # on the freed C++ object would RuntimeError out of the Qt slot and abort the
+        # WHOLE app. Skip the grant if the tab closed during the dialog -- deny-by-default
+        # already holds, so no clipboard byte was released.
+        if self._tab_is_live(term):
+            term.grant_clipboard_read(result['decision'])
 
     def set_scrollback(self, lines):
         if 'scrollback' in self._locked:
