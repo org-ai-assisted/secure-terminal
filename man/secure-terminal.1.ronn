@@ -199,8 +199,8 @@ standalone process that never becomes a primary and answers no `ctl` or
 ## REMOTE CONTROL
 
 `secure-terminal ctl` can list tabs, rename a tab, read a tab's rendered text
-(`dump-tab`) and send text into a tab (`send-text`, as if typed) over an
-owner-only socket. It is an injection/read surface and is OFF by default; it can
+(`dump-tab`), live-zoom a tab (`zoom`, no restart) and send text into a tab
+(`send-text`, as if typed) over an owner-only socket. It is an injection/read surface and is OFF by default; it can
 only be enabled from a privileged configuration directory (`remote_control`).
 
 ## FILES
