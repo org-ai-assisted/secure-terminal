@@ -2214,6 +2214,16 @@ class SecureTerminal(QPlainTextEdit):
             tc = self.textCursor()
             tc.setPosition(min(pos, doc.characterCount() - 1))
             self.setTextCursor(tc)
+            # setTextCursor calls ensureCursorVisible, which follows the caret RIGHT when a
+            # Show-mode wide glyph renders past the base-font cell width the grid advertised
+            # to the child -- parking the view mid-grid and hiding column 0. A TUI grid is a
+            # fixed viewport-wide canvas that always fits by construction, so column 0 must
+            # stay visible -- the horizontal analog of the alt-screen top-pin (row 0). Unlike
+            # a CLI line, which can genuinely exceed the width (so _paint_line follows the
+            # caret when it must), the grid never scrolls horizontally: pin home every frame.
+            hbar = self.horizontalScrollBar()
+            if hbar is not None:
+                hbar.setValue(hbar.minimum())
 
     # -- optional ANSI colours ------------------------------------------------
     def apply_colors(self, enabled):
@@ -3905,11 +3915,7 @@ class SecureTerminal(QPlainTextEdit):
             # _render_tui while a selection is active) resumes -- TUI keys go straight to the
             # child, never through Qt's editor, so the selection would otherwise persist and
             # freeze the view until a mouse click.
-            if self.textCursor().hasSelection():
-                cur = self.textCursor()
-                cur.clearSelection()
-                self.setTextCursor(cur)
-                self._render_timer.start(16)
+            self._clear_grid_selection()
             self._tui_key(event)
             return
 
@@ -4487,10 +4493,26 @@ class SecureTerminal(QPlainTextEdit):
     def _shift(self, event):
         return bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
 
+    def _clear_grid_selection(self):
+        """Clear a held selection and re-arm the grid render it froze (_render_tui bails
+        while a selection is active, so the view stays frozen until the selection goes).
+        No-op when nothing is selected."""
+        if not self.textCursor().hasSelection():
+            return
+        cur = self.textCursor()
+        cur.clearSelection()
+        self.setTextCursor(cur)
+        self._render_timer.start(16)
+
     def mousePressEvent(self, event):
         # When the child grabs the mouse (tracking + SGR), a plain press is REPORTED
         # to it rather than starting a local selection; Shift is the local override.
         if self._mouse_reporting() and not self._shift(event):
+            # A plain click is forwarded to the child, so it never reaches Qt's editor to
+            # clear a held selection -- which freezes the grid rebuild until a keypress.
+            # Dismiss it here (as keyPressEvent does for a typed key), then still report
+            # the click: the child sees it either way, and the view unfreezes.
+            self._clear_grid_selection()
             base = self._SGR_BUTTON.get(event.button())
             if base is not None:
                 self._report_mouse(base, event, pressed=True)
@@ -4501,6 +4523,14 @@ class SecureTerminal(QPlainTextEdit):
         # the user selects (a left-button press begins a possible drag).
         if event.button() == Qt.MouseButton.LeftButton:
             self._mouse_selecting = True
+            if self._mouse_reporting() and self._shift(event):
+                # Shift is MANDATORY to bypass the child's mouse grab, but Qt reads a
+                # Shift+press as "EXTEND the selection from the current cursor" -- which the
+                # grid render loop pins to the child's cursor (_place_grid_cursor). Left
+                # alone every selection anchored there and a single line was unselectable.
+                # Collapse the cursor to the click first, so the shift-press starts a FRESH
+                # selection at the click instead of extending from the pinned cursor.
+                self.setTextCursor(self.cursorForPosition(event.position().toPoint()))
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
