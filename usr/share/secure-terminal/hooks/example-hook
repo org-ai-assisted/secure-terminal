@@ -58,7 +58,10 @@ _DEFAULT_RULES = [
      'This runs the output of a command as a script (process substitution). Read it first.', ''),
     ('ask', r'\bgit\s+push\b.*(--force|(\s|=)-f\b)',
      'A force-push can overwrite history on the remote.', ''),
-    ('ask', r'^\s*sudo\b', 'This runs with root privileges.', ''),
+    # Match sudo at line start OR immediately after a `;`/`&`/`|` separator, so a chained
+    # `ls; sudo rm -rf /` is caught; a start-anchor alone (`^\s*sudo`) let it slip past.
+    # A separator/anchor prefix avoids matching sudo inside a quoted arg (`echo "use sudo"`).
+    ('ask', r'(?:^|[;&|])\s*sudo\b', 'This runs with root privileges.', ''),
 ]
 
 
