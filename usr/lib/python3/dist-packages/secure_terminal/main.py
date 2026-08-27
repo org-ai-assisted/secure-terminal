@@ -902,6 +902,13 @@ class MainWindow(QMainWindow):
         otherwise the hint would hang over an unrelated terminal. kind is 'tui' for
         a full-screen hint (auto-dismissed when TUI is enabled), 'osc', or 'autobox'
         (Reveal/Detail auto-switched to Box on entering TUI)."""
+        # The banner slot is one-per-tab, and the 'escape' freeze notice is the most
+        # actionable (output is actively being discarded) AND de-duped (it never
+        # re-raises), so a lower-priority notice must not overwrite it -- only another
+        # 'escape' may. Autobox is conveyed by the greyed Reveal/Detail controls and a
+        # 'tui'/'osc' hint is lesser, so they wait until the freeze notice is dismissed.
+        if kind != 'escape' and self._advisories.get(term, (None,))[0] == 'escape':
+            return
         self._advisories[term] = (kind, message)
         if term is self.current():
             self._refresh_banner()
