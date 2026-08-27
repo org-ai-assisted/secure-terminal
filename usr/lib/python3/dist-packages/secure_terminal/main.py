@@ -1721,9 +1721,16 @@ class MainWindow(QMainWindow):
         # invalid into its Clear path (correct for a bad spec/session colour string), so
         # passing the dialog result straight through would ERASE the tab's colour on
         # Cancel. Only apply a real pick here -- Cancel is a no-op.
+        term = self.tabs.widget(index)
         color = QColorDialog.getColor(parent=self)
-        if color.isValid():
-            self.set_tab_color(index, color)
+        if not color.isValid():
+            return
+        # The picker is modal: a background tab's shell can exit during it and shift
+        # indices, so the captured `index` may now point at a DIFFERENT tab. Re-resolve
+        # the CURRENT index of the tab we opened the picker for (skipping it if it closed
+        # during the modal), so the colour never lands on the wrong tab.
+        if term is not None and self._tab_is_live(term):
+            self.set_tab_color(self.tabs.indexOf(term), color)
 
     # -- find in scrollback: per-tab and across all tabs ----------------------
     _FIND_FMT = None
