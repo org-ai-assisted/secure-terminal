@@ -654,8 +654,11 @@ _COMBINING_RUN_MAX = 32
 _ZALGO_MARK_MAX = 8
 
 
+@functools.lru_cache(maxsize=4096)
 def _combining_count(ch):
-    """Number of combining marks (grapheme extenders U+0300+) stacked in one cell."""
+    """Number of combining marks (grapheme extenders U+0300+) stacked in one cell.
+    Pure in `ch`; memoized (bounded) since it is recomputed per cell per render
+    frame in SHOW mode for a small, recurring set of cell strings."""
     return sum(1 for c in ch if ord(c) >= 0x0300 and _is_mark(c))
 
 
@@ -1019,6 +1022,7 @@ def is_invisible(ch):
     return not ch.isprintable() or is_default_ignorable(ch)
 
 
+@functools.lru_cache(maxsize=8192)
 def marking_cp_for_cell(data):
     """The source code point to risk-classify / inspect for a TUI grid cell. A pyte
     cell can hold a base grapheme plus combining / zero-width / format code points, so
@@ -1029,7 +1033,10 @@ def marking_cp_for_cell(data):
     neutralized cell as a benign line is never masked by the line, and the grid tint
     plus the inspect popup name the real hazard. None when every code point is plain
     printable ASCII (not a marking). Pure, so dist-ai unit-tests it beside
-    marking_class."""
+    marking_class -- and memoized (bounded): it is the per-cell classification the
+    TUI grid runs for every cell every frame, over a small recurring set of cell
+    strings. Its result is a source code point, independent of theme/mode/markings,
+    so caching cannot leak state across those (they are applied downstream)."""
     best_cp = None
     best_rank = -1
     for ch in data:
@@ -1042,7 +1049,11 @@ def marking_cp_for_cell(data):
     return best_cp
 
 
+@functools.lru_cache(maxsize=4096)
 def marking_class(cp):
+    # Pure in `cp` (reads only build-once frozensets + deterministic unicodedata),
+    # so memoizing is behaviour-preserving; bounded because it is called per cell
+    # per render frame and the on-screen code-point set is small and recurring.
     if not 0 <= cp <= 0x10FFFF:
         return 'nonascii'             # not a code point at all: generic fallback
     if is_bidi_control(cp):
@@ -1071,6 +1082,7 @@ _MARKING_SEVERITY = {
 }
 
 
+@functools.lru_cache(maxsize=4096)
 def is_structural(cp):
     """True for the Unicode Box Drawing (U+2500..U+257F) and Block Elements
     (U+2580..U+259F) blocks -- the purely STRUCTURAL glyphs a curses/ncurses program
@@ -1091,6 +1103,7 @@ def is_structural(cp):
     return 0x2500 <= cp <= 0x259F and cp not in _ascii_confusables()
 
 
+@functools.lru_cache(maxsize=4096)
 def is_space_separator(cp):
     """True for a NON-ASCII space: Unicode general category Zs excluding the plain
     ASCII space U+0020 -- U+00A0 NO-BREAK SPACE, U+1680, U+2000..U+200A, U+202F,
