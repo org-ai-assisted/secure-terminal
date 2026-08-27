@@ -2068,7 +2068,13 @@ class SecureTerminal(QPlainTextEdit):
         columns = screen.columns
         dirty = screen.dirty
         cache = self._row_sig_cache
-        cursor_y = screen.cursor.y
+        # pyte's resize() does NOT reposition the cursor on a shrink, so cursor.y can be left
+        # BELOW the resized screen (out of bounds). Clamp it: an OOB cursor_y would make
+        # `max(last, cursor_y)` return a row past screen.lines, so _render_primary_grid builds
+        # a `target` LONGER than the signatures -> _grid_rows overcounts -> grid_top drifts and
+        # later frames overwrite committed (immutable) scrollback. A caret cannot render below
+        # the screen; _place_grid_cursor clamps at the document level for the same reason.
+        cursor_y = min(screen.cursor.y, screen.lines - 1)
         all_runs = []
         last = cursor_y
         for y in range(screen.lines):
@@ -2261,15 +2267,19 @@ class SecureTerminal(QPlainTextEdit):
         cur = self.textCursor()
         cur.movePosition(QTextCursor.MoveOperation.End)
         have = self.document().characterCount() > 1
+        appended = 0
         for row, cell_runs in zip(rows, runs_list):
             if have:
                 cur.insertText('\n')
             self._insert_grid_row(cur, row, columns, cell_runs)
             have = True
-        # Actual block count, not the row count: a scrollback cap smaller than the
-        # grid makes Qt prune blocks as they are inserted, and an over-counted
-        # _grid_rows would make the next _delete_grid compute a negative start.
-        self._grid_rows = min(self._grid_rows + len(rows),
+            appended += 1
+        # Bump by the ACTUAL number appended, not len(rows): zip truncates to the shorter of
+        # rows / runs_list, so len(rows) can exceed what was inserted and inflate _grid_rows
+        # (drifting grid_top into committed scrollback). Still clamp to blockCount(): a
+        # scrollback cap smaller than the grid makes Qt prune blocks as they are inserted, and
+        # an over-counted _grid_rows would make the next _delete_grid compute a negative start.
+        self._grid_rows = min(self._grid_rows + appended,
                               self.document().blockCount())
 
     def _set_grid_model(self, target, tsig):
@@ -2337,8 +2347,14 @@ class SecureTerminal(QPlainTextEdit):
             return
         doc = self.document()
         grid_top = doc.blockCount() - self._grid_rows
-        block = doc.findBlockByNumber(
-            min(grid_top + screen.cursor.y, doc.blockCount() - 1))
+        # Clamp cursor.y: pyte's resize() can leave it below a shrunk screen (the same OOB
+        # class fixed in _grid_signatures). Unclamped, screen.buffer[cursor.y] fabricates a
+        # blank defaultdict row -> the width sum below is 0 -> the caret is drawn at column 0
+        # instead of its true column until the program's next redraw. Bounds BOTH the block
+        # lookup and the per-cell width sum (the block lookup was already min()-clamped to the
+        # last block; the row read below was not).
+        cy = min(screen.cursor.y, screen.lines - 1)
+        block = doc.findBlockByNumber(min(grid_top + cy, doc.blockCount() - 1))
         if block.isValid():
             # The caret's document offset is the WIDTH of the rendered cells left of
             # it, not the cell column: a cell that renders to more than one UTF-16 unit
@@ -2346,7 +2362,7 @@ class SecureTerminal(QPlainTextEdit):
             # document by more than one position, so `+ cursor.x` drifts the caret left.
             # Sum each left cell's render width exactly as _insert_grid_row records it.
             col = min(screen.cursor.x, screen.columns)
-            row = screen.buffer[screen.cursor.y]
+            row = screen.buffer[cy]
             offset = sum(display_len(tui_cell(row[x].data, self._mode))
                          for x in range(col))
             pos = block.position() + offset
