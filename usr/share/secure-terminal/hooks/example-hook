@@ -110,7 +110,13 @@ def _has_line_continuation(command):
     decide(), so it is resolved here first, not a refusal."""
     joined = command.replace('\\\n', '')
     for line in joined.split('\n')[:-1]:
-        if line.rstrip().endswith(('|', '&')):
+        # A trailing comment can hide a line-continuing operator: `curl x | # note` then
+        # `sh` runs `curl x | sh`, yet the physical line ends with the comment. Test the
+        # raw line AND a comment-stripped copy; refuse on either (fail closed). ORing the
+        # two never REMOVES a refusal, so a `#` inside quotes (which mangles the strip) is
+        # still caught by the raw test / the unbalanced-quote check below. No shell parser.
+        bare = re.sub(r'\s#.*$', '', line)
+        if line.rstrip().endswith(('|', '&')) or bare.rstrip().endswith(('|', '&')):
             return True
     if any(joined.count(q) % 2 for q in ('"', "'", '`')):
         return True

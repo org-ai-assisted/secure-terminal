@@ -82,8 +82,12 @@ def _invoke(handler_argv, payload, timeout):
     return json.loads(raw) if raw else {}
 
 
-def _error(on_error, why) -> HookResult:
-    verdict = 'block' if on_error == 'block' else 'allow'
+def _error(on_error, why, script=False) -> HookResult:
+    # A multi-line (script) batch that errored was NEVER confirmed reviewed as a whole,
+    # so it must fail CLOSED regardless of on_error: the multiline_reviewed gate never
+    # runs on the error/invalid path, and an errored or legacy handler judging only the
+    # first line could wave through a dangerous later line. Single-line: honour on_error.
+    verdict = 'block' if (on_error == 'block' or script) else 'allow'
     tail = ' (blocked)' if verdict == 'block' else ' (allowed)'
     return {'verdict': verdict, 'message': why + tail, 'suggestion': '',
             'error': True}
@@ -113,9 +117,9 @@ def evaluate(handler_argv, command, timeout=10, on_error='allow',
         # the stack; it is a RuntimeError, so without this it escapes evaluate() into
         # the Qt keyPressEvent override and PyQt aborts the process (all tabs). Fail
         # closed like any other hook error. Mirrors the ipc.py / main.py fix.
-        return _error(on_error, 'command hook error: ' + str(exc))
+        return _error(on_error, 'command hook error: ' + str(exc), script=script)
     if not isinstance(reply, dict) or reply.get('verdict') not in VERDICTS:
-        return _error(on_error, 'command hook returned an invalid verdict')
+        return _error(on_error, 'command hook returned an invalid verdict', script=script)
     result: HookResult = {
         'verdict': reply['verdict'],
         'message': _sanitize_message(reply.get('message')),
