@@ -1443,6 +1443,16 @@ class SecureTerminal(QPlainTextEdit):
         self.setLineWrapMode(
             QPlainTextEdit.LineWrapMode.WidgetWidth if wrap
             else QPlainTextEdit.LineWrapMode.NoWrap)
+        # A TUI grid is a fixed viewport-wide canvas: a real terminal never shows a
+        # horizontal scrollbar on one. The grid is sized to fit, but a Show-mode wide
+        # glyph (or fractional char-advance accumulation) can render a few pixels past
+        # the viewport and raise an AsNeeded bar; suppress it in grid mode -- the
+        # home-pin in _place_grid_cursor keeps column 0 visible and the residual clips
+        # at the right edge, exactly as a real terminal does. CLI keeps AsNeeded: a
+        # genuinely long NoWrap Box/Show line there is reachable by a real scroll.
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if self._grid_mode()
+            else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
     def _sync_display(self):
         """Match the on-screen view to the current mode. TUI mode shows the pyte
