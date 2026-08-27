@@ -1520,6 +1520,12 @@ class MainWindow(QMainWindow):
         font_size = _saved_int(info.get('font_size'), self._default_font_size)
         term.set_font_size(_locked('font_size', font_size, self._default_font_size))
         scrollback = _saved_int(info.get('scrollback'), self._scrollback)
+        # an in-range custom scrollback is honoured (restore is not menu-restricted like the
+        # config load), but a value outside Qt's C int32 (e.g. 99999999999) survives int()
+        # then overflows apply_scrollback -> setMaximumBlockCount and crashes the restore --
+        # fall back to the default for those. (ai-review)
+        if not -2147483648 <= scrollback <= 2147483647:
+            scrollback = self._scrollback
         term.apply_scrollback(_locked('scrollback', scrollback, self._scrollback))
         term.apply_paste_delay(self._paste_delay)
         term.apply_escape_limit(self._escape_limit)
