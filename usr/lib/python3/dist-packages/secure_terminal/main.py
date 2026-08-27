@@ -760,6 +760,9 @@ class MainWindow(QMainWindow):
         col.addWidget(self._find_bar)
         col.addWidget(self._banner)
         self.setCentralWidget(central)
+        # Theme the container up front so the very first tab's opaque-viewport
+        # paint has a dark backdrop, not white (see _apply_container_theme).
+        self._apply_container_theme(self._default_theme)
         # render tooltips as interactive, zoom-aware popups (selectable + copyable)
         self._tip_filter = _ToolTipFilter(self)
         app = QApplication.instance()
@@ -1998,10 +2001,38 @@ class MainWindow(QMainWindow):
             self.showNormal()
 
     # -- keep the toolbar/menu showing the CURRENT tab's theme and zoom -------
+    def _apply_container_theme(self, theme):
+        """Paint the tab container's OWN surfaces -- the QTabWidget pane and its
+        internal QStackedWidget -- with the active tab's theme background. During a
+        tab switch the incoming terminal's viewport is WA_OpaquePaintEvent (Qt does
+        not pre-erase it) and its backing store was discarded while hidden, so for
+        the frame between the page show() and the first (heavy, per-cell) repaint
+        the exposed area composites whatever is behind it. Un-themed, that is the
+        system-default WHITE -- the reported flash of white space before the tab
+        redraws. Giving the container the terminal's own background makes that
+        transient frame invisible. Follows the CURRENT tab (theme is per-tab)."""
+        base = THEMES.get(theme, THEMES['dark'])[0]
+        self.tabs.setStyleSheet(
+            'QTabWidget::pane, QStackedWidget { background: %s; }' % base)
+
+    def _update_render_active(self):
+        """Only the foreground tab repaints at interactive speed. Every hidden tab
+        still feeds its pyte model on each read, but coalesces the expensive
+        per-cell document rebuild to a slow cadence, so many background TUIs cannot
+        saturate the single GIL-bound render thread and lag the foreground tab's
+        echo. Idempotent: safe to call on every currentChanged."""
+        cur = self.tabs.currentWidget()
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, SecureTerminal):
+                w.set_render_active(w is cur)
+
     def _sync_chrome_to_tab(self, *_args):
+        self._update_render_active()        # foreground tab renders fast, others slow
         term = self.current()
         if not isinstance(term, SecureTerminal):
             return                          # a restore placeholder is transiently current
+        self._apply_container_theme(term.current_theme())   # kill the switch white-flash
         self._refresh_banner()          # the banner follows the current tab
         self.zoom_box.blockSignals(True)
         self.zoom_box.setValue(term.current_zoom())
@@ -2077,6 +2108,7 @@ class MainWindow(QMainWindow):
         term = self.current()
         if term is not None:
             term.apply_theme(theme)
+            self._apply_container_theme(theme)   # container follows the current tab
         self._default_theme = theme
         self._persist()
 
@@ -4419,6 +4451,7 @@ class MainWindow(QMainWindow):
             # NB: bell is intentionally NOT applied here. This global-settings
             # dialog has no bell field, so touching it would silently reset each
             # tab's per-tab bell choice; the bell is managed via the View menu only.
+        self._apply_container_theme(opts['theme'])   # keep the container in step
         if 'auto_tab_colors' in opts:
             self.set_auto_tab_colors(opts['auto_tab_colors'])
         if 'systray' in opts:
