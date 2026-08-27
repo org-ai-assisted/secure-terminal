@@ -188,6 +188,10 @@ def has_bell(text):
     bell -- as opposed to a BEL that merely terminates an OSC sequence (a shell
     ends a title with one). ANSI_RE removes the OSC/escape matches, so only a
     standalone BEL survives."""
+    if '\x07' not in text:
+        return False        # fast path: no BEL byte at all -> skip the whole-chunk
+                            # regex sub. ANSI_RE.sub only ever REMOVES bytes, never
+                            # adds a \x07, so this is exact -- runs on every CLI read.
     return '\x07' in ANSI_RE.sub('', text)
 
 

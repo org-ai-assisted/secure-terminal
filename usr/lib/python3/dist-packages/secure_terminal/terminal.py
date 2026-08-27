@@ -757,6 +757,11 @@ class SecureTerminal(QPlainTextEdit):
         self._base_point_size = BASE_POINT_SIZE
         self._zoom = 100
         self._font_family = DEFAULT_FONT_FAMILY
+        # Last font actually applied (size, family) -- lets _apply_font skip a
+        # redundant re-apply (e.g. the trailing zoom-debounce fire at an unchanged
+        # size). None so the first _apply_font always runs.
+        self._applied_font_size = None
+        self._applied_font_family = None
         self._apply_font(sync=False)
 
         # Render the (restored) history ONCE in the final theme: setting it before
@@ -998,6 +1003,11 @@ class SecureTerminal(QPlainTextEdit):
         self._reexport_pending = False
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
+        # PreciseTimer: the default CoarseTimer rounds a 16ms interval UP (up to
+        # ~5% slop, and it aligns fires to coarse ticks), directly padding the
+        # keypress->echo->paint latency. The interactive echo path rides this
+        # timer, so a precise 16ms is felt as snappier typing.
+        self._render_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._render_timer.timeout.connect(self._render_tui)
         # CLI line-mode paint debounce: the model (_line_cells) is fed every read
         # for correctness, but the document REBUILD (_paint_line) is coalesced to
@@ -1007,6 +1017,7 @@ class SecureTerminal(QPlainTextEdit):
         # current (teardown, and any transcript/copy/save getter).
         self._paint_timer = QTimer(self)
         self._paint_timer.setSingleShot(True)
+        self._paint_timer.setTimerType(Qt.TimerType.PreciseTimer)  # see _render_timer
         self._paint_timer.timeout.connect(self._flush_paint)
         self._paint_pending = []          # completed cell-lines awaiting a paint
         self._paint_pending_wraps = []    # parallel autowrap flags
@@ -1020,6 +1031,22 @@ class SecureTerminal(QPlainTextEdit):
         self._sync_timer = QTimer(self)
         self._sync_timer.setSingleShot(True)
         self._sync_timer.timeout.connect(self._end_sync_update)
+        # Foreground-tab render gating. Only the visible tab coalesces its
+        # (expensive per-cell) grid/line repaint at interactive speed; a hidden
+        # tab still feeds its pyte model on EVERY read (screen state stays current
+        # for a correct repaint on switch), but the document rebuild is coalesced
+        # to a slow cadence, so N background TUIs cannot pin the one GIL-bound
+        # render thread and starve the foreground tab's echo. The window sets this
+        # per tab on switch (set_render_active); a tab becoming foreground repaints
+        # its latest frame at once. The hidden cadence stays well inside pyte's
+        # history depth, so a background tab keeps full scrollback.
+        self._render_active = True
+        self._HIDDEN_RENDER_MS = 500
+        # Coalesce a burst of zoom steps into ONE font apply (see apply_zoom).
+        self._zoom_timer = QTimer(self)
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.timeout.connect(self._apply_font)
+        self._zoom_debounce_ms = 40
 
         # restored scrollback from a previous session, shown as history above
         # the fresh shell (line mode; a TUI tab repaints over it on first draw).
@@ -1103,8 +1130,17 @@ class SecureTerminal(QPlainTextEdit):
         allows it -- ligatures HIDE characters, a deception vector for a WYSIWYG
         terminal; the default family (Hack) ships no ligature tables anyway."""
         size = max(1, round(self._base_point_size * self._zoom / 100.0))
+        family = self._font_family or DEFAULT_FONT_FAMILY
+        if size == self._applied_font_size and family == self._applied_font_family:
+            # Nothing changed: skip the setFont relayout + pyte resize/SIGWINCH. This
+            # dedups the leading-edge zoom debounce -- a single notch applies once
+            # (leading), and the trailing timer fire, still at the same size, no-ops
+            # here instead of forcing a second relayout + child redraw.
+            return
+        self._applied_font_size = size
+        self._applied_font_family = family
         font = QFont()
-        font.setFamily(self._font_family or DEFAULT_FONT_FAMILY)
+        font.setFamily(family)
         font.setStyleHint(QFont.StyleHint.Monospace)
         font.setFixedPitch(True)
         for _tag in ('liga', 'clig', 'calt', 'dlig'):
@@ -1121,7 +1157,16 @@ class SecureTerminal(QPlainTextEdit):
 
     def apply_zoom(self, percent):
         self._zoom = max(10, min(1000, int(percent)))
-        self._apply_font()
+        # Leading-edge debounce. Each apply is a full setFont relayout + a pyte
+        # resize whose SIGWINCH makes the child (a TUI) repaint its whole frame, so
+        # applying on every Ctrl+wheel / key-repeat notch churns the screen (the
+        # reported zoom flicker). Apply the FIRST notch at once (a single zoom stays
+        # instant), then coalesce the rest of a fast burst into one final apply when
+        # it settles. A zero debounce applies every call synchronously.
+        if self._zoom_debounce_ms <= 0 or not self._zoom_timer.isActive():
+            self._apply_font()
+        if self._zoom_debounce_ms > 0:
+            self._zoom_timer.start(self._zoom_debounce_ms)
 
     def set_font_family(self, family):
         self._font_family = (family or '').strip() or DEFAULT_FONT_FAMILY
@@ -1786,6 +1831,36 @@ class SecureTerminal(QPlainTextEdit):
         finally:
             self._programmatic_scroll = False
         self.viewport().update()
+
+    def _render_interval(self):
+        """Coalesce window for the render/paint debounce: interactive 16ms for the
+        foreground tab, a slow cadence for a hidden one (see _render_active)."""
+        return 16 if self._render_active else self._HIDDEN_RENDER_MS
+
+    def set_render_active(self, active):
+        """Mark this tab foreground (fast repaint) or background (slow cadence).
+        Called by the window on every tab switch. Going foreground repaints the
+        latest frame immediately rather than waiting out a slow hidden interval,
+        so a switched-to tab is current at once (no stale frame)."""
+        active = bool(active)
+        if active == self._render_active:
+            return
+        self._render_active = active
+        if not active:
+            return
+        if self._fd is None:
+            # Torn down: shutdown() nulled the fd. A window close tears tabs down and
+            # THEN the QTabWidget teardown can emit currentChanged -> _update_render_active
+            # -> here; rendering into a half-freed widget (shutdown does not null _screen)
+            # would fault. Nothing live to catch up on, so return.
+            return
+        # Foreground now: render the newest frame at once. The pyte model / _raw
+        # were kept current while hidden, so this is a single catch-up repaint.
+        if self._grid_mode():
+            self._render_timer.stop()
+            self._render_tui()
+        else:
+            self._flush_paint()      # paints any lines coalesced while hidden
 
     def _render_tui_body(self, screen, bar, at_bottom, prev_scroll):
         self.setUpdatesEnabled(False)
@@ -2699,7 +2774,8 @@ class SecureTerminal(QPlainTextEdit):
                 if self._shot:
                     self._render_tui()           # shot mode: render NOW (byte-stable capture)
                 else:
-                    self._render_timer.start(16)     # coalesce bursts into ~60fps
+                    # ~60fps foreground; slow cadence when this tab is hidden
+                    self._render_timer.start(self._render_interval())
             return
 
         # CLI line mode: display through the escape-stripping pipeline. Prepend any
@@ -3216,11 +3292,22 @@ class SecureTerminal(QPlainTextEdit):
                             wrap, self._line_edits)
         self._paint_pending.extend(completed)
         self._paint_pending_wraps.extend(wraps)
+        # Bound the debounced backlog. A hidden tab coalesces at the slow cadence, so a
+        # fast producer (yes / cat bigfile) could otherwise buffer an unbounded list and
+        # then freeze the GUI rebuilding it in one flush. The document keeps only
+        # _scrollback blocks, so completed lines beyond that would be evicted on insert
+        # anyway -- drop the oldest here so memory and flush cost stay bounded. Unlimited
+        # scrollback (_scrollback == 0): no cap, honouring the user's choice.
+        _cap = self._scrollback
+        if _cap and len(self._paint_pending) > _cap:
+            del self._paint_pending[:-_cap]
+            del self._paint_pending_wraps[:-_cap]
         self._paint_dirty = True          # the current line changed too, not just
         if not defer:                     # any completed lines above
             self._flush_paint()
         elif not self._paint_timer.isActive():
-            self._paint_timer.start(16)
+            # ~60fps foreground; slow cadence when this tab is hidden
+            self._paint_timer.start(self._render_interval())
 
     def _flush_paint(self):
         """Paint any debounced line output now: the scrollback lines finished since
@@ -3237,6 +3324,18 @@ class SecureTerminal(QPlainTextEdit):
         self._paint_pending_wraps = []
         self._paint_dirty = False
         self._paint_line(completed, wraps)
+
+    def _force_current_frame(self):
+        """Make the document reflect the LATEST output now, whatever the render
+        cadence. CLI: flush the debounced line paint. GRID: fire a pending debounced
+        render -- a hidden tab coalesces at the slow cadence, so its last painted
+        frame can trail the pyte model by up to _HIDDEN_RENDER_MS. Every external
+        text getter (toPlainText / transcript_text) calls this so a save / copy /
+        session-cap of a background tab is never a frame stale."""
+        self._flush_paint()
+        if self._grid_mode() and self._render_timer.isActive():
+            self._render_timer.stop()
+            self._render_tui()
 
     def _paint_line(self, completed, wraps=None):
         """Render the just-finished lines (immutable scrollback) plus the current
@@ -3316,7 +3415,7 @@ class SecureTerminal(QPlainTextEdit):
         # Overrides QPlainTextEdit.toPlainText so every external text getter
         # (save transcript, _hook_transcript, session cap) yields ASCII, not the
         # display box. Qt's own rendering does not go through this method.
-        self._flush_paint()          # never read a stale (debounced) document
+        self._force_current_frame()  # never read a stale (debounced/gated) document
         return self._export_ascii(super().toPlainText())
 
     def _write_transcript_file(self):
@@ -3402,7 +3501,7 @@ class SecureTerminal(QPlainTextEdit):
         unchanged: Reveal/Detail already carry <U+XXXX> badges, and Show keeps the
         glyph you opted into. Works the same in CLI and TUI (both render a
         document)."""
-        self._flush_paint()          # a save must include the last unpainted line
+        self._force_current_frame()  # a save must include the last unpainted/ungated frame
         doc = self.document()
         out = []
         cur = QTextCursor(doc)
