@@ -134,4 +134,7 @@ class Framer:
             raise ValueError('bad frame length')
         if len(self._buf) < 4 + length:
             return None
-        return self._buf[4:4 + length]
+        frame = self._buf[4:4 + length]
+        self._buf = self._buf[4 + length:]   # consume the frame so a reused Framer
+                                             # advances instead of re-returning frame 1
+        return frame
