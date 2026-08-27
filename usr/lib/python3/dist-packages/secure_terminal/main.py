@@ -1239,11 +1239,38 @@ class MainWindow(QMainWindow):
                              'mode': term.current_mode(),
                              'tui': term.tui_active()})
             return {'ok': True, 'tabs': tabs}
-        if op in ('ctl-send-text', 'ctl-set-tab-title', 'ctl-dump-tab'):
+        if op in ('ctl-send-text', 'ctl-set-tab-title', 'ctl-dump-tab', 'ctl-zoom'):
             term = self._find_tab(request.get('tab'))
             if term is None:
                 return {'ok': False, 'error': 'no tab matched %r'
                         % (request.get('tab'),)}
+            if op == 'ctl-zoom':
+                # Live font-zoom of a tab (no restart): in/out step by ZOOM_STEP,
+                # reset -> 100, or an explicit percent, clamped to ZOOM_MIN..ZOOM_MAX.
+                if 'zoom' in self._locked:
+                    return {'ok': False, 'error': 'zoom is admin-locked'}
+                level = request.get('level')
+                cur = term.current_zoom()
+                if level == 'in':
+                    target = cur + ZOOM_STEP
+                elif level == 'out':
+                    target = cur - ZOOM_STEP
+                elif level == 'reset':
+                    target = 100
+                else:
+                    try:
+                        target = int(level)
+                    except (TypeError, ValueError):
+                        return {'ok': False,
+                                'error': 'zoom level must be in|out|reset|<percent>'}
+                target = max(ZOOM_MIN, min(ZOOM_MAX, target))
+                # Apply to the TARGET tab; when it is the current tab, route through
+                # set_zoom so the toolbar zoom box + persisted default track it too.
+                if term is self.current():
+                    self.set_zoom(target)
+                else:
+                    term.apply_zoom(target)
+                return {'ok': True, 'zoom': term.current_zoom()}
             if op == 'ctl-send-text':
                 text = request.get('text')
                 if not isinstance(text, str):
@@ -5106,11 +5133,18 @@ def _ctl_main(argv):
     dump.add_argument('--tab', required=True, metavar='MATCH')
     dump.add_argument('--lines', type=int, metavar='N',
                       help='only the last N lines (0 = none)')
+    zoom = sub.add_parser('zoom',
+                          help='live font-zoom a tab (no restart)')
+    zoom.add_argument('--tab', required=True, metavar='MATCH')
+    zoom.add_argument('level', metavar='LEVEL',
+                      help='in | out | reset | a percent (25-400)')
     args = parser.parse_args(argv)
 
     request = {'op': 'ctl-' + args.cmd}
-    if args.cmd in ('send-text', 'set-tab-title', 'dump-tab'):
+    if args.cmd in ('send-text', 'set-tab-title', 'dump-tab', 'zoom'):
         request['tab'] = args.tab
+    if args.cmd == 'zoom':
+        request['level'] = args.level
     if args.cmd == 'send-text':
         request['text'] = args.text
     if args.cmd == 'set-tab-title':
@@ -5134,6 +5168,8 @@ def _ctl_main(argv):
                 '  [tui]' if tab.get('tui') else ''))
     elif args.cmd == 'dump-tab':
         sys.stdout.write(reply.get('text', ''))
+    elif args.cmd == 'zoom':
+        sys.stdout.write('%s\n' % reply.get('zoom', ''))
     return 0
 
 

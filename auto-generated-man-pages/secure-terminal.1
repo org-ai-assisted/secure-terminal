@@ -114,7 +114,7 @@ Reuse is opt\-in\. \fB\-\-reuse\fR hands the launch to the group's PRIMARY insta
 .P
 \fB\-\-instance\-group\fR \fINAME\fR selects the group (socket identity); an instance is still a new window unless \fB\-\-reuse\fR is also given\. \fB\-\-new\-instance\fR forces a standalone process that never becomes a primary and answers no \fBctl\fR or \fB\-\-reuse\fR\.
 .SH "REMOTE CONTROL"
-\fBsecure\-terminal ctl\fR can list tabs, rename a tab, read a tab's rendered text (\fBdump\-tab\fR) and send text into a tab (\fBsend\-text\fR, as if typed) over an owner\-only socket\. It is an injection/read surface and is OFF by default; it can only be enabled from a privileged configuration directory (\fBremote_control\fR)\.
+\fBsecure\-terminal ctl\fR can list tabs, rename a tab, read a tab's rendered text (\fBdump\-tab\fR), live\-zoom a tab (\fBzoom\fR, no restart) and send text into a tab (\fBsend\-text\fR, as if typed) over an owner\-only socket\. It is an injection/read surface and is OFF by default; it can only be enabled from a privileged configuration directory (\fBremote_control\fR)\.
 .SH "FILES"
 .TP
 \fB~/\.config/secure\-terminal\.d/*\.conf\fR
