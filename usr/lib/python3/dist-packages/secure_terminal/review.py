@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
 from secure_terminal.sanitize import (
     classify_paste, sanitize_paste, sanitize_paste_unicode,
     sanitize_clipboard, sanitize_clipboard_display, sanitize_clipboard_unicode,
+    paste_no_autosubmit,
 )
 from secure_terminal.terminal import SecureTerminal
 
@@ -68,8 +69,14 @@ _KINDS = {
         'titles': ('Original (as it looks)', 'Detail (what is really there)',
                    'Paste stripped sends', 'Paste with unicode sends'),
         'dispatch': 'dispatch_pending_paste',
-        'strip': lambda t: sanitize_paste(t).replace('\r', '\n'),
-        'keep': lambda t: sanitize_paste_unicode(t).replace('\r', '\n'),
+        # Sanitizers return the \r-form; show_review then applies paste_no_autosubmit
+        # (only when the target is NOT bracketed-paste, matching _dispatch_paste) and maps
+        # \r -> \n for display, so the "sends" panes show EXACTLY what reaches the pty --
+        # at a bare prompt the trailing auto-submit CR is dropped, so the preview no longer
+        # implies a submit that will not happen. Keyed by 'paste_newline'.
+        'strip': sanitize_paste,
+        'keep': sanitize_paste_unicode,
+        'paste_newline': True,
     },
     'copy': {
         'summary': 'This copy would carry %s onto the clipboard.',
@@ -198,7 +205,19 @@ class ReviewBar(QWidget):
         theme = getattr(term, '_theme', 'dark')
         family = term.current_font_family() if hasattr(term, 'current_font_family') \
             else None
-        texts = (raw, raw, self._kind['strip'](raw), self._kind['keep'](raw))
+        def preview_send(sanitizer):
+            sent = sanitizer(raw)
+            if self._kind.get('paste_newline'):
+                # Match _dispatch_paste: at a non-bracketed target the trailing auto-submit
+                # CR is stripped (so a pasted command waits for the user's own Enter), then
+                # \r -> \n for a readable preview. A bracketed-paste TUI keeps the CR, so its
+                # preview keeps the newline -- the pane tracks the real delivery either way.
+                if not term._bracketed_paste_active():
+                    sent = paste_no_autosubmit(sent)
+                sent = sent.replace('\r', '\n')
+            return sent
+        texts = (raw, raw, preview_send(self._kind['strip']),
+                 preview_send(self._kind['keep']))
         for view, text, (mode, mark) in zip(self._views, texts, _PANE_RENDER):
             view.apply_theme(theme)
             if family:

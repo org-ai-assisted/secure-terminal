@@ -1309,7 +1309,13 @@ class SecureTerminal(QPlainTextEdit):
         return self._scrollback
 
     def apply_paste_delay(self, seconds):
-        self._paste_delay = max(0, int(seconds))
+        # Clamp the int32 upper bound at the SINK so every caller (/paste-delay command,
+        # config, ctl, restore) is safe in one spot, as apply_scrollback does. _paste_delay
+        # reaches the paste-review gate on a pyqtSignal(str, int) C int, where an out-of-int32
+        # value WRAPS (does not raise) to a negative -- review.py floors it to 0, which SKIPS
+        # the countdown and enables the paste buttons at once, defeating the paste_delay gate.
+        # The /paste-delay command gate is isascii()+isdigit() with no magnitude bound.
+        self._paste_delay = max(0, min(int(seconds), 2147483647))
 
     def current_paste_delay(self):
         return self._paste_delay
@@ -1317,8 +1323,10 @@ class SecureTerminal(QPlainTextEdit):
     def apply_escape_limit(self, limit):
         # Only the notice THRESHOLD; changing it cannot alter what is on screen, so
         # no _rerender. Suppression is unaffected -- this only tunes when the
-        # one-time "output suppressed" notice fires.
-        self._escape_limit = max(0, int(limit))
+        # one-time "output suppressed" notice fires. Clamp the int32 upper bound at the
+        # SINK too, completing the setter class (apply_scrollback/apply_paste_delay): a
+        # value beyond int32 cannot silently over/underflow a downstream C int here.
+        self._escape_limit = max(0, min(int(limit), 2147483647))
 
     def current_escape_limit(self):
         return self._escape_limit
@@ -1538,7 +1546,12 @@ class SecureTerminal(QPlainTextEdit):
             self._osc[key] = bool(enabled)
             if key == 'osc_colors' and not enabled and self._osc_palette:
                 self._osc_palette.clear()
-                self.apply_theme(self._theme)  # restore the theme palette + repaint
+                self.apply_theme(self._theme)  # restore the theme QPalette (Base/Text)
+                # apply_theme SKIPS its own _rerender on an unchanged theme (the #78 restore
+                # guard), so a CLI/line view kept the program's OSC palette colours in its
+                # already-rendered scrollback until some unrelated re-render. Repaint now, like
+                # the sibling toggles apply_colors / apply_markings do unconditionally.
+                self._rerender()
             if key == 'osc_clipboard_read' and not enabled \
                     and self._clipboard_read == 'pending':
                 # Disabling the feature abandons any in-flight consent: drop the pending
