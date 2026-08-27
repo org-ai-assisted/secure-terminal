@@ -108,7 +108,11 @@ def evaluate(handler_argv, command, timeout=10, on_error='allow',
             payload['transcript'] = (transcript_provider() if transcript_provider
                                      else '')
             reply = _invoke(handler_argv, payload, timeout)
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError, RecursionError) as exc:
+        # RecursionError: _invoke's json.loads on a deeply-nested handler reply blows
+        # the stack; it is a RuntimeError, so without this it escapes evaluate() into
+        # the Qt keyPressEvent override and PyQt aborts the process (all tabs). Fail
+        # closed like any other hook error. Mirrors the ipc.py / main.py fix.
         return _error(on_error, 'command hook error: ' + str(exc))
     if not isinstance(reply, dict) or reply.get('verdict') not in VERDICTS:
         return _error(on_error, 'command hook returned an invalid verdict')
