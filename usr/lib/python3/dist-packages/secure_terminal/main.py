@@ -1471,6 +1471,17 @@ class MainWindow(QMainWindow):
             # session.json value like "false"/"off"/0 would coerce truthy through
             # bool() and fail OPEN (re-enabling a feature the user disabled).
             return value if isinstance(value, bool) else default
+
+        def _saved_int(value, default):
+            # A saved int (zoom/font_size/scrollback) falls back on a corrupt or
+            # hand-edited session.json rather than crash the restore at startup: a
+            # non-numeric value raises TypeError/ValueError, and a JSON number like
+            # 1e400 arrives as float('inf') whose int() raises OverflowError -- the
+            # same class guarded for ctl-zoom. (ai-review)
+            try:
+                return int(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
         mode = info.get('mode')
         mode = mode if mode in DISPLAY_MODES else self._default_mode
         # pass the saved display settings to the ctor so the restored scrollback is
@@ -1495,29 +1506,20 @@ class MainWindow(QMainWindow):
                              self._default_markings),
             theme=theme)
         term.apply_theme(theme)          # idempotent (ctor set it): no re-render
-        try:
-            zoom = int(info.get('zoom', self._default_zoom))
-        except (TypeError, ValueError):
-            zoom = self._default_zoom
+        zoom = _saved_int(info.get('zoom'), self._default_zoom)
         term.apply_zoom(_locked('zoom', zoom, self._default_zoom))
-        # font_family/font_size come from the session JSON, like zoom/scrollback, so
+        # font_family comes from the session JSON, like zoom/font_size/scrollback, so
         # a corrupt or hand-edited record must fall back to the default rather than
-        # crash the restore: a non-str family hits .strip() (AttributeError) and a
-        # non-int size hits int() (TypeError/ValueError). (ai-review)
+        # crash the restore: a non-str family hits .strip() (AttributeError), guarded
+        # here; the numeric fields fall back via _saved_int. (ai-review)
         font_family = info.get('font_family')
         if not isinstance(font_family, str) or not font_family:
             font_family = self._default_font_family
         term.set_font_family(_locked('font_family', font_family,
                                      self._default_font_family))
-        try:
-            font_size = int(info.get('font_size', self._default_font_size))
-        except (TypeError, ValueError):
-            font_size = self._default_font_size
+        font_size = _saved_int(info.get('font_size'), self._default_font_size)
         term.set_font_size(_locked('font_size', font_size, self._default_font_size))
-        try:
-            scrollback = int(info.get('scrollback', self._scrollback))
-        except (TypeError, ValueError):
-            scrollback = self._scrollback
+        scrollback = _saved_int(info.get('scrollback'), self._scrollback)
         term.apply_scrollback(_locked('scrollback', scrollback, self._scrollback))
         term.apply_paste_delay(self._paste_delay)
         term.apply_escape_limit(self._escape_limit)
