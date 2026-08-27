@@ -1262,7 +1262,11 @@ class SecureTerminal(QPlainTextEdit):
 
     def apply_scrollback(self, lines):
         """Limit retained scrollback to `lines` blocks (0 = unlimited)."""
-        lines = max(0, int(lines))
+        # setMaximumBlockCount takes a C int, so a value beyond int32 (a hand-edited
+        # session, a /scrollback <huge> command, or a ctl request) raises OverflowError
+        # here. Clamp the upper bound at the SINK so every caller is crash-safe in one
+        # spot, not per-caller.
+        lines = max(0, min(int(lines), 2147483647))
         # No change: the cap is already this value, so setMaximumBlockCount would
         # prune nothing and the grid model stays in sync -- there is nothing to
         # rebuild. This is the COMMON path: _apply_global re-applies the SAME
