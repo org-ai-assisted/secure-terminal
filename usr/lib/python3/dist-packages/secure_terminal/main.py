@@ -255,55 +255,6 @@ def _toggle_icon(theme_name, letter, color):
     return _letter_icon(letter, color)
 
 
-# Upper bound for command_hook_timeout (seconds). No legitimate per-command hook
-# needs longer than an hour, and a huge value (e.g. 2**63) overflows subprocess's C
-# PyTime_t with an uncaught OverflowError -- so anything above this is clamped away.
-_HOOK_TIMEOUT_MAX = 3600
-
-
-def _read_hook_config(cfg):
-    """Build the opt-in command-hook config from a settings drop-in, or None when
-    no handler is configured. Keys: command_hook (the handler command line, empty
-    = off) plus optional command_hook_transcript (none|tail:N|full),
-    command_hook_timeout (seconds), command_hook_on_error (allow|block)."""
-    raw = (cfg.get('command_hook') or '').strip()
-    if not raw:
-        return None
-    try:
-        argv = shlex.split(raw)
-    except ValueError:
-        return None
-    if not argv:  # pragma: no cover - a non-empty non-whitespace command always yields a token
-        return None
-    try:
-        timeout = int(cfg.get('command_hook_timeout') or 10)
-    except ValueError:
-        timeout = 10
-    if not 0 < timeout <= _HOOK_TIMEOUT_MAX:
-        # Out of range -> the default. A NON-POSITIVE timeout makes subprocess.run
-        # raise TimeoutExpired INSTANTLY (before the handler answers) and, with
-        # on_error=allow, fails OPEN; an ABSURDLY LARGE one (e.g. 2**63) overflows the
-        # C PyTime_t and raises OverflowError, which the hook error path does not catch.
-        # Either way the enforced hook is defeated, so clamp to a sane positive bound.
-        timeout = 10
-    # on_error default: an ADMIN-LOCKED (enforced) hook fails CLOSED -- a gate that
-    # fails open on error is no gate. An opt-in (unlocked) hook keeps the historical
-    # fail-open default. An explicit value always wins. (Locking auto-locks this key,
-    # so a user cannot then downgrade a locked block to allow; and because the default
-    # is now block, an admin who locks the hook without setting on_error still gets
-    # fail-closed rather than the old fail-open.)
-    on_error = cfg.get('command_hook_on_error')
-    if on_error not in ('allow', 'block'):
-        locked = getattr(cfg, 'locked', frozenset())
-        on_error = 'block' if 'command_hook' in locked else 'allow'
-    return {
-        'argv': argv,
-        'transcript': cfg.get('command_hook_transcript') or 'none',
-        'timeout': timeout,
-        'on_error': on_error,
-    }
-
-
 def _dot_icon(color):
     """A filled circle in `color` -- the traffic-light lamp of the security
     indicator (green safe / yellow TUI / red unicode-shown)."""
@@ -717,8 +668,6 @@ class MainWindow(QMainWindow):
         self._persist_session = cfg.get('persist_session') != 'false'
         # confirm before closing a tab/window that still runs a foreground program
         self._confirm_close = cfg.get('confirm_close') != 'false'
-        # optional opt-in command hook, configured only via a settings drop-in
-        self._hook_config = _read_hook_config(cfg)
         # remote control (the ctl inject-into-tab surface) is OFF unless an admin
         # turned it on in a privileged directory (remote_control is privileged-
         # only, so a home config cannot enable it).
@@ -860,8 +809,6 @@ class MainWindow(QMainWindow):
         term.zoom_step.connect(self._on_zoom_step)
         term.tab_step.connect(self._on_tab_step)
         term.tab_move.connect(self._on_tab_move)
-        term.apply_hook(self._hook_config)
-        term.hook_notice.connect(self._on_hook_notice)
         term.shell_exited.connect(lambda t=term: self._on_shell_exited(t))
         term.title_changed.connect(
             lambda title, t=term: self._on_tab_title(t, title))
@@ -1301,13 +1248,10 @@ class MainWindow(QMainWindow):
                 text = request.get('text')
                 if not isinstance(text, str):
                     return {'ok': False, 'error': 'text must be a string'}
-                # Review EACH injected line through the command hook, exactly as a
-                # typed Enter would: this is a remote-control injection surface, so an
-                # embedded newline must not auto-run the earlier line with no verdict.
-                # (A plain paste only strips the TRAILING submit; `send-text $'id\nx\n'`
-                # would still run `id` unreviewed.) Falls back to the safe paste path
-                # when no hook is configured or a foreground program owns the input.
-                term._inject_text_reviewed(text)
+                # Deliver through the safe paste path: sanitized, and the trailing
+                # submit stripped so a final line waits at the prompt for the user's
+                # own Enter rather than auto-running.
+                term._dispatch_paste(text, 'stripped')
                 return {'ok': True}
             if op == 'ctl-dump-tab':
                 # read back the tab's CURRENT rendered text (already sanitized --
@@ -1680,7 +1624,7 @@ class MainWindow(QMainWindow):
         # setTabToolTip renders rich text (unlike setTabText), so an OSC-set program
         # title with HTML-like content would render as markup in the tab chrome. Escape
         # each part and join with an explicit <br>, so the untrusted title is shown
-        # literally -- the same PlainText guarantee the command-hook dialog enforces.
+        # literally rather than interpreted as markup.
         self.tabs.setTabToolTip(index, '<br>'.join(html.escape(p) for p in parts))
 
     def set_tab_color(self, index, color):
@@ -2567,10 +2511,6 @@ class MainWindow(QMainWindow):
     def _on_notify(self, text):
         # passive, non-intrusive: a timed status-bar message, already ASCII-safe
         self.statusBar().showMessage('Notification: ' + text, 6000)
-
-    def _on_hook_notice(self, message):
-        # the command hook's advisory (already sanitized in hook.evaluate)
-        self.statusBar().showMessage('Command hook: ' + message, 8000)
 
     # -- granular OSC features ------------------------------------------------
     def _apply_osc_defaults(self, term):
@@ -4269,8 +4209,9 @@ class MainWindow(QMainWindow):
         _tip_row(session_box, 'Paste review', paste_warn,
                  'When to hold a paste for review before it reaches the shell: '
                  'Always, Only when it carries unicode/control characters (the '
-                 'default -- the case worth a second look), or Never. A command '
-                 'hook still reviews an auto-submitting paste whatever this is set to.')
+                 'default -- the case worth a second look), or Never. A paste with '
+                 'an embedded newline is always held for review whatever this is '
+                 'set to.')
         copy_warn = QComboBox()
         for _wl, _wv in _WARN_CHOICES:
             copy_warn.addItem(_wl, _wv)

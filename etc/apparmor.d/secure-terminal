@@ -87,12 +87,6 @@ profile secure-terminal /usr/bin/secure-terminal {
   /usr/local/bin/*  Ux,
   /usr/local/sbin/* Ux,
 
-  # opt-in command hooks: the shipped example handlers run like the user's own
-  # commands (unconfined). A handler at a custom path is added via the local
-  # include below.
-  /usr/share/secure-terminal/hooks/* Ux,
-
-  # site additions (a custom hook path, an extra shell) go here without editing
-  # this file
+  # site additions (an extra shell) go here without editing this file
   include if exists <local/secure-terminal>
 }

@@ -47,8 +47,7 @@ Design (see https://secure-terminal.github.io):
   SIGINT, while a raw-mode program reads the byte itself (so an app's own "press
   Ctrl+C again to exit" works). Still one-directional. terminate_foreground() is
   the guaranteed panic button (SIGTERM then SIGKILL) for a program that ignores
-  all of the above. An opt-in command hook (apply_hook) can additionally judge a
-  typed line before Enter submits it.
+  all of the above.
 
 This is a deliberately minimal, line-oriented terminal by default: no escape
 parser at all -- every escape sequence in the output is stripped in the renderer
@@ -653,8 +652,6 @@ class SecureTerminal(QPlainTextEdit):
     # move the current tab. Handled at the widget because it owns the keyboard.
     tab_step = pyqtSignal(int)
     tab_move = pyqtSignal(int)
-    # the command hook produced an advisory message to surface (status bar)
-    hook_notice = pyqtSignal(str)
     # An advisory from the terminal itself (e.g. "turn on TUI mode"). Emitted, NOT
     # injected into the document: injected text is unfaithful -- it could be
     # selected and copied into a transcript as if a program printed it.
@@ -993,13 +990,12 @@ class SecureTerminal(QPlainTextEdit):
         # emitted whenever a program uses an OSC escape while in pure CLI mode,
         # where it is stripped; the window de-duplicates to a once-per-tab notice
         # (it knows the setting, so the terminal must not consume the state itself).
-        # optional command hook (opt-in): config dict or None, plus the current
-        # typed input line so it can be judged before Enter submits it.
-        self._hook = None
+        # mirror of the current typed input line, kept so _line_pending() knows the
+        # prompt still holds unfinished text a CR-terminated re-export must not submit.
         self._line_buffer = ''
         # set when history recall / cursor editing desyncs _line_buffer from the
-        # real shell line, so the hook fails safe (asks) rather than judge a stale
-        # line. See keyPressEvent (line-edit keys) and _hook_intercept.
+        # real shell line, so _line_pending() must assume the prompt holds a line it
+        # cannot see. See keyPressEvent (line-edit keys) and _line_pending.
         self._line_dirty = False
         # a mode change wanted to re-export TERM but the prompt held a pending
         # line, so the CR-terminated re-export would have submitted it. Held here
@@ -1381,12 +1377,10 @@ class SecureTerminal(QPlainTextEdit):
         That CR is why a pending line DEFERS the re-export instead of racing it.
         This is typed input: with a half-typed line at the prompt the shell would
         receive `<pending>export TERM=...` and RUN it -- an Enter the user never
-        pressed, submitting their unfinished text. Worse, that submission is
-        generated here rather than by the Enter handler, so it never passes
-        command_hook: the one control that judges what reaches the shell would be
-        routed around by the terminal itself. So the line is left untouched (never
-        killed -- discarding what someone typed to satisfy our own housekeeping is
-        not ours to do) and the re-export waits for a clear prompt."""
+        pressed, submitting their unfinished text. So the line is left untouched
+        (never killed -- discarding what someone typed to satisfy our own
+        housekeeping is not ours to do) and the re-export waits for a clear
+        prompt."""
         if self._line_pending():
             self._reexport_pending = True
             self._advise('Display switched now; the shell will be told once the '
@@ -2417,31 +2411,6 @@ class SecureTerminal(QPlainTextEdit):
         Qt.MouseButton.RightButton: 2,
     }
 
-    # Cancel a line of UNKNOWN content (recalled from history / cursor-edited, so
-    # neither its text nor the cursor column is mirrored). Ctrl+C (SIGINT), NOT a
-    # kill-line key sequence: any End/Ctrl+E/Ctrl+U combination depends on the
-    # shell's keymap and SILENTLY LEAVES the command in some of them (bash vi-insert
-    # needed End-then-U; zsh vi-insert has ESC[F unbound; xterm's End is ESC O F).
-    # The hook only fires at a bare prompt (no foreground child -- enforced by the
-    # has_foreground_program() guard at every _hook_intercept call site), so SIGINT
-    # there cancels the line editor and gives a fresh prompt in EVERY shell and
-    # editing mode. It is best-effort: a user who ran `stty intr undef` disarms it,
-    # so the caller marks _line_dirty afterward to FAIL SAFE (re-ask, never submit
-    # a line the cancel may have left behind). A line whose content IS mirrored is
-    # cleared deterministically by _clear_typed_line instead (no signal, no tcflush).
-    _CANCEL_UNKNOWN_LINE = b'\x03'
-
-    def _clear_typed_line(self, command):
-        """BEST-EFFORT visual erase of a mirrored line: one Backspace (^?) per
-        character. It is NOT reliable and the caller must NOT treat the line as
-        cleared: ^? is the erase key only until `stty erase` rebinds it (then these
-        DELs are inserted as text), and a cooked ICANON editor deletes BYTES while
-        len(command) counts code points, so multibyte content can leave bytes
-        behind. The security against submitting the un-erased line comes from the
-        caller keeping _line_dirty set, not from this erase. The caller only reaches
-        here with a non-empty command (the empty line returns earlier)."""
-        self._write(b'\x7f' * len(command))
-
     def _mouse_report_on(self):
         """True when the child has enabled mouse tracking WITH SGR encoding, so its
         mouse/wheel events are reported. Shift (the local override) is checked per
@@ -3409,7 +3378,7 @@ class SecureTerminal(QPlainTextEdit):
 
     def _export_ascii(self, text):
         """Map the display box (BOX) back to ASCII '_' for any text that LEAVES the
-        widget (copy, command hook, session restore -- a saved transcript instead
+        widget (copy, session restore -- a saved transcript instead
         uses transcript_text, which stays lossless), so neutralized text leaves as
         pure ASCII. Map in every mode EXCEPT Show: Box neutralizes every non-ASCII
         byte to a box, and in a TUI grid Reveal/Detail also fall back to the box
@@ -3427,7 +3396,7 @@ class SecureTerminal(QPlainTextEdit):
 
     def toPlainText(self):
         # Overrides QPlainTextEdit.toPlainText so every external text getter
-        # (save transcript, _hook_transcript, session cap) yields ASCII, not the
+        # (save transcript, session cap) yields ASCII, not the
         # display box. Qt's own rendering does not go through this method.
         self._force_current_frame()  # never read a stale (debounced/gated) document
         return self._export_ascii(super().toPlainText())
@@ -3944,9 +3913,9 @@ class SecureTerminal(QPlainTextEdit):
                 # observable here: with NOFLSH off the tty flushes it, but under `stty
                 # noflsh` -- or a shell that traps SIGQUIT, which bash does at its prompt --
                 # the line is RETAINED. Clearing the mirror to empty would then let a
-                # retained command run UNJUDGED on the next Enter. So do NOT clear it; mark
-                # the line unverifiable, so the next Enter FAILS SAFE and re-judges. This is
-                # the #34 pattern: security comes from KEEPING _line_dirty set, not an erase.
+                # CR-terminated re-export be typed onto a retained line and submit it. So
+                # do NOT clear it; mark the line unmirrorable so _line_pending() keeps
+                # deferring the re-export. This is the #34 pattern: KEEP _line_dirty set.
                 # (Ctrl+C differs: readline HANDLES SIGINT and discards the line regardless
                 # of NOFLSH, so its mirror-clear below stays correct.)
                 self._line_dirty = True
@@ -3955,16 +3924,8 @@ class SecureTerminal(QPlainTextEdit):
                 byte = key & 0x1f                  # Ctrl+C -> 0x03, Ctrl+L -> 0x0c
                 if byte in (0x0a, 0x0d):
                     # Ctrl+J (LF) and Ctrl+M (CR) are accept-line: readline/zle
-                    # submit the line exactly like Enter, so route them through the
-                    # hook and reset the line state -- else the command runs unjudged
-                    # and a stale dirty flag would poison the next prompt. Judge only
-                    # at a bare prompt: with a foreground program the keystrokes are
-                    # ITS input (a password at sudo/ssh, text in cat), not a shell
-                    # command -- feeding them to the hook would leak them and the
-                    # discard would signal/disrupt that program (matches the TUI path).
-                    if (self._hook is not None and not self.has_foreground_program()
-                            and self._hook_intercept()):
-                        return
+                    # submit the line exactly like Enter, so reset the line state --
+                    # else a stale dirty flag would poison the next prompt.
                     self._line_buffer = ''
                     self._line_dirty = False
                     self._write(bytes([byte]))
@@ -3981,18 +3942,17 @@ class SecureTerminal(QPlainTextEdit):
                     # the cursor position, which we do not track. So clear the mirror but
                     # PRESERVE _line_dirty: only a clean mirror (cursor at end, not dirty)
                     # truly killed the whole line. If the cursor had already moved, the
-                    # survivor is unknown and the next Enter must fail safe (ask), not
-                    # submit it unjudged. Regression: resetting the flag let Home then
-                    # Ctrl+U bypass the command hook.
+                    # survivor is unknown, so _line_pending() must keep assuming the
+                    # prompt holds text. Regression: resetting the flag let Home then
+                    # Ctrl+U leave an invisible survivor _line_pending missed.
                     self._line_buffer = ''
                 else:
                     # any OTHER readline control edit (Ctrl+A/E/B/F move, Ctrl+K/W
                     # kill, Ctrl+Y yank, Ctrl+T transpose, Ctrl+D delete, Ctrl+R
                     # search) rewrites the real line without updating _line_buffer,
-                    # so the hook must not judge the stale buffer -- fail safe (ask).
-                    # Flagged whether or not a hook is configured: _line_pending
-                    # reads it too, and a line we cannot see is exactly the line a
-                    # CR-terminated re-export must not be typed into.
+                    # so mark it unmirrorable: _line_pending reads the flag, and a line
+                    # we cannot see is exactly the line a CR-terminated re-export must
+                    # not be typed into.
                     self._line_dirty = True
                 return
             # The rest of the Ctrl+@..Ctrl+_ range (Ctrl+[ -> 0x1b ESC, Ctrl+] ->
@@ -4007,13 +3967,7 @@ class SecureTerminal(QPlainTextEdit):
                 return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            # The command hook (if configured) judges the typed line before Enter
-            # submits it; it may block, ask, or offer a safer command. Only at a
-            # bare prompt: with a foreground program in place the line is ITS input
-            # (a sudo/ssh password), not a shell command (matches the TUI path).
-            if (self._hook is not None and not self.has_foreground_program()
-                    and self._hook_intercept()):
-                return
+            # Enter submits the line: reset the mirror state, then send CR.
             self._line_buffer = ''
             self._line_dirty = False
             self._write(b'\r')
@@ -4024,8 +3978,8 @@ class SecureTerminal(QPlainTextEdit):
             return
         if key == Qt.Key.Key_Tab:
             # Tab completion rewrites the shell's line (path/command completion)
-            # without updating _line_buffer, so the hook would judge the
-            # pre-completion fragment. Fail safe: ask.
+            # without updating _line_buffer, so mark the mirror unreliable for
+            # _line_pending().
             self._line_dirty = True
             self._write(b'\t')
             return
@@ -4044,9 +3998,8 @@ class SecureTerminal(QPlainTextEdit):
                 # History recall / intra-line cursor editing happens inside the
                 # shell's line editor, which we do not mirror -- so once one of
                 # these is used, _line_buffer no longer reflects the real command.
-                # Mark it, so the hook fails safe (asks) instead of judging a
-                # stale or empty line -- and so _line_pending knows a recalled
-                # command is sitting at the prompt even though we never saw it.
+                # Mark it so _line_pending knows a recalled command is sitting at
+                # the prompt even though we never saw it.
                 self._line_dirty = True
                 self._write(seq)
                 return
@@ -4091,136 +4044,6 @@ class SecureTerminal(QPlainTextEdit):
             return False
         return True
 
-    # -- command hook: judge the typed line before Enter submits it -----------
-    def apply_hook(self, config):
-        """Enable the command hook (a dict with keys argv, timeout, on_error,
-        transcript) or disable it with None."""
-        self._hook = config or None
-
-    def hook_enabled(self):
-        return self._hook is not None
-
-    def _foreground_cwd(self):
-        pgrp = self._foreground_pgrp()
-        if pgrp:
-            try:
-                return os.readlink('/proc/%d/cwd' % pgrp)
-            except OSError:
-                pass            # gone / not readable -> no cwd
-        return ''
-
-    def _hook_transcript(self):
-        setting = (self._hook or {}).get('transcript', 'none')
-        if setting == 'full':
-            return self.toPlainText()
-        if setting.startswith('tail:'):
-            try:
-                count = int(setting.split(':', 1)[1])
-            except ValueError:
-                count = 0
-            if count > 0:
-                return '\n'.join(self.toPlainText().split('\n')[-count:])
-        return ''
-
-    def _hook_intercept(self):
-        """Judge the typed line through the hook before it is submitted. Returns
-        True when the hook handled the Enter (blocked, or asked and decided);
-        False to let the normal path submit the line unchanged."""
-        from secure_terminal import hook
-        # If the line was recalled from history or edited with the cursor keys,
-        # _line_buffer no longer matches what the shell will run, so judging it
-        # would be misleading (it could wave a dangerous recalled command through).
-        # Fail safe: ask the user to confirm the line the hook could not read.
-        if self._line_dirty:
-            action = self._hook_ask('(recalled / edited line)', {
-                'verdict': 'ask',
-                'message': 'This line was recalled from history or edited in '
-                           'place, so the command hook could not read it. Review '
-                           'it before it runs.',
-                'suggestion': ''})
-            self._line_buffer = ''
-            if action == 'run':
-                self._line_dirty = False
-                self._write(b'\r')
-            else:
-                # Best-effort cancel of a line we cannot see. Its content is unknown
-                # so a counted erase is impossible; SIGINT is the only keymap-free
-                # cancel. It can be disarmed (`stty intr undef`), so KEEP _line_dirty
-                # set -- the next Enter re-asks instead of submitting a retained line.
-                self._write(self._CANCEL_UNKNOWN_LINE)
-            return True
-        command = self._line_buffer
-        if not command.strip():
-            return False
-        cfg = self._hook or {}            # never None here (the caller guards), and
-        result = hook.evaluate(           # the `or {}` mirrors _hook_transcript
-            cfg['argv'], command,
-            timeout=cfg.get('timeout', 10),
-            on_error=cfg.get('on_error', 'allow'),
-            cwd=self._foreground_cwd(),
-            transcript_provider=self._hook_transcript)
-        if result['message']:
-            self.hook_notice.emit(result['message'])
-        if result['verdict'] == 'allow':
-            return False
-        action = self._hook_ask(command, result)     # 'run' | 'suggest' | 'discard'
-        if action == 'run':
-            self._line_buffer = ''
-            self._write(b'\r')
-            return True
-        # Best-effort erase of the rejected line -- but the erase is NOT reliable:
-        # ^? (DEL) is the erase key only until `stty erase` rebinds it (then the DELs
-        # are INSERTED as text), and a cooked ICANON editor deletes BYTES while
-        # len(command) counts code points, so multibyte padding can leave bytes
-        # behind. So the SECURITY comes from KEEPING _line_dirty set (as the SIGINT
-        # path above does), NOT from the erase: the next Enter then re-asks via the
-        # dirty branch instead of reaching the empty-buffer shortcut and submitting
-        # the un-erased command UNJUDGED. The write is still made so the common case
-        # (^? is the erase key) visibly clears the line / shows the suggestion.
-        self._clear_typed_line(command)
-        self._line_buffer = ''
-        self._line_dirty = True
-        if action == 'suggest' and result['suggestion']:
-            # insert the suggested command for review -- never with a newline, so it
-            # never auto-runs; the user's Enter is re-judged via the dirty branch.
-            # The hook layer already single-lines a suggestion, but strip CR/LF HERE
-            # too so the no-auto-run invariant holds at the write site.
-            suggestion = result['suggestion'].replace('\r', ' ').replace('\n', ' ')
-            self._write(suggestion.encode('ascii', 'ignore'))
-            self._line_buffer = suggestion
-        return True
-
-    def _hook_ask(self, command, result):
-        """Prompt for a blocked/ask verdict. Returns 'run', 'suggest' or
-        'discard'. A 'block' with no suggestion needs no prompt (just discard)."""
-        from PyQt6.QtWidgets import QMessageBox
-        if result['verdict'] == 'block' and not result['suggestion']:
-            return 'discard'
-        text = ('The command hook flagged this command:\n\n  ' + command
-                + (('\n\n' + result['message']) if result['message'] else ''))
-        box = QMessageBox(QMessageBox.Icon.Warning, 'Command hook', text, parent=self)
-        # The command + hook message are untrusted (program- / config-supplied), so pin
-        # PlainText: QMessageBox auto-detects rich text, and HTML-like content would else
-        # render as markup (hiding or restyling the very command being reviewed).
-        box.setTextFormat(Qt.TextFormat.PlainText)
-        run_btn = None
-        if result['verdict'] == 'ask':
-            run_btn = box.addButton('Run as typed',
-                                    QMessageBox.ButtonRole.AcceptRole)
-        suggest_btn = None
-        if result['suggestion']:
-            suggest_btn = box.addButton('Use: ' + result['suggestion'][:40],
-                                        QMessageBox.ButtonRole.ActionRole)
-        cancel_btn = box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(cancel_btn)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is run_btn and run_btn is not None:
-            return 'run'
-        if clicked is suggest_btn and suggest_btn is not None:
-            return 'suggest'
-        return 'discard'
-
     def _tui_key(self, event):
         """Encode a keystroke as VT input for the program in TUI mode."""
         key = event.key()
@@ -4250,36 +4073,21 @@ class SecureTerminal(QPlainTextEdit):
         #   text, a history recall, a completion) leaves text at the bare prompt --
         #   which TUI cannot mirror. Flag it dirty: otherwise a later TUI->CLI
         #   switch fires an immediate CR-terminated re-export that concatenates onto
-        #   and SUBMITS that line, an Enter the user never pressed that also bypasses
-        #   command_hook. Pure navigation/deletion keys (_NON_CONTENT_KEYS) never
-        #   introduce content, so they do NOT flag -- else a no-op Backspace/Left at
-        #   an empty prompt would needlessly defer the re-export. Unlike the CLI path
-        #   the flag here feeds ONLY the re-export (the hook is not consulted in TUI),
-        #   so this precision is safe. Gated on "no foreground program" so a program's
-        #   own keys never strand the flag (a `less` quit with `q` leaves no prompt
-        #   line, yet marking would defer the re-export forever).
+        #   and SUBMITS that line, an Enter the user never pressed. Pure navigation/
+        #   deletion keys (_NON_CONTENT_KEYS) never introduce content, so they do NOT
+        #   flag -- else a no-op Backspace/Left at an empty prompt would needlessly
+        #   defer the re-export. Gated on "no foreground program" so a program's own
+        #   keys never strand the flag (a `less` quit with `q` leaves no prompt line,
+        #   yet marking would defer the re-export forever).
         accept_line = (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
                 or (ctrl and not shift and key in (Qt.Key.Key_J, Qt.Key.Key_M)))
         submit_or_discard = accept_line or (
                 ctrl and not shift and key in (Qt.Key.Key_C, Qt.Key.Key_U))
-        # A bare shell prompt in TUI mode still submits real commands, so the command
-        # hook must judge an accept-line here too -- otherwise switching to TUI is a
-        # SILENT BYPASS of it. Only a bare prompt routes through (a foreground program
-        # owns its own keys), and only when a hook is configured. TUI does not mirror
-        # the line, so _hook_intercept sees _line_dirty (set above for typed content)
-        # and falls through to a human review rather than judging an empty buffer -- a
-        # prompted override, never a silent pass. It performs the submit/discard itself
-        # when it fires, so return without also writing the accept byte; an empty prompt
-        # (nothing typed, not dirty) returns False and submits normally with no prompt.
-        if (accept_line and not self.has_foreground_program()
-                and self._hook is not None and self._hook_intercept()):
-            return
         if submit_or_discard:
             self._line_buffer = ''
-            # accept-line and Ctrl+C settle the line (judged, or SIGINT-discarded), so
-            # the flag clears. Ctrl+U does NOT: its reach is cursor-dependent (untracked),
-            # so a survivor must keep the next accept-line failing safe -- same reason as
-            # the CLI path. Regression: clearing it let Home then Ctrl+U bypass the hook.
+            # accept-line and Ctrl+C settle the line, so the flag clears. Ctrl+U does
+            # NOT: its reach is cursor-dependent (untracked), so a survivor must keep
+            # _line_pending() deferring the re-export -- same reason as the CLI path.
             if not (ctrl and key == Qt.Key.Key_U):
                 self._line_dirty = False
 
@@ -4313,9 +4121,8 @@ class SecureTerminal(QPlainTextEdit):
         # A content key marks the line pending. So does a navigation/deletion key
         # (_NON_CONTENT_KEYS) WHEN a CLI-typed line was carried into TUI (_line_buffer
         # still populated): TUI cannot mirror the edit, so a Home/Delete/Backspace
-        # there desyncs that buffer from the real shell line -- and command_hook must
-        # not judge the stale buffer while the shell runs the edited command. Marking
-        # it dirty forces the hook to fail safe (ask). At an EMPTY prompt (no carried
+        # there desyncs that buffer from the real shell line. Marking it dirty keeps
+        # _line_pending() deferring the re-export. At an EMPTY prompt (no carried
         # buffer) a no-op key still does not mark, so the re-export is not deferred
         # needlessly.
         if (not submit_or_discard and not self.has_foreground_program()
@@ -4674,17 +4481,6 @@ class SecureTerminal(QPlainTextEdit):
         self.paste_review_resolved.emit()
         if raw is None or action == 'reject':
             return
-        # A held paste is multi-line (that is why it was force-reviewed). At a bare prompt
-        # with a command hook, its embedded newlines are REAL submits, so _dispatch_paste
-        # would auto-run every line but the last WITHOUT the hook judging them (only the
-        # trailing line, left at the prompt, is caught on the next Enter). Route it through
-        # the SAME atomic whole-batch review the injected-text path uses: judge the whole
-        # script once, deliver only on an approving verdict. No hook, or a foreground
-        # program (the paste is that program's data, buffered), delivers as before.
-        if (self._hook is not None and not self.has_foreground_program()
-                and paste_is_multiline(raw) and not self._bracketed_paste_active()):
-            self._inject_text_reviewed(raw)
-            return
         self._dispatch_paste(raw, action)
 
     def review_pending(self):
@@ -4716,144 +4512,14 @@ class SecureTerminal(QPlainTextEdit):
         # Keep our view of the line honest across a paste. A paste that lands at a
         # bare SHELL prompt (CLI, or TUI with no foreground program) sits there as a
         # command the next Enter submits -- _line_buffer never saw it, so mark the
-        # line unverifiable. _line_dirty has TWO consumers, both of which must catch
-        # a pasted command: the hook (which then FAILS SAFE, asking on the next
-        # Enter, including in TUI where accept-line now routes through it) AND
-        # _line_pending(), the guard that stops _send_reexport from typing
-        # "export TERM=...\r" onto a line that already holds text. Only a paste
-        # delivered to a FOREGROUND PROGRAM (a TUI app that asked for it) is its
-        # data, not a shell line, so it is the sole case left unmarked.
+        # line unmirrorable. _line_pending() reads _line_dirty: it is the guard that
+        # stops _send_reexport from typing "export TERM=...\r" onto a line that
+        # already holds text. Only a paste delivered to a FOREGROUND PROGRAM (a TUI
+        # app that asked for it) is its data, not a shell line, so it is the sole
+        # case left unmarked.
         if not self.tui_active() or not self.has_foreground_program():
             self._line_dirty = True
         data = safe.encode('utf-8')
         if bracketed:
             data = b'\x1b[200~' + data + b'\x1b[201~'
         self._write(data)
-
-    def _inject_judge_script(self, submits):
-        """Judge a MULTI-LINE injected batch (its submitted lines) as ONE script,
-        once, against the state at injection time. Returns 'run' to deliver the whole
-        batch or '' to refuse it (nothing runs). Fails closed: an unmirrorable prompt
-        line, a Tab in any submitted line (shell completion would run something other
-        than the judged bytes), or a block / ask-cancel verdict all refuse the batch."""
-        from secure_terminal import hook
-        if self._line_dirty or any('\t' in line for line in submits):
-            self.hook_notice.emit(
-                'Injected multi-line payload could not be reviewed as one unit '
-                '(recalled/edited line or Tab completion); refused.')
-            return ''
-        # The first submitted line runs together with whatever the prompt already
-        # holds (mirrored in _line_buffer); the rest are separate commands. Join with
-        # newline so the hook judges the whole script exactly as it will run.
-        script = self._line_buffer + '\n'.join(submits)
-        if not script.strip():
-            # Only blank lines: at a shell CONTINUATION prompt (an unclosed quote, or a
-            # backslash-continued line the widget's mirror does not track) a blank line
-            # COMPLETES and runs the pending command. The widget cannot see that state,
-            # so an all-blank injected batch is UNVERIFIABLE -> refuse (fail closed).
-            self.hook_notice.emit(
-                'Injected blank-only payload could not be reviewed (a blank line may '
-                'complete a pending shell command); refused.')
-            return ''
-        cfg = self._hook or {}
-        result = hook.evaluate(
-            cfg['argv'], script,
-            timeout=cfg.get('timeout', 10),
-            on_error=cfg.get('on_error', 'allow'),
-            cwd=self._foreground_cwd(),
-            script=True,
-            transcript_provider=self._hook_transcript)
-        if result['message']:
-            self.hook_notice.emit(result['message'])
-        if result['verdict'] == 'allow':
-            return 'run'
-        # block / ask: reuse the same modal the per-line path uses. A suggestion is not
-        # auto-applied to a batch (the per-line suggest-insert does not generalize to a
-        # multi-line script), so anything but an explicit 'run' refuses the whole batch.
-        return 'run' if self._hook_ask(script, result) == 'run' else ''
-
-    def _inject_text_reviewed(self, text):
-        """Deliver remote-control-injected text (ctl-send-text). At a bare prompt with a
-        command hook, judge the injected command(s) before they run, so an injected
-        payload cannot auto-run an UNREVIEWED command -- a plain paste would let an
-        embedded newline submit a line with no verdict.
-
-        A MULTI-LINE payload (>=2 submitted lines) is judged as ONE script, ONCE,
-        against the state (cwd/env/umask/...) at injection time, then -- if allowed --
-        delivered without re-judging. This removes the stale-state TOCTOU of judging
-        line i before line i-1 has actually executed (e.g. a `cd /tmp` on line 1 else
-        moves the cwd the hook reads when judging line 2). It fails closed: a block, an
-        unmirrorable prompt line, or a Tab (completion would run other than the judged
-        bytes) refuses the WHOLE batch before anything runs.
-
-        A SINGLE submitted line keeps the per-line path (no interleaved-judge window):
-        content the prompt ALREADY holds is folded into the judged line (an injection
-        cannot submit a pending typed line the hook never saw), and once the hook leaves
-        a line dirty (a block whose erase is unreliable) the injection stops rather than
-        submitting onto leftover bytes. The trailing partial line (no final newline) is
-        left at the prompt marked unverifiable, never auto-submitted. With no hook
-        configured, or when a foreground program owns the input, fall back to the safe
-        paste path (the bytes are that program's data, not shell commands)."""
-        if self._hook is None or self.has_foreground_program():
-            self._dispatch_paste(text, 'stripped')
-            return
-        # sanitize_paste maps every newline to CR, so the CR-separated pieces are the
-        # lines; a trailing newline yields a final '' piece (nothing left un-judged).
-        pieces = sanitize_paste(text).split('\r')
-        submits = pieces[:-1]         # each submitted with CR; pieces[-1] left at prompt
-        prejudged = False
-        if len(submits) >= 2:
-            # Multi-line: judge the whole script ONCE, atomically. Refuse the batch
-            # (deliver nothing) on anything but an approving verdict.
-            if self._inject_judge_script(submits) != 'run':
-                return
-            prejudged = True
-        for i, line in enumerate(pieces):
-            if line:
-                self._write(line.encode('utf-8'))     # "type" the line (the shell echoes it)
-            if '\t' in line:
-                # A Tab triggers the shell's completion, so it runs a DIFFERENT command
-                # than the hook would judge from the literal bytes (`/bin/ech\t` -> the
-                # completed `/bin/echo`). Mark the line unverifiable, exactly as a typed
-                # Tab does, so _hook_intercept ASKS rather than auto-submitting the
-                # pre-completion text. (sanitize_paste keeps only \t and \r among C0.)
-                # The atomic pre-judge already refused a batch with a Tab in any
-                # SUBMITTED line, so on that path this only marks the trailing piece.
-                self._line_dirty = True
-            # The next Enter submits (whatever the prompt already held) + this piece,
-            # so FOLD any mirrored prefix into the judged command -- the hook must see
-            # exactly what will run, or a pending typed line (or an injected bare
-            # newline onto one) would submit unreviewed. When the prefix is
-            # UNMIRRORABLE (_line_dirty: a recalled / cursor-edited line) the fold is
-            # impossible, so _line_dirty stays set and _hook_intercept's dirty branch
-            # ASKS instead of auto-submitting. Never reset _line_dirty here: a prior
-            # piece the hook left dirty must stay dirty.
-            if not self._line_dirty:
-                self._line_buffer = self._line_buffer + line
-            if i == len(pieces) - 1:
-                # a final piece with NO trailing newline: leave it for the user's own
-                # Enter (which re-judges via the hook), never auto-submit it.
-                self._line_dirty = self._line_dirty or bool(self._line_buffer)
-                return
-            if prejudged:
-                # The whole batch was approved as one unit; submit each line without a
-                # second, race-prone judgment.
-                self._line_buffer = ''
-                self._write(b'\r')
-                continue
-            # Co-locate the no-foreground guard with the call (formal INV-LEAK): the
-            # 4652 early-return covers today's single-line path, but the gate pins the
-            # guard AT every _hook_intercept site so a future multi-line reach (a prior
-            # submitted line having launched a program) cannot fire the hook mid-batch.
-            if not self.has_foreground_program() and self._hook_intercept():
-                # The hook handled the Enter. An approved 'run' submitted a clean line
-                # (_line_dirty cleared, buffer empty) so we may keep going; a block /
-                # ask left the line dirty because the best-effort erase is UNRELIABLE
-                # (stty erase rebind / multibyte). STOP there -- a later piece must not
-                # send a bare CR onto un-erased rejected bytes. The user's own Enter
-                # re-judges the leftover via the dirty branch.
-                if self._line_dirty:
-                    return
-                continue
-            self._line_buffer = ''
-            self._write(b'\r')    # allowed (or an empty line) -> submit it
