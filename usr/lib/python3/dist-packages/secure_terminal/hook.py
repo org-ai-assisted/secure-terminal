@@ -17,8 +17,20 @@ a confused or hostile handler cannot inject escape sequences or auto-run a
 command.
 
 Request (stdin): {"version":1,"command":..,"cwd":..,"tab":..,"transcript":..?}
+  or, for a multi-line injected payload judged as ONE unit (ctl-send-text):
+                 {"version":2,"command":..,"script":..,"cwd":..,"tab":..,
+                  "transcript":..?}
 Reply (stdout):  {"verdict":"allow|block|ask|need_transcript",
-                  "message":..?,"suggestion":..?}
+                  "message":..?,"suggestion":..?,"multiline_reviewed":..?}
+
+Version 2 adds `script`: the WHOLE multi-line payload, judged once against the state
+at injection time (no per-line stale-state race). A version-2 handler reads `script`,
+reasons over the whole thing, and -- to have an ALLOW trusted -- MUST set
+`multiline_reviewed: true` in its reply. `command` mirrors `script` for a handler that
+still reads `command`, but an ALLOW without the ack is NOT trusted for a multi-line
+batch (a version-1 handler judges only the single-line `command`, so a
+`startswith`/`^`-anchored rule would miss a dangerous later line): the caller fails
+CLOSED and refuses the batch. `block`/`ask` are always honored.
 
 A reply of need_transcript triggers a second call with the transcript attached
 (the cheap-then-escalate pass), so the expensive/long/injection-prone transcript
@@ -78,12 +90,18 @@ def _error(on_error, why) -> HookResult:
 
 
 def evaluate(handler_argv, command, timeout=10, on_error='allow',
-             cwd='', tab='', transcript_provider=None) -> HookResult:
+             cwd='', tab='', script=False, transcript_provider=None) -> HookResult:
     """Run the handler for `command` and return a decision:
     {'verdict': 'allow'|'block'|'ask', 'message': str, 'suggestion': str,
      'error': bool}. transcript_provider, if given, is called only when the
-    handler replies need_transcript."""
-    payload = {'version': 1, 'command': command, 'cwd': cwd, 'tab': tab}
+    handler replies need_transcript. With script=True, `command` is a MULTI-LINE
+    payload judged as one unit: the request is version 2 with an explicit `script`
+    field (and `command` mirrors it, so a version-1 handler still sees the content
+    and cannot fail open on an empty command)."""
+    payload = {'version': 2 if script else 1, 'command': command,
+               'cwd': cwd, 'tab': tab}
+    if script:
+        payload['script'] = command
     try:
         reply = _invoke(handler_argv, payload, timeout)
         if isinstance(reply, dict) and reply.get('verdict') == 'need_transcript':
@@ -94,7 +112,22 @@ def evaluate(handler_argv, command, timeout=10, on_error='allow',
         return _error(on_error, 'command hook error: ' + str(exc))
     if not isinstance(reply, dict) or reply.get('verdict') not in VERDICTS:
         return _error(on_error, 'command hook returned an invalid verdict')
-    return {'verdict': reply['verdict'],
-            'message': _sanitize_message(reply.get('message')),
-            'suggestion': _sanitize_suggestion(reply.get('suggestion')),
-            'error': False}
+    result: HookResult = {
+        'verdict': reply['verdict'],
+        'message': _sanitize_message(reply.get('message')),
+        'suggestion': _sanitize_suggestion(reply.get('suggestion')),
+        'error': False}
+    if (script and result['verdict'] == 'allow'
+            and reply.get('multiline_reviewed') is not True):
+        # A multi-line batch was sent, but the handler did not confirm it reviewed the
+        # whole `script` (a version-1 handler judges only the single-line `command`, so
+        # its ALLOW can miss a dangerous later line -- e.g. a `startswith`/`^`-anchored
+        # rule sees only the first line). Fail closed: refuse the batch rather than
+        # trust an unconfirmed allow. A handler opts in by reading `script` and setting
+        # `multiline_reviewed: true` in its reply.
+        return {'verdict': 'block',
+                'message': _sanitize_message(
+                    'command hook did not confirm multi-line review; refusing the '
+                    'injected batch (upgrade the hook to read the "script" field)'),
+                'suggestion': '', 'error': False}
+    return result

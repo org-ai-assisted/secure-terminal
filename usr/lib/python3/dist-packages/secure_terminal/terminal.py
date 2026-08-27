@@ -84,6 +84,7 @@ import shlex
 import unicodedata
 
 import pyte
+import pyte.graphics
 # pyte's own hard dependency, so no new package: it is what pyte's draw() uses to
 # decide a character's cell width, and _SafeHistoryScreen.draw has to agree with
 # that decision to know which characters pyte would silently drop.
@@ -107,7 +108,56 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
     def select_graphic_rendition(self, *attrs, private=False, **kwargs):
         if private:
             return
-        super().select_graphic_rendition(*attrs)
+        # pyte encodes AIXTERM bright BACKGROUND (SGR 100-107) as a base-name bg PLUS
+        # bold=True, conflating a bright bg with bold: the bg then renders DIM (the base
+        # palette index, not the +8 bright entry) and the phantom bold both brightens the
+        # fg (see _pyte_format's bright=cell.bold) and bolds the font. Handle bright-bg
+        # here: strip it from what pyte parses (so no phantom bold is set) and point the
+        # bg at the matching BRIGHT palette name, which _pyte_qcolor renders from
+        # ANSI_PALETTE[8..15] -- OSC-palette aware, exactly like bright fg. Scan in order
+        # so a later reset / normal-bg / 256-bg still wins over an earlier bright-bg.
+        passthrough = []
+        bright_bg = None
+        it = iter(attrs)
+        for attr in it:
+            if attr in (38, 48):
+                # 38/48 introduce an EXTENDED colour (5;<idx> or 2;<r>;<g>;<b>); the params
+                # that follow are colour DATA, not opcodes, so CONSUME them -- else a component
+                # in 100-107 (e.g. the index in 38;5;101) is misread as a bright-bg code and
+                # corrupts the 256/truecolour sequence.
+                passthrough.append(attr)
+                mode = next(it, None)
+                complete = False
+                if mode is not None:
+                    passthrough.append(mode)
+                    need = 3 if mode == 2 else 1 if mode == 5 else 0
+                    got = 0
+                    for _ in range(need):
+                        comp = next(it, None)
+                        if comp is None:
+                            break
+                        passthrough.append(comp)
+                        got += 1
+                    complete = need > 0 and got == need
+                if attr == 48 and complete:
+                    # a COMPLETE 256/truecolour bg (48;5;N or 48;2;R;G;B) overrides an earlier
+                    # bright-bg. An INCOMPLETE/malformed 48 (bare, bad mode, or missing
+                    # components) is ignored and must NOT clear a preceding valid bright-bg --
+                    # e.g. `101;48` keeps the bright-red bg.
+                    bright_bg = None
+                continue
+            if attr in _BG_AIXTERM_BRIGHT:
+                bright_bg = _BG_AIXTERM_BRIGHT[attr]
+            else:
+                passthrough.append(attr)
+                if attr in _BG_OVERRIDE_CODES:
+                    bright_bg = None
+        # Skip super when the ONLY codes were bright-bg: an empty *passthrough would hit
+        # pyte's reset-all fast path. A genuine ESC[m (no attrs) must still reach it.
+        if passthrough or not attrs:
+            super().select_graphic_rendition(*passthrough)
+        if bright_bg is not None:
+            self.cursor.attrs = self.cursor.attrs._replace(bg=bright_bg)
 
     def linefeed(self):
         # A line that fills the EXACT width leaves the cursor "past" the last column (pyte's
@@ -139,10 +189,14 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         # in O(n^2) and freezes the render for seconds. Drop a mark once its
         # TARGET cell already holds the Unicode stream-safe maximum: cell-accurate,
         # so neither read boundaries nor cursor moves can bypass it. Lossless for
-        # real decomposed text (never nears the cap). Fast path: an all-ASCII
+        # real decomposed text (never nears the cap). Fast path: a printable-ASCII
         # chunk (the common case) batches through at C speed, since ASCII can
-        # never be a combining mark.
-        if data.isascii():
+        # never be a combining mark. It must ALSO be printable: stock pyte draw
+        # breaks its whole batch on the first wcwidth==-1 byte (screens.py `else:
+        # break`), so a C0 control in an all-ASCII chunk would drop the C0 AND the
+        # rest of the chunk unmarked -- the per-char loop below instead marks the
+        # C0 (via _merge_invisible/_mark_own_cell) and keeps going.
+        if data.isascii() and data.isprintable():
             super().draw(data)
             return
         for ch in data:
@@ -229,6 +283,16 @@ class _Utf8CharsetByteStream(pyte.ByteStream):
         # character split across reads still decodes), then parse the str directly
         # -- bypassing ByteStream.feed's use_utf8-gated latin-1 pass-through.
         pyte.Stream.feed(self, self.utf8_decoder.decode(data))
+
+    def select_other_charset(self, code):
+        # We ALWAYS UTF-8-decode in feed() and hold use_utf8 False solely to arm the
+        # ISO-2022 charset-designation path. pyte's base flips use_utf8 back ON for a
+        # child's ESC%G / ESC%8 (announce UTF-8 mode) -- which would make the parser skip
+        # every ESC(0 designation again, so DEC line-drawing renders as literal 'lqqqk'
+        # (the exact defect this class exists to fix, e.g. GNU screen announces UTF-8 that
+        # way). We are unconditionally UTF-8, so ignore the mode select and keep the
+        # charset path armed.
+        return
 
 
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
@@ -504,11 +568,24 @@ def _rgb(color):
     return (color.red(), color.green(), color.blue())
 
 
-# pyte colour name -> ANSI_PALETTE index (bold promotes to the bright variant).
+# pyte colour name -> ANSI_PALETTE index (base 0-7; bold promotes to the +8 bright
+# variant). The bright NAMES map straight to 8-15 so a bright background (set by
+# _SafeHistoryScreen from an AIXTERM SGR 100-107) renders from the bright palette
+# without the bold flag pyte otherwise overloads for it.
 _PYTE_COLOR = {
     'black': 0, 'red': 1, 'green': 2, 'brown': 3,
     'blue': 4, 'magenta': 5, 'cyan': 6, 'white': 7,
+    'brightblack': 8, 'brightred': 9, 'brightgreen': 10, 'brightbrown': 11,
+    'brightblue': 12, 'brightmagenta': 13, 'brightcyan': 14, 'brightwhite': 15,
 }
+
+# AIXTERM bright-background SGR code (100-107) -> the bright palette name above.
+_BG_AIXTERM_BRIGHT = {code: 'bright' + name
+                      for code, name in pyte.graphics.BG_AIXTERM.items()}
+# Codes that re-select or reset the background; any AFTER a bright-bg code overrides it:
+# normal/default bg (40-47/49) and reset-all (0). The 256/truecolor bg selector (48) is
+# handled in select_graphic_rendition (it consumes its own colour params there).
+_BG_OVERRIDE_CODES = frozenset(pyte.graphics.BG) | {0}
 
 
 def _build_tui_keys():
@@ -1384,6 +1461,12 @@ class SecureTerminal(QPlainTextEdit):
             if key == 'osc_colors' and not enabled and self._osc_palette:
                 self._osc_palette.clear()
                 self.apply_theme(self._theme)  # restore the theme palette + repaint
+            if key == 'osc_clipboard_read' and not enabled \
+                    and self._clipboard_read == 'pending':
+                # Disabling the feature abandons any in-flight consent: drop the pending
+                # state so a still-open dialog's grant answers no stale READ query and
+                # the next request (should the feature be re-enabled) asks afresh.
+                self._clipboard_read = None
 
     def osc_enabled(self, key):
         return self._osc.get(key, False)
@@ -1602,7 +1685,9 @@ class SecureTerminal(QPlainTextEdit):
             return QColor(default) if default is not None else None
         idx = _PYTE_COLOR.get(color)
         if idx is not None:
-            real = idx + 8 if bright else idx
+            # bold promotes a BASE colour (0-7) to its bright variant; a name that is
+            # ALREADY bright (8-15, e.g. a bright bg) must not promote past the palette.
+            real = idx + 8 if bright and idx < 8 else idx
             return QColor(self._osc_palette.get(real, ANSI_PALETTE[real]))
         col = QColor('#' + color)          # 256/truecolor as a 6-hex string
         if col.isValid():
@@ -1842,7 +1927,8 @@ class SecureTerminal(QPlainTextEdit):
         offset = 0
         for text, fmt in self._grid_row_runs(row, columns):
             length = len(text) + sum(ord(ch) > 0xFFFF for ch in text)   # UTF-16 units
-            cp = fmt.property(_CP_PROP)
+            # _grid_row_runs always yields a real QTextCharFormat (pyrefly types it Optional).
+            cp = fmt.property(_CP_PROP)  # pyrefly: ignore[missing-attribute]
             runs.append((offset, length, fmt, None if cp is None else int(cp)))
             parts.append(text)
             offset += length
@@ -2934,23 +3020,27 @@ class SecureTerminal(QPlainTextEdit):
     CLIP_DENY_ALWAYS = 'deny_always'
 
     def grant_clipboard_read(self, decision):
-        """Record the user's clipboard-read decision from the dialog. Four choices:
-        allow/deny, each ONCE (this request only, re-ask next time) or ALWAYS
-        (remembered for the tab's life). A bool is accepted for compatibility
-        (True -> allow-always, False -> deny-always). When the answer allows, reply
-        to the query that opened the dialog now -- it was consumed when the prompt
-        went up, so a one-shot client would otherwise wait forever."""
-        if decision is True:
-            decision = self.CLIP_ALLOW_ALWAYS
-        elif decision is False:
-            decision = self.CLIP_DENY_ALWAYS
-        was_pending = self._clipboard_read == 'pending'
+        """Record the user's clipboard-read decision from the dialog -- one of the four
+        CLIP_* choices: allow/deny, each ONCE (this request only, re-ask next time) or
+        ALWAYS (remembered for the tab's life). When the answer allows, reply to the
+        query that opened the dialog now -- it was consumed when the prompt went up, so a
+        one-shot client would otherwise wait forever."""
+        if self._clipboard_read != 'pending':
+            # Stale dialog: its request was abandoned (osc_clipboard_read toggled off, or it
+            # was already resolved), so a late click must NOT establish a tab decision -- a
+            # disable + re-enable + stale allow-always would otherwise grant the tab and let
+            # the next read reply with no fresh prompt. Drop it; the next read re-asks.
+            return
         allow = decision in (self.CLIP_ALLOW_ONCE, self.CLIP_ALLOW_ALWAYS)
         remember = decision in (self.CLIP_ALLOW_ALWAYS, self.CLIP_DENY_ALWAYS)
         # remember -> persist the tab decision; once -> reset to None so the next
         # request asks again.
         self._clipboard_read = allow if remember else None
-        if allow and was_pending:
+        # Re-check the feature flag: osc_clipboard_read can be disabled WHILE this consent
+        # dialog is open (TOCTOU). The in-flight READ query must not be answered once the
+        # feature is off, or an allow click would exfiltrate the clipboard the disable was
+        # meant to stop. A recorded allow still stands for a later re-enable.
+        if allow and self._osc.get('osc_clipboard_read'):
             self._reply_clipboard()
 
     def set_clipboard_read_always(self, on):
@@ -3017,8 +3107,10 @@ class SecureTerminal(QPlainTextEdit):
         path = '/' + path if not path.startswith('/') else path
         # percent-decoding can reintroduce control/bidi/zero-width characters, so
         # run the decoded path through the same safe-ASCII sanitizer as titles
-        # before it is shown as a tooltip (no control, no homoglyph, no bidi).
-        path = sanitize_title(path)[:4096]
+        # before it is shown as a tooltip (no control, no homoglyph, no bidi). Pass the
+        # bound to the sanitizer: its default limit is 80, so a trailing [:4096] slice
+        # would be dead -- a deep cwd path must show up to 4096, not be cut to 80.
+        path = sanitize_title(path, limit=4096)
         if path and path != self._reported_cwd:
             self._reported_cwd = path
             self.cwd_changed.emit(path)
@@ -3675,12 +3767,18 @@ class SecureTerminal(QPlainTextEdit):
             super().keyPressEvent(event)
             return
         if self._review_active:
-            # A pasted text is held for review: input is suspended so a stray key
-            # can never leak into the shell or fire the paste. Enter or Esc rejects
-            # (the safe default); everything else is swallowed until a choice.
+            # A pasted OR copied text is held for review: input is suspended so a
+            # stray key can never leak into the shell, fire the paste, or release the
+            # copy. Enter or Esc rejects (the safe default); everything else is
+            # swallowed until a choice. Route to whichever review is actually pending
+            # -- a copy review rejected through the paste dispatcher would clear the
+            # paste state and strand _pending_copy set (a later copy dispatch no-ops).
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter,
                                Qt.Key.Key_Escape):
-                self.dispatch_pending_paste('reject')
+                if self._pending_copy is not None:
+                    self.dispatch_pending_copy('reject')
+                else:
+                    self.dispatch_pending_paste('reject')
             return
         key = event.key()
         mods = event.modifiers()
@@ -3733,6 +3831,16 @@ class SecureTerminal(QPlainTextEdit):
             if key == Qt.Key.Key_Backslash:
                 self._write(b'\x1c')          # Ctrl+\ -> SIGQUIT (cooked)
                 self._echo_caret('^\\')       # make the signal visible
+                # SIGQUIT's effect on the pending line is tty/shell-dependent and NOT
+                # observable here: with NOFLSH off the tty flushes it, but under `stty
+                # noflsh` -- or a shell that traps SIGQUIT, which bash does at its prompt --
+                # the line is RETAINED. Clearing the mirror to empty would then let a
+                # retained command run UNJUDGED on the next Enter. So do NOT clear it; mark
+                # the line unverifiable, so the next Enter FAILS SAFE and re-judges. This is
+                # the #34 pattern: security comes from KEEPING _line_dirty set, not an erase.
+                # (Ctrl+C differs: readline HANDLES SIGINT and discards the line regardless
+                # of NOFLSH, so its mirror-clear below stays correct.)
+                self._line_dirty = True
                 return
             if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
                 byte = key & 0x1f                  # Ctrl+C -> 0x03, Ctrl+L -> 0x0c
@@ -4477,25 +4585,84 @@ class SecureTerminal(QPlainTextEdit):
             data = b'\x1b[200~' + data + b'\x1b[201~'
         self._write(data)
 
+    def _inject_judge_script(self, submits):
+        """Judge a MULTI-LINE injected batch (its submitted lines) as ONE script,
+        once, against the state at injection time. Returns 'run' to deliver the whole
+        batch or '' to refuse it (nothing runs). Fails closed: an unmirrorable prompt
+        line, a Tab in any submitted line (shell completion would run something other
+        than the judged bytes), or a block / ask-cancel verdict all refuse the batch."""
+        from secure_terminal import hook
+        if self._line_dirty or any('\t' in line for line in submits):
+            self.hook_notice.emit(
+                'Injected multi-line payload could not be reviewed as one unit '
+                '(recalled/edited line or Tab completion); refused.')
+            return ''
+        # The first submitted line runs together with whatever the prompt already
+        # holds (mirrored in _line_buffer); the rest are separate commands. Join with
+        # newline so the hook judges the whole script exactly as it will run.
+        script = self._line_buffer + '\n'.join(submits)
+        if not script.strip():
+            # Only blank lines: at a shell CONTINUATION prompt (an unclosed quote, or a
+            # backslash-continued line the widget's mirror does not track) a blank line
+            # COMPLETES and runs the pending command. The widget cannot see that state,
+            # so an all-blank injected batch is UNVERIFIABLE -> refuse (fail closed).
+            self.hook_notice.emit(
+                'Injected blank-only payload could not be reviewed (a blank line may '
+                'complete a pending shell command); refused.')
+            return ''
+        cfg = self._hook or {}
+        result = hook.evaluate(
+            cfg['argv'], script,
+            timeout=cfg.get('timeout', 10),
+            on_error=cfg.get('on_error', 'allow'),
+            cwd=self._foreground_cwd(),
+            script=True,
+            transcript_provider=self._hook_transcript)
+        if result['message']:
+            self.hook_notice.emit(result['message'])
+        if result['verdict'] == 'allow':
+            return 'run'
+        # block / ask: reuse the same modal the per-line path uses. A suggestion is not
+        # auto-applied to a batch (the per-line suggest-insert does not generalize to a
+        # multi-line script), so anything but an explicit 'run' refuses the whole batch.
+        return 'run' if self._hook_ask(script, result) == 'run' else ''
+
     def _inject_text_reviewed(self, text):
-        """Deliver remote-control-injected text (ctl-send-text). At a bare prompt with
-        a command hook, judge EACH complete line through the hook exactly as a typed
-        Enter would (block / ask / allow), so an injected multi-line payload cannot
-        auto-run an UNREVIEWED command -- a plain paste would let an embedded newline
-        submit the earlier line with no verdict. Content the prompt ALREADY holds is
-        folded into the first judged line (an injection cannot submit a pending typed
-        line the hook never saw), and once the hook leaves a line dirty (a block whose
-        erase is unreliable) the injection stops rather than submitting onto leftover
-        bytes. The trailing partial line (no final newline) is left at the prompt
-        marked unverifiable, never auto-submitted. With no hook configured, or when a
-        foreground program owns the input, fall back to the safe paste path (the bytes
-        are that program's data, not shell commands)."""
+        """Deliver remote-control-injected text (ctl-send-text). At a bare prompt with a
+        command hook, judge the injected command(s) before they run, so an injected
+        payload cannot auto-run an UNREVIEWED command -- a plain paste would let an
+        embedded newline submit a line with no verdict.
+
+        A MULTI-LINE payload (>=2 submitted lines) is judged as ONE script, ONCE,
+        against the state (cwd/env/umask/...) at injection time, then -- if allowed --
+        delivered without re-judging. This removes the stale-state TOCTOU of judging
+        line i before line i-1 has actually executed (e.g. a `cd /tmp` on line 1 else
+        moves the cwd the hook reads when judging line 2). It fails closed: a block, an
+        unmirrorable prompt line, or a Tab (completion would run other than the judged
+        bytes) refuses the WHOLE batch before anything runs.
+
+        A SINGLE submitted line keeps the per-line path (no interleaved-judge window):
+        content the prompt ALREADY holds is folded into the judged line (an injection
+        cannot submit a pending typed line the hook never saw), and once the hook leaves
+        a line dirty (a block whose erase is unreliable) the injection stops rather than
+        submitting onto leftover bytes. The trailing partial line (no final newline) is
+        left at the prompt marked unverifiable, never auto-submitted. With no hook
+        configured, or when a foreground program owns the input, fall back to the safe
+        paste path (the bytes are that program's data, not shell commands)."""
         if self._hook is None or self.has_foreground_program():
             self._dispatch_paste(text, 'stripped')
             return
         # sanitize_paste maps every newline to CR, so the CR-separated pieces are the
         # lines; a trailing newline yields a final '' piece (nothing left un-judged).
         pieces = sanitize_paste(text).split('\r')
+        submits = pieces[:-1]         # each submitted with CR; pieces[-1] left at prompt
+        prejudged = False
+        if len(submits) >= 2:
+            # Multi-line: judge the whole script ONCE, atomically. Refuse the batch
+            # (deliver nothing) on anything but an approving verdict.
+            if self._inject_judge_script(submits) != 'run':
+                return
+            prejudged = True
         for i, line in enumerate(pieces):
             if line:
                 self._write(line.encode('utf-8'))     # "type" the line (the shell echoes it)
@@ -4505,6 +4672,8 @@ class SecureTerminal(QPlainTextEdit):
                 # completed `/bin/echo`). Mark the line unverifiable, exactly as a typed
                 # Tab does, so _hook_intercept ASKS rather than auto-submitting the
                 # pre-completion text. (sanitize_paste keeps only \t and \r among C0.)
+                # The atomic pre-judge already refused a batch with a Tab in any
+                # SUBMITTED line, so on that path this only marks the trailing piece.
                 self._line_dirty = True
             # The next Enter submits (whatever the prompt already held) + this piece,
             # so FOLD any mirrored prefix into the judged command -- the hook must see
@@ -4521,7 +4690,17 @@ class SecureTerminal(QPlainTextEdit):
                 # Enter (which re-judges via the hook), never auto-submit it.
                 self._line_dirty = self._line_dirty or bool(self._line_buffer)
                 return
-            if self._hook_intercept():
+            if prejudged:
+                # The whole batch was approved as one unit; submit each line without a
+                # second, race-prone judgment.
+                self._line_buffer = ''
+                self._write(b'\r')
+                continue
+            # Co-locate the no-foreground guard with the call (formal INV-LEAK): the
+            # 4652 early-return covers today's single-line path, but the gate pins the
+            # guard AT every _hook_intercept site so a future multi-line reach (a prior
+            # submitted line having launched a program) cannot fire the hook mid-batch.
+            if not self.has_foreground_program() and self._hook_intercept():
                 # The hook handled the Enter. An approved 'run' submitted a clean line
                 # (_line_dirty cleared, buffer empty) so we may keep going; a block /
                 # ask left the line dirty because the best-effort erase is UNRELIABLE

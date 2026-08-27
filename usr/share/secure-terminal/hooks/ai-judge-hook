@@ -127,7 +127,18 @@ def _ask_ai(command, transcript):
 
 
 def decide(request):
-    command = request.get('command', '') if isinstance(request, dict) else ''
+    request = request if isinstance(request, dict) else {}
+    script = request.get('script')
+    if script is not None:
+        # A version-2 multi-line batch: judge the WHOLE script with the AI. Never take
+        # the trivial-allowlist shortcut here -- its first-line match could wave through
+        # a dangerous later line. Keep the cheap-then-escalate transcript step.
+        if not script.strip():
+            return {'verdict': 'allow'}
+        if 'transcript' not in request and _CONTEXTUAL.search(script):
+            return {'verdict': 'need_transcript'}
+        return _ask_ai(script, request.get('transcript', ''))
+    command = request.get('command', '')
     if not command.strip() or _TRIVIAL.search(command):
         return {'verdict': 'allow'}
     have_transcript = 'transcript' in request
@@ -142,7 +153,14 @@ def main():
     except (ValueError, OSError):
         print(json.dumps({'verdict': 'allow'}))
         return 0
-    print(json.dumps(decide(request)))
+    # Confirm we judged the WHOLE multi-line script (never the trivial shortcut), so
+    # secure-terminal trusts an ALLOW; without this ack a batch fails closed. A fresh dict
+    # keeps the bool from fighting decide()'s str-valued return type.
+    result = decide(request)
+    out = ({**result, 'multiline_reviewed': True}
+           if isinstance(request, dict) and request.get('script') is not None
+           else result)
+    print(json.dumps(out))
     return 0
 
 

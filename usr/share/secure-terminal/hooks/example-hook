@@ -81,11 +81,40 @@ _RULES = _load_rules()
 
 
 def decide(command):
-    for verdict, pattern, message, suggestion in _RULES:
-        if pattern.search(command):
-            return {'verdict': verdict, 'message': message,
-                    'suggestion': suggestion}
-    return {'verdict': 'allow'}
+    # A trailing `\` continues the command on the next line (the shell joins them), so join
+    # backslash-continuations FIRST -- else a pipeline split across lines (`curl x |\` then
+    # `sudo sh`) would be judged as two lines and slip past a single-line pipeline rule.
+    command = command.replace('\\\n', '')
+    # Judge EACH line and take the MOST RESTRICTIVE verdict (block > ask > allow): an
+    # `allow` matching one line must not mask a `block`/`ask` matching another (searching
+    # the whole multi-line string with first-match-wins would fail open). Per line the
+    # FIRST matching rule wins, exactly the ordered-rule model for a single line.
+    rank = {'allow': 0, 'ask': 1, 'block': 2}
+    best = {'verdict': 'allow', 'message': '', 'suggestion': ''}
+    for line in command.split('\n'):
+        for verdict, pattern, message, suggestion in _RULES:
+            if pattern.search(line):
+                if rank[verdict] > rank[best['verdict']]:
+                    best = {'verdict': verdict, 'message': message,
+                            'suggestion': suggestion}
+                break                # first matching rule wins for THIS line
+    return best
+
+
+def _has_line_continuation(command):
+    """True if the batch cannot be judged line-by-line because a line runs ONTO the next --
+    a trailing pipe / and-or list operator (`|`, `&&`, `||`, `&`), or an unbalanced quote or
+    paren -- so the shell would run a command the per-line rules never saw whole (e.g.
+    `curl x |` then `sh` executes `curl x | sh`). We do NOT reinvent a shell parser (never
+    do); we conservatively refuse on any such signal. A trailing backslash is JOINED in
+    decide(), so it is resolved here first, not a refusal."""
+    joined = command.replace('\\\n', '')
+    for line in joined.split('\n')[:-1]:
+        if line.rstrip().endswith(('|', '&')):
+            return True
+    if any(joined.count(q) % 2 for q in ('"', "'", '`')):
+        return True
+    return joined.count('(') != joined.count(')')
 
 
 def main():
@@ -96,8 +125,25 @@ def main():
         # default); never crash, never block the user's terminal on a bug here.
         print(json.dumps({'verdict': 'allow'}))
         return 0
-    command = request.get('command', '') if isinstance(request, dict) else ''
-    print(json.dumps(decide(command)))
+    # Version 2 sends the whole multi-line payload as `script`; judge it as a unit.
+    # `command` mirrors `script` for version-1 handlers, so either key yields content.
+    is_script = isinstance(request, dict) and request.get('script') is not None
+    command = ((request.get('script') or request.get('command', ''))
+               if isinstance(request, dict) else '')
+    if is_script and _has_line_continuation(command):
+        # A line runs onto the next, so the shell executes a command the per-line rules
+        # never saw whole. Rather than reinvent a shell parser, FAIL CLOSED: ask, and do
+        # NOT claim review (no multiline_reviewed) -- an unconfirmed batch is refused.
+        print(json.dumps({'verdict': 'ask',
+                          'message': 'multi-line batch has an unresolved line '
+                                     'continuation; review it before it runs'}))
+        return 0
+    result = decide(command)
+    # Confirm we reviewed the WHOLE multi-line script (each line judged), so secure-terminal
+    # trusts an ALLOW; without this ack a batch fails closed. A fresh dict keeps the bool
+    # from fighting decide()'s str-valued return type.
+    out = {**result, 'multiline_reviewed': True} if is_script else result
+    print(json.dumps(out))
     return 0
 
 
