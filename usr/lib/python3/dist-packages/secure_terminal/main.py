@@ -3771,6 +3771,14 @@ class MainWindow(QMainWindow):
         else:
             default = default_seq
         seq = self._keybindings.get(ident, default)
+        # _is_reserved_shortcut guards the Keyboard Shortcuts dialog, but a config
+        # keybindings= override reaches here UNVALIDATED. Honor the same guarantee (a
+        # terminal control key like Ctrl+C is never remappable): drop a reserved OVERRIDE
+        # back to the trusted default, while a built-in default that is itself reserved
+        # (quit = Ctrl+Q) is allowed to stand -- exactly as _set_shortcuts decides.
+        if (QKeySequence(seq).toString() != QKeySequence(default).toString()
+                and self._is_reserved_shortcut(seq)):
+            seq = default
         action.setShortcut(QKeySequence(seq))
         label = action.text().replace('&', '').replace('...', '').strip()
         self._shortcuts[ident] = (action, default, label)
@@ -4027,13 +4035,16 @@ class MainWindow(QMainWindow):
             self.set_tui(on)
         elif cmd == 'title' and (on or off):
             self.set_allow_title(on)
-        elif cmd == 'zoom' and arg.isdigit():
+        # str.isdigit() accepts non-ASCII digit-likes (superscripts, etc.) that int()
+        # rejects, so a bare int() raised an uncaught ValueError out of the Qt slot;
+        # require ASCII digits so an odd arg falls to the "invalid command" branch below.
+        elif cmd == 'zoom' and arg.isascii() and arg.isdigit():
             self.set_zoom(int(arg))
-        elif cmd == 'scrollback' and arg.isdigit():
+        elif cmd == 'scrollback' and arg.isascii() and arg.isdigit():
             self.set_scrollback(int(arg))
-        elif cmd == 'paste-delay' and arg.isdigit():
+        elif cmd == 'paste-delay' and arg.isascii() and arg.isdigit():
             self.set_paste_delay(int(arg))
-        elif cmd == 'escape-limit' and arg.isdigit():
+        elif cmd == 'escape-limit' and arg.isascii() and arg.isdigit():
             self.set_escape_limit(int(arg))
         else:
             self.statusBar().showMessage(
