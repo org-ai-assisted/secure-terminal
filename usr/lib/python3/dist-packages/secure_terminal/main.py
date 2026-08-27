@@ -1034,7 +1034,11 @@ class MainWindow(QMainWindow):
         """Ctrl+PageUp/Down: move to the previous/next tab, wrapping around."""
         count = self.tabs.count()
         if count > 1:
-            self.tabs.setCurrentIndex((self.tabs.currentIndex() + step) % count)
+            target = (self.tabs.currentIndex() + step) % count
+            # skip a disabled restore placeholder: setCurrentIndex would else make a bare
+            # QWidget the current tab (setTabEnabled(False) only blocks a mouse click).
+            if self.tabs.isTabEnabled(target):
+                self.tabs.setCurrentIndex(target)
 
     def _on_tab_move(self, step):
         """Ctrl+Shift+PageUp/Down: move the current tab left/right, wrapping."""
@@ -1047,7 +1051,9 @@ class MainWindow(QMainWindow):
         """Alt+1..9: jump straight to a tab by position (Alt+9 = last)."""
         if index == 8 or index >= self.tabs.count():
             index = self.tabs.count() - 1
-        if 0 <= index < self.tabs.count():
+        # skip a disabled restore placeholder: setCurrentIndex bypasses setTabEnabled(False)
+        # (which only blocks a mouse click), which would make a bare QWidget the current tab.
+        if 0 <= index < self.tabs.count() and self.tabs.isTabEnabled(index):
             self.tabs.setCurrentIndex(index)
 
     def new_tab(self, command=None, tui=None):
@@ -1227,7 +1233,10 @@ class MainWindow(QMainWindow):
         handled here; remote-control ops are added (and gated) separately."""
         try:
             request = json.loads(payload.decode('utf-8'))
-        except (ValueError, UnicodeDecodeError):
+        # RecursionError: json.loads raises it (a RuntimeError subclass, NOT ValueError) on
+        # deeply-nested input; uncaught it escapes this same-UID Qt readyRead slot and aborts
+        # the whole instance (SIGABRT), a control-socket DoS. Treat it as a malformed request.
+        except (ValueError, UnicodeDecodeError, RecursionError):
             return {'ok': False, 'error': 'malformed request'}
         if not isinstance(request, dict):
             return {'ok': False, 'error': 'malformed request'}
@@ -1927,7 +1936,14 @@ class MainWindow(QMainWindow):
             self._refresh_tab_label(term)
 
     def current(self):
-        return self.tabs.currentWidget()
+        # A restore placeholder (a bare QWidget) can be the current widget: setTabEnabled(False)
+        # blocks a MOUSE click but NOT a programmatic setCurrentIndex (_goto_tab / _on_tab_step).
+        # Return None unless the current widget is a real terminal, so the many current()
+        # consumers that gate on `is not None` (copy/paste/zoom/theme/font/osc/security-lamps)
+        # never call a SecureTerminal method on a placeholder -- an AttributeError there escapes
+        # the Qt slot and aborts the process.
+        w = self.tabs.currentWidget()
+        return w if isinstance(w, SecureTerminal) else None
 
     def _real_terms(self):
         """The fully-restored terminal tabs, skipping any restore placeholder still

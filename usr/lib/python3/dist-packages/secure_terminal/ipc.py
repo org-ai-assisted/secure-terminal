@@ -69,7 +69,9 @@ def send_request(group, request, timeout=1.5):
         client.sendall(frame(json.dumps(request).encode('utf-8')))
         reply = _recv_framed(client)
         return json.loads(reply.decode('utf-8')) if reply else {}
-    except (OSError, ValueError):
+    # RecursionError: json.loads raises it (not ValueError) on a deeply-nested reply -- a
+    # squatter answering our probe could else crash this short-lived ctl/launch client.
+    except (OSError, ValueError, RecursionError):
         return None
     finally:
         client.close()

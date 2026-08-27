@@ -284,6 +284,16 @@ class _Utf8CharsetByteStream(pyte.ByteStream):
         # -- bypassing ByteStream.feed's use_utf8-gated latin-1 pass-through.
         pyte.Stream.feed(self, self.utf8_decoder.decode(data))
 
+    def select_other_charset(self, code):
+        # We ALWAYS UTF-8-decode in feed() and hold use_utf8 False solely to arm the
+        # ISO-2022 charset-designation path. pyte's base flips use_utf8 back ON for a
+        # child's ESC%G / ESC%8 (announce UTF-8 mode) -- which would make the parser skip
+        # every ESC(0 designation again, so DEC line-drawing renders as literal 'lqqqk'
+        # (the exact defect this class exists to fix, e.g. GNU screen announces UTF-8 that
+        # way). We are unconditionally UTF-8, so ignore the mode select and keep the
+        # charset path armed.
+        return
+
 
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData)
@@ -3097,8 +3107,10 @@ class SecureTerminal(QPlainTextEdit):
         path = '/' + path if not path.startswith('/') else path
         # percent-decoding can reintroduce control/bidi/zero-width characters, so
         # run the decoded path through the same safe-ASCII sanitizer as titles
-        # before it is shown as a tooltip (no control, no homoglyph, no bidi).
-        path = sanitize_title(path)[:4096]
+        # before it is shown as a tooltip (no control, no homoglyph, no bidi). Pass the
+        # bound to the sanitizer: its default limit is 80, so a trailing [:4096] slice
+        # would be dead -- a deep cwd path must show up to 4096, not be cut to 80.
+        path = sanitize_title(path, limit=4096)
         if path and path != self._reported_cwd:
             self._reported_cwd = path
             self.cwd_changed.emit(path)
