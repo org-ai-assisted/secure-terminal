@@ -2546,6 +2546,12 @@ class MainWindow(QMainWindow):
         if term is not None:
             term.apply_allow_title(enabled)
         self._default_allow_title = bool(enabled)
+        # Sync the granular OSC defaults that seed NEW tabs (_apply_osc_defaults reads
+        # _osc_defaults), mirroring set_osc's reverse sync -- else unchecking the legacy
+        # "Allow title" leaves osc_title/osc_notify True for any tab opened afterward,
+        # so a title spoof / fake notification still reaches new tabs.
+        self._osc_defaults['osc_title'] = bool(enabled)
+        self._osc_defaults['osc_notify'] = bool(enabled)
         self.act_title.setChecked(enabled)
         if enabled:
             # letting titles/notifications through answers the OSC "was ignored"

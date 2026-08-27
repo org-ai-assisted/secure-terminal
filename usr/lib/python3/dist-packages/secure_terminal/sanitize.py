@@ -133,6 +133,13 @@ ANSI_RE = re.compile(
     # whole 0x30-0x3F range, or a private-prefix sequence a capable-TERM program
     # emits (e.g. modifyOtherKeys "\x1b[>4;2m", "\x1b[?25l") is left unstripped.
     r'\x1b\[[0-?]*[ -/]*[@-~]'
+    # An INTERRUPTED CSI -- ESC [ params (+ intermediates) with NO final byte, cut short by
+    # a non-final byte (e.g. "\x1b[38;5;123\n") -- must still be consumed, or its param
+    # bytes ("38;5;123") leak as literal text (the generic arm below strips only "\x1b[",
+    # leaving the params). Ordered AFTER the complete-CSI arm, so a well-formed CSI is
+    # consumed whole first; only params-without-a-final reach here. (A CSI genuinely split
+    # across reads is held by feed_chunk_carry, not leaked.)
+    r'|\x1b\[[0-?]*[ -/]*'
     r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?'
     # DCS (ESC P), SOS (ESC X), PM (ESC ^), APC (ESC _): a string sequence whose
     # BODY runs to an ST (ESC \) terminator. Unlike OSC, BEL does NOT terminate

