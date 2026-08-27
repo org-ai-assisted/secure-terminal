@@ -3819,12 +3819,16 @@ class SecureTerminal(QPlainTextEdit):
             if key == Qt.Key.Key_Backslash:
                 self._write(b'\x1c')          # Ctrl+\ -> SIGQUIT (cooked)
                 self._echo_caret('^\\')       # make the signal visible
-                # SIGQUIT (VQUIT) flushes the tty input queue like SIGINT, so the pending
-                # line is discarded -- clear the mirror too, or _hook_intercept would later
-                # judge a stale prefix plus the next keystrokes as one command (a real
-                # hook bypass, same class as the #34/#35 fixes).
-                self._line_buffer = ''
-                self._line_dirty = False
+                # SIGQUIT's effect on the pending line is tty/shell-dependent and NOT
+                # observable here: with NOFLSH off the tty flushes it, but under `stty
+                # noflsh` -- or a shell that traps SIGQUIT, which bash does at its prompt --
+                # the line is RETAINED. Clearing the mirror to empty would then let a
+                # retained command run UNJUDGED on the next Enter. So do NOT clear it; mark
+                # the line unverifiable, so the next Enter FAILS SAFE and re-judges. This is
+                # the #34 pattern: security comes from KEEPING _line_dirty set, not an erase.
+                # (Ctrl+C differs: readline HANDLES SIGINT and discards the line regardless
+                # of NOFLSH, so its mirror-clear below stays correct.)
+                self._line_dirty = True
                 return
             if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
                 byte = key & 0x1f                  # Ctrl+C -> 0x03, Ctrl+L -> 0x0c
