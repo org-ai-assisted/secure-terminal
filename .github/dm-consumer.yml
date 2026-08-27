@@ -49,4 +49,8 @@ dist-ai-tests:
   ## wrapper tests: the wrapper suite runs against STUBBED natives on PATH to stay
   ## hermetic, but these are installed so a real-tool smoke can run and so a future
   ## `command -v xclip` guard cannot silently SKIP (the false-green class).
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard"
+  ## imagemagick (convert/identify/compare) backs secure-terminal-shots-tests'
+  ## image-comparison suites (render_settle_wait, tighten_skip, zoom_live_wiring);
+  ## absent, they FAIL the whole dist-ai-tests job -- a permanently-red shots job that
+  ## then hides a real regression (the silent-green trap this opt-in exists to remove).
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard"
