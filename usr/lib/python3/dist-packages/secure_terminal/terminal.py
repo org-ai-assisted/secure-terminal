@@ -955,6 +955,7 @@ class SecureTerminal(QPlainTextEdit):
         # parity); Shift is the local override. See wheelEvent / mousePressEvent.
         self._mouse_modes = set()
         self._mouse_scan_carry = ''   # incomplete escape carried across a read split
+        self._bracket_had_fg = False  # last-seen fg-program state while DEC 2004 was set
         self._wheel_accum_x = 0       # horizontal wheel delta (vertical: _wheel_accum)
         self._mouse_report_btns = set()  # Qt buttons whose reported press awaits release
         self._mouse_report_cell = None  # last cell reported for motion (coalesce 1003)
@@ -2808,6 +2809,19 @@ class SecureTerminal(QPlainTextEdit):
         # cue to retry a re-export deferred by a pending line. No-ops (one flag
         # test) unless a mode switch is actually waiting.
         self._flush_reexport()
+        # Drop a STALE bracketed-paste bit on the foreground-program True->False edge. A
+        # program can enable bracketed paste (DEC private mode 2004) then die WITHOUT
+        # disabling it (crash / kill -9 / dropped SSH); pyte keeps the sticky bit, so
+        # _bracketed_paste_active() would then trust the RETURNING SHELL (or a later
+        # unrelated program) to buffer a paste inert -- and a multiline paste's embedded
+        # \r would auto-run, bypassing the paste gate. The returning prompt's output lands
+        # here, so when the foreground program that owned it is gone, clear the bit; a
+        # shell that truly supports bracketed paste re-arms it by re-emitting ?2004h on
+        # its next prompt (has_foreground_program is a cheap syscall pair; reads coalesce).
+        fg = self.has_foreground_program()
+        if self._bracket_had_fg and not fg and self._screen is not None:
+            self._screen.mode.discard(_BRACKETED_PASTE_MODE)
+        self._bracket_had_fg = fg
         text = self._decoder.decode(data)
         # The bell is rung where each mode consumes the stream, NOT here: in TUI via
         # pyte's BEL dispatch (_pyte_bell), in CLI on the carry-aware renderable text
