@@ -10,7 +10,6 @@ usr/lib/python3/dist-packages/secure_terminal usr/lib/python3/dist-packages/
 usr/share/applications/secure-terminal.desktop usr/share/applications/
 usr/share/icons/hicolor/scalable/apps/secure-terminal.svg usr/share/icons/hicolor/scalable/apps/
 usr/share/metainfo/io.github.secure_terminal.secure_terminal.metainfo.xml usr/share/metainfo/
-usr/share/secure-terminal/hooks usr/share/secure-terminal/
 usr/share/secure-terminal/terminfo/secure-terminal.ti usr/share/secure-terminal/terminfo/
 etc/apparmor.d/secure-terminal etc/apparmor.d/
 etc/apparmor.d/unicode-tag-stdin etc/apparmor.d/

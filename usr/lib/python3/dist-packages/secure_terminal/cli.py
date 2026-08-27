@@ -36,8 +36,7 @@ Like every bracketed-paste consumer, it relies on the outer terminal to filter a
 paste-end marker (ESC[201~) embedded in the clipboard, which the bracketed-paste
 spec requires and every modern terminal does; a non-compliant terminal could let a
 crafted clipboard break the framing, so this is a best-effort layer, not an absolute
-boundary. This wrapper does not judge whether a command is dangerous either; that is
-the (planned) hook's job.
+boundary. This wrapper does not judge whether a command is dangerous either.
 """
 
 import os
