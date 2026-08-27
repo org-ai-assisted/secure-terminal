@@ -2347,8 +2347,14 @@ class SecureTerminal(QPlainTextEdit):
             return
         doc = self.document()
         grid_top = doc.blockCount() - self._grid_rows
-        block = doc.findBlockByNumber(
-            min(grid_top + screen.cursor.y, doc.blockCount() - 1))
+        # Clamp cursor.y: pyte's resize() can leave it below a shrunk screen (the same OOB
+        # class fixed in _grid_signatures). Unclamped, screen.buffer[cursor.y] fabricates a
+        # blank defaultdict row -> the width sum below is 0 -> the caret is drawn at column 0
+        # instead of its true column until the program's next redraw. Bounds BOTH the block
+        # lookup and the per-cell width sum (the block lookup was already min()-clamped to the
+        # last block; the row read below was not).
+        cy = min(screen.cursor.y, screen.lines - 1)
+        block = doc.findBlockByNumber(min(grid_top + cy, doc.blockCount() - 1))
         if block.isValid():
             # The caret's document offset is the WIDTH of the rendered cells left of
             # it, not the cell column: a cell that renders to more than one UTF-16 unit
@@ -2356,7 +2362,7 @@ class SecureTerminal(QPlainTextEdit):
             # document by more than one position, so `+ cursor.x` drifts the caret left.
             # Sum each left cell's render width exactly as _insert_grid_row records it.
             col = min(screen.cursor.x, screen.columns)
-            row = screen.buffer[screen.cursor.y]
+            row = screen.buffer[cy]
             offset = sum(display_len(tui_cell(row[x].data, self._mode))
                          for x in range(col))
             pos = block.position() + offset
