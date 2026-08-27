@@ -881,6 +881,15 @@ class SecureTerminal(QPlainTextEdit):
         # re-render -- a stale cell can never survive a format change.
         self._grid_row_ids = []
         self._grid_row_sig = []
+        # Cross-frame render cache: buffer row index -> the (text, format) runs
+        # that row rendered to last frame. _grid_row_runs is a per-cell Unicode
+        # classification pass; recomputing it for EVERY row every ~16ms frame is
+        # the dominant render cost, though a full-screen program (tmux, htop,
+        # claude) usually repaints only a handful of rows. pyte marks the changed
+        # rows in screen.dirty, so an unchanged row reuses its cached runs. Keyed
+        # by index (aligned 1:1 with pyte's dirty set) not by id(), so no object
+        # id-reuse can mask a changed row; cleared wherever the format caches are.
+        self._row_sig_cache = {}
         # Repaints each grid block's cached formats from its _GridRow on relayout
         # (a non-grid line-mode block carries none and is left as inserted).
         self._grid_hl = _GridHighlighter(self.document())
@@ -1119,6 +1128,7 @@ class SecureTerminal(QPlainTextEdit):
         self._fmt_cache = {}          # theme changes the resolved cell colours
         self._line_fmt_cache = {}     # and the line-mode SGR format cache
         self._grid_mark_cache = {}    # and the grid risk-class marking formats
+        self._row_sig_cache = {}      # so cached grid rows re-render in the new theme
         if self._grid_mode():         # repaint the grid ONLY while it owns the
             self._render_timer.start(16)   # screen; line-TUI keeps its scrollback
         elif changed and getattr(self, '_paint_timer', None) is not None:
@@ -1235,6 +1245,7 @@ class SecureTerminal(QPlainTextEdit):
         self._fmt_cache = {}
         self._grid_mark_cache = {}
         self._line_fmt_cache = {}
+        self._row_sig_cache = {}   # mode/marking/colour change re-renders every grid row
         # A debounced CLI paint must NOT survive the reset: its stale pending lines
         # would be replayed on top of the freshly-rebuilt document (duplicating
         # completed output), or painted over a TUI grid by the still-armed timer.
@@ -1722,6 +1733,7 @@ class SecureTerminal(QPlainTextEdit):
         self._grid_rows = 0
         self._grid_row_ids = []
         self._grid_row_sig = []
+        self._row_sig_cache = {}      # buffer swap (alt enter/leave), seed, resize-rebuild
         self._tui_follow = True       # a fresh grid view follows the tail until the user scrolls
 
     def _on_scroll_value(self, value):
@@ -1883,6 +1895,16 @@ class SecureTerminal(QPlainTextEdit):
             self._render_tui()
         else:
             self._flush_paint()      # paints any lines coalesced while hidden
+        # Qt discards a hidden QPlainTextEdit viewport's backing store, so on show it
+        # must repaint the whole viewport from the (intact) document. The catch-up
+        # render above ends in an ASYNC viewport().update(), which lands a frame LATER
+        # -- so the switched-to tab briefly shows a blank default-background viewport
+        # that then visibly fills in (the reported tab-switch flash / partial
+        # re-render). Force the paint SYNCHRONOUSLY here, on the activation path ONLY
+        # (steady-state output keeps the coalesced async update), so the tab is drawn
+        # in one frame. Cheap: the catch-up render now only re-renders rows pyte
+        # marked dirty, so an unchanged hidden tab's activation repaint is near-free.
+        self.viewport().repaint()
 
     def _render_tui_body(self, screen, bar, at_bottom, prev_scroll):
         self.setUpdatesEnabled(False)
@@ -1901,7 +1923,9 @@ class SecureTerminal(QPlainTextEdit):
             # small region, not every cell).
             columns = screen.columns
             target = [screen.buffer[y] for y in range(screen.lines)]
-            tsig = [self._grid_row_runs(r, columns) for r in target]
+            # Fixed canvas: no trailing-blank trim (the program owns every row),
+            # so keep the full grid; _grid_signatures reuses unchanged rows.
+            tsig, _ = self._grid_signatures(screen)
             self._reconcile_grid_tail(target, tsig, columns)
         else:
             # Left the alternate screen: rebuild the scrolling view from a clean
@@ -2011,6 +2035,46 @@ class SecureTerminal(QPlainTextEdit):
             runs.append((run_text, run_fmt))
         return runs
 
+    def _grid_signatures(self, screen):
+        """Run-lists for every live grid row (0..lines-1), reusing the cross-frame
+        cache for any row pyte did not mark dirty since the last consumed frame,
+        plus `last` -- the highest row that renders as non-blank, or the cursor row
+        (for the primary view's trailing-blank trim, Bug #64). This is the single
+        per-frame cell pass: it feeds BOTH the reconcile signature and the
+        blank-row trim, replacing the old separate full-grid tui_cell scan.
+
+        Only rows in screen.dirty (plus the cursor row, defensive) are reclassified;
+        pyte marks every changed row, and marks ALL rows on a scroll / resize /
+        reset, so a shifted or rebuilt grid always recomputes -- a cached row is
+        therefore byte-identical to a fresh render. dirty is consumed (cleared)
+        here, on the frame it is used; the selection-freeze early return in
+        _render_tui never reaches this, so those rows stay dirty for the next real
+        frame. A cell change pyte does NOT mark dirty for -- theme / mode / marking
+        / palette -- is covered by clearing _row_sig_cache wherever the format
+        caches are cleared."""
+        columns = screen.columns
+        dirty = screen.dirty
+        cache = self._row_sig_cache
+        cursor_y = screen.cursor.y
+        all_runs = []
+        last = cursor_y
+        for y in range(screen.lines):
+            runs = cache.get(y)
+            if runs is None or y in dirty or y == cursor_y:
+                # _grid_row_runs excludes the caret, so the cursor row need not be
+                # forced for correctness; it is one row/frame of insurance against a
+                # future pyte path under-marking the actively-written row.
+                runs = self._grid_row_runs(screen.buffer[y], columns)
+                cache[y] = runs
+            all_runs.append(runs)
+            # A row is blank iff every rendered run is spaces. tui_cell maps
+            # U+00A0 / tab / ideographic space to visible placeholders (non-space),
+            # so a lone marked space keeps its row -- matching the old tui_cell test.
+            if any(text.strip(' ') for text, _ in runs):
+                last = y
+        dirty.clear()
+        return all_runs, max(last, cursor_y)
+
     def _insert_grid_row(self, cursor, row, columns):
         """Insert one pyte row at the cursor as PLAIN text, recording its format
         runs on the block for the grid highlighter to paint. This is far cheaper
@@ -2070,21 +2134,16 @@ class SecureTerminal(QPlainTextEdit):
         re-rendered. A distinct-truecolour board therefore renders each row about
         once as it is drawn, not once per read."""
         columns = screen.columns
-        # Trim trailing blank rows BELOW the cursor so the document ends at the
-        # prompt/last output; without this the full grid pads ~screen.lines empty
-        # rows below it and you can scroll down into empty space (Bug #64). A row
-        # counts as blank only if it RENDERS as empty: test tui_cell, not
-        # cell.data.strip() -- str.strip() drops U+00A0 / tab / ideographic space,
-        # which tui_cell marks as a visible placeholder, so a lone marked space
-        # below the cursor must keep its row rather than be trimmed away and hidden.
-        last = screen.cursor.y
-        for y in range(screen.lines):
-            if any(tui_cell(cell.data, self._mode) != ' '
-                   for cell in screen.buffer[y].values()):
-                last = y
-        last = max(last, screen.cursor.y)
+        # One cached cell pass yields both the per-row signatures and `last`, the
+        # last non-blank / cursor row. `last` trims trailing blank rows BELOW the
+        # cursor so the document ends at the prompt/last output; without it the full
+        # grid pads ~screen.lines empty rows below and you can scroll into empty
+        # space (Bug #64). Blankness is by RENDERED content (tui_cell), not
+        # cell.data.strip(), so a lone U+00A0 / tab / ideographic-space placeholder
+        # keeps its row rather than being trimmed away and hidden.
+        all_runs, last = self._grid_signatures(screen)
         target = [screen.buffer[y] for y in range(last + 1)]
-        tsig = [self._grid_row_runs(r, columns) for r in target]
+        tsig = all_runs[:last + 1]
 
         hist = list(screen.history.top)
         new_hist = self._new_history_rows(hist)
@@ -3074,6 +3133,7 @@ class SecureTerminal(QPlainTextEdit):
         # changes cannot force one full re-render per change.
         self._fmt_cache.clear()
         self._grid_mark_cache.clear()   # markings-off grid formats clone _pyte_format
+        self._row_sig_cache.clear()     # palette recolours cells with no pyte dirty mark
 
     def _osc_clipboard_read(self):
         """OSC 52 READ query. Answering exfiltrates the clipboard (which may hold
