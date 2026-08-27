@@ -2075,28 +2075,60 @@ class SecureTerminal(QPlainTextEdit):
         dirty.clear()
         return all_runs, max(last, cursor_y)
 
-    def _insert_grid_row(self, cursor, row, columns):
-        """Insert one pyte row at the cursor as PLAIN text, recording its format
-        runs on the block for the grid highlighter to paint. This is far cheaper
-        than a per-cell cursor.insertText(text, fmt) on a distinct-colour board,
-        and keeps each region's SOURCE code point (which layout formats do not
-        expose via charFormat) for hover / copy / transcript. Offsets are UTF-16
-        code units, to match Qt document positions and QSyntaxHighlighter.setFormat."""
-        block_pos = cursor.position()
+    def _gridrow_blockdata(self, cell_runs):
+        """(joined block text, _GridRow run tuples) for one row's (text, fmt) runs.
+        Offsets/lengths are UTF-16 code units, to match Qt document positions and
+        QSyntaxHighlighter.setFormat; each run keeps its SOURCE code point (which
+        layout formats do not expose via charFormat) for hover / copy / transcript."""
         runs = []
         parts = []
         offset = 0
-        for text, fmt in self._grid_row_runs(row, columns):
+        for text, fmt in cell_runs:
             length = len(text) + sum(ord(ch) > 0xFFFF for ch in text)   # UTF-16 units
             # _grid_row_runs always yields a real QTextCharFormat (pyrefly types it Optional).
             cp = fmt.property(_CP_PROP)  # pyrefly: ignore[missing-attribute]
             runs.append((offset, length, fmt, None if cp is None else int(cp)))
             parts.append(text)
             offset += length
-        cursor.insertText(''.join(parts))
+        return ''.join(parts), runs
+
+    def _insert_grid_row(self, cursor, row, columns, cell_runs=None):
+        """Insert one pyte row at the cursor as PLAIN text, recording its format
+        runs on the block for the grid highlighter to paint. This is far cheaper
+        than a per-cell cursor.insertText(text, fmt) on a distinct-colour board.
+        `cell_runs` is the row's already-computed (text, fmt) runs (the reconcile
+        signature) -- reused here to avoid a second _grid_row_runs classification
+        pass over the same cells; None recomputes them (the rebuild/scrollback paths)."""
+        if cell_runs is None:
+            cell_runs = self._grid_row_runs(row, columns)
+        block_pos = cursor.position()
+        text, runs = self._gridrow_blockdata(cell_runs)
+        cursor.insertText(text)
         block = self.document().findBlock(block_pos)
         block.setUserData(_GridRow(runs))
         self._grid_hl.rehighlightBlock(block)
+
+    def _replace_grid_rows(self, start, cell_runs_list):
+        """Rewrite the text + _GridRow of live grid blocks [start, start+len) IN
+        PLACE, leaving the surrounding blocks untouched. Used when a frame keeps the
+        same row count (a full-screen program repainting a band): editing only the
+        changed blocks avoids deleting and re-inserting every row below the first
+        change -- the dominant insertText/rehighlight cost when a top status line
+        updates each frame. A row's rendered text holds no newline, so an in-place
+        replace never changes the block count and block numbers stay stable."""
+        doc = self.document()
+        grid_top = doc.blockCount() - self._grid_rows
+        for i, cell_runs in enumerate(cell_runs_list):
+            num = grid_top + start + i
+            text, runs = self._gridrow_blockdata(cell_runs)
+            cur = QTextCursor(doc.findBlockByNumber(num))
+            cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            cur.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                             QTextCursor.MoveMode.KeepAnchor)
+            cur.insertText(text)                 # replaces the selected old row text
+            block = doc.findBlockByNumber(num)   # same block (no newline added)
+            block.setUserData(_GridRow(runs))
+            self._grid_hl.rehighlightBlock(block)
 
     def _delete_grid(self, keep=0):
         """Remove the live grid down to its first `keep` blocks (default: all of
@@ -2188,21 +2220,38 @@ class SecureTerminal(QPlainTextEdit):
         d = 0
         while d < len(cur_sig) and d < len(tsig) and cur_sig[d] == tsig[d]:
             d += 1
+        if len(cur_sig) == len(tsig):
+            # Same row count (a full-screen program repainting in place, the common
+            # alt-screen case): keep the unchanged leading AND trailing blocks and
+            # rewrite only the divergent middle band in place. A leading-prefix-only
+            # match deletes and re-inserts every row below the first change, so a top
+            # status line updating each frame re-inserted the whole grid every frame
+            # -- the dominant insertText/rehighlight cost.
+            n = len(tsig)
+            s = 0
+            while s < n - d and cur_sig[n - 1 - s] == tsig[n - 1 - s]:
+                s += 1
+            if d + s < n:
+                self._replace_grid_rows(d, tsig[d:n - s])
+            self._set_grid_model(target, tsig)
+            return
         self._delete_grid(keep=d)
-        self._append_grid_rows(target[d:], columns)
+        self._append_grid_rows(target[d:], columns, tsig[d:])
         self._set_grid_model(target, tsig)
 
-    def _append_grid_rows(self, rows, columns):
-        """Append `rows` as new grid blocks at the end of the document."""
+    def _append_grid_rows(self, rows, columns, runs_list):
+        """Append `rows` as new grid blocks at the end of the document, reusing each
+        row's already-computed signature (`runs_list`) so the append does not
+        reclassify cells the reconcile just classified."""
         if not rows:
             return
         cur = self.textCursor()
         cur.movePosition(QTextCursor.MoveOperation.End)
         have = self.document().characterCount() > 1
-        for row in rows:
+        for row, cell_runs in zip(rows, runs_list):
             if have:
                 cur.insertText('\n')
-            self._insert_grid_row(cur, row, columns)
+            self._insert_grid_row(cur, row, columns, cell_runs)
             have = True
         # Actual block count, not the row count: a scrollback cap smaller than the
         # grid makes Qt prune blocks as they are inserted, and an over-counted
