@@ -2674,10 +2674,15 @@ class SecureTerminal(QPlainTextEdit):
                         self._report_mouse(base, event, pressed=True)
             event.accept()
             return
-        # A full-screen program that did NOT request the mouse (a plain pager in the
-        # alt screen): translate the wheel to arrow-key line scrolls, like xterm's
-        # alternateScroll -- the surrogate it understands. ~3 lines per notch.
-        if self._alt_screen:
+        # A full-screen program the user is VIEWING that did NOT request the mouse (a
+        # plain pager in the alt screen): translate the wheel to arrow-key line scrolls,
+        # like xterm's alternateScroll -- the surrogate it understands. ~3 lines per notch.
+        # Gated on tui_active() as well as _alt_screen: _alt_screen alone is output-armed
+        # (untrusted CLI output printing ?1049h sets it mode-agnostically), so without the
+        # tui_active() check a plain wheel in default CLI mode would inject arrow bytes
+        # into the child -- the same output-armed input channel the report path gates. In
+        # CLI mode the wheel falls through to the local scrollback scroll below.
+        if self._alt_screen and self.tui_active():
             lines = int(self._wheel_accum / 40)
             if lines:
                 self._wheel_accum -= lines * 40
