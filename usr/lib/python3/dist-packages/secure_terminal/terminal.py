@@ -2573,12 +2573,25 @@ class SecureTerminal(QPlainTextEdit):
         Qt.MouseButton.RightButton: 2,
     }
 
+    def _mouse_input_allowed(self):
+        """Whether output-armed mouse reporting may reach the child in the CURRENT mode.
+        Mouse tracking is an OUTPUT-armed INPUT channel: untrusted output printing
+        ?1000h/?1006h/?1004h arms _mouse_modes for ANY chunk (the scan is deliberately
+        mode-agnostic, so the state tracks the child's request across a mode switch). In
+        default CLI mode -- whose contract is "output cannot affect input" -- a click,
+        drag, wheel or focus change must therefore NOT become pty bytes. Only a
+        full-screen program actually driving the terminal may receive them: the user's
+        explicit TUI mode, or a program holding the alt screen. Gate the CONSUMPTION here
+        (re-evaluated per event), leaving the scan itself untouched."""
+        return self.tui_active() or self._alt_screen
+
     def _mouse_report_on(self):
-        """True when the child has enabled mouse tracking WITH SGR encoding, so its
-        mouse/wheel events are reported. Shift (the local override) is checked per
-        handler, not here."""
+        """True when the child has enabled mouse tracking WITH SGR encoding AND the mode
+        permits reporting, so its mouse/wheel events are reported. Shift (the local
+        override) is checked per handler, not here."""
         return (bool(self._mouse_modes & _MOUSE_BUTTON_MODES)
-                and _MOUSE_SGR_MODE in self._mouse_modes)
+                and _MOUSE_SGR_MODE in self._mouse_modes
+                and self._mouse_input_allowed())
 
     def _event_cell(self, event):
         """1-based (col, row) of the terminal cell under a mouse/wheel event, for an
@@ -2661,10 +2674,15 @@ class SecureTerminal(QPlainTextEdit):
                         self._report_mouse(base, event, pressed=True)
             event.accept()
             return
-        # A full-screen program that did NOT request the mouse (a plain pager in the
-        # alt screen): translate the wheel to arrow-key line scrolls, like xterm's
-        # alternateScroll -- the surrogate it understands. ~3 lines per notch.
-        if self._alt_screen:
+        # A full-screen program the user is VIEWING that did NOT request the mouse (a
+        # plain pager in the alt screen): translate the wheel to arrow-key line scrolls,
+        # like xterm's alternateScroll -- the surrogate it understands. ~3 lines per notch.
+        # Gated on tui_active() as well as _alt_screen: _alt_screen alone is output-armed
+        # (untrusted CLI output printing ?1049h sets it mode-agnostically), so without the
+        # tui_active() check a plain wheel in default CLI mode would inject arrow bytes
+        # into the child -- the same output-armed input channel the report path gates. In
+        # CLI mode the wheel falls through to the local scrollback scroll below.
+        if self._alt_screen and self.tui_active():
             lines = int(self._wheel_accum / 40)
             if lines:
                 self._wheel_accum -= lines * 40
@@ -2860,9 +2878,12 @@ class SecureTerminal(QPlainTextEdit):
 
         # Track the child's mouse-reporting request (button/motion tracking + SGR
         # encoding), carrying an escape split across this read boundary so a divided
-        # DECSET is not missed. Mode-agnostic: a full-screen program requests the
-        # mouse whether or not this terminal is showing its frame. Only the wheel is
-        # ever acted on (wheelEvent), never clicks/motion.
+        # DECSET is not missed. The SCAN is deliberately mode-agnostic: a full-screen
+        # program requests the mouse whether or not this terminal is showing its frame,
+        # so the state must persist across a mode switch. What is mode-gated is the
+        # CONSUMPTION -- clicks/drags/motion/wheel/focus only become pty reports when
+        # _mouse_input_allowed() (TUI mode or a live alt screen), so untrusted CLI-mode
+        # output cannot arm an input channel in the "output cannot affect input" mode.
         mouse_body = self._mouse_scan_carry + text
         mouse_body, self._mouse_scan_carry = split_trailing_escape(mouse_body)
         self._mouse_modes = scan_mouse_modes(mouse_body, self._mouse_modes)
@@ -4575,14 +4596,18 @@ class SecureTerminal(QPlainTextEdit):
         super().mouseMoveEvent(event)
 
     def focusInEvent(self, event):
-        # not while a paste/copy review is up: input to the child is suspended (as in
-        # _report_mouse / keyPressEvent), so a focus report must not leak either.
-        if _MOUSE_FOCUS_MODE in self._mouse_modes and not self._review_active:
+        # DEC 1004 focus reporting is the same output-armed input channel as button
+        # tracking: gated on _mouse_input_allowed() so untrusted CLI-mode output cannot
+        # turn a focus change into pty bytes. Also not while a paste/copy review is up:
+        # input to the child is suspended (as in _report_mouse / keyPressEvent).
+        if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
+                and not self._review_active):
             self._write(b'\x1b[I')          # DEC 1004 focus-in report
         super().focusInEvent(event)
 
     def focusOutEvent(self, event):
-        if _MOUSE_FOCUS_MODE in self._mouse_modes and not self._review_active:
+        if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
+                and not self._review_active):
             self._write(b'\x1b[O')          # DEC 1004 focus-out report
         super().focusOutEvent(event)
 
