@@ -4588,12 +4588,23 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
     def _bracketed_paste_active(self):
-        """True when a TUI child has enabled bracketed paste (DEC mode 2004): it
-        then BUFFERS a pasted payload as inert data rather than interpreting the
-        bytes as keystrokes, so an embedded newline cannot auto-run a command. This
-        is the ONLY condition under which a multiline paste is safe to deliver
-        without a forced review, and the ONLY one that gets the 200~/201~ framing."""
-        return (self.tui_active() and self._screen is not None
+        """True when a LIVE foreground program has enabled bracketed paste (DEC mode
+        2004): it then BUFFERS a pasted payload as inert data rather than interpreting the
+        bytes as keystrokes, so an embedded newline cannot auto-run a command. This is the
+        ONLY condition under which a multiline paste is safe to deliver without a forced
+        review, and the ONLY one that gets the 200~/201~ framing.
+
+        Requiring a foreground program to OWN the bit is what makes it trustworthy: a
+        sticky 2004 bit left by a crashed/killed program -- or armed by a shell at a prior
+        prompt -- must NOT gate a paste to the CURRENT reader, or a multiline paste would
+        be framed and its embedded \\r auto-run past the review. The read-path
+        transition-clear drops most stale bits when the owning program exits; this fg
+        check closes the single-read crash window it cannot observe (the program's ?2004h
+        and its death coalesced into one read, so no edge was ever seen). A bare shell
+        prompt is therefore force-reviewed, never trusted -- consistent with the
+        review-every-multiline-paste model."""
+        return (self.tui_active() and self.has_foreground_program()
+                and self._screen is not None
                 and _BRACKETED_PASTE_MODE in getattr(self._screen, 'mode', ()))
 
     def insertFromMimeData(self, source):
