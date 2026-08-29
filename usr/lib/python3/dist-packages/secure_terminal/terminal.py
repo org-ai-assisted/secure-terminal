@@ -305,10 +305,10 @@ class _Utf8CharsetByteStream(pyte.ByteStream):
 
 
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
-                          QMimeData)
+                          QMimeData, QRect)
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
                          QTextFormat, QGuiApplication, QSyntaxHighlighter,
-                         QTextBlockUserData)
+                         QTextBlockUserData, QPainter)
 from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QApplication)
 
@@ -714,8 +714,18 @@ class SecureTerminal(QPlainTextEdit):
         # shot-mode branches below; the normal render path and every security
         # guarantee are unchanged when it is off.
         self._shot = os.environ.get('SECURE_TERMINAL_SHOT') == '1'
-        if self._shot:
-            self.setCursorWidth(0)     # no caret drawn -> no frame depends on blink phase
+        # Draw our OWN cursor (see paintEvent) instead of Qt's native caret: the
+        # native caret STOPS blinking whenever the text cursor holds a selection, so
+        # selecting text froze the prompt caret (konsole keeps it blinking). Ours is
+        # anchored to the OUTPUT cursor (where typed input goes), independent of any
+        # selection, and blinks on its own timer. Hide the native caret unconditionally
+        # so there is never a second one; shot mode additionally suppresses OURS
+        # (paintEvent) so a capture stays byte-identical.
+        self.setCursorWidth(0)
+        self._cursor_on = True         # blink phase: True = drawn this half-cycle
+        self._cursor_visible = True    # a TUI program can hide it (DECTCEM); CLI always shows
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._blink_cursor)
         # Optional live transcript file: when SECURE_TERMINAL_TRANSCRIPT_FILE names a path,
         # this tab's transcript is written there whenever output SETTLES, kept current. A
         # generic, mode-agnostic configuration -- set it on the command line
@@ -1172,7 +1182,19 @@ class SecureTerminal(QPlainTextEdit):
         font.setPointSize(size)
         self.setFont(font)
         if sync:
-            self._sync_tui_size()          # a font change resizes the grid
+            # Push the new glyph size through to the pty winsize, exactly as
+            # resizeEvent does for a viewport resize: a zoom changes how many
+            # cols/rows fit even though the widget itself did not resize, and the
+            # child must be told or it keeps formatting to the old size.
+            if self.tui_active() or (self._alt_screen and self._screen is not None):
+                self._sync_tui_size()          # TUI / held alt-screen: resize the pyte grid
+            else:
+                # CLI line mode: _sync_tui_size no-ops (no _screen), so update the
+                # winsize directly. Without this a zoom left the shell formatting to
+                # the OLD column count, overflowing the narrower viewport -- right-
+                # truncated text with no wrap and a horizontal caret-follow jump
+                # (the reported zoom truncation bug).
+                self._set_winsize(*self._grid_size())
             if self._grid_mode():
                 self._render_timer.start(16)   # repaint at the new glyph size
 
@@ -1665,10 +1687,23 @@ class SecureTerminal(QPlainTextEdit):
         """The viewport size MINUS the document margins, i.e. the pixels actually
         available for text. Dividing the raw viewport width instead gave the grid
         one column too many -- it overflowed by the margin and showed a useless
-        horizontal scrollbar (and nano-style apps drew past the right edge)."""
+        horizontal scrollbar (and nano-style apps drew past the right edge).
+
+        The vertical scrollbar's width is reserved UNCONDITIONALLY: Qt already
+        subtracts it from the viewport when the (AsNeeded) bar is shown, so we
+        subtract it ourselves when it is HIDDEN, and the text width is then the SAME
+        either way. Otherwise the width jumps by a scrollbar the instant the bar
+        toggles, which changes the column count -> SIGWINCH -> the child's redraw
+        toggles the bar back: an endless flicker of a full-screen app (nano was the
+        report). A stable width breaks that feedback loop, and matches both size
+        helpers' intent (line mode excludes the scrollbar; TUI never reclaims it)."""
         margin = int(self.document().documentMargin())
         vp = self.viewport()
-        return (max(1, vp.width() - 2 * margin), max(1, vp.height() - 2 * margin))
+        bar = self.verticalScrollBar()
+        reserve = (bar.sizeHint().width()
+                   if bar is not None and not bar.isVisible() else 0)
+        return (max(1, vp.width() - reserve - 2 * margin),
+                max(1, vp.height() - 2 * margin))
 
     def _grid_size(self):
         """Columns and rows that fit the viewport at the current font. Used for
@@ -2345,7 +2380,13 @@ class SecureTerminal(QPlainTextEdit):
 
     def _place_grid_cursor(self, screen):
         if screen.cursor.hidden:
+            # DECTCEM: the program hid the cursor. Stop drawing ours and erase a
+            # previously-drawn one (leave _out_cursor where it was).
+            if self._cursor_visible:
+                self._cursor_visible = False
+                self._update_cursor_region()
             return
+        self._cursor_visible = True
         doc = self.document()
         grid_top = doc.blockCount() - self._grid_rows
         # Clamp cursor.y: pyte's resize() can leave it below a shrunk screen (the same OOB
@@ -2370,6 +2411,7 @@ class SecureTerminal(QPlainTextEdit):
             tc = self.textCursor()
             tc.setPosition(min(pos, doc.characterCount() - 1))
             self.setTextCursor(tc)
+            self._out_cursor = QTextCursor(tc)   # anchor our blinking cursor here (TUI)
             # setTextCursor calls ensureCursorVisible, which follows the caret RIGHT when a
             # Show-mode wide glyph renders past the base-font cell width the grid advertised
             # to the child -- parking the view mid-grid and hiding column 0. A TUI grid is a
@@ -3378,12 +3420,13 @@ class SecureTerminal(QPlainTextEdit):
             self._reported_cwd = path
             self.cwd_changed.emit(path)
 
-    def shutdown(self):
-        """Detach the notifier, close the master fd and hang up the child. Used
-        when a tab is closed so the shell does not linger, and on app quit so the
-        pty machinery is torn down inside the event loop, not during teardown."""
-        self._render_timer.stop()          # no pending paint fires into teardown
-        self._flush_paint()                # paint the last CLI line before we go
+    def _release_pty(self, hangup):
+        """Detach the notifier, close the master fd, and drop the child pid from the
+        reaper registry. hangup=True SIGHUPs a child that MAY still be alive (a tab
+        close); False when the child has already exited (restart_as_shell). SIGHUP is
+        asynchronous, so a one-shot WNOHANG only mops up a child that has ALREADY died
+        (e.g. the widget used without the app's SIGCHLD handler); a child still alive
+        stays in _LIVE_PTY_PIDS for the app's reap handler, never lingering defunct."""
         if self._notifier is not None:
             self._notifier.setEnabled(False)
             try:
@@ -3398,16 +3441,11 @@ class SecureTerminal(QPlainTextEdit):
                 pass        # already closed -> nothing to do
             self._fd = None
         if self._pid:
-            try:
-                os.kill(self._pid, signal.SIGHUP)
-            except OSError:
-                pass        # child already gone -> nothing to hang up
-            # SIGHUP is asynchronous, so the child may still be alive here; a one-shot
-            # WNOHANG only mops up a child that has ALREADY died (e.g. the widget used
-            # without the app's SIGCHLD handler). A child still alive stays in
-            # _LIVE_PTY_PIDS, and the app's reap_pty_children handler collects it when it
-            # exits -- so it never lingers defunct, without a blanket SIGCHLD=SIG_IGN that
-            # would defang subprocess returncodes.
+            if hangup:
+                try:
+                    os.kill(self._pid, signal.SIGHUP)
+                except OSError:
+                    pass    # child already gone -> nothing to hang up
             try:
                 reaped = os.waitpid(self._pid, os.WNOHANG)[0]
             except (OSError, ChildProcessError):
@@ -3415,6 +3453,59 @@ class SecureTerminal(QPlainTextEdit):
             if reaped:
                 SecureTerminal._LIVE_PTY_PIDS.discard(self._pid)
             self._pid = None
+
+    def shutdown(self):
+        """Detach the notifier, close the master fd and hang up the child. Used
+        when a tab is closed so the shell does not linger, and on app quit so the
+        pty machinery is torn down inside the event loop, not during teardown."""
+        self._render_timer.stop()          # no pending paint fires into teardown
+        self._blink_timer.stop()           # nor a cursor-blink paint into teardown
+        self._flush_paint()                # paint the last CLI line before we go
+        self._release_pty(hangup=True)
+
+    def restart_as_shell(self):
+        """A launched program (-- PROGRAM tab) exited: drop to a fresh login shell
+        IN PLACE instead of closing the tab, so a finished program (a session, an
+        ssh, an editor) leaves a usable prompt -- gnome-terminal/konsole's 'restart'
+        disposition. Returns True when it restarts. A no-op (False) for a plain
+        login-shell tab (self._command is None): typing `exit` there closes the tab,
+        as a real terminal does. Keeps every widget setting (theme/zoom/mode/...);
+        only the exited child's pty and its half-parsed stream state are reset, and
+        the exited program's output stays above the new prompt as scrollback."""
+        if self._command is None or self._fd is None:
+            return False
+        # Tear down the exited child's pty (the master fd still opens; the read that
+        # brought us here raised EIO). No SIGHUP -- the child is already gone.
+        self._release_pty(hangup=False)
+        # Reset the half-parsed per-child stream state so the new shell's very first
+        # bytes are not corrupted by a stale carry, a stuck alt-screen bit, or the
+        # exited program's mouse-tracking request.
+        self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        self._esc_carry = ''
+        self._esc_drop = ''
+        self._esc_dropped = 0
+        self._esc_notified = False
+        self._osc_carry = b''
+        self._alt_scan_carry = ''
+        self._alt_feed_carry = b''
+        self._sync_scan_carry = ''
+        self._mouse_scan_carry = ''
+        self._alt_screen = False
+        self._alt_saved = None
+        self._alt_view = False
+        self._mouse_modes = set()
+        self.setMouseTracking(False)
+        self._mouse_report_btns = set()
+        self._mouse_report_cell = None
+        self._bracket_had_fg = False
+        self._sync_update = False
+        self._line_dirty = False
+        # Now a plain login-shell tab; a visible separator marks the handover so the
+        # new prompt is never mistaken for the exited program's output.
+        self._command = None
+        self._append('\r\n[secure-terminal] program exited -- new shell\r\n')
+        self._start(None)
+        return True
 
     def _append(self, text):
         self._feed_line(text)
@@ -3553,6 +3644,7 @@ class SecureTerminal(QPlainTextEdit):
         target = blk_start + prefix + disp
         cursor.setPosition(min(target, self.document().characterCount() - 1))
         self._out_cursor = cursor
+        self._cursor_visible = True          # CLI always shows the cursor
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
         # A terminal does not auto-scroll horizontally: anchor the view at the left
@@ -3570,12 +3662,11 @@ class SecureTerminal(QPlainTextEdit):
         hbar = self.horizontalScrollBar()
         if hbar is not None:
             # Home only when the WHOLE caret fits at the left, so pinning never clips
-            # it against the right edge -- include the caret WIDTH, not just its left
-            # edge (a caret exactly on the boundary would else be pinned and shaved).
-            # cursorWidth() is reliable even in shot mode, where cursorRect() reports
-            # zero width; cursorRect().x() gives the caret's current viewport x and
-            # the scroll terms map it to where it would sit once homed.
-            caret_right = (self.cursorRect().x() + self.cursorWidth()
+            # it against the right edge -- include the drawn cursor WIDTH, not just its
+            # left edge (a caret exactly on the boundary would else be pinned and
+            # shaved). The native caret is hidden (setCursorWidth 0), so cursorRect()
+            # gives the position and _cursor_rect().width() the width WE draw.
+            caret_right = (self.cursorRect().x() + self._cursor_rect().width()
                            + hbar.value() - hbar.minimum())
             if caret_right <= self.viewport().width():
                 hbar.setValue(hbar.minimum())
@@ -4497,6 +4588,69 @@ class SecureTerminal(QPlainTextEdit):
         self._char_popup = dlg          # keep a reference so it is not GC'd
         dlg.show()
 
+    # -- our own blinking cursor (native caret hidden; see __init__) -----------
+    def _cursor_anchor(self):
+        """The QTextCursor the visible cursor is drawn at: the OUTPUT cursor (where
+        typed input goes), NOT self.textCursor() -- during a selection the text
+        cursor is the selection's moving end, but the terminal cursor stays put at
+        the prompt (this is what keeps it blinking there while you select)."""
+        return self._out_cursor if self._out_cursor is not None else self.textCursor()
+
+    def _cursor_rect(self):
+        """Viewport rectangle of the cursor: a thin vertical bar at the output
+        cursor, the line's height (a bar never hides the glyph under it, unlike a
+        block, and matches the caret shape this terminal already showed)."""
+        r = self.cursorRect(self._cursor_anchor())
+        return QRect(r.x(), r.y(), 2, r.height())
+
+    def _cursor_color(self):
+        _bg, theme_fg = THEMES.get(self._theme, THEMES['dark'])
+        return QColor(self._osc_palette.get('fg', theme_fg))
+
+    def _update_cursor_region(self):
+        r = self._cursor_rect()
+        self.viewport().update(r.x() - 1, r.y() - 1, r.width() + 3, r.height() + 2)
+
+    def _blink_cursor(self):
+        self._cursor_on = not self._cursor_on
+        self._update_cursor_region()
+
+    def _restart_blink(self):
+        """Show the cursor at once and (re)start its blink -- called on every output-
+        cursor placement, so a streaming/moving cursor stays solid and it blinks
+        once output settles. No blink when unfocused, in shot mode, or when the
+        system cursor-flash time is 0 (blinking disabled)."""
+        self._cursor_on = True
+        flash = QApplication.styleHints().cursorFlashTime()
+        if self.hasFocus() and flash > 0 and not self._shot:
+            self._blink_timer.start(max(1, flash // 2))
+        else:
+            self._blink_timer.stop()
+        self._update_cursor_region()
+
+    def hideEvent(self, event):
+        # A hidden widget (a background tab, or one being closed) must not keep a
+        # blink timer alive: its timeout would repaint a viewport that may be mid-
+        # teardown. Focus-in restarts it when the tab is shown again.
+        self._blink_timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # Our own terminal cursor, drawn over the text. It blinks independent of any
+        # selection (the native caret, which we hid, does not). Suppressed for a
+        # deterministic screenshot (shot mode), on a non-interactive preview surface,
+        # when the widget is not visible (a queued paint into teardown), and while a
+        # TUI program has hidden the cursor (DECTCEM).
+        if (self._shot or self._preview or not self._cursor_visible
+                or not self.isVisible()):
+            return
+        if self.hasFocus() and not self._cursor_on:
+            return                          # blink OFF half-cycle
+        painter = QPainter(self.viewport())
+        painter.fillRect(self._cursor_rect(), self._cursor_color())
+        painter.end()
+
     def reset_caret(self):
         """Snap the visible caret back to the output cursor (where typed input
         goes), clearing any selection. Used after a search moves the caret to a
@@ -4617,12 +4771,18 @@ class SecureTerminal(QPlainTextEdit):
         if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
                 and not self._review_active):
             self._write(b'\x1b[I')          # DEC 1004 focus-in report
+        self._restart_blink()               # resume blinking, cursor visible at once
         super().focusInEvent(event)
 
     def focusOutEvent(self, event):
         if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
                 and not self._review_active):
             self._write(b'\x1b[O')          # DEC 1004 focus-out report
+        # Unfocused: stop blinking and draw the cursor statically (a real terminal
+        # shows a solid/hollow cursor when its window loses focus, never a blank).
+        self._blink_timer.stop()
+        self._cursor_on = True
+        self._update_cursor_region()
         super().focusOutEvent(event)
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
