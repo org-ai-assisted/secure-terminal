@@ -68,7 +68,13 @@ def send_request(group, request, timeout=1.5):
     try:
         client.sendall(frame(json.dumps(request).encode('utf-8')))
         reply = _recv_framed(client)
-        return json.loads(reply.decode('utf-8')) if reply else {}
+        # An empty read is a FAILED exchange, not a reply: a primary that has bound
+        # the socket but whose Qt event loop is not yet servicing connections accepts
+        # the connect (socket_is_live) and can close it with no framed answer. Every
+        # real reply is a non-empty dict ({'ok': ...}), so map empty -> None and let
+        # the caller retry (_wait_primary / _handoff) rather than mistake it for a
+        # valid pidless reply.
+        return json.loads(reply.decode('utf-8')) if reply else None
     # RecursionError: json.loads raises it (not ValueError) on a deeply-nested reply -- a
     # squatter answering our probe could else crash this short-lived ctl/launch client.
     except (OSError, ValueError, RecursionError):

@@ -57,6 +57,14 @@ profile secure-terminal /usr/bin/secure-terminal {
   # so a second launch reuses the running instance.
   owner /run/user/[0-9]*/secure-terminal/ rw,
   owner /run/user/[0-9]*/secure-terminal/*.sock rwkl,
+  # QLocalServer(UserAccessOption) does NOT bind the 0700 socket in place: it
+  # creates a private 0700 temp SUBDIR, binds the socket inside it, renames the
+  # socket to <group>.sock, then removes the subdir. Without a rule for that
+  # transient subdir + its socket, mkdir is denied -> listen() fails EACCES ->
+  # no single-instance primary, so every --reuse opens a NEW window. The subtree
+  # is already owner-only 0700, so allowing one level below stays tight.
+  owner /run/user/[0-9]*/secure-terminal/*/ rw,
+  owner /run/user/[0-9]*/secure-terminal/*/* rwkl,
   # clipboard-watch singleton gate: an owner-only flock lock file (needs 'k').
   owner /run/user/[0-9]*/secure-terminal/*.lock rwk,
 

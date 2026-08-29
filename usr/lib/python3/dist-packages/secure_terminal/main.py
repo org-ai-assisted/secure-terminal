@@ -12,6 +12,8 @@ import os
 import signal
 import sys
 import shlex
+import time
+import fcntl
 import argparse
 import json
 
@@ -672,6 +674,10 @@ class MainWindow(QMainWindow):
         # turned it on in a privileged directory (remote_control is privileged-
         # only, so a home config cannot enable it).
         self._remote_control = cfg.get('remote_control') == 'true'
+        # single-instance group socket: None until this window claims the group's
+        # primary socket (a server-less coexisting instance leaves it None).
+        self._server = None
+        self._instance_group = 'default'
         self._tab_ids = {}            # term -> stable id (for `ctl --tab id:N`)
         self._next_tab_id = 0
 
@@ -729,6 +735,7 @@ class MainWindow(QMainWindow):
         self._osc_notified = set()   # (term, key) pairs already shown the OSC notice
         self._esc_notified = set()   # terms already shown the escape-suppressed notice
         self._closing_tabs = set()   # terms mid-close (reentrancy guard across the modal)
+        self._shell_exited_pending = set()   # shell died DURING a close-confirm modal
         self._syncing = False        # guard: programmatic chip sync vs user click
         # toolbar chip buttons, populated by _build_toolbar; empty here so a
         # _sync during _build_menu (which runs first) is a harmless no-op.
@@ -993,10 +1000,16 @@ class MainWindow(QMainWindow):
         count = self.tabs.count()
         if count > 1:
             target = (self.tabs.currentIndex() + step) % count
-            # skip a disabled restore placeholder: setCurrentIndex would else make a bare
-            # QWidget the current tab (setTabEnabled(False) only blocks a mouse click).
-            if self.tabs.isTabEnabled(target):
-                self.tabs.setCurrentIndex(target)
+            # Skip disabled restore placeholders and KEEP walking in `step`'s direction,
+            # wrapping, to the next real tab: setTabEnabled(False) only blocks a mouse
+            # click, and a single `if enabled` would DEAD-END the switch on a placeholder
+            # (e.g. from live 2 of [live,live,live,ph,ph] a PageDown to the ph never
+            # wraps round to live 0). At least the current tab is enabled, so this ends.
+            for _ in range(count):
+                if self.tabs.isTabEnabled(target):
+                    self.tabs.setCurrentIndex(target)
+                    return
+                target = (target + step) % count
 
     def _on_tab_move(self, step):
         """Ctrl+Shift+PageUp/Down: move the current tab left/right, wrapping."""
@@ -1118,46 +1131,31 @@ class MainWindow(QMainWindow):
 
     # -- single-instance IPC server (owner-only socket) -----------------------
     def start_instance_server(self, group='default'):
-        """Claim the group's owner-only socket as its PRIMARY instance (the one
-        --reuse and ctl target), IF it is free. Multiple independent instances now
-        coexist, so a claim must never STEAL a live peer's socket -- including a peer
-        that has just bound but cannot yet answer (its Qt event loop is not up).
-
-        The liveness guard MUST come before listen(): Qt's QLocalServer.listen() is
-        not a safe arbiter -- on an occupied path it silently removes and rebinds
-        (it steals). socket_is_live is a raw CONNECT probe the kernel accepts the
-        instant a peer has bound, even before that peer runs accept(), which a
-        reply-based ping would miss. If it answers, stay a server-less independent
-        instance and never touch the socket. Otherwise the socket is absent or a
-        crashed primary's stale file: clear it and bind.
-
-        Residual: the irreducible bind race -- a peer binding in the microsecond
-        after the probe returns 'not live' is then unlinked by removeServer. It only
-        orphans one instance (still a usable window), never crashes, and Qt offers no
-        atomic bind-or-fail to close it fully."""
+        """Claim the group's owner-only socket as this window's PRIMARY (the one
+        --reuse and ctl target), if it is free, and return the claim outcome
+        ('claimed' | 'peer_owns' | 'failed'). Multiple independent instances
+        coexist, so a claim never steals a live peer's socket. See
+        _bind_instance_server for the atomic bind; main() uses the same helper to
+        claim BEFORE building a window (so a --reuse launch that loses the race
+        hands off instead of opening a redundant window)."""
         self._instance_group = group
-        try:
-            ipc.ensure_socket_dir()
-        except OSError:
-            return                          # no runtime dir -> no single instance
-        # A live listener already owns this group (even one still starting up): stay
-        # server-less, never disturb its socket. Only an absent/stale socket falls
-        # through -- listen() would STEAL a live one, so this check gates it.
-        if ipc.socket_is_live(group):
-            return
-        # imported here, not at module top: an instance that stays server-less (a
-        # live peer owns the socket, or a --reuse client that hands off and exits)
-        # should not pay QtNetwork's import cost; only the primary needs it.
-        from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
-        path = ipc.socket_path(group)
-        QLocalServer.removeServer(path)     # clear a stale socket, if any
-        self._server = QLocalServer(self)
-        self._server.setSocketOptions(
-            QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
-        if not self._server.listen(path):  # pragma: no cover - a same-UID path binds after removeServer; a failure is a rare OS fault
-            self._server = None
-            return
-        self._server.newConnection.connect(self._on_instance_connection)
+        server, status = _bind_instance_server(group)
+        if server is not None:
+            self.adopt_instance_server(server, group)
+        return status
+
+    def adopt_instance_server(self, server, group):
+        """Take ownership of a pre-bound group-socket server: parent it to this
+        window (so closing the window frees the socket for a successor), wire the
+        connection handler, and drain any connections that queued between the bind
+        and now (newConnection does not replay a connection that arrived before the
+        slot was connected)."""
+        self._instance_group = group
+        self._server = server
+        server.setParent(self)
+        server.newConnection.connect(self._on_instance_connection)
+        while server.hasPendingConnections():
+            self._on_instance_connection()
 
     def _on_instance_connection(self):
         conn = self._server.nextPendingConnection()
@@ -1511,7 +1509,7 @@ class MainWindow(QMainWindow):
             history=history,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
             mode=_locked('unicode_mode', mode, self._default_mode),
-            colors=_locked('colors', _saved_bool(info.get('colors'), False), self._default_colors),
+            colors=_locked('colors', _saved_bool(info.get('colors', True), True), self._default_colors),
             line_edits=_locked('line_edits', _saved_bool(info.get('line_edits', True), True),
                                self._default_line_edits),
             markings=_locked('colored_markings', _saved_bool(info.get('markings', True), True),
@@ -1551,8 +1549,14 @@ class MainWindow(QMainWindow):
             for _f in OSC_FEATURES:
                 locked = _f[0] in self._locked or (
                     _f[0] in ('osc_title', 'osc_notify') and 'allow_title' in self._locked)
+                # _saved_bool, not bool(): a tampered session.json value like "off" /
+                # "false" / 0 would coerce truthy through bool() and fail OPEN --
+                # re-enabling a risk='high' OSC feature (OSC-52 clipboard) the saved
+                # value says is disabled. A non-bool falls back to the feature's own
+                # secure default, exactly as the locked branch and the legacy field do.
                 term.apply_osc(_f[0], self._osc_defaults.get(_f[0], False) if locked
-                               else bool(osc_state.get(_f[0], False)))
+                               else _saved_bool(osc_state.get(_f[0], False),
+                                                self._osc_defaults.get(_f[0], False)))
         else:
             # a legacy session carries only the allow_title bool, which maps to
             # osc_title + osc_notify. Honour a lock on EITHER granular key OR on
@@ -1622,7 +1626,12 @@ class MainWindow(QMainWindow):
                     'Close tab?',
                     'A program is still running in this tab. Close it anyway?',
                     [term]):
-                return
+                # Cancel. But the shell may have EXITED while the dialog was up: its
+                # _on_shell_exited -> close_tab re-entry was swallowed by the
+                # _closing_tabs guard above, so a plain return would strand a tab with a
+                # dead child. If that happened, close it now instead of cancelling.
+                if term not in self._shell_exited_pending:
+                    return
             # If this tab holds a paste/copy review, hide the bar first -- otherwise it
             # keeps the about-to-be-destroyed terminal and its buttons would dispatch
             # onto a deleted C++ object (RuntimeError). F2.
@@ -1648,11 +1657,20 @@ class MainWindow(QMainWindow):
                 self.close()
         finally:
             self._closing_tabs.discard(term)
+            self._shell_exited_pending.discard(term)
 
     def _on_shell_exited(self, term):
         index = self.tabs.indexOf(term)
-        if index != -1:
-            self.close_tab(index)
+        if index == -1:
+            return
+        if term in self._closing_tabs:
+            # A close-confirm modal is up for THIS term and its shell just exited, so
+            # the "still running?" question is moot -- the tab must close. close_tab's
+            # reentrancy guard swallows this re-entrant close, so record it; close_tab
+            # closes the tab on Cancel rather than stranding a dead child.
+            self._shell_exited_pending.add(term)
+            return
+        self.close_tab(index)
 
     # -- tab label: user name + program title kept separately -----------------
     def _tab_is_live(self, term):
@@ -1936,18 +1954,26 @@ class MainWindow(QMainWindow):
         index = self.tabs.tabBar().tabAt(point)
         if index < 0:
             return
+        # Bind the actions to the tab WIDGET, re-resolving its index when they fire:
+        # menu.exec spins a nested loop during which a background tab can close (a
+        # shell exit -> _on_shell_exited), shifting indices, so a captured `index`
+        # would then act on the WRONG tab. indexOf() re-resolves (-1 if it is gone,
+        # which every target below tolerates as a no-op).
+        term = self.tabs.widget(index)
         menu = QMenu(self)
-        menu.addAction('Rename...', lambda: self.rename_tab(index))
+        menu.addAction('Rename...', lambda: self.rename_tab(self.tabs.indexOf(term)))
         color_menu = menu.addMenu('Colour')
         for name, value in (('Red', '#d83933'), ('Green', '#1f8a54'),
                             ('Blue', '#3b82f6'), ('Yellow', '#e5a50a'),
                             ('Purple', '#8b5cf6')):
             color_menu.addAction(
-                name, lambda v=value: self.set_tab_color(index, QColor(v)))
-        color_menu.addAction('Custom...', lambda: self._pick_custom_tab_color(index))
-        color_menu.addAction('Clear', lambda: self.set_tab_color(index, None))
+                name, lambda v=value: self.set_tab_color(self.tabs.indexOf(term), QColor(v)))
+        color_menu.addAction(
+            'Custom...', lambda: self._pick_custom_tab_color(self.tabs.indexOf(term)))
+        color_menu.addAction(
+            'Clear', lambda: self.set_tab_color(self.tabs.indexOf(term), None))
         menu.addSeparator()
-        menu.addAction('Close Tab', lambda: self.close_tab(index))
+        menu.addAction('Close Tab', lambda: self.close_tab(self.tabs.indexOf(term)))
         menu.exec(self.tabs.tabBar().mapToGlobal(point))
 
     def terminate_foreground(self):
@@ -4796,8 +4822,9 @@ class MainWindow(QMainWindow):
     # -- session persistence --------------------------------------------------
     def _session_tabs(self):
         tabs = []
-        for i in range(self.tabs.count()):
-            term = self.tabs.widget(i)
+        # Real terminals only: a surviving restore placeholder (a bare QWidget) has none
+        # of the toPlainText/current_* accessors below, so it would abort the save.
+        for term in self._real_terms():
             text = session.cap_text(term.toPlainText(), term.current_scrollback())
             tabs.append({
                 'name': self._user_titles.get(term, ''),
@@ -4903,8 +4930,12 @@ class MainWindow(QMainWindow):
         # be pruned by session.save).
         while self._deferred_restore:
             self._swap_placeholder(self._deferred_restore.pop(0))
-        running = sum(1 for i in range(self.tabs.count())
-                      if self.tabs.widget(i).has_foreground_program())
+        # Real terminals only: a restore placeholder can survive the drain above (an
+        # unknown placeholder is a safe swap no-op), and has_foreground_program /
+        # shutdown are SecureTerminal methods a bare QWidget placeholder has neither of
+        # -- an AttributeError here escapes closeEvent and aborts the process.
+        terms = self._real_terms()
+        running = sum(1 for t in terms if t.has_foreground_program())
         # A signal-driven / programmatic quit skips the interactive confirmation:
         # there is no user to answer it, and a modal opened during XCB teardown
         # segfaults (see _install_signal_quit).
@@ -4912,7 +4943,7 @@ class MainWindow(QMainWindow):
                 'Quit?',
                 ('A program is still running in %d tab%s. Quit anyway?'
                  % (running, '' if running == 1 else 's')),
-                [self.tabs.widget(i) for i in range(self.tabs.count())]):
+                terms):
             event.ignore()
             return
         if self._persist_session:
@@ -4920,8 +4951,8 @@ class MainWindow(QMainWindow):
                          self.tabs.currentIndex())
         else:
             session.clear()
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).shutdown()
+        for t in terms:
+            t.shutdown()
         super().closeEvent(event)
 
 
@@ -5353,6 +5384,109 @@ def _clipboard_watch_main():
     return ClipboardWatchApp(app).run()
 
 
+def _acquire_group_lock(group):
+    """Blocking exclusive flock that serializes the claim of a group's socket across
+    processes (a lock file beside the socket). Held only for the brief
+    check-then-bind, released by the caller closing the fd; flock auto-releases if
+    the holder dies, so a crash mid-claim cannot deadlock the next claimant.
+
+    Returns the held fd, or None if the lock cannot be acquired -- the caller then
+    claims WITHOUT serialization (the rare TOCTOU race) rather than CRASHING. The
+    lock is an OPTIMISATION, never a hard dependency: a mis-owned lock file left by
+    a root-context launch, or an unwritable runtime dir, must degrade the
+    single-instance claim, not take the whole app down. A mis-owned stale file is
+    self-healed by unlinking it (the socket dir is our own 0700, so we may unlink
+    any file in it) and retrying once before giving up."""
+    path = ipc.socket_path(group) + '.lock'
+    for attempt in (1, 2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        except OSError:
+            # A stale lock file with the wrong owner/mode (e.g. from a root-context
+            # launch) blocks os.open. Our socket dir is 0700 and ours, so we may
+            # unlink any file in it; drop the bad one and retry once, else degrade.
+            if attempt == 1:
+                try:
+                    os.unlink(path)
+                    continue
+                except OSError:
+                    # Cannot even unlink the bad lock (the runtime dir lost its
+                    # perms/ownership): stop self-healing and fall through to
+                    # degrade -- the caller claims without serialization rather
+                    # than crash. Swallow is deliberate best-effort.
+                    pass
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+    return None                              # pragma: no cover - loop always returns
+
+
+def _bind_instance_server(group):
+    """Claim the group's owner-only socket. Returns (server, status): a listening
+    QLocalServer + 'claimed', or (None, 'peer_owns'), or (None, 'failed').
+
+    QLocalServer.listen() is NOT a safe arbiter -- on an occupied path it silently
+    removes and REBINDS (it steals a live peer). So the claim is a check-then-bind:
+    a raw liveness probe (socket_is_live, which the kernel answers the instant a peer
+    has bound, even before its event loop can reply) gates the bind, and a crashed
+    primary's stale file is cleared first. That check-then-bind is serialized across
+    processes by an flock, closing the TOCTOU where two racing launches both saw the
+    socket free, both bound, and the second's rebind orphaned the first -- the state
+    that left a group with windows but ZERO listeners. A genuine bind failure is
+    reported on stderr, never swallowed silently. QtNetwork is imported here so a
+    launch that only hands off (never claims) does not pay the import cost."""
+    try:
+        ipc.ensure_socket_dir()
+    except OSError:
+        return None, 'failed'               # no runtime dir -> no single instance
+    from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
+    path = ipc.socket_path(group)
+    # None when the lock cannot be taken (a mis-owned lock file / unwritable dir):
+    # claim WITHOUT serialization (best-effort, the rare TOCTOU race) rather than
+    # crash -- the single-instance lock is an optimisation, not a hard dependency.
+    lock_fd = _acquire_group_lock(group)
+    try:
+        # Under the lock (if held): a live peer owns the group -> never disturb it.
+        if ipc.socket_is_live(group):
+            return None, 'peer_owns'
+        QLocalServer.removeServer(path)     # clear a crashed primary's stale file
+        server = QLocalServer()
+        server.setSocketOptions(
+            QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
+        if server.listen(path):
+            return server, 'claimed'
+        # listen() failing here (a free, non-stale path just cleared by removeServer)
+        # is a rare OS bind fault, not a live peer -- that returned 'peer_owns' above.
+        # Report it rather than leave a window silently unreachable.
+        sys.stderr.write('secure-terminal: could not bind instance socket %s; '  # pragma: no cover
+                         '--reuse and ctl cannot reach this window\n' % (path,))
+        return None, 'failed'  # pragma: no cover
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)               # release the flock (also frees on death)
+
+
+def _handoff(group, request, timeout=8.0):
+    """Hand a --reuse launch to the group's primary, RETRYING while the socket is
+    live: a primary that has bound the socket but whose Qt event loop is not up yet
+    accepts a raw connect (socket_is_live) but cannot answer send_request, so a
+    single ping would spuriously fail and the caller would open a redundant window.
+    Returns the reply dict once the primary answers, or None if the socket goes
+    away first (the primary died -> the caller opens its own window)."""
+    end = time.monotonic() + timeout
+    while True:
+        reply = ipc.send_request(group, request)
+        if reply is not None:
+            return reply
+        if not ipc.socket_is_live(group) or time.monotonic() >= end:
+            return None
+        time.sleep(0.15)
+
+
 def main():
     _quiet_font_warnings()
     if sys.argv[1:2] == ['ctl']:
@@ -5380,7 +5514,13 @@ def main():
     # never hand off -- we build our own window below (and, unless --new-instance,
     # claim the group socket if it is free, per start_instance_server).
     if launch.reuse:
-        reply = ipc.send_request(launch.instance_group, _launch_to_request(launch))
+        request = _launch_to_request(launch)
+        reply = ipc.send_request(launch.instance_group, request)
+        # A peer that is bound but did not answer in time (a briefly-busy primary)
+        # reads as absent to a single 1.5s ping. Give it one more, longer chance
+        # before we take over and open a redundant window.
+        if reply is None and ipc.socket_is_live(launch.instance_group):
+            reply = _handoff(launch.instance_group, request)
         if reply is not None:
             if not reply.get('ok'):
                 sys.stderr.write('secure-terminal: %s\n'
@@ -5416,6 +5556,26 @@ def main():
     except (OSError, ValueError, AttributeError):
         pass            # if we cannot auto-reap, tabs simply reap on exit
 
+    # Claim the group's primary socket BEFORE building the window (which spawns its
+    # tabs). A successful claim makes us the primary; if a --reuse launch whose own
+    # initial ping found no primary now LOSES the atomic bind to a peer that became
+    # primary in the meantime, hand off to that peer here rather than open a
+    # redundant window. --new-instance opts out entirely (never the primary).
+    server = None
+    if not launch.new_instance:
+        server, status = _bind_instance_server(launch.instance_group)
+        if launch.reuse and status == 'peer_owns':
+            reply = _handoff(launch.instance_group, request)
+            if reply is not None:
+                return 0 if reply.get('ok') else 1
+            # The peer we deferred to became unreachable (it died mid-handoff -- a
+            # RESTART is exactly this: the old primary is still bound when we launch,
+            # so we defer, then it exits). Its socket is now free, so RE-CLAIM it and
+            # become the new primary; otherwise we would open a server-less window and
+            # leave the group with NO primary, so every later --reuse opens yet
+            # another window (the reported duplicate-window regression).
+            server, status = _bind_instance_server(launch.instance_group)
+
     window = MainWindow(launch=launch)
     # Install the terminate-on-signal handler only now, after the window exists:
     # its handler force-closes every window (see _install_signal_quit), so a
@@ -5424,12 +5584,11 @@ def main():
     # takes its default disposition (prompt termination) -- correct for startup.
     _install_signal_quit(app)
 
-    # Claim the group socket as its primary (so --reuse/ctl can target this
-    # process) -- but only if the group has no live primary yet; start_instance_server
-    # pings first and stays server-less otherwise. --new-instance opts out entirely:
-    # a standalone process that never becomes the primary.
-    if not launch.new_instance:
-        window.start_instance_server(launch.instance_group)
+    # Adopt the group socket claimed above so --reuse/ctl can target this window
+    # (wiring its handler; a later window close frees the socket for a successor).
+    # A server-less coexisting instance leaves `server` None and never adopts.
+    if server is not None:
+        window.adopt_instance_server(server, launch.instance_group)
     window.show()
 
     # On ANY quit -- a SIGTERM/SIGHUP from the launching terminal (via
