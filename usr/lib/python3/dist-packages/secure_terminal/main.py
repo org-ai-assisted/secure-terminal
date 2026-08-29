@@ -1670,6 +1670,14 @@ class MainWindow(QMainWindow):
             # closes the tab on Cancel rather than stranding a dead child.
             self._shell_exited_pending.add(term)
             return
+        # A tab launched to run a specific program (-- PROGRAM) drops to a fresh login
+        # shell when that program exits, rather than closing -- so a finished program
+        # (a session, an ssh, an editor) leaves a usable prompt. restart_as_shell()
+        # no-ops (returns False) for a plain login-shell tab, which still closes on
+        # `exit`, as a real terminal does.
+        if term.restart_as_shell():
+            self._update_terminate_enabled()   # _command is now None; refresh chrome/label
+            return
         self.close_tab(index)
 
     # -- tab label: user name + program title kept separately -----------------
@@ -2135,6 +2143,7 @@ class MainWindow(QMainWindow):
         self.zoom_box.setValue(percent)
         self.zoom_box.blockSignals(False)
         self._default_zoom = percent
+        self._review_bar.rerender_mirror()   # an open review mirrors the tab's font
         self._persist()
 
     def _on_zoom_step(self, direction):
@@ -2164,6 +2173,7 @@ class MainWindow(QMainWindow):
             term.apply_theme(theme)
             self._apply_container_theme(theme)   # container follows the current tab
         self._default_theme = theme
+        self._review_bar.rerender_mirror()   # an open review follows the theme
         self._persist()
 
     # -- unicode display mode: per current tab --------------------------------
@@ -2189,6 +2199,7 @@ class MainWindow(QMainWindow):
         self._sync_mode_toggles(mode)
         self._update_security_indicator()
         self._default_mode = mode
+        self._review_bar.rerender_mirror()   # flip the tab's mode -> mirror re-renders
         self._persist()
 
     def set_font_family(self, family):
@@ -2203,6 +2214,7 @@ class MainWindow(QMainWindow):
         if term is not None:
             term.set_font_family(family)
         self._default_font_family = family
+        self._review_bar.rerender_mirror()   # an open review follows the font family
         self._persist()
 
     def choose_font(self):
