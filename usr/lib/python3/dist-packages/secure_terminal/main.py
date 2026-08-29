@@ -1552,8 +1552,14 @@ class MainWindow(QMainWindow):
             for _f in OSC_FEATURES:
                 locked = _f[0] in self._locked or (
                     _f[0] in ('osc_title', 'osc_notify') and 'allow_title' in self._locked)
+                # _saved_bool, not bool(): a tampered session.json value like "off" /
+                # "false" / 0 would coerce truthy through bool() and fail OPEN --
+                # re-enabling a risk='high' OSC feature (OSC-52 clipboard) the saved
+                # value says is disabled. A non-bool falls back to the feature's own
+                # secure default, exactly as the locked branch and the legacy field do.
                 term.apply_osc(_f[0], self._osc_defaults.get(_f[0], False) if locked
-                               else bool(osc_state.get(_f[0], False)))
+                               else _saved_bool(osc_state.get(_f[0], False),
+                                                self._osc_defaults.get(_f[0], False)))
         else:
             # a legacy session carries only the allow_title bool, which maps to
             # osc_title + osc_notify. Honour a lock on EITHER granular key OR on
