@@ -4713,6 +4713,16 @@ class SecureTerminal(QPlainTextEdit):
         A single-line payload is made safe by _dispatch_paste (its trailing submit is
         stripped, so it waits at the prompt for the user's own Enter). Returns None on
         success, or an error string to relay to the caller."""
+        if self._review_active:
+            # A paste/copy review is up: input to the child is SUSPENDED (the security
+            # promise the review bar makes -- no byte reaches the shell until the user
+            # chooses). _dispatch_paste writes to the pty immediately, which would land
+            # this text on the shell's input line to concatenate with the held paste and
+            # submit together on the next Enter -- defeating the suspension. Headless ctl
+            # has no user to release a held payload, so REFUSE; the caller can retry once
+            # the review resolves.
+            return ('a paste/copy review is in progress; input to the child is '
+                    'suspended -- retry after it resolves')
         if paste_is_multiline(text) and not self._bracketed_paste_active():
             return ('multiline text would auto-execute; send one line at a time '
                     '(an embedded newline is held for GUI review, which ctl cannot '
