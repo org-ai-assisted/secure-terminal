@@ -5386,14 +5386,39 @@ def _clipboard_watch_main():
 
 def _acquire_group_lock(group):
     """Blocking exclusive flock that serializes the claim of a group's socket across
-    processes (a stable lock file beside the socket, never removed). Held only for
-    the brief check-then-bind, released by the caller closing the fd; flock also
-    auto-releases if the holder dies, so a crash mid-claim cannot deadlock the next
-    claimant. Returns the held fd."""
-    fd = os.open(ipc.socket_path(group) + '.lock',
-                 os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    return fd
+    processes (a lock file beside the socket). Held only for the brief
+    check-then-bind, released by the caller closing the fd; flock auto-releases if
+    the holder dies, so a crash mid-claim cannot deadlock the next claimant.
+
+    Returns the held fd, or None if the lock cannot be acquired -- the caller then
+    claims WITHOUT serialization (the rare TOCTOU race) rather than CRASHING. The
+    lock is an OPTIMISATION, never a hard dependency: a mis-owned lock file left by
+    a root-context launch, or an unwritable runtime dir, must degrade the
+    single-instance claim, not take the whole app down. A mis-owned stale file is
+    self-healed by unlinking it (the socket dir is our own 0700, so we may unlink
+    any file in it) and retrying once before giving up."""
+    path = ipc.socket_path(group) + '.lock'
+    for attempt in (1, 2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        except OSError:
+            # A stale lock file with the wrong owner/mode (e.g. from a root-context
+            # launch) blocks os.open. Our socket dir is 0700 and ours, so we may
+            # unlink any file in it; drop the bad one and retry once, else degrade.
+            if attempt == 1:
+                try:
+                    os.unlink(path)
+                    continue
+                except OSError:
+                    pass
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+    return None                              # pragma: no cover - loop always returns
 
 
 def _bind_instance_server(group):
@@ -5416,9 +5441,12 @@ def _bind_instance_server(group):
         return None, 'failed'               # no runtime dir -> no single instance
     from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
     path = ipc.socket_path(group)
+    # None when the lock cannot be taken (a mis-owned lock file / unwritable dir):
+    # claim WITHOUT serialization (best-effort, the rare TOCTOU race) rather than
+    # crash -- the single-instance lock is an optimisation, not a hard dependency.
     lock_fd = _acquire_group_lock(group)
     try:
-        # Under the lock: a live peer already owns the group -> never disturb it.
+        # Under the lock (if held): a live peer owns the group -> never disturb it.
         if ipc.socket_is_live(group):
             return None, 'peer_owns'
         QLocalServer.removeServer(path)     # clear a crashed primary's stale file
@@ -5427,11 +5455,15 @@ def _bind_instance_server(group):
             QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
         if server.listen(path):
             return server, 'claimed'
-        sys.stderr.write('secure-terminal: could not bind instance socket %s; '
+        # listen() failing here (a free, non-stale path just cleared by removeServer)
+        # is a rare OS bind fault, not a live peer -- that returned 'peer_owns' above.
+        # Report it rather than leave a window silently unreachable.
+        sys.stderr.write('secure-terminal: could not bind instance socket %s; '  # pragma: no cover
                          '--reuse and ctl cannot reach this window\n' % (path,))
-        return None, 'failed'
+        return None, 'failed'  # pragma: no cover
     finally:
-        os.close(lock_fd)                   # release the flock (also frees on death)
+        if lock_fd is not None:
+            os.close(lock_fd)               # release the flock (also frees on death)
 
 
 def _handoff(group, request, timeout=8.0):
