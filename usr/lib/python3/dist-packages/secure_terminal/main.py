@@ -5564,7 +5564,13 @@ def main():
             reply = _handoff(launch.instance_group, request)
             if reply is not None:
                 return 0 if reply.get('ok') else 1
-            # the peer became unreachable after all -> open our own window below
+            # The peer we deferred to became unreachable (it died mid-handoff -- a
+            # RESTART is exactly this: the old primary is still bound when we launch,
+            # so we defer, then it exits). Its socket is now free, so RE-CLAIM it and
+            # become the new primary; otherwise we would open a server-less window and
+            # leave the group with NO primary, so every later --reuse opens yet
+            # another window (the reported duplicate-window regression).
+            server, status = _bind_instance_server(launch.instance_group)
 
     window = MainWindow(launch=launch)
     # Install the terminate-on-signal handler only now, after the window exists:
