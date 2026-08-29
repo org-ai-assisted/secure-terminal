@@ -4070,6 +4070,7 @@ class SecureTerminal(QPlainTextEdit):
         mods = event.modifiers()
         ctrl = mods & Qt.KeyboardModifier.ControlModifier
         shift = mods & Qt.KeyboardModifier.ShiftModifier
+        alt = mods & Qt.KeyboardModifier.AltModifier
 
         # Tab navigation is a window action and must work in both modes (even
         # while a full-screen program owns the keyboard): Ctrl+PageUp/Down switch
@@ -4095,6 +4096,11 @@ class SecureTerminal(QPlainTextEdit):
         # Ctrl+Shift+<key> is reserved for the window (copy/paste, new/close tab,
         # zoom); let those fall through to the QAction shortcuts.
         if ctrl and not shift:
+            # Ctrl+Alt is Meta: a real terminal (xterm metaSendsEscape, the default)
+            # prefixes the control byte with ESC, so an UNBOUND Ctrl+Alt+<key> reaches
+            # the child as ESC+byte (M-C-key). A key BOUND to a window shortcut fired
+            # its QAction before this, so meta only ever prefixes a byte the child gets.
+            meta = b'\x1b' if alt else b''
             # Send the control byte to the pty, exactly as a real terminal does.
             # In cooked mode the line discipline turns 0x03/0x1a/0x1c into
             # SIGINT/SIGTSTP/SIGQUIT for the foreground process group; a raw-mode
@@ -4111,7 +4117,7 @@ class SecureTerminal(QPlainTextEdit):
             # not to print it at its prompt (verified: identical in xterm), so we
             # add no local echo -- that would double-print under bash.
             if key == Qt.Key.Key_Backslash:
-                self._write(b'\x1c')          # Ctrl+\ -> SIGQUIT (cooked)
+                self._write(meta + b'\x1c')   # Ctrl+\ -> SIGQUIT (cooked)
                 self._echo_caret('^\\')       # make the signal visible
                 # SIGQUIT's effect on the pending line is tty/shell-dependent and NOT
                 # observable here: with NOFLSH off the tty flushes it, but under `stty
@@ -4132,9 +4138,9 @@ class SecureTerminal(QPlainTextEdit):
                     # else a stale dirty flag would poison the next prompt.
                     self._line_buffer = ''
                     self._line_dirty = False
-                    self._write(bytes([byte]))
+                    self._write(meta + bytes([byte]))
                     return
-                self._write(bytes([byte]))
+                self._write(meta + bytes([byte]))
                 if key == Qt.Key.Key_C:
                     self._echo_caret('^C')    # make the interrupt visible
                 if key == Qt.Key.Key_C:
@@ -4167,7 +4173,7 @@ class SecureTerminal(QPlainTextEdit):
             ctl = event.text()
             if len(ctl) == 1 and ord(ctl) < 0x20 and ctl not in '\b\t\n\r':
                 self._line_dirty = True       # an unmirrored control edit may desync
-                self._write(ctl.encode('latin-1'))
+                self._write(meta + ctl.encode('latin-1'))
                 return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -4313,10 +4319,11 @@ class SecureTerminal(QPlainTextEdit):
             out = seq
         elif ctrl and not shift and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
             # Ctrl+letter -> the control byte (Ctrl+C -> 0x03) the program
-            # receives; the Terminate action stays the escape hatch.
-            out = bytes([key & 0x1f])
+            # receives; the Terminate action stays the escape hatch. Ctrl+Alt is
+            # Meta: prefix ESC (metaSendsEscape), matching the printable branch below.
+            out = (b'\x1b' if alt else b'') + bytes([key & 0x1f])
         elif text and len(text) == 1 and ord(text) < 0x20:
-            out = text.encode('latin-1')            # e.g. Ctrl+[ -> ESC
+            out = (b'\x1b' if alt else b'') + text.encode('latin-1')   # e.g. Ctrl+[ -> ESC
         elif text and all(ch.isprintable() for ch in text):
             out = (b'\x1b' if alt else b'') + text.encode('utf-8')
         else:
