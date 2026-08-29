@@ -3362,7 +3362,11 @@ class SecureTerminal(QPlainTextEdit):
         url = params.decode('ascii', 'ignore')
         if not url.startswith('file://'):
             return
-        path = urllib.parse.unquote(url[7:].split('/', 1)[-1])
+        # urlparse().path is the PATH after the authority, so a 'file://host/dir'
+        # keeps only '/dir' and a malformed 'file://dir' (no leading '/', so 'dir'
+        # is the authority) does not smuggle the host in as the path -- unlike a
+        # manual url[7:].split('/', 1)[-1], which treated a bare authority as a path.
+        path = urllib.parse.unquote(urllib.parse.urlparse(url).path)
         path = '/' + path if not path.startswith('/') else path
         # percent-decoding can reintroduce control/bidi/zero-width characters, so
         # run the decoded path through the same safe-ASCII sanitizer as titles

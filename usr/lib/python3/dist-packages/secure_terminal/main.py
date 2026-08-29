@@ -994,10 +994,16 @@ class MainWindow(QMainWindow):
         count = self.tabs.count()
         if count > 1:
             target = (self.tabs.currentIndex() + step) % count
-            # skip a disabled restore placeholder: setCurrentIndex would else make a bare
-            # QWidget the current tab (setTabEnabled(False) only blocks a mouse click).
-            if self.tabs.isTabEnabled(target):
-                self.tabs.setCurrentIndex(target)
+            # Skip disabled restore placeholders and KEEP walking in `step`'s direction,
+            # wrapping, to the next real tab: setTabEnabled(False) only blocks a mouse
+            # click, and a single `if enabled` would DEAD-END the switch on a placeholder
+            # (e.g. from live 2 of [live,live,live,ph,ph] a PageDown to the ph never
+            # wraps round to live 0). At least the current tab is enabled, so this ends.
+            for _ in range(count):
+                if self.tabs.isTabEnabled(target):
+                    self.tabs.setCurrentIndex(target)
+                    return
+                target = (target + step) % count
 
     def _on_tab_move(self, step):
         """Ctrl+Shift+PageUp/Down: move the current tab left/right, wrapping."""
@@ -1512,7 +1518,7 @@ class MainWindow(QMainWindow):
             history=history,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
             mode=_locked('unicode_mode', mode, self._default_mode),
-            colors=_locked('colors', _saved_bool(info.get('colors'), False), self._default_colors),
+            colors=_locked('colors', _saved_bool(info.get('colors', True), True), self._default_colors),
             line_edits=_locked('line_edits', _saved_bool(info.get('line_edits', True), True),
                                self._default_line_edits),
             markings=_locked('colored_markings', _saved_bool(info.get('markings', True), True),
@@ -1957,18 +1963,26 @@ class MainWindow(QMainWindow):
         index = self.tabs.tabBar().tabAt(point)
         if index < 0:
             return
+        # Bind the actions to the tab WIDGET, re-resolving its index when they fire:
+        # menu.exec spins a nested loop during which a background tab can close (a
+        # shell exit -> _on_shell_exited), shifting indices, so a captured `index`
+        # would then act on the WRONG tab. indexOf() re-resolves (-1 if it is gone,
+        # which every target below tolerates as a no-op).
+        term = self.tabs.widget(index)
         menu = QMenu(self)
-        menu.addAction('Rename...', lambda: self.rename_tab(index))
+        menu.addAction('Rename...', lambda: self.rename_tab(self.tabs.indexOf(term)))
         color_menu = menu.addMenu('Colour')
         for name, value in (('Red', '#d83933'), ('Green', '#1f8a54'),
                             ('Blue', '#3b82f6'), ('Yellow', '#e5a50a'),
                             ('Purple', '#8b5cf6')):
             color_menu.addAction(
-                name, lambda v=value: self.set_tab_color(index, QColor(v)))
-        color_menu.addAction('Custom...', lambda: self._pick_custom_tab_color(index))
-        color_menu.addAction('Clear', lambda: self.set_tab_color(index, None))
+                name, lambda v=value: self.set_tab_color(self.tabs.indexOf(term), QColor(v)))
+        color_menu.addAction(
+            'Custom...', lambda: self._pick_custom_tab_color(self.tabs.indexOf(term)))
+        color_menu.addAction(
+            'Clear', lambda: self.set_tab_color(self.tabs.indexOf(term), None))
         menu.addSeparator()
-        menu.addAction('Close Tab', lambda: self.close_tab(index))
+        menu.addAction('Close Tab', lambda: self.close_tab(self.tabs.indexOf(term)))
         menu.exec(self.tabs.tabBar().mapToGlobal(point))
 
     def terminate_foreground(self):
@@ -4817,8 +4831,9 @@ class MainWindow(QMainWindow):
     # -- session persistence --------------------------------------------------
     def _session_tabs(self):
         tabs = []
-        for i in range(self.tabs.count()):
-            term = self.tabs.widget(i)
+        # Real terminals only: a surviving restore placeholder (a bare QWidget) has none
+        # of the toPlainText/current_* accessors below, so it would abort the save.
+        for term in self._real_terms():
             text = session.cap_text(term.toPlainText(), term.current_scrollback())
             tabs.append({
                 'name': self._user_titles.get(term, ''),
@@ -4924,8 +4939,12 @@ class MainWindow(QMainWindow):
         # be pruned by session.save).
         while self._deferred_restore:
             self._swap_placeholder(self._deferred_restore.pop(0))
-        running = sum(1 for i in range(self.tabs.count())
-                      if self.tabs.widget(i).has_foreground_program())
+        # Real terminals only: a restore placeholder can survive the drain above (an
+        # unknown placeholder is a safe swap no-op), and has_foreground_program /
+        # shutdown are SecureTerminal methods a bare QWidget placeholder has neither of
+        # -- an AttributeError here escapes closeEvent and aborts the process.
+        terms = self._real_terms()
+        running = sum(1 for t in terms if t.has_foreground_program())
         # A signal-driven / programmatic quit skips the interactive confirmation:
         # there is no user to answer it, and a modal opened during XCB teardown
         # segfaults (see _install_signal_quit).
@@ -4933,7 +4952,7 @@ class MainWindow(QMainWindow):
                 'Quit?',
                 ('A program is still running in %d tab%s. Quit anyway?'
                  % (running, '' if running == 1 else 's')),
-                [self.tabs.widget(i) for i in range(self.tabs.count())]):
+                terms):
             event.ignore()
             return
         if self._persist_session:
@@ -4941,8 +4960,8 @@ class MainWindow(QMainWindow):
                          self.tabs.currentIndex())
         else:
             session.clear()
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).shutdown()
+        for t in terms:
+            t.shutdown()
         super().closeEvent(event)
 
 
