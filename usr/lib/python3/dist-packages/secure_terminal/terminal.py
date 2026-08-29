@@ -2579,11 +2579,14 @@ class SecureTerminal(QPlainTextEdit):
         ?1000h/?1006h/?1004h arms _mouse_modes for ANY chunk (the scan is deliberately
         mode-agnostic, so the state tracks the child's request across a mode switch). In
         default CLI mode -- whose contract is "output cannot affect input" -- a click,
-        drag, wheel or focus change must therefore NOT become pty bytes. Only a
-        full-screen program actually driving the terminal may receive them: the user's
-        explicit TUI mode, or a program holding the alt screen. Gate the CONSUMPTION here
-        (re-evaluated per event), leaving the scan itself untouched."""
-        return self.tui_active() or self._alt_screen
+        drag, wheel or focus change must therefore NOT become pty bytes. Gate on
+        tui_active() ONLY: _tui is set solely by apply_tui() (the user's explicit TUI
+        mode) and is never output-armed, whereas _alt_screen is set by the child's
+        ?1049h -- so trusting _alt_screen let output alone re-open this channel for a
+        click/button/focus report (the wheel alternateScroll path is likewise gated on
+        tui_active()). A full-screen program gets mouse input once the user is in TUI
+        mode. Gate the CONSUMPTION here (re-evaluated per event); the scan is untouched."""
+        return self.tui_active()
 
     def _mouse_report_on(self):
         """True when the child has enabled mouse tracking WITH SGR encoding AND the mode
