@@ -729,6 +729,7 @@ class MainWindow(QMainWindow):
         self._osc_notified = set()   # (term, key) pairs already shown the OSC notice
         self._esc_notified = set()   # terms already shown the escape-suppressed notice
         self._closing_tabs = set()   # terms mid-close (reentrancy guard across the modal)
+        self._shell_exited_pending = set()   # shell died DURING a close-confirm modal
         self._syncing = False        # guard: programmatic chip sync vs user click
         # toolbar chip buttons, populated by _build_toolbar; empty here so a
         # _sync during _build_menu (which runs first) is a harmless no-op.
@@ -1622,7 +1623,12 @@ class MainWindow(QMainWindow):
                     'Close tab?',
                     'A program is still running in this tab. Close it anyway?',
                     [term]):
-                return
+                # Cancel. But the shell may have EXITED while the dialog was up: its
+                # _on_shell_exited -> close_tab re-entry was swallowed by the
+                # _closing_tabs guard above, so a plain return would strand a tab with a
+                # dead child. If that happened, close it now instead of cancelling.
+                if term not in self._shell_exited_pending:
+                    return
             # If this tab holds a paste/copy review, hide the bar first -- otherwise it
             # keeps the about-to-be-destroyed terminal and its buttons would dispatch
             # onto a deleted C++ object (RuntimeError). F2.
@@ -1648,11 +1654,20 @@ class MainWindow(QMainWindow):
                 self.close()
         finally:
             self._closing_tabs.discard(term)
+            self._shell_exited_pending.discard(term)
 
     def _on_shell_exited(self, term):
         index = self.tabs.indexOf(term)
-        if index != -1:
-            self.close_tab(index)
+        if index == -1:
+            return
+        if term in self._closing_tabs:
+            # A close-confirm modal is up for THIS term and its shell just exited, so
+            # the "still running?" question is moot -- the tab must close. close_tab's
+            # reentrancy guard swallows this re-entrant close, so record it; close_tab
+            # closes the tab on Cancel rather than stranding a dead child.
+            self._shell_exited_pending.add(term)
+            return
+        self.close_tab(index)
 
     # -- tab label: user name + program title kept separately -----------------
     def _tab_is_live(self, term):
