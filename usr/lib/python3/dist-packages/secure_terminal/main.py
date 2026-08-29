@@ -5410,6 +5410,10 @@ def _acquire_group_lock(group):
                     os.unlink(path)
                     continue
                 except OSError:
+                    # Cannot even unlink the bad lock (the runtime dir lost its
+                    # perms/ownership): stop self-healing and fall through to
+                    # degrade -- the caller claims without serialization rather
+                    # than crash. Swallow is deliberate best-effort.
                     pass
             return None
         try:
