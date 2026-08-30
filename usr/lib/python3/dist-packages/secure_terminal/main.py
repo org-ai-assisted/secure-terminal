@@ -1627,10 +1627,18 @@ class MainWindow(QMainWindow):
                     'A program is still running in this tab. Close it anyway?',
                     [term]):
                 # Cancel. But the shell may have EXITED while the dialog was up: its
-                # _on_shell_exited -> close_tab re-entry was swallowed by the
-                # _closing_tabs guard above, so a plain return would strand a tab with a
-                # dead child. If that happened, close it now instead of cancelling.
+                # _on_shell_exited -> restart/close was swallowed by the _closing_tabs
+                # guard above, so a plain return would strand a tab with a dead child.
                 if term not in self._shell_exited_pending:
+                    return                            # still running -> honour the cancel
+                # The program exited during the modal. Honour the SAME disposition as a
+                # normal exit: a -- PROGRAM tab drops to a fresh shell (the deferred
+                # restart), never closing on a cancel; a login-shell tab falls through
+                # and closes (its dead child cannot stay).
+                self._shell_exited_pending.discard(term)
+                if term.restart_as_shell():
+                    term.launch_command = None
+                    self._update_terminate_enabled()
                     return
             # If this tab holds a paste/copy review, hide the bar first -- otherwise it
             # keeps the about-to-be-destroyed terminal and its buttons would dispatch
@@ -1664,10 +1672,11 @@ class MainWindow(QMainWindow):
         if index == -1:
             return
         if term in self._closing_tabs:
-            # A close-confirm modal is up for THIS term and its shell just exited, so
-            # the "still running?" question is moot -- the tab must close. close_tab's
-            # reentrancy guard swallows this re-entrant close, so record it; close_tab
-            # closes the tab on Cancel rather than stranding a dead child.
+            # A close-confirm modal is up for THIS term and its shell just exited, so the
+            # "still running?" question is moot. close_tab's reentrancy guard swallows this
+            # re-entrant close, so record it; on Cancel close_tab then applies the exit
+            # disposition (a -- PROGRAM tab restarts to a shell, a login shell closes)
+            # rather than stranding a dead child.
             self._shell_exited_pending.add(term)
             return
         # A tab launched to run a specific program (-- PROGRAM) drops to a fresh login
@@ -1676,6 +1685,10 @@ class MainWindow(QMainWindow):
         # no-ops (returns False) for a plain login-shell tab, which still closes on
         # `exit`, as a real terminal does.
         if term.restart_as_shell():
+            # The tab no longer runs its launch program -- clear the launch_command so
+            # a repeated --if-absent for the same program OPENS a fresh tab instead of
+            # deduping against this now-a-plain-shell tab (silently reported "skipped").
+            term.launch_command = None
             self._update_terminate_enabled()   # _command is now None; refresh chrome/label
             return
         self.close_tab(index)

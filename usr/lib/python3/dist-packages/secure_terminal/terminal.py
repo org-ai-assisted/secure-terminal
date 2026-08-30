@@ -2412,6 +2412,8 @@ class SecureTerminal(QPlainTextEdit):
             tc.setPosition(min(pos, doc.characterCount() - 1))
             self.setTextCursor(tc)
             self._out_cursor = QTextCursor(tc)   # anchor our blinking cursor here (TUI)
+            self._cursor_on = True               # solid while output streams; the blink
+                                                 # timer resumes toggling once it settles
             # setTextCursor calls ensureCursorVisible, which follows the caret RIGHT when a
             # Show-mode wide glyph renders past the base-font cell width the grid advertised
             # to the child -- parking the view mid-grid and hiding column 0. A TUI grid is a
@@ -3470,13 +3472,28 @@ class SecureTerminal(QPlainTextEdit):
         disposition. Returns True when it restarts. A no-op (False) for a plain
         login-shell tab (self._command is None): typing `exit` there closes the tab,
         as a real terminal does. Keeps every widget setting (theme/zoom/mode/...);
-        only the exited child's pty and its half-parsed stream state are reset, and
-        the exited program's output stays above the new prompt as scrollback."""
+        only the exited child's pty and its half-parsed stream state are reset. A CLI
+        tab keeps the exited program's output above the new prompt as scrollback; a
+        TUI tab's transient alt-screen frame is discarded (as a real terminal drops it
+        on rmcup) and the grid shows the handover banner then the new shell."""
         if self._command is None or self._fd is None:
             return False
+        # SECURITY: drop any pending paste/copy review FIRST. Its held (reviewed) text
+        # must never become dispatchable to the NEW shell -- a reviewed multiline paste
+        # would then execute in it. Resolving hides the review bar and clears the
+        # suspended-input state before the new child exists.
+        if (self._review_active or self._pending_paste is not None
+                or self._pending_copy is not None):
+            self._pending_paste = None
+            self._pending_copy = None
+            self._review_active = False
+            self.paste_review_resolved.emit()
         # Tear down the exited child's pty (the master fd still opens; the read that
-        # brought us here raised EIO). No SIGHUP -- the child is already gone.
-        self._release_pty(hangup=False)
+        # brought us here raised EIO). SIGHUP the child: EIO means every pty-slave
+        # holder is gone, but a program that CLOSED the tty yet keeps running would
+        # otherwise be left orphaned + invisible when we fork the new shell -- SIGHUP
+        # reaps it (a no-op ESRCH for one that truly exited), matching close_tab.
+        self._release_pty(hangup=True)
         # Reset the half-parsed per-child stream state so the new shell's very first
         # bytes are not corrupted by a stale carry, a stuck alt-screen bit, or the
         # exited program's mouse-tracking request.
@@ -3503,8 +3520,21 @@ class SecureTerminal(QPlainTextEdit):
         # Now a plain login-shell tab; a visible separator marks the handover so the
         # new prompt is never mistaken for the exited program's output.
         self._command = None
-        self._append('\r\n[secure-terminal] program exited -- new shell\r\n')
-        self._start(None)
+        _banner = '\r\n[secure-terminal] program exited -- new shell\r\n'
+        if self._grid_mode():
+            # TUI: _start below makes a FRESH pyte screen (clearing the doc -- the
+            # alt-screen program's transient frame is dropped, as a real terminal does
+            # on rmcup). Seed the banner into that fresh grid AFTER the fork and render
+            # it, so the tab is not blank until the shell's first prompt.
+            self._start(None)
+            self._raw = _banner
+            self._feed_stream(_banner.encode('utf-8', 'replace'))
+            self._render_tui()
+        else:
+            # CLI: the line document keeps the exited program's output as scrollback;
+            # append the banner below it, then fork (which does not clear that document).
+            self._append(_banner)
+            self._start(None)
         return True
 
     def _append(self, text):
@@ -3645,6 +3675,7 @@ class SecureTerminal(QPlainTextEdit):
         cursor.setPosition(min(target, self.document().characterCount() - 1))
         self._out_cursor = cursor
         self._cursor_visible = True          # CLI always shows the cursor
+        self._cursor_on = True               # solid while output streams (blink resumes idle)
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
         # A terminal does not auto-scroll horizontally: anchor the view at the left

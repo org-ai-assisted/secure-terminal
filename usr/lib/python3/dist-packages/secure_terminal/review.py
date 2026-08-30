@@ -36,7 +36,11 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton,
 )
 
-from secure_terminal.sanitize import classify_paste
+from secure_terminal.sanitize import (
+    classify_paste, sanitize_paste, sanitize_paste_unicode,
+    sanitize_clipboard, sanitize_clipboard_display, sanitize_clipboard_unicode,
+    paste_no_autosubmit,
+)
 from secure_terminal.terminal import SecureTerminal
 
 # Semantic button/dot colours: the app's canonical safe-green and caution-red (the
@@ -177,6 +181,8 @@ class ReviewBar(QWidget):
         self._mirror.apply_theme(theme)
         if family:
             self._mirror.set_font_family(family)
+        if hasattr(term, 'current_zoom'):
+            self._mirror.apply_zoom(term.current_zoom())   # follow the tab's zoom
         self._mirror.render_preview(self._raw, mode=mode, markings=True)
 
     def rerender_mirror(self):
