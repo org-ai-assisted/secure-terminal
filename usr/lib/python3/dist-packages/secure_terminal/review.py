@@ -122,8 +122,12 @@ class ReviewBar(QWidget):
         # which delivery action's OUTCOME the mirror is previewing (None = the raw
         # held text). Focusing/hovering a delivery button shows exactly what it would
         # send, so an obfuscated command's de-obfuscated, auto-submitting form cannot
-        # stay hidden behind the button label.
+        # stay hidden behind the button label. _focused/_hovered track the delivery
+        # buttons' keyboard-focus and mouse-hover so the preview is derived
+        # focus-first (see eventFilter) and never goes stale.
         self._preview_action = None
+        self._focused = None
+        self._hovered = None
         self._kind = _KINDS['paste']
         self._remaining = 0
         self._countdown = QTimer(self)
@@ -193,7 +197,10 @@ class ReviewBar(QWidget):
                               if parts else self._kind['summary_empty'])
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
-        self._preview_action = None            # each review opens on the raw text
+        # each review opens on the raw text, with no button focused or hovered
+        self._preview_action = None
+        self._focused = None
+        self._hovered = None
         self._render_mirror(term)
 
         self._remaining = max(0, int(delay))
@@ -252,15 +259,26 @@ class ReviewBar(QWidget):
         self._render_mirror(self._term)
 
     def eventFilter(self, obj, event):
-        et = event.type()
-        if et in (QEvent.Type.FocusIn, QEvent.Type.Enter):
-            self._set_preview('stripped' if obj is self._stripped else 'unicode')
-        elif et in (QEvent.Type.FocusOut, QEvent.Type.Leave):
-            # revert to raw only once NEITHER delivery button holds focus or hover --
-            # a focus-out to the sibling button must keep previewing.
-            if not (self._stripped.hasFocus() or self._unicode.hasFocus()
-                    or self._stripped.underMouse() or self._unicode.underMouse()):
-                self._set_preview(None)
+        # Track focus and hover on the two delivery buttons from their events, then
+        # derive the previewed action FOCUS-FIRST. Keyboard Enter/Space commits the
+        # FOCUSED button, so the mirror must show that button's outcome whenever one
+        # is focused -- otherwise un-hovering a button while its sibling keeps focus
+        # would leave the mirror stale on the un-hovered outcome, letting Enter
+        # dispatch a payload the mirror is not showing. Re-derived on EVERY event so
+        # the preview can never go stale.
+        action = ('stripped' if obj is self._stripped
+                  else 'unicode' if obj is self._unicode else None)
+        if action is not None:
+            et = event.type()
+            if et == QEvent.Type.FocusIn:
+                self._focused = action
+            elif et == QEvent.Type.FocusOut and self._focused == action:
+                self._focused = None
+            elif et == QEvent.Type.Enter:
+                self._hovered = action
+            elif et == QEvent.Type.Leave and self._hovered == action:
+                self._hovered = None
+            self._set_preview(self._focused or self._hovered)
         return super().eventFilter(obj, event)
 
     def rerender_mirror(self):
