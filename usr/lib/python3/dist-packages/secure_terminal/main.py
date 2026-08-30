@@ -1816,8 +1816,13 @@ class MainWindow(QMainWindow):
 
     def _hide_paste_review(self, term):
         """The text was resolved (crossed or rejected): hide the bar and return
-        focus to the terminal so typing resumes."""
-        self._review_bar.hide_review()
+        focus to the terminal so typing resumes. Hide ONLY if the bar is actually
+        showing THIS term's review -- one bar is shared across tabs, so a review
+        resolved on tab A must not tear down a review the bar has since been
+        re-shown for on tab B (which would strand B: input suspended, bar gone).
+        Mirrors close_tab's reviewed_term() guard."""
+        if self._review_bar.reviewed_term() is term:
+            self._review_bar.hide_review()
         if term is self.current():
             term.setFocus()
 
