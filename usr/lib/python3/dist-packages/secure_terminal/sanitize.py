@@ -1269,6 +1269,10 @@ def is_default_ignorable(ch):
 def sanitize_paste(text):
     """Strip a pasted string to printable ASCII; newlines become carriage
     returns (what the shell expects for a submitted line)."""
+    # A CRLF pair is ONE line break: collapse it first so it maps to a single '\r',
+    # not two (which would submit a spurious empty line -- or, in a staged paste,
+    # leave an empty line to Enter past -- for Windows-clipboard text).
+    text = text.replace('\r\n', '\n')
     out = []
     for ch in text:
         cp = ord(ch)
@@ -1302,6 +1306,8 @@ def sanitize_paste_unicode(text):
     keeps, e.g. variation selectors), and a paste can never smuggle a hidden
     newline or an escape sequence this way either. Newlines still become the
     carriage return the shell expects for a submitted line."""
+    # CRLF is one line break -> one '\r' (see sanitize_paste).
+    text = text.replace('\r\n', '\n')
     out = []
     for ch in text:
         if ch == '\n' or ch == '\r':
