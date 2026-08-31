@@ -246,11 +246,19 @@ class ReviewBar(QWidget):
         # sanitizers are per-character and length-non-increasing, so this stays a true
         # prefix of the delivered form, and render_preview caps the render further; the
         # truncation notice already fires from the raw-path render in show_review.
-        sent = sanitizer(self._raw[:self._mirror._RAW_MAX])
+        raw = self._raw[:self._mirror._RAW_MAX]
+        sent = sanitizer(raw)
         if self._kind.get('paste_newline'):
             term = self._term
             if term is not None and hasattr(term, '_bracketed_paste_active') \
-                    and not term._bracketed_paste_active():
+                    and not term._bracketed_paste_active() \
+                    and len(raw) >= len(self._raw):
+                # Strip the trailing submit CR ONLY when the preview shows the WHOLE
+                # paste. On a TRUNCATED preview the trailing byte is mid-paste content
+                # -- an embedded newline that WILL auto-run the lines before it -- not
+                # the final submit; stripping it would deceptively show a safe prompt
+                # wait while delivery auto-executes. Left in, it renders as \n below so
+                # the user sees the embedded run.
                 sent = paste_no_autosubmit(sent)
             sent = sent.replace('\r', '\n')
         return sent
