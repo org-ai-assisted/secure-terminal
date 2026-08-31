@@ -198,8 +198,17 @@ class ReviewBar(QWidget):
 
         parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
                  for label, n in classify_paste(raw)]
-        self._summary.setText(self._kind['summary'] % ', '.join(parts)
-                              if parts else self._kind['summary_empty'])
+        summary = (self._kind['summary'] % ', '.join(parts)
+                   if parts else self._kind['summary_empty'])
+        # The mirror caps its render at _RAW_MAX (render_preview) so a multi-MB paste
+        # cannot hang the pane. Delivery still sends the WHOLE text, so a truncated
+        # preview must SAY so in unspoofable chrome (this label, not the terminal
+        # pane a paste could forge): the user can then reject what they cannot verify.
+        if len(raw) > self._mirror._RAW_MAX:
+            summary += ('  [preview truncated to %d of %d chars -- the FULL paste '
+                        'will be delivered; Reject if you cannot verify it]'
+                        % (self._mirror._RAW_MAX, len(raw)))
+        self._summary.setText(summary)
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
         # each review opens on the raw text, with no button focused or hovered

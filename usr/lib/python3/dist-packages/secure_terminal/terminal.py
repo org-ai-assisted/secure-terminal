@@ -1136,6 +1136,14 @@ class SecureTerminal(QPlainTextEdit):
         preview carries the same risk-class colouring and the same click-to-inspect
         popup as the terminal itself. Preview instances only."""
         self.clear()
+        # A pathological multi-MB paste must not hang the review pane: cap what the
+        # preview RENDERS to _RAW_MAX, kept from the HEAD (line 1 -- what auto-runs
+        # first -- is the review priority), trimming a partial escape left at the cut.
+        # DISPLAY-only: this is the review MIRROR (sole caller), never the delivery
+        # path, which sends the full text; ReviewBar.show_review shows a truncation
+        # notice so a partial preview never silently understates what will cross.
+        if len(text) > self._RAW_MAX:
+            text, _ = split_trailing_escape(text[:self._RAW_MAX])
         # Retain `text` as the raw source (not ''), so a later apply_mode /
         # apply_markings / apply_colors re-renders the preview instead of blanking
         # it, and reset the per-line state (cursor + SGR) so a previous preview's
