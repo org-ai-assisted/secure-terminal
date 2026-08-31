@@ -10,23 +10,37 @@ The same bar reviews text in BOTH trust directions: a paste coming IN (before it
 reaches the shell) and a selection being copied OUT (before it reaches the system
 clipboard). When such text carries unicode or control characters, the terminal
 HOLDS it and asks the window to show this bar (docked at the bottom, like the find
-bar). The preview reuses the terminal's own renderer, so risk-class colouring and
-click-to-inspect come for free.
+bar).
 
-The bar shows a one-line summary of what is hidden and, on the Detail toggle, four
-read-only preview panes -- Original (how it looks), Detail (each hidden character
-named inline), and exactly what each action button would deliver (stripped to
-ASCII, or with printable unicode kept). Three choices: Reject / Don't copy
-(default, and what Enter/Esc do while the text is held), the stripped action, and
-the with-unicode action. For a paste both action buttons are countdown-gated so a
-stray click cannot run it; a copy (not executed) has no countdown. The choice is
-dispatched back to the tab that held the text, the only path that lets it cross.
+The bar shows a one-line summary of what is hidden plus a SINGLE mirror pane: a
+read-only terminal view that renders through the SAME pipeline as the tab it came
+from, so a homoglyph is tinted and each character is click-to-inspect exactly as in
+the terminal. The pane FOLLOWS the reviewed tab live -- its display mode
+(box/show/reveal/detail), theme, font and zoom -- so flipping the tab's mode with
+the normal shortcut re-renders it (rerender_mirror). There is no preview-only render
+branch, so a "works live, wrong in the review box" divergence cannot recur.
+Risk-class colouring stays ON regardless of the tab's markings setting: revealing
+risk is the pane's whole job.
+
+Crucially the pane shows what each choice DELIVERS, not just the raw text: by
+default it shows the held text, but FOCUSING or HOVERING a delivery button
+re-renders it to that button's exact delivered form (_delivered). So focusing
+"Paste (ASCII)" reveals `rm -rf /` when the raw looked like a harmless `ram` --
+the de-obfuscation a strip performs cannot hide behind a label. Three choices:
+Reject / Don't copy / Leave it (default, and what Enter/Esc do while the text is
+held), the ASCII action (stripped), and the unicode action (printable unicode
+kept). ONLY Reject is coloured (safe-green): it is the one unconditionally-safe
+choice. The two delivery buttons are UNCOLOURED on purpose -- neither is safe in
+general (stripping de-obfuscates, keeping preserves deception), so a green there
+would mislead; the mirror shows the truth. For a paste both action buttons are
+countdown-gated so a stray click cannot run it; a copy (not executed) has no
+countdown. The choice is dispatched back to the tab that held the text, the only
+path that lets it cross.
 """
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QEvent
 from PyQt6.QtWidgets import (
-    QWidget, QLabel, QGridLayout, QHBoxLayout, QVBoxLayout, QPushButton,
-    QToolButton,
+    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton,
 )
 
 from secure_terminal.sanitize import (
@@ -36,27 +50,22 @@ from secure_terminal.sanitize import (
 )
 from secure_terminal.terminal import SecureTerminal
 
-# Semantic button/dot colours: the app's canonical safe-green and caution-red (the
-# same values the mode lamps and risk dots use). Chosen to clear the contrast guard
-# (sanitize.too_close) against BOTH the light and the dark theme background, so the
-# send buttons and the risk dot stay readable whatever the desktop palette -- unlike
-# a foreground-only tint tuned for one theme. Pinned as constants so test_review.py
-# can assert the contrast directly.
+# Semantic colours: the app's canonical safe-green and caution-red (the same values
+# the mode lamps and risk dots use). SAFE_FG tints ONLY the Reject button (the one
+# safe choice); RISK_FG is the risk dot. Chosen to clear the contrast guard
+# (sanitize.too_close) against BOTH the light and the dark theme background, so they
+# stay readable whatever the desktop palette -- unlike a foreground-only tint tuned
+# for one theme. Pinned as constants so test_review.py can assert the contrast.
 SAFE_FG = '#1f8a54'
 RISK_FG = '#d83933'
 
-# (display mode, risk-class colouring?) for the four preview panes, in order.
-_PANE_RENDER = (
-    ('show', False),      # Original -- how it looks, deceptive, untinted
-    ('detail', True),     # Detail -- named + tinted + click-to-inspect
-    ('show', False),      # the stripped (ASCII) result
-    ('show', True),       # the printable-unicode-kept result, tinted
-)
-
 # Everything that differs between the two directions. `dispatch` is the tab method
-# the choice is routed to; `panes` are the four column titles; `strip`/`keep` are
-# the sanitizers used to build the last two preview panes (paste maps newlines to
-# the shell's carriage return, copy preserves them for the clipboard).
+# the choice is routed to; `strip`/`keep` are the sanitizers the mirror uses to
+# render EXACTLY what each action button would deliver (focusing a delivery button
+# shows its outcome in the mirror), closing the "the delivered form is unseen" gap
+# a homoglyph-obfuscated command could hide behind. `paste_newline` maps the shell's
+# carriage return to a newline for display and drops the trailing auto-submit CR at a
+# bare prompt, so the paste preview matches what actually reaches the pty.
 _KINDS = {
     'paste': {
         'summary': 'This paste hides %s.',
@@ -64,16 +73,9 @@ _KINDS = {
         'summary_empty': 'Review this paste before it reaches the shell.',
         'reject': 'Reject',
         'reject_tip': 'Do not paste (Enter or Esc)',
-        'stripped': 'Paste stripped',
-        'unicode': 'Paste with unicode',
-        'titles': ('Original (as it looks)', 'Detail (what is really there)',
-                   'Paste stripped sends', 'Paste with unicode sends'),
+        'stripped': 'Paste (ASCII)',
+        'unicode': 'Paste (unicode)',
         'dispatch': 'dispatch_pending_paste',
-        # Sanitizers return the \r-form; show_review then applies paste_no_autosubmit
-        # (only when the target is NOT bracketed-paste, matching _dispatch_paste) and maps
-        # \r -> \n for display, so the "sends" panes show EXACTLY what reaches the pty --
-        # at a bare prompt the trailing auto-submit CR is dropped, so the preview no longer
-        # implies a submit that will not happen. Keyed by 'paste_newline'.
         'strip': sanitize_paste,
         'keep': sanitize_paste_unicode,
         'paste_newline': True,
@@ -83,33 +85,28 @@ _KINDS = {
         'summary_empty': 'Review this copy before it reaches the clipboard.',
         'reject': "Don't copy",
         'reject_tip': 'Do not copy (Enter or Esc)',
-        'stripped': 'Copy stripped',
-        'unicode': 'Copy with unicode',
-        'titles': ('Original (as it looks)', 'Detail (what is really there)',
-                   'Copy stripped puts', 'Copy with unicode puts'),
+        'stripped': 'Copy (ASCII)',
+        'unicode': 'Copy (unicode)',
         'dispatch': 'dispatch_pending_copy',
-        # the display-aware strip, so the "Copy stripped puts" preview matches what
-        # dispatch_pending_copy('stripped') actually places (a box -> '_', never gone).
+        # the display-aware strip, so the mirror's stripped form matches what
+        # dispatch_pending_copy('stripped') places (a box -> '_', never gone).
         'strip': sanitize_clipboard_display,
         'keep': sanitize_clipboard_unicode,
     },
     # The standalone clipboard sanitizer (clipboard_watch.py): text already ON the
     # system clipboard, reviewed before it is pasted elsewhere. Not a terminal
     # direction -- dispatch_pending_clipboard lives on a small holder object, not a
-    # tab -- but the bar and previews are identical.
+    # tab -- but the bar and mirror are identical.
     'clipboard': {
         'summary': 'This clipboard text hides %s.',
         'summary_empty': 'Review the clipboard text.',
-        'reject': 'Keep original',
+        'reject': 'Leave it',
         'reject_tip': 'Leave the clipboard unchanged (Enter or Esc)',
         'stripped': 'Replace (ASCII)',
-        'unicode': 'Replace (keep unicode)',
-        'titles': ('Original (as it looks)', 'Detail (what is really there)',
-                   'Replace (ASCII) puts', 'Replace (keep unicode) puts'),
+        'unicode': 'Replace (unicode)',
         'dispatch': 'dispatch_pending_clipboard',
-        # plain ASCII strip -- the text is raw clipboard content, NOT lifted from the
-        # rendered display, so the display-aware strip's box->'_' rewrite does not
-        # apply; this matches what dispatch_pending_clipboard writes back.
+        # plain ASCII strip -- raw clipboard content, not lifted from the display,
+        # so the display-aware box->'_' rewrite does not apply.
         'strip': sanitize_clipboard,
         'keep': sanitize_clipboard_unicode,
     },
@@ -121,6 +118,16 @@ class ReviewBar(QWidget):
         super().__init__(window)
         self._window = window
         self._term = None
+        self._raw = ''
+        # which delivery action's OUTCOME the mirror is previewing (None = the raw
+        # held text). Focusing/hovering a delivery button shows exactly what it would
+        # send, so an obfuscated command's de-obfuscated, auto-submitting form cannot
+        # stay hidden behind the button label. _focused/_hovered track the delivery
+        # buttons' keyboard-focus and mouse-hover so the preview is derived
+        # focus-first (see eventFilter) and never goes stale.
+        self._preview_action = None
+        self._focused = None
+        self._hovered = None
         self._kind = _KINDS['paste']
         self._remaining = 0
         self._countdown = QTimer(self)
@@ -143,44 +150,37 @@ class ReviewBar(QWidget):
         self._summary.setStyleSheet('font-weight:bold;')
         self._summary.setWordWrap(True)
         row.addWidget(self._summary, 1)
-        self._detail_btn = QToolButton(self)
-        self._detail_btn.setText('Detail')
-        self._detail_btn.setCheckable(True)
-        self._detail_btn.setToolTip('Show what the text really contains, and what '
-                                    'each button would deliver')
-        self._detail_btn.toggled.connect(self._toggle_detail)
-        row.addWidget(self._detail_btn)
+        # Only Reject is coloured (green): it is the one unconditionally-safe choice
+        # (nothing crosses). The two DELIVERY buttons carry NO colour on purpose --
+        # neither delivery is safe in general (stripping DE-OBFUSCATES a homoglyph
+        # command, keeping preserves the deception), so a "safe" tint on either would
+        # mislead. The mirror (delivered-form-on-focus) is where the truth is shown.
         self._reject = QPushButton('Reject', self)
+        self._reject.setStyleSheet('color:%s; font-weight:600;' % SAFE_FG)
         self._reject.clicked.connect(lambda: self._choose('reject'))
         row.addWidget(self._reject)
-        self._stripped = QPushButton('Paste stripped', self)
-        self._stripped.setStyleSheet('color:%s; font-weight:600;' % SAFE_FG)
+        self._stripped = QPushButton('Paste (ASCII)', self)
         self._stripped.clicked.connect(lambda: self._choose('stripped'))
         row.addWidget(self._stripped)
-        self._unicode = QPushButton('Paste with unicode', self)
-        self._unicode.setStyleSheet('color:%s; font-weight:600;' % RISK_FG)
+        self._unicode = QPushButton('Paste (unicode)', self)
         self._unicode.clicked.connect(lambda: self._choose('unicode'))
         row.addWidget(self._unicode)
         outer.addLayout(row)
 
-        # preview panes (hidden until Detail is toggled): read-only terminal views
-        # that render through the SAME pipeline, so a homoglyph is tinted and each
-        # character is click-to-inspect, exactly as in the terminal.
-        self._panes_host = QWidget(self)
-        grid = QGridLayout(self._panes_host)
-        grid.setContentsMargins(0, 0, 0, 0)
-        self._views = []
-        self._pane_labels = []
-        for column in range(len(_PANE_RENDER)):
-            label = QLabel('', self._panes_host)
-            grid.addWidget(label, 0, column)
-            self._pane_labels.append(label)
-            view = SecureTerminal(preview=True)
-            view.setMinimumSize(200, 130)
-            grid.addWidget(view, 1, column)
-            self._views.append(view)
-        self._panes_host.setVisible(False)
-        outer.addWidget(self._panes_host)
+        # Focusing or hovering a delivery button previews its OUTCOME in the mirror.
+        # The action buttons are countdown-gated, so the user has time to focus one
+        # and SEE what it delivers before it becomes clickable.
+        self._stripped.installEventFilter(self)
+        self._unicode.installEventFilter(self)
+
+        # The single mirror pane: a read-only terminal view that renders the held
+        # text through the SAME pipeline as the tab, so risk-class colouring and
+        # click-to-inspect come for free. Always visible while the bar is open (a
+        # fast visual review, no toggle); it follows the tab's mode/theme/font via
+        # rerender_mirror.
+        self._mirror = SecureTerminal(preview=True)
+        self._mirror.setMinimumHeight(120)
+        outer.addWidget(self._mirror)
 
     # -- lifecycle ------------------------------------------------------------
     def show_review(self, term, raw, delay, kind='paste'):
@@ -188,10 +188,8 @@ class ReviewBar(QWidget):
         ('paste' or 'copy'), gating the action buttons for `delay` seconds. Focus
         lands on Reject so Enter/Esc reject and nothing crosses until a choice."""
         self._term = term
+        self._raw = raw
         self._kind = _KINDS.get(kind, _KINDS['paste'])
-        # Each review opens collapsed: a prior review's expanded Detail must not
-        # reveal the next text's previews without an explicit toggle.
-        self._detail_btn.setChecked(False)
 
         parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
                  for label, n in classify_paste(raw)]
@@ -199,30 +197,11 @@ class ReviewBar(QWidget):
                               if parts else self._kind['summary_empty'])
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
-        for label, title in zip(self._pane_labels, self._kind['titles']):
-            label.setText(title)
-
-        theme = getattr(term, '_theme', 'dark')
-        family = term.current_font_family() if hasattr(term, 'current_font_family') \
-            else None
-        def preview_send(sanitizer):
-            sent = sanitizer(raw)
-            if self._kind.get('paste_newline'):
-                # Match _dispatch_paste: at a non-bracketed target the trailing auto-submit
-                # CR is stripped (so a pasted command waits for the user's own Enter), then
-                # \r -> \n for a readable preview. A bracketed-paste TUI keeps the CR, so its
-                # preview keeps the newline -- the pane tracks the real delivery either way.
-                if not term._bracketed_paste_active():
-                    sent = paste_no_autosubmit(sent)
-                sent = sent.replace('\r', '\n')
-            return sent
-        texts = (raw, raw, preview_send(self._kind['strip']),
-                 preview_send(self._kind['keep']))
-        for view, text, (mode, mark) in zip(self._views, texts, _PANE_RENDER):
-            view.apply_theme(theme)
-            if family:
-                view.set_font_family(family)
-            view.render_preview(text, mode=mode, markings=mark)
+        # each review opens on the raw text, with no button focused or hovered
+        self._preview_action = None
+        self._focused = None
+        self._hovered = None
+        self._render_mirror(term)
 
         self._remaining = max(0, int(delay))
         self._gate(self._remaining > 0)
@@ -232,6 +211,84 @@ class ReviewBar(QWidget):
         self.setVisible(True)
         self._reject.setDefault(True)
         self._reject.setFocus()
+
+    def _delivered(self, action):
+        """The EXACT text `action`'s button would deliver, formatted for display --
+        so the mirror shows what actually crosses: a stripped homoglyph revealed as
+        its ASCII, the trailing auto-submit CR dropped at a bare prompt, embedded
+        carriage returns shown as newlines. Mirrors _dispatch_paste so the preview
+        cannot understate what runs."""
+        sanitizer = self._kind['strip'] if action == 'stripped' else self._kind['keep']
+        sent = sanitizer(self._raw)
+        if self._kind.get('paste_newline'):
+            term = self._term
+            if term is not None and hasattr(term, '_bracketed_paste_active') \
+                    and not term._bracketed_paste_active():
+                sent = paste_no_autosubmit(sent)
+            sent = sent.replace('\r', '\n')
+        return sent
+
+    def _render_mirror(self, term):
+        """Render into the mirror pane the way the reviewed tab would -- its CURRENT
+        display mode, theme, font and zoom. When a delivery action is being previewed
+        (_preview_action set by focusing/hovering its button) the mirror shows that
+        action's DELIVERED form; otherwise the RAW held text. Risk-class colouring is
+        forced ON (markings=True) even if the tab has it off -- the review pane exists
+        to REVEAL risk. The line path is used deliberately: a review surface must SHOW
+        control/hidden characters (named, tinted, click-to-inspect), not run them
+        through a pyte grid that would consume them."""
+        theme = getattr(term, '_theme', 'dark')
+        family = term.current_font_family() \
+            if hasattr(term, 'current_font_family') else None
+        mode = term.current_mode() if hasattr(term, 'current_mode') else 'detail'
+        self._mirror.apply_theme(theme)
+        if family:
+            self._mirror.set_font_family(family)
+        if hasattr(term, 'current_zoom'):
+            self._mirror.apply_zoom(term.current_zoom())   # follow the tab's zoom
+        text = self._delivered(self._preview_action) \
+            if self._preview_action in ('stripped', 'unicode') else self._raw
+        self._mirror.render_preview(text, mode=mode, markings=True)
+
+    def _set_preview(self, action):
+        """Switch the mirror between the raw held text (action=None) and a delivery
+        action's outcome, re-rendering only on a real change."""
+        if action == self._preview_action or self._term is None:
+            return
+        self._preview_action = action
+        self._render_mirror(self._term)
+
+    def eventFilter(self, obj, event):
+        # Track focus and hover on the two delivery buttons from their events, then
+        # derive the previewed action FOCUS-FIRST. Keyboard Enter/Space commits the
+        # FOCUSED button, so the mirror must show that button's outcome whenever one
+        # is focused -- otherwise un-hovering a button while its sibling keeps focus
+        # would leave the mirror stale on the un-hovered outcome, letting Enter
+        # dispatch a payload the mirror is not showing. Re-derived on EVERY event so
+        # the preview can never go stale.
+        action = ('stripped' if obj is self._stripped
+                  else 'unicode' if obj is self._unicode else None)
+        if action is not None:
+            et = event.type()
+            if et == QEvent.Type.FocusIn:
+                self._focused = action
+            elif et == QEvent.Type.FocusOut and self._focused == action:
+                self._focused = None
+            elif et == QEvent.Type.Enter:
+                self._hovered = action
+            elif et == QEvent.Type.Leave and self._hovered == action:
+                self._hovered = None
+            self._set_preview(self._focused or self._hovered)
+        return super().eventFilter(obj, event)
+
+    def rerender_mirror(self):
+        """Re-render the mirror to follow a live change (mode/theme/font/zoom) on
+        the reviewed tab. No-op when no review is open (_term is None iff a review
+        is showing), so the window can call it unconditionally from its
+        mode/theme/font setters."""
+        if self._term is None:
+            return
+        self._render_mirror(self._term)
 
     def hide_review(self):
         """Hide the bar and stop the countdown; called when the text is resolved."""
@@ -257,9 +314,6 @@ class ReviewBar(QWidget):
         # dispatch emits paste_review_resolved, which the window routes back to
         # hide_review -- so the bar always closes, however the choice was made.
         getattr(term, self._kind['dispatch'])(action)
-
-    def _toggle_detail(self, on):
-        self._panes_host.setVisible(bool(on))
 
     def _gate(self, disabled):
         self._stripped.setEnabled(not disabled)

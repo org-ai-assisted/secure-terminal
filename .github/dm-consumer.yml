@@ -33,6 +33,13 @@ dist-ai-tests:
   ## dist-ai-tests-all reports as SKIP and counts toward a green run -- the gate
   ## reads as wired while never having run a single PoC.
   terminal-poc-corpus: true
+  ## Check out helper-scripts and symlink it to /usr/libexec/helper-scripts. The
+  ## secure-terminal-shots comparison-capture.sh sources check_runtime.bsh (for its
+  ## was_executed sourced-vs-run guard) from that absolute path, so the shots image
+  ## suites (render_settle_wait, tighten_skip, zoom_live_wiring) FAIL the whole
+  ## dist-ai-tests job without it -- a permanently-red shots job that then hides a
+  ## real regression (the silent-green trap terminal-poc-corpus/imagemagick also guard).
+  helper-scripts: true
   ## vim/htop/nano/tmux back the full-screen-program E2E (start it in TUI mode,
   ## confirm it renders a frame in the pyte grid, send its quit key, confirm a clean
   ## exit) -- the widget suite FAILS on a program that is absent, so they must be here.

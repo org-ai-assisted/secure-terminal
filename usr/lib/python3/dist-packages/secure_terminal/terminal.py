@@ -305,10 +305,10 @@ class _Utf8CharsetByteStream(pyte.ByteStream):
 
 
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
-                          QMimeData)
+                          QMimeData, QRect)
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
                          QTextFormat, QGuiApplication, QSyntaxHighlighter,
-                         QTextBlockUserData)
+                         QTextBlockUserData, QPainter)
 from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QApplication)
 
@@ -480,6 +480,24 @@ def tui_available():
     # python3-pyte is a hard dependency (see debian/control), so TUI mode is
     # always available. Retained as a stable capability query for callers/tests.
     return True
+
+
+def _argv_for_command(command):
+    """Build the child's argv from `command`: a list/tuple is used verbatim (the
+    "-- prog args" CLI form, no shell reparse), a string is split like a shell word
+    list ("ssh -p 22 host"), none/empty -> []. A MALFORMED string (e.g. an unbalanced
+    quote) also yields [] rather than raising: raised in the pty.fork child it would
+    print an uncaught traceback the parent then masks as a normal exit -- so fall back
+    to the login shell exactly as an empty command does. Caller substitutes the shell
+    for an empty argv."""
+    if isinstance(command, (list, tuple)):
+        return [str(a) for a in command]
+    if not command:
+        return []
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
 
 
 # Directories a bell sound file may live in. Restricting to these keeps the
@@ -714,8 +732,18 @@ class SecureTerminal(QPlainTextEdit):
         # shot-mode branches below; the normal render path and every security
         # guarantee are unchanged when it is off.
         self._shot = os.environ.get('SECURE_TERMINAL_SHOT') == '1'
-        if self._shot:
-            self.setCursorWidth(0)     # no caret drawn -> no frame depends on blink phase
+        # Draw our OWN cursor (see paintEvent) instead of Qt's native caret: the
+        # native caret STOPS blinking whenever the text cursor holds a selection, so
+        # selecting text froze the prompt caret (konsole keeps it blinking). Ours is
+        # anchored to the OUTPUT cursor (where typed input goes), independent of any
+        # selection, and blinks on its own timer. Hide the native caret unconditionally
+        # so there is never a second one; shot mode additionally suppresses OURS
+        # (paintEvent) so a capture stays byte-identical.
+        self.setCursorWidth(0)
+        self._cursor_on = True         # blink phase: True = drawn this half-cycle
+        self._cursor_visible = True    # a TUI program can hide it (DECTCEM); CLI always shows
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._blink_cursor)
         # Optional live transcript file: when SECURE_TERMINAL_TRANSCRIPT_FILE names a path,
         # this tab's transcript is written there whenever output SETTLES, kept current. A
         # generic, mode-agnostic configuration -- set it on the command line
@@ -1017,6 +1045,13 @@ class SecureTerminal(QPlainTextEdit):
         # real shell line, so _line_pending() must assume the prompt holds a line it
         # cannot see. See keyPressEvent (line-edit keys) and _line_pending.
         self._line_dirty = False
+        # HELD lines 2..N of a reviewed non-bracketed multi-line paste. Line 1 is
+        # delivered; the rest are held here (NEVER typed ahead) and inserted one at a
+        # time by an explicit paste gesture, only while no foreground program owns the
+        # tty -- so a line reviewed for this shell can never reach a program a prior
+        # line launched (sudo -i, ssh, a pager). See _dispatch_paste /
+        # _insert_next_staged. Empty except while such a paste is mid-delivery.
+        self._staged_paste = []
         # a mode change wanted to re-export TERM but the prompt held a pending
         # line, so the CR-terminated re-export would have submitted it. Held here
         # until the line is clear again. See _reexport_term / _flush_reexport.
@@ -1172,7 +1207,19 @@ class SecureTerminal(QPlainTextEdit):
         font.setPointSize(size)
         self.setFont(font)
         if sync:
-            self._sync_tui_size()          # a font change resizes the grid
+            # Push the new glyph size through to the pty winsize, exactly as
+            # resizeEvent does for a viewport resize: a zoom changes how many
+            # cols/rows fit even though the widget itself did not resize, and the
+            # child must be told or it keeps formatting to the old size.
+            if self.tui_active() or (self._alt_screen and self._screen is not None):
+                self._sync_tui_size()          # TUI / held alt-screen: resize the pyte grid
+            else:
+                # CLI line mode: _sync_tui_size no-ops (no _screen), so update the
+                # winsize directly. Without this a zoom left the shell formatting to
+                # the OLD column count, overflowing the narrower viewport -- right-
+                # truncated text with no wrap and a horizontal caret-follow jump
+                # (the reported zoom truncation bug).
+                self._set_winsize(*self._grid_size())
             if self._grid_mode():
                 self._render_timer.start(16)   # repaint at the new glyph size
 
@@ -1665,10 +1712,23 @@ class SecureTerminal(QPlainTextEdit):
         """The viewport size MINUS the document margins, i.e. the pixels actually
         available for text. Dividing the raw viewport width instead gave the grid
         one column too many -- it overflowed by the margin and showed a useless
-        horizontal scrollbar (and nano-style apps drew past the right edge)."""
+        horizontal scrollbar (and nano-style apps drew past the right edge).
+
+        The vertical scrollbar's width is reserved UNCONDITIONALLY: Qt already
+        subtracts it from the viewport when the (AsNeeded) bar is shown, so we
+        subtract it ourselves when it is HIDDEN, and the text width is then the SAME
+        either way. Otherwise the width jumps by a scrollbar the instant the bar
+        toggles, which changes the column count -> SIGWINCH -> the child's redraw
+        toggles the bar back: an endless flicker of a full-screen app (nano was the
+        report). A stable width breaks that feedback loop, and matches both size
+        helpers' intent (line mode excludes the scrollbar; TUI never reclaims it)."""
         margin = int(self.document().documentMargin())
         vp = self.viewport()
-        return (max(1, vp.width() - 2 * margin), max(1, vp.height() - 2 * margin))
+        bar = self.verticalScrollBar()
+        reserve = (bar.sizeHint().width()
+                   if bar is not None and not bar.isVisible() else 0)
+        return (max(1, vp.width() - reserve - 2 * margin),
+                max(1, vp.height() - 2 * margin))
 
     def _grid_size(self):
         """Columns and rows that fit the viewport at the current font. Used for
@@ -2345,7 +2405,13 @@ class SecureTerminal(QPlainTextEdit):
 
     def _place_grid_cursor(self, screen):
         if screen.cursor.hidden:
+            # DECTCEM: the program hid the cursor. Stop drawing ours and erase a
+            # previously-drawn one (leave _out_cursor where it was).
+            if self._cursor_visible:
+                self._cursor_visible = False
+                self._update_cursor_region()
             return
+        self._cursor_visible = True
         doc = self.document()
         grid_top = doc.blockCount() - self._grid_rows
         # Clamp cursor.y: pyte's resize() can leave it below a shrunk screen (the same OOB
@@ -2370,6 +2436,9 @@ class SecureTerminal(QPlainTextEdit):
             tc = self.textCursor()
             tc.setPosition(min(pos, doc.characterCount() - 1))
             self.setTextCursor(tc)
+            self._out_cursor = QTextCursor(tc)   # anchor our blinking cursor here (TUI)
+            self._cursor_on = True               # solid while output streams; the blink
+                                                 # timer resumes toggling once it settles
             # setTextCursor calls ensureCursorVisible, which follows the caret RIGHT when a
             # Show-mode wide glyph renders past the base-font cell width the grid advertised
             # to the child -- parking the view mid-grid and hiding column 0. A TUI grid is a
@@ -2757,13 +2826,7 @@ class SecureTerminal(QPlainTextEdit):
             # fingerprint. Programs then emit truecolor instead of down-mapping.
             os.environ['COLORTERM'] = 'truecolor'
             os.environ.setdefault('PAGER', 'cat')
-            # `command` is an optional program to run: a list is used verbatim as
-            # argv (the "-- prog args" CLI form, no shell reparse), a string is
-            # split like a shell word list ("ssh -p 22 host"); none -> login shell.
-            if isinstance(command, (list, tuple)):
-                argv = [str(a) for a in command]
-            else:
-                argv = shlex.split(command) if command else []
+            argv = _argv_for_command(command)   # [] for none/malformed -> login shell
             if not argv:
                 argv = [os.environ.get('SHELL') or '/bin/bash']
             if self._cwd:
@@ -2842,6 +2905,12 @@ class SecureTerminal(QPlainTextEdit):
         fg = self.has_foreground_program()
         if self._bracket_had_fg and not fg and self._screen is not None:
             self._screen.mode.discard(_BRACKETED_PASTE_MODE)
+        if fg and not self._bracket_had_fg:
+            # A foreground program just took the tty: a HELD multi-line paste belonged
+            # to the shell prompt it was pasted at, not to this program, so drop the
+            # remainder proactively (the paste gesture also refuses while fg, but this
+            # clears it the moment the program appears -- e.g. line 1 was sudo -i).
+            self._staged_paste = []
         self._bracket_had_fg = fg
         text = self._decoder.decode(data)
         # The bell is rung where each mode consumes the stream, NOT here: in TUI via
@@ -3378,12 +3447,13 @@ class SecureTerminal(QPlainTextEdit):
             self._reported_cwd = path
             self.cwd_changed.emit(path)
 
-    def shutdown(self):
-        """Detach the notifier, close the master fd and hang up the child. Used
-        when a tab is closed so the shell does not linger, and on app quit so the
-        pty machinery is torn down inside the event loop, not during teardown."""
-        self._render_timer.stop()          # no pending paint fires into teardown
-        self._flush_paint()                # paint the last CLI line before we go
+    def _release_pty(self, hangup):
+        """Detach the notifier, close the master fd, and drop the child pid from the
+        reaper registry. hangup=True SIGHUPs a child that MAY still be alive (a tab
+        close); False when the child has already exited (restart_as_shell). SIGHUP is
+        asynchronous, so a one-shot WNOHANG only mops up a child that has ALREADY died
+        (e.g. the widget used without the app's SIGCHLD handler); a child still alive
+        stays in _LIVE_PTY_PIDS for the app's reap handler, never lingering defunct."""
         if self._notifier is not None:
             self._notifier.setEnabled(False)
             try:
@@ -3398,16 +3468,11 @@ class SecureTerminal(QPlainTextEdit):
                 pass        # already closed -> nothing to do
             self._fd = None
         if self._pid:
-            try:
-                os.kill(self._pid, signal.SIGHUP)
-            except OSError:
-                pass        # child already gone -> nothing to hang up
-            # SIGHUP is asynchronous, so the child may still be alive here; a one-shot
-            # WNOHANG only mops up a child that has ALREADY died (e.g. the widget used
-            # without the app's SIGCHLD handler). A child still alive stays in
-            # _LIVE_PTY_PIDS, and the app's reap_pty_children handler collects it when it
-            # exits -- so it never lingers defunct, without a blanket SIGCHLD=SIG_IGN that
-            # would defang subprocess returncodes.
+            if hangup:
+                try:
+                    os.kill(self._pid, signal.SIGHUP)
+                except OSError:
+                    pass    # child already gone -> nothing to hang up
             try:
                 reaped = os.waitpid(self._pid, os.WNOHANG)[0]
             except (OSError, ChildProcessError):
@@ -3415,6 +3480,92 @@ class SecureTerminal(QPlainTextEdit):
             if reaped:
                 SecureTerminal._LIVE_PTY_PIDS.discard(self._pid)
             self._pid = None
+
+    def shutdown(self):
+        """Detach the notifier, close the master fd and hang up the child. Used
+        when a tab is closed so the shell does not linger, and on app quit so the
+        pty machinery is torn down inside the event loop, not during teardown."""
+        self._render_timer.stop()          # no pending paint fires into teardown
+        self._blink_timer.stop()           # nor a cursor-blink paint into teardown
+        self._flush_paint()                # paint the last CLI line before we go
+        self._release_pty(hangup=True)
+
+    def restart_as_shell(self):
+        """A launched program (-- PROGRAM tab) exited: drop to a fresh login shell
+        IN PLACE instead of closing the tab, so a finished program (a session, an
+        ssh, an editor) leaves a usable prompt -- gnome-terminal/konsole's 'restart'
+        disposition. Returns True when it restarts. A no-op (False) for a plain
+        login-shell tab (self._command is None): typing `exit` there closes the tab,
+        as a real terminal does. Keeps every widget setting (theme/zoom/mode/...);
+        only the exited child's pty and its half-parsed stream state are reset. A CLI
+        tab keeps the exited program's output above the new prompt as scrollback; a
+        TUI tab's transient alt-screen frame is discarded (as a real terminal drops it
+        on rmcup) and the grid shows the handover banner then the new shell."""
+        if self._command is None or self._fd is None:
+            return False
+        # SECURITY: drop any pending paste/copy review FIRST. Its held (reviewed) text
+        # must never become dispatchable to the NEW shell -- a reviewed multiline paste
+        # would then execute in it. Resolving hides the review bar and clears the
+        # suspended-input state before the new child exists.
+        if (self._review_active or self._pending_paste is not None
+                or self._pending_copy is not None):
+            self._pending_paste = None
+            self._pending_copy = None
+            self._review_active = False
+            self.paste_review_resolved.emit()
+        # Tear down the exited child's pty (the master fd still opens; the read that
+        # brought us here raised EIO). SIGHUP the child: EIO means every pty-slave
+        # holder is gone, but a program that CLOSED the tty yet keeps running would
+        # otherwise be left orphaned + invisible when we fork the new shell -- SIGHUP
+        # reaps it (a no-op ESRCH for one that truly exited), matching close_tab.
+        self._release_pty(hangup=True)
+        # Reset the half-parsed per-child stream state so the new shell's very first
+        # bytes are not corrupted by a stale carry, a stuck alt-screen bit, or the
+        # exited program's mouse-tracking request.
+        self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        self._esc_carry = ''
+        self._esc_drop = ''
+        self._esc_dropped = 0
+        self._esc_notified = False
+        self._osc_carry = b''
+        self._alt_scan_carry = ''
+        self._alt_feed_carry = b''
+        self._sync_scan_carry = ''
+        self._mouse_scan_carry = ''
+        self._alt_screen = False
+        self._alt_saved = None
+        self._alt_view = False
+        self._mouse_modes = set()
+        self.setMouseTracking(False)
+        self._mouse_report_btns = set()
+        self._mouse_report_cell = None
+        self._bracket_had_fg = False
+        self._sync_update = False
+        self._line_dirty = False
+        # SECURITY: a held multi-line paste for the EXITED program's shell must not
+        # survive into the fresh one -- else a later paste gesture would insert a line
+        # reviewed for the OLD context into the new login shell. Drop it with the rest
+        # of the per-child state.
+        self._staged_paste = []
+        # Now a plain login-shell tab; a visible separator marks the handover so the
+        # new prompt is never mistaken for the exited program's output.
+        self._command = None
+        _banner = '\r\n[secure-terminal] program exited -- new shell\r\n'
+        if self._grid_mode():
+            # TUI: _start below makes a FRESH pyte screen (clearing the doc -- the
+            # alt-screen program's transient frame is dropped, as a real terminal does
+            # on rmcup). Seed the banner into that fresh grid AFTER the fork and render
+            # it, so the tab is not blank until the shell's first prompt.
+            self._start(None)
+            self._raw = _banner
+            self._feed_stream(_banner.encode('utf-8', 'replace'))
+            self._render_tui()
+        else:
+            # CLI: the line document keeps the exited program's output as scrollback;
+            # append the banner below it, then fork (which does not clear that document).
+            self._append(_banner)
+            self._start(None)
+        return True
 
     def _append(self, text):
         self._feed_line(text)
@@ -3553,6 +3704,8 @@ class SecureTerminal(QPlainTextEdit):
         target = blk_start + prefix + disp
         cursor.setPosition(min(target, self.document().characterCount() - 1))
         self._out_cursor = cursor
+        self._cursor_visible = True          # CLI always shows the cursor
+        self._cursor_on = True               # solid while output streams (blink resumes idle)
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
         # A terminal does not auto-scroll horizontally: anchor the view at the left
@@ -3570,12 +3723,11 @@ class SecureTerminal(QPlainTextEdit):
         hbar = self.horizontalScrollBar()
         if hbar is not None:
             # Home only when the WHOLE caret fits at the left, so pinning never clips
-            # it against the right edge -- include the caret WIDTH, not just its left
-            # edge (a caret exactly on the boundary would else be pinned and shaved).
-            # cursorWidth() is reliable even in shot mode, where cursorRect() reports
-            # zero width; cursorRect().x() gives the caret's current viewport x and
-            # the scroll terms map it to where it would sit once homed.
-            caret_right = (self.cursorRect().x() + self.cursorWidth()
+            # it against the right edge -- include the drawn cursor WIDTH, not just its
+            # left edge (a caret exactly on the boundary would else be pinned and
+            # shaved). The native caret is hidden (setCursorWidth 0), so cursorRect()
+            # gives the position and _cursor_rect().width() the width WE draw.
+            caret_right = (self.cursorRect().x() + self._cursor_rect().width()
                            + hbar.value() - hbar.minimum())
             if caret_right <= self.viewport().width():
                 hbar.setValue(hbar.minimum())
@@ -4135,7 +4287,8 @@ class SecureTerminal(QPlainTextEdit):
                 if byte in (0x0a, 0x0d):
                     # Ctrl+J (LF) and Ctrl+M (CR) are accept-line: readline/zle
                     # submit the line exactly like Enter, so reset the line state --
-                    # else a stale dirty flag would poison the next prompt.
+                    # else a stale dirty flag would poison the next prompt. Like Enter,
+                    # accept-line never advances a held paste (only a paste gesture does).
                     self._line_buffer = ''
                     self._line_dirty = False
                     self._write(meta + bytes([byte]))
@@ -4146,6 +4299,7 @@ class SecureTerminal(QPlainTextEdit):
                 if key == Qt.Key.Key_C:
                     self._line_buffer = ''    # SIGINT discards the whole line
                     self._line_dirty = False
+                    self._staged_paste = []   # ...and abandons a held paste
                 elif key == Qt.Key.Key_U:
                     # Ctrl+U (kill-line) reaches cursor-to-start (bash unix-line-discard)
                     # or the whole line (zsh kill-whole-line) -- its extent depends on
@@ -4177,7 +4331,10 @@ class SecureTerminal(QPlainTextEdit):
                 return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            # Enter submits the line: reset the mirror state, then send CR.
+            # Enter submits the line: reset the mirror state, then send CR. Enter NEVER
+            # advances a held multi-line paste -- the next line is inserted only by an
+            # explicit paste gesture at an idle prompt (see _insert_next_staged), so a
+            # line reviewed for this shell cannot ride the Enter that launched a program.
             self._line_buffer = ''
             self._line_dirty = False
             self._write(b'\r')
@@ -4497,6 +4654,69 @@ class SecureTerminal(QPlainTextEdit):
         self._char_popup = dlg          # keep a reference so it is not GC'd
         dlg.show()
 
+    # -- our own blinking cursor (native caret hidden; see __init__) -----------
+    def _cursor_anchor(self):
+        """The QTextCursor the visible cursor is drawn at: the OUTPUT cursor (where
+        typed input goes), NOT self.textCursor() -- during a selection the text
+        cursor is the selection's moving end, but the terminal cursor stays put at
+        the prompt (this is what keeps it blinking there while you select)."""
+        return self._out_cursor if self._out_cursor is not None else self.textCursor()
+
+    def _cursor_rect(self):
+        """Viewport rectangle of the cursor: a thin vertical bar at the output
+        cursor, the line's height (a bar never hides the glyph under it, unlike a
+        block, and matches the caret shape this terminal already showed)."""
+        r = self.cursorRect(self._cursor_anchor())
+        return QRect(r.x(), r.y(), 2, r.height())
+
+    def _cursor_color(self):
+        _bg, theme_fg = THEMES.get(self._theme, THEMES['dark'])
+        return QColor(self._osc_palette.get('fg', theme_fg))
+
+    def _update_cursor_region(self):
+        r = self._cursor_rect()
+        self.viewport().update(r.x() - 1, r.y() - 1, r.width() + 3, r.height() + 2)
+
+    def _blink_cursor(self):
+        self._cursor_on = not self._cursor_on
+        self._update_cursor_region()
+
+    def _restart_blink(self):
+        """Show the cursor at once and (re)start its blink -- called on every output-
+        cursor placement, so a streaming/moving cursor stays solid and it blinks
+        once output settles. No blink when unfocused, in shot mode, or when the
+        system cursor-flash time is 0 (blinking disabled)."""
+        self._cursor_on = True
+        flash = QApplication.styleHints().cursorFlashTime()
+        if self.hasFocus() and flash > 0 and not self._shot:
+            self._blink_timer.start(max(1, flash // 2))
+        else:
+            self._blink_timer.stop()
+        self._update_cursor_region()
+
+    def hideEvent(self, event):
+        # A hidden widget (a background tab, or one being closed) must not keep a
+        # blink timer alive: its timeout would repaint a viewport that may be mid-
+        # teardown. Focus-in restarts it when the tab is shown again.
+        self._blink_timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # Our own terminal cursor, drawn over the text. It blinks independent of any
+        # selection (the native caret, which we hid, does not). Suppressed for a
+        # deterministic screenshot (shot mode), on a non-interactive preview surface,
+        # when the widget is not visible (a queued paint into teardown), and while a
+        # TUI program has hidden the cursor (DECTCEM).
+        if (self._shot or self._preview or not self._cursor_visible
+                or not self.isVisible()):
+            return
+        if self.hasFocus() and not self._cursor_on:
+            return                          # blink OFF half-cycle
+        painter = QPainter(self.viewport())
+        painter.fillRect(self._cursor_rect(), self._cursor_color())
+        painter.end()
+
     def reset_caret(self):
         """Snap the visible caret back to the output cursor (where typed input
         goes), clearing any selection. Used after a search moves the caret to a
@@ -4617,12 +4837,18 @@ class SecureTerminal(QPlainTextEdit):
         if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
                 and not self._review_active):
             self._write(b'\x1b[I')          # DEC 1004 focus-in report
+        self._restart_blink()               # resume blinking, cursor visible at once
         super().focusInEvent(event)
 
     def focusOutEvent(self, event):
         if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
                 and not self._review_active):
             self._write(b'\x1b[O')          # DEC 1004 focus-out report
+        # Unfocused: stop blinking and draw the cursor statically (a real terminal
+        # shows a solid/hollow cursor when its window loses focus, never a blank).
+        self._blink_timer.stop()
+        self._cursor_on = True
+        self._update_cursor_region()
         super().focusOutEvent(event)
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
@@ -4651,6 +4877,12 @@ class SecureTerminal(QPlainTextEdit):
             # A copy or paste is already held for review: ignore a second paste
             # rather than clobber the pending one (input is otherwise suspended
             # during a review; copy() guards the same way). Re-paste after choosing.
+            return
+        if self._staged_paste:
+            # A reviewed multi-line paste is mid-delivery: this paste gesture inserts
+            # its next HELD line (fg-gated) rather than starting a new clipboard paste.
+            # Clear the held remainder first (Ctrl+C) to paste something else.
+            self._insert_next_staged()
             return
         raw = source.text()
         # When to review the paste, per the paste_warn setting:
@@ -4742,6 +4974,9 @@ class SecureTerminal(QPlainTextEdit):
         return None
 
     def _dispatch_paste(self, raw, action):
+        # A new delivery supersedes any half-delivered held paste: drop the remainder
+        # so a stale line can never trail a later paste.
+        self._staged_paste = []
         # 'unicode' keeps printable non-ASCII (still no control/bidi/zero-width);
         # 'stripped' is ASCII only. Both are safe to send as UTF-8.
         safe = (sanitize_paste_unicode(raw) if action == 'unicode'
@@ -4763,6 +4998,27 @@ class SecureTerminal(QPlainTextEdit):
             safe = paste_no_autosubmit(safe)
             if not safe:
                 return
+            # A non-bracketed MULTI-line paste still carries embedded submit CRs
+            # (paste_no_autosubmit only drops the TRAILING one), and with no bracketed
+            # framing to make the child buffer them inert, each would AUTO-RUN a line
+            # the instant the paste lands -- the reviewed unseen second command a
+            # security terminal must never run. So deliver only the FIRST line now (it
+            # waits at the prompt for the user's own Enter) and HOLD the rest; the user
+            # inserts each held line with an explicit paste gesture (_insert_next_staged),
+            # only while no foreground program owns the tty -- so nothing auto-runs and a
+            # held line can reach ONLY the reviewed shell. Single-line holds nothing.
+            lines = safe.split('\r')
+            if len(lines) > 1:
+                safe = lines[0]
+                # Deliver line 1; HOLD the rest, DROPPING empty lines -- a blank line in
+                # the paste (or the second half of a Windows CRLF, which sanitize maps to
+                # '\r\r') is a no-op command, not worth a paste gesture to skip.
+                self._staged_paste = [ln for ln in lines[1:] if ln]
+                if self._staged_paste:
+                    self._advise(
+                        '%d more pasted line%s held -- press Paste to insert the next '
+                        'at the prompt.' % (len(self._staged_paste),
+                                            '' if len(self._staged_paste) == 1 else 's'))
         # Keep our view of the line honest across a paste. A paste that lands at a
         # bare SHELL prompt (CLI, or TUI with no foreground program) sits there as a
         # command the next Enter submits -- _line_buffer never saw it, so mark the
@@ -4777,3 +5033,31 @@ class SecureTerminal(QPlainTextEdit):
         if bracketed:
             data = b'\x1b[200~' + data + b'\x1b[201~'
         self._write(data)
+
+    def _insert_next_staged(self):
+        """Insert the next HELD line of a reviewed multi-line paste at the prompt, on
+        an explicit paste gesture (insertFromMimeData). No submit CR, so it still waits
+        for the user's Enter.
+
+        GUARANTEE: it is written ONLY when no foreground program owns the tty
+        (not tui_active() and not has_foreground_program()). This is reliable BECAUSE
+        the gesture is a deliberate keypress at an IDLE prompt -- no command is
+        mid-launch, so no fork is racing the tty, and the check sees a settled state.
+        Under an interactive shell's normal JOB CONTROL a launched program / subshell /
+        sudo -i root shell runs in its own pgrp, so has_foreground_program() reads True
+        and we refuse; tui_active() additionally catches any full-screen program (vim,
+        a pager, ssh's session) regardless of job control. RESIDUAL: a non-TUI
+        stdin-reader under a shell with job control OFF (atypical: `set +m`) shares the
+        shell's pgrp, so neither check sees it -- there is no reliable per-process
+        signal there (a /proc child-scan false-positives on background jobs). If a
+        program owns the tty the reviewed context is gone, so DROP the remainder rather
+        than deliver a reviewed line into it. An empty held line (a blank line in the
+        paste) writes nothing but is still consumed."""
+        if self.tui_active() or self.has_foreground_program():
+            self._staged_paste = []
+            return
+        line = self._staged_paste.pop(0)
+        if line:
+            # the inserted line sits at the shell prompt unmirrored, like any paste
+            self._line_dirty = True
+            self._write(line.encode('utf-8'))

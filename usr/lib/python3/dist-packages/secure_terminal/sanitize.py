@@ -1268,7 +1268,10 @@ def is_default_ignorable(ch):
 
 def sanitize_paste(text):
     """Strip a pasted string to printable ASCII; newlines become carriage
-    returns (what the shell expects for a submitted line)."""
+    returns (what the shell expects for a submitted line). PER-CHARACTER: the Z3
+    formal proof (T3 homomorphism) depends on sanitize(a+b) == sanitize(a)+sanitize(b),
+    so this must map each char independently -- no cross-character rewrite (a CRLF pair
+    is handled where it matters, in _dispatch_paste's held-line split, not here)."""
     out = []
     for ch in text:
         cp = ord(ch)
@@ -1301,7 +1304,8 @@ def sanitize_paste_unicode(text):
     str.isprintable() excludes them (plus the default-ignorable characters it
     keeps, e.g. variation selectors), and a paste can never smuggle a hidden
     newline or an escape sequence this way either. Newlines still become the
-    carriage return the shell expects for a submitted line."""
+    carriage return the shell expects for a submitted line. PER-CHARACTER, like
+    sanitize_paste (the T3 homomorphism proof depends on it)."""
     out = []
     for ch in text:
         if ch == '\n' or ch == '\r':

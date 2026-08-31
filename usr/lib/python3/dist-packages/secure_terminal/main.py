@@ -1627,10 +1627,18 @@ class MainWindow(QMainWindow):
                     'A program is still running in this tab. Close it anyway?',
                     [term]):
                 # Cancel. But the shell may have EXITED while the dialog was up: its
-                # _on_shell_exited -> close_tab re-entry was swallowed by the
-                # _closing_tabs guard above, so a plain return would strand a tab with a
-                # dead child. If that happened, close it now instead of cancelling.
+                # _on_shell_exited -> restart/close was swallowed by the _closing_tabs
+                # guard above, so a plain return would strand a tab with a dead child.
                 if term not in self._shell_exited_pending:
+                    return                            # still running -> honour the cancel
+                # The program exited during the modal. Honour the SAME disposition as a
+                # normal exit: a -- PROGRAM tab drops to a fresh shell (the deferred
+                # restart), never closing on a cancel; a login-shell tab falls through
+                # and closes (its dead child cannot stay).
+                self._shell_exited_pending.discard(term)
+                if term.restart_as_shell():
+                    term.launch_command = None
+                    self._update_terminate_enabled()
                     return
             # If this tab holds a paste/copy review, hide the bar first -- otherwise it
             # keeps the about-to-be-destroyed terminal and its buttons would dispatch
@@ -1664,11 +1672,24 @@ class MainWindow(QMainWindow):
         if index == -1:
             return
         if term in self._closing_tabs:
-            # A close-confirm modal is up for THIS term and its shell just exited, so
-            # the "still running?" question is moot -- the tab must close. close_tab's
-            # reentrancy guard swallows this re-entrant close, so record it; close_tab
-            # closes the tab on Cancel rather than stranding a dead child.
+            # A close-confirm modal is up for THIS term and its shell just exited, so the
+            # "still running?" question is moot. close_tab's reentrancy guard swallows this
+            # re-entrant close, so record it; on Cancel close_tab then applies the exit
+            # disposition (a -- PROGRAM tab restarts to a shell, a login shell closes)
+            # rather than stranding a dead child.
             self._shell_exited_pending.add(term)
+            return
+        # A tab launched to run a specific program (-- PROGRAM) drops to a fresh login
+        # shell when that program exits, rather than closing -- so a finished program
+        # (a session, an ssh, an editor) leaves a usable prompt. restart_as_shell()
+        # no-ops (returns False) for a plain login-shell tab, which still closes on
+        # `exit`, as a real terminal does.
+        if term.restart_as_shell():
+            # The tab no longer runs its launch program -- clear the launch_command so
+            # a repeated --if-absent for the same program OPENS a fresh tab instead of
+            # deduping against this now-a-plain-shell tab (silently reported "skipped").
+            term.launch_command = None
+            self._update_terminate_enabled()   # _command is now None; refresh chrome/label
             return
         self.close_tab(index)
 
@@ -1795,8 +1816,13 @@ class MainWindow(QMainWindow):
 
     def _hide_paste_review(self, term):
         """The text was resolved (crossed or rejected): hide the bar and return
-        focus to the terminal so typing resumes."""
-        self._review_bar.hide_review()
+        focus to the terminal so typing resumes. Hide ONLY if the bar is actually
+        showing THIS term's review -- one bar is shared across tabs, so a review
+        resolved on tab A must not tear down a review the bar has since been
+        re-shown for on tab B (which would strand B: input suspended, bar gone).
+        Mirrors close_tab's reviewed_term() guard."""
+        if self._review_bar.reviewed_term() is term:
+            self._review_bar.hide_review()
         if term is self.current():
             term.setFocus()
 
@@ -2135,6 +2161,7 @@ class MainWindow(QMainWindow):
         self.zoom_box.setValue(percent)
         self.zoom_box.blockSignals(False)
         self._default_zoom = percent
+        self._review_bar.rerender_mirror()   # an open review mirrors the tab's font
         self._persist()
 
     def _on_zoom_step(self, direction):
@@ -2164,6 +2191,7 @@ class MainWindow(QMainWindow):
             term.apply_theme(theme)
             self._apply_container_theme(theme)   # container follows the current tab
         self._default_theme = theme
+        self._review_bar.rerender_mirror()   # an open review follows the theme
         self._persist()
 
     # -- unicode display mode: per current tab --------------------------------
@@ -2189,6 +2217,7 @@ class MainWindow(QMainWindow):
         self._sync_mode_toggles(mode)
         self._update_security_indicator()
         self._default_mode = mode
+        self._review_bar.rerender_mirror()   # flip the tab's mode -> mirror re-renders
         self._persist()
 
     def set_font_family(self, family):
@@ -2203,6 +2232,7 @@ class MainWindow(QMainWindow):
         if term is not None:
             term.set_font_family(family)
         self._default_font_family = family
+        self._review_bar.rerender_mirror()   # an open review follows the font family
         self._persist()
 
     def choose_font(self):
