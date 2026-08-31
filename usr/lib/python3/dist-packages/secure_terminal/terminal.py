@@ -1045,17 +1045,13 @@ class SecureTerminal(QPlainTextEdit):
         # real shell line, so _line_pending() must assume the prompt holds a line it
         # cannot see. See keyPressEvent (line-edit keys) and _line_pending.
         self._line_dirty = False
-        # remaining lines of a STAGED multi-line paste, delivered one per the user's
-        # own Enter so no embedded newline auto-runs (see _dispatch_paste /
-        # _feed_staged_paste). Empty except while a reviewed non-bracketed multi-line
-        # paste is being fed line by line.
+        # HELD lines 2..N of a reviewed non-bracketed multi-line paste. Line 1 is
+        # delivered; the rest are held here (NEVER typed ahead) and inserted one at a
+        # time by an explicit paste gesture, only while no foreground program owns the
+        # tty -- so a line reviewed for this shell can never reach a program a prior
+        # line launched (sudo -i, ssh, a pager). See _dispatch_paste /
+        # _insert_next_staged. Empty except while such a paste is mid-delivery.
         self._staged_paste = []
-        # set by the user's Enter when a staged line is due; the ACTUAL feed happens on
-        # the next PTY read that finds NO foreground program (i.e. back at the reviewed
-        # shell). Deferring past the keypress is what stops a staged line reaching a
-        # program/shell the FIRST line launched (sudo -i, ssh, a pager): at keypress
-        # time that program has not forked yet, so only a later read can see it.
-        self._stage_feed_pending = False
         # a mode change wanted to re-export TERM but the prompt held a pending
         # line, so the CR-terminated re-export would have submitted it. Held here
         # until the line is clear again. See _reexport_term / _flush_reexport.
@@ -2910,22 +2906,12 @@ class SecureTerminal(QPlainTextEdit):
         if self._bracket_had_fg and not fg and self._screen is not None:
             self._screen.mode.discard(_BRACKETED_PASTE_MODE)
         if fg and not self._bracket_had_fg:
-            # A foreground program just took the tty: a CLI-staged paste belonged to
-            # the shell prompt it was pasted at, not to this program, so drop the
-            # remainder -- else exiting the program and pressing Enter would feed a
-            # stale line to the returning prompt.
+            # A foreground program just took the tty: a HELD multi-line paste belonged
+            # to the shell prompt it was pasted at, not to this program, so drop the
+            # remainder proactively (the paste gesture also refuses while fg, but this
+            # clears it the moment the program appears -- e.g. line 1 was sudo -i).
             self._staged_paste = []
-            self._stage_feed_pending = False
         self._bracket_had_fg = fg
-        # Feed the next armed staged line ONLY now that a read confirms NO foreground
-        # program owns the tty -- i.e. we are back at the reviewed shell, not inside a
-        # program/shell the previous line launched (sudo -i, ssh, a pager). Gating the
-        # feed on this read (not the keypress) is what closes the fg-redirect bypass:
-        # at keypress time the launched program has not forked yet, so the check there
-        # would miss it. One line per armed Enter.
-        if self._stage_feed_pending and not fg:
-            self._stage_feed_pending = False
-            self._feed_staged_paste()
         text = self._decoder.decode(data)
         # The bell is rung where each mode consumes the stream, NOT here: in TUI via
         # pyte's BEL dispatch (_pyte_bell), in CLI on the carry-aware renderable text
@@ -3556,6 +3542,11 @@ class SecureTerminal(QPlainTextEdit):
         self._bracket_had_fg = False
         self._sync_update = False
         self._line_dirty = False
+        # SECURITY: a held multi-line paste for the EXITED program's shell must not
+        # survive into the fresh one -- else a later paste gesture would insert a line
+        # reviewed for the OLD context into the new login shell. Drop it with the rest
+        # of the per-child state.
+        self._staged_paste = []
         # Now a plain login-shell tab; a visible separator marks the handover so the
         # new prompt is never mistaken for the exited program's output.
         self._command = None
@@ -4296,15 +4287,11 @@ class SecureTerminal(QPlainTextEdit):
                 if byte in (0x0a, 0x0d):
                     # Ctrl+J (LF) and Ctrl+M (CR) are accept-line: readline/zle
                     # submit the line exactly like Enter, so reset the line state --
-                    # else a stale dirty flag would poison the next prompt.
+                    # else a stale dirty flag would poison the next prompt. Like Enter,
+                    # accept-line never advances a held paste (only a paste gesture does).
                     self._line_buffer = ''
                     self._line_dirty = False
                     self._write(meta + bytes([byte]))
-                    # a plain (non-meta) accept-line submits, so arm the next staged
-                    # line just like Enter; a meta-prefixed byte is not a bare
-                    # accept-line, so it does not advance the stage.
-                    if not alt:
-                        self._arm_staged_feed()
                     return
                 self._write(meta + bytes([byte]))
                 if key == Qt.Key.Key_C:
@@ -4312,8 +4299,7 @@ class SecureTerminal(QPlainTextEdit):
                 if key == Qt.Key.Key_C:
                     self._line_buffer = ''    # SIGINT discards the whole line
                     self._line_dirty = False
-                    self._staged_paste = []   # ...and abandons a staged paste
-                    self._stage_feed_pending = False
+                    self._staged_paste = []   # ...and abandons a held paste
                 elif key == Qt.Key.Key_U:
                     # Ctrl+U (kill-line) reaches cursor-to-start (bash unix-line-discard)
                     # or the whole line (zsh kill-whole-line) -- its extent depends on
@@ -4345,14 +4331,13 @@ class SecureTerminal(QPlainTextEdit):
                 return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            # Enter submits the line: reset the mirror state, then send CR. If a
-            # staged multi-line paste is waiting, ARM its next line -- it is fed on the
-            # next read that finds the reviewed shell in the foreground, never here
-            # synchronously (see _arm_staged_feed / _read_and_render).
+            # Enter submits the line: reset the mirror state, then send CR. Enter NEVER
+            # advances a held multi-line paste -- the next line is inserted only by an
+            # explicit paste gesture at an idle prompt (see _insert_next_staged), so a
+            # line reviewed for this shell cannot ride the Enter that launched a program.
             self._line_buffer = ''
             self._line_dirty = False
             self._write(b'\r')
-            self._arm_staged_feed()
             return
         if key == Qt.Key.Key_Backspace:
             self._line_buffer = self._line_buffer[:-1]
@@ -4893,6 +4878,12 @@ class SecureTerminal(QPlainTextEdit):
             # rather than clobber the pending one (input is otherwise suspended
             # during a review; copy() guards the same way). Re-paste after choosing.
             return
+        if self._staged_paste:
+            # A reviewed multi-line paste is mid-delivery: this paste gesture inserts
+            # its next HELD line (fg-gated) rather than starting a new clipboard paste.
+            # Clear the held remainder first (Ctrl+C) to paste something else.
+            self._insert_next_staged()
+            return
         raw = source.text()
         # When to review the paste, per the paste_warn setting:
         #   'always'  -- every paste (even plain ASCII);
@@ -4983,10 +4974,9 @@ class SecureTerminal(QPlainTextEdit):
         return None
 
     def _dispatch_paste(self, raw, action):
-        # A new delivery supersedes any half-fed staged paste: drop the remainder so
-        # a stale line can never trail a later paste.
+        # A new delivery supersedes any half-delivered held paste: drop the remainder
+        # so a stale line can never trail a later paste.
         self._staged_paste = []
-        self._stage_feed_pending = False
         # 'unicode' keeps printable non-ASCII (still no control/bidi/zero-width);
         # 'stripped' is ASCII only. Both are safe to send as UTF-8.
         safe = (sanitize_paste_unicode(raw) if action == 'unicode'
@@ -5009,18 +4999,22 @@ class SecureTerminal(QPlainTextEdit):
             if not safe:
                 return
             # A non-bracketed MULTI-line paste still carries embedded submit CRs
-            # (paste_no_autosubmit only drops the TRAILING one), and with no
-            # bracketed framing to make the child buffer them inert, each would
-            # AUTO-RUN a line the instant the paste lands -- the reviewed unseen
-            # second command a security terminal must never run. So deliver only the
-            # FIRST line now (it waits at the prompt for the user's own Enter) and
-            # STAGE the rest; _feed_staged_paste hands the next line to the prompt on
-            # each subsequent Enter, so every line runs only on an explicit keystroke.
-            # A single-line paste has no embedded CR and stages nothing.
+            # (paste_no_autosubmit only drops the TRAILING one), and with no bracketed
+            # framing to make the child buffer them inert, each would AUTO-RUN a line
+            # the instant the paste lands -- the reviewed unseen second command a
+            # security terminal must never run. So deliver only the FIRST line now (it
+            # waits at the prompt for the user's own Enter) and HOLD the rest; the user
+            # inserts each held line with an explicit paste gesture (_insert_next_staged),
+            # only while no foreground program owns the tty -- so nothing auto-runs and a
+            # held line can reach ONLY the reviewed shell. Single-line holds nothing.
             lines = safe.split('\r')
             if len(lines) > 1:
                 safe = lines[0]
                 self._staged_paste = lines[1:]
+                self._advise(
+                    '%d more pasted line%s held -- press Paste to insert the next '
+                    'at the prompt.' % (len(self._staged_paste),
+                                        '' if len(self._staged_paste) == 1 else 's'))
         # Keep our view of the line honest across a paste. A paste that lands at a
         # bare SHELL prompt (CLI, or TUI with no foreground program) sits there as a
         # command the next Enter submits -- _line_buffer never saw it, so mark the
@@ -5036,28 +5030,30 @@ class SecureTerminal(QPlainTextEdit):
             data = b'\x1b[200~' + data + b'\x1b[201~'
         self._write(data)
 
-    def _arm_staged_feed(self):
-        """The user submitted a line (Enter / accept-line); if a staged multi-line
-        paste is waiting, mark its next line due. The line is NOT written here -- it is
-        fed by _read_and_render on the next read that finds the reviewed shell in the
-        foreground, so a line the paste launched (sudo -i, ssh, a pager) can never
-        capture the staged input. A no-op when nothing is staged, so submitting the
-        final line arms nothing."""
-        if self._staged_paste:
-            self._stage_feed_pending = True
+    def _insert_next_staged(self):
+        """Insert the next HELD line of a reviewed multi-line paste at the prompt, on
+        an explicit paste gesture (insertFromMimeData). No submit CR, so it still waits
+        for the user's Enter.
 
-    def _feed_staged_paste(self):
-        """Deliver the next line of a STAGED multi-line paste -- called by
-        _read_and_render once a read confirms we are back at the reviewed shell (no
-        foreground program). Written WITHOUT a submit CR, so it sits at the prompt
-        awaiting the user's NEXT Enter, which arms the one after, until the stage
-        drains: one line per explicit keystroke, never an auto-run. A no-op when
-        nothing is staged. An empty staged line (a blank line in the paste) writes
-        nothing but is still consumed, so the Enter that submitted it advances on."""
-        if not self._staged_paste:
+        GUARANTEE: it is written ONLY when no foreground program owns the tty
+        (not tui_active() and not has_foreground_program()). This is reliable BECAUSE
+        the gesture is a deliberate keypress at an IDLE prompt -- no command is
+        mid-launch, so no fork is racing the tty, and the check sees a settled state.
+        Under an interactive shell's normal JOB CONTROL a launched program / subshell /
+        sudo -i root shell runs in its own pgrp, so has_foreground_program() reads True
+        and we refuse; tui_active() additionally catches any full-screen program (vim,
+        a pager, ssh's session) regardless of job control. RESIDUAL: a non-TUI
+        stdin-reader under a shell with job control OFF (atypical: `set +m`) shares the
+        shell's pgrp, so neither check sees it -- there is no reliable per-process
+        signal there (a /proc child-scan false-positives on background jobs). If a
+        program owns the tty the reviewed context is gone, so DROP the remainder rather
+        than deliver a reviewed line into it. An empty held line (a blank line in the
+        paste) writes nothing but is still consumed."""
+        if self.tui_active() or self.has_foreground_program():
+            self._staged_paste = []
             return
         line = self._staged_paste.pop(0)
         if line:
-            # the fed line sits at the shell prompt unmirrored, like any paste
+            # the inserted line sits at the shell prompt unmirrored, like any paste
             self._line_dirty = True
             self._write(line.encode('utf-8'))
