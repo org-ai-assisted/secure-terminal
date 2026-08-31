@@ -5010,11 +5010,15 @@ class SecureTerminal(QPlainTextEdit):
             lines = safe.split('\r')
             if len(lines) > 1:
                 safe = lines[0]
-                self._staged_paste = lines[1:]
-                self._advise(
-                    '%d more pasted line%s held -- press Paste to insert the next '
-                    'at the prompt.' % (len(self._staged_paste),
-                                        '' if len(self._staged_paste) == 1 else 's'))
+                # Deliver line 1; HOLD the rest, DROPPING empty lines -- a blank line in
+                # the paste (or the second half of a Windows CRLF, which sanitize maps to
+                # '\r\r') is a no-op command, not worth a paste gesture to skip.
+                self._staged_paste = [ln for ln in lines[1:] if ln]
+                if self._staged_paste:
+                    self._advise(
+                        '%d more pasted line%s held -- press Paste to insert the next '
+                        'at the prompt.' % (len(self._staged_paste),
+                                            '' if len(self._staged_paste) == 1 else 's'))
         # Keep our view of the line honest across a paste. A paste that lands at a
         # bare SHELL prompt (CLI, or TUI with no foreground program) sits there as a
         # command the next Enter submits -- _line_buffer never saw it, so mark the
