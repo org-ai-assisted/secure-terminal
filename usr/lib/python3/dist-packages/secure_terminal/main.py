@@ -4567,6 +4567,10 @@ class MainWindow(QMainWindow):
             # dialog has no bell field, so touching it would silently reset each
             # tab's per-tab bell choice; the bell is managed via the View menu only.
         self._apply_container_theme(opts['theme'])   # keep the container in step
+        # An OPEN review mirrors the reviewed tab's theme/mode/font/zoom, and this
+        # global-settings apply just changed all of them on that tab -- so refresh the
+        # mirror too, exactly as the per-tab setters do (a no-op when no review is open).
+        self._review_bar.rerender_mirror()
         if 'auto_tab_colors' in opts:
             self.set_auto_tab_colors(opts['auto_tab_colors'])
         if 'systray' in opts:
