@@ -130,6 +130,11 @@ class ReviewBar(QWidget):
         self._hovered = None
         self._kind = _KINDS['paste']
         self._remaining = 0
+        # True while the anti-fat-finger countdown is up: the delivery buttons stay
+        # ENABLED (so focusing/hovering one previews its delivered form -- the whole
+        # point of the countdown window), but a delivery CLICK is ignored until it
+        # elapses. Reject is never gated.
+        self._gated = False
         self._countdown = QTimer(self)
         self._countdown.timeout.connect(self._tick)
         self.setObjectName('reviewbar')
@@ -304,20 +309,33 @@ class ReviewBar(QWidget):
     # -- internals ------------------------------------------------------------
     def _choose(self, action):
         # Single-shot: clear _term before dispatching so a second click (a
-        # double-click, or Esc right after) is a no-op, independent of when the
-        # resolved signal hides the bar.
+        # double-click, or Esc right after) is a no-op.
         term = self._term
         if term is None:
             return
+        # Anti-fat-finger: while the countdown is up, a DELIVERY choice is ignored (the
+        # buttons stay enabled only so the preview works). Reject is never gated -- it
+        # is the safe choice, and Esc/Enter must always be able to back out.
+        if self._gated and action in ('stripped', 'unicode'):
+            return
         self._term = None
         self._countdown.stop()
-        # dispatch emits paste_review_resolved, which the window routes back to
-        # hide_review -- so the bar always closes, however the choice was made.
         getattr(term, self._kind['dispatch'])(action)
+        # HIDE the bar directly: this bar made a definitive choice on the term it was
+        # showing, so it must close. We cannot rely on the paste_review_resolved ->
+        # _hide_paste_review path here, because that path guards on reviewed_term()
+        # (to avoid a cross-tab resolution tearing down another tab's re-shown bar)
+        # and we just cleared _term above -- so the guarded hide would be skipped and
+        # the bar would stay open after the click.
+        self.hide_review()
 
     def _gate(self, disabled):
-        self._stripped.setEnabled(not disabled)
-        self._unicode.setEnabled(not disabled)
+        # Do NOT setEnabled(False): a DISABLED Qt button cannot take keyboard focus and
+        # does not reliably receive hover, so the delivered-form preview (focus/hover a
+        # delivery button) would be dead during the very countdown it exists for. Keep
+        # the buttons enabled -- so the preview works -- and gate the CLICK in _choose.
+        # The "(N)" countdown suffix on the labels is the visible not-yet cue.
+        self._gated = disabled
 
     def _tick_labels(self):
         suffix = ' (%d)' % self._remaining if self._remaining > 0 else ''
