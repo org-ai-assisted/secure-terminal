@@ -2676,8 +2676,13 @@ class SecureTerminal(QPlainTextEdit):
         off = self.contentOffset()
         margin = self.document().documentMargin()
         pos = event.position()
+        # Margin asymmetry: contentOffset() places the content's DRAW origin in the
+        # viewport. Its y ALREADY includes the top document margin (the first grid row
+        # is painted at off.y()), so the row must NOT subtract margin again -- doing so
+        # shifted every cell down by margin px, misreporting a click in a cell's top
+        # band as the row ABOVE. Its x does NOT include the left margin, so col keeps it.
         col = int((pos.x() - margin - off.x()) // char_w) + 1
-        row = int((pos.y() - margin - off.y()) // char_h) + 1
+        row = int((pos.y() - off.y()) // char_h) + 1
         cols = self._cols if self._cols and self._cols > 0 else self._MAX_LINE
         rows = self._rows if self._rows and self._rows > 0 else self._MAX_LINE
         col = min(col, cols) if col > 1 else 1
