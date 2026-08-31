@@ -325,7 +325,7 @@ from secure_terminal.sanitize import (
     feed_line_edits, cells_to_runs, cells_display_col, display_len,
     MARK_KEY, WRAP_NL, BOX,
     SPACE_MARK,
-    render_output,
+    render_output, render_cap_prefix,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
     describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
@@ -823,6 +823,7 @@ class SecureTerminal(QPlainTextEdit):
         # cannot grow it without limit; the oldest output is dropped first.
         self._raw = ''
         self._RAW_MAX = 1_000_000
+        self._preview_truncated = False   # render_preview capped a huge paste's render
         # cap alternate-screen enter/leave snapshots per read (anti-DoS: a flood of
         # alternating ?1049h/?1049l would otherwise deepcopy the screen thousands of
         # times); a real full-screen program toggles it at most a handful of times.
@@ -1136,11 +1137,25 @@ class SecureTerminal(QPlainTextEdit):
         preview carries the same risk-class colouring and the same click-to-inspect
         popup as the terminal itself. Preview instances only."""
         self.clear()
-        # Retain `text` as the raw source (not ''), so a later apply_mode /
-        # apply_markings / apply_colors re-renders the preview instead of blanking
-        # it, and reset the per-line state (cursor + SGR) so a previous preview's
+        # Bound the RENDERED preview size, not just the source length. `detail` mode
+        # expands every non-ASCII / control character into a verbose <U+XXXX NAME>
+        # badge (~8-99x), so a source-length cap alone would still let a multi-MB
+        # unicode paste build a huge Qt document and freeze the mandatory review (one
+        # million Cyrillic characters -> a ~32M-character document). render_cap_prefix
+        # keeps the longest HEAD prefix (line 1 -- what auto-runs first -- is the
+        # review priority) whose DETAIL render fits _RAW_MAX; detail is the widest
+        # mode, so the prefix stays bounded even if a later apply_mode re-renders it.
+        # split_trailing_escape drops a partial escape left at the cut. DISPLAY-only:
+        # this is the review MIRROR (sole caller), never the delivery path (which
+        # sends the full text) -- ReviewBar.show_review flags the truncation, so a
+        # partial preview never silently understates what will cross.
+        capped, _carry = split_trailing_escape(render_cap_prefix(text, self._RAW_MAX))
+        self._preview_truncated = len(capped) < len(text)
+        # Retain the (capped) text as the raw source (not ''), so a later apply_mode /
+        # apply_markings / apply_colors re-renders the preview instead of blanking it,
+        # and reset the per-line state (cursor + SGR) so a previous preview's
         # unfinished formatting cannot bleed into this one.
-        self._raw = text
+        self._raw = capped
         self._out_cursor = None
         self._line_cells = []
         self._line_col = 0
@@ -1149,7 +1164,7 @@ class SecureTerminal(QPlainTextEdit):
         self._mode = mode if mode in DISPLAY_MODES else 'detail'
         self._markings = bool(markings)
         self._sync_wrap_mode()            # preview feeds the line path directly
-        self._feed_line(text)
+        self._feed_line(capped)
 
     # -- appearance: theme + zoom ---------------------------------------------
     def apply_theme(self, theme):
@@ -1311,10 +1326,14 @@ class SecureTerminal(QPlainTextEdit):
         self._line_col = 0
         self._sgr_reset()                 # replay SGR colours from a clean slate
         if self._raw:
-            # Only the recent tail, so a mode toggle after a flood cannot freeze
-            # the UI re-rendering (and reveal-expanding) megabytes of scrollback.
-            self._feed_line(tail_from_escape_boundary(self._raw,
-                                                      self._RERENDER_TAIL))
+            # Live output is uncapped, so a mode toggle after a flood replays only the
+            # recent tail -- re-rendering (and reveal-expanding) megabytes of scrollback
+            # would freeze the UI. A PREVIEW's _raw is already render-capped by
+            # render_cap_prefix (bounded, kept from the HEAD), so it replays in FULL:
+            # the tail limit would show the END, hiding the line 1 the review keeps.
+            self._feed_line(self._raw if self._preview
+                            else tail_from_escape_boundary(self._raw,
+                                                           self._RERENDER_TAIL))
 
     def current_mode(self):
         return self._mode

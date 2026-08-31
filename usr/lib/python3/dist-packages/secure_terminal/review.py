@@ -196,17 +196,38 @@ class ReviewBar(QWidget):
         self._raw = raw
         self._kind = _KINDS.get(kind, _KINDS['paste'])
 
+        # classify_paste is the one uncapped materialization left in show_review: on a
+        # 50-100MB clipboard it scans for tens of seconds on the Qt thread BEFORE the
+        # bar (and its Reject button) can appear, while terminal input is already
+        # suspended -- a hung window the user cannot even reject from. Cap its input to
+        # the same budget the mirror uses; a hidden char beyond the cap is then
+        # uncounted, but the truncation notice below fires (raw > _RAW_MAX), so the
+        # partial count is disclosed, not silent.
         parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
-                 for label, n in classify_paste(raw)]
-        self._summary.setText(self._kind['summary'] % ', '.join(parts)
-                              if parts else self._kind['summary_empty'])
+                 for label, n in classify_paste(raw[:self._mirror._RAW_MAX])]
+        summary = (self._kind['summary'] % ', '.join(parts)
+                   if parts else self._kind['summary_empty'])
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
         # each review opens on the raw text, with no button focused or hovered
         self._preview_action = None
         self._focused = None
         self._hovered = None
-        self._render_mirror(term)
+        self._render_mirror(term)         # caps a huge render; sets _preview_truncated
+        # The mirror bounds its RENDER (render_preview) so a multi-MB paste -- unicode
+        # badges expand ~30x -- cannot hang the pane, and classify_paste above scans
+        # only the same first _RAW_MAX chars. Delivery still sends the WHOLE text, so a
+        # truncated review must SAY that BOTH the shown text AND the hidden-char count
+        # are partial, in unspoofable chrome (this label, not the terminal pane a paste
+        # could forge) -- otherwise a definite-looking "0 hidden" count past the cutoff
+        # would understate. The user can then reject what they cannot verify. Keyed off
+        # the actual render, not a raw length.
+        if getattr(self._mirror, '_preview_truncated', False):
+            summary += ('  [truncated: only the first {:,} characters are shown and '
+                        'scanned for hidden characters -- the FULL paste still '
+                        'delivers; Reject if you cannot verify the rest]'
+                        .format(self._mirror._RAW_MAX))
+        self._summary.setText(summary)
 
         self._remaining = max(0, int(delay))
         self._gate(self._remaining > 0)
@@ -231,11 +252,31 @@ class ReviewBar(QWidget):
         the de-obfuscated, dangerous lines are all shown; it just does not imply one
         atomic delivery."""
         sanitizer = self._kind['strip'] if action == 'stripped' else self._kind['keep']
-        sent = sanitizer(self._raw)
+        # Bound the materialization: sanitizing an UNBOUNDED paste here (a 50MB clipboard
+        # -> ~8.6s / ~0.5GB) would freeze or OOM the UI on a mere button hover, BEFORE the
+        # mirror's render cap ever runs. Sanitize only a bounded source prefix -- the
+        # sanitizers are per-character and length-non-increasing, so this stays a true
+        # prefix of the delivered form, and render_preview caps the render further; the
+        # truncation notice already fires from the raw-path render in show_review.
+        raw = self._raw[:self._mirror._RAW_MAX]
+        sent = sanitizer(raw)
         if self._kind.get('paste_newline'):
             term = self._term
             if term is not None and hasattr(term, '_bracketed_paste_active') \
-                    and not term._bracketed_paste_active():
+                    and not term._bracketed_paste_active() \
+                    and len(raw) >= len(self._raw):
+                # Strip the trailing submit CR ONLY when the preview shows the WHOLE
+                # paste. On a TRUNCATED preview the trailing byte is mid-paste content
+                # -- an embedded newline that WILL auto-run the lines before it -- not
+                # the final submit; stripping it would deceptively show a safe prompt
+                # wait while delivery auto-executes. Left in, it renders as \n below so
+                # the user sees the embedded run.
+                # Deliberate SAFE-direction limit: if everything after the cap sanitizes
+                # to nothing (e.g. a trailing NUL run), delivery WOULD strip the boundary
+                # newline, so showing it OVER-states the run. Determining that needs
+                # unbounded tail sanitization (the DoS this cap exists to stop), so we
+                # err toward showing it -- a false alarm, never a hidden auto-run -- and
+                # the truncation notice tells the user to reject what they cannot verify.
                 sent = paste_no_autosubmit(sent)
             sent = sent.replace('\r', '\n')
         return sent
