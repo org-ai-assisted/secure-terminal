@@ -218,11 +218,18 @@ class ReviewBar(QWidget):
         self._reject.setFocus()
 
     def _delivered(self, action):
-        """The EXACT text `action`'s button would deliver, formatted for display --
-        so the mirror shows what actually crosses: a stripped homoglyph revealed as
-        its ASCII, the trailing auto-submit CR dropped at a bare prompt, embedded
-        carriage returns shown as newlines. Mirrors _dispatch_paste so the preview
-        cannot understate what runs."""
+        """The full sanitized text `action` would deliver, formatted for display -- so
+        the mirror shows what actually crosses: a stripped homoglyph revealed as its
+        ASCII, the trailing auto-submit CR dropped at a bare prompt, embedded carriage
+        returns shown as newlines.
+
+        It shows the WHOLE delivered content, which is a SUPERSET of any single click:
+        for a non-bracketed MULTI-line paste _dispatch_paste delivers only line 1 on
+        the click and holds the rest for later paste gestures (see _insert_next_staged),
+        so the mirror lists every line that will run rather than modelling that
+        line-by-line staging. This never UNDERSTATES/hides what crosses (the point) --
+        the de-obfuscated, dangerous lines are all shown; it just does not imply one
+        atomic delivery."""
         sanitizer = self._kind['strip'] if action == 'stripped' else self._kind['keep']
         sent = sanitizer(self._raw)
         if self._kind.get('paste_newline'):
