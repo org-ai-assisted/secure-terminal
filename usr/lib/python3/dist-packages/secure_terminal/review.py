@@ -196,8 +196,15 @@ class ReviewBar(QWidget):
         self._raw = raw
         self._kind = _KINDS.get(kind, _KINDS['paste'])
 
+        # classify_paste is the one uncapped materialization left in show_review: on a
+        # 50-100MB clipboard it scans for tens of seconds on the Qt thread BEFORE the
+        # bar (and its Reject button) can appear, while terminal input is already
+        # suspended -- a hung window the user cannot even reject from. Cap its input to
+        # the same budget the mirror uses; a hidden char beyond the cap is then
+        # uncounted, but the truncation notice below fires (raw > _RAW_MAX), so the
+        # partial count is disclosed, not silent.
         parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
-                 for label, n in classify_paste(raw)]
+                 for label, n in classify_paste(raw[:self._mirror._RAW_MAX])]
         summary = (self._kind['summary'] % ', '.join(parts)
                    if parts else self._kind['summary_empty'])
         self._reject.setText(self._kind['reject'])
@@ -259,6 +266,12 @@ class ReviewBar(QWidget):
                 # the final submit; stripping it would deceptively show a safe prompt
                 # wait while delivery auto-executes. Left in, it renders as \n below so
                 # the user sees the embedded run.
+                # Deliberate SAFE-direction limit: if everything after the cap sanitizes
+                # to nothing (e.g. a trailing NUL run), delivery WOULD strip the boundary
+                # newline, so showing it OVER-states the run. Determining that needs
+                # unbounded tail sanitization (the DoS this cap exists to stop), so we
+                # err toward showing it -- a false alarm, never a hidden auto-run -- and
+                # the truncation notice tells the user to reject what they cannot verify.
                 sent = paste_no_autosubmit(sent)
             sent = sent.replace('\r', '\n')
         return sent
