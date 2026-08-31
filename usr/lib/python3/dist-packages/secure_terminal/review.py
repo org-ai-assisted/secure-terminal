@@ -215,13 +215,18 @@ class ReviewBar(QWidget):
         self._hovered = None
         self._render_mirror(term)         # caps a huge render; sets _preview_truncated
         # The mirror bounds its RENDER (render_preview) so a multi-MB paste -- unicode
-        # badges expand ~30x -- cannot hang the pane. Delivery still sends the WHOLE
-        # text, so a truncated preview must SAY so in unspoofable chrome (this label,
-        # not the terminal pane a paste could forge): the user can then reject what
-        # they cannot fully verify. Keyed off the actual render, not a raw length.
+        # badges expand ~30x -- cannot hang the pane, and classify_paste above scans
+        # only the same first _RAW_MAX chars. Delivery still sends the WHOLE text, so a
+        # truncated review must SAY that BOTH the shown text AND the hidden-char count
+        # are partial, in unspoofable chrome (this label, not the terminal pane a paste
+        # could forge) -- otherwise a definite-looking "0 hidden" count past the cutoff
+        # would understate. The user can then reject what they cannot verify. Keyed off
+        # the actual render, not a raw length.
         if getattr(self._mirror, '_preview_truncated', False):
-            summary += ('  [preview truncated -- the FULL paste will be delivered; '
-                        'Reject if you cannot verify it]')
+            summary += ('  [truncated: only the first {:,} characters are shown and '
+                        'scanned for hidden characters -- the FULL paste still '
+                        'delivers; Reject if you cannot verify the rest]'
+                        .format(self._mirror._RAW_MAX))
         self._summary.setText(summary)
 
         self._remaining = max(0, int(delay))
