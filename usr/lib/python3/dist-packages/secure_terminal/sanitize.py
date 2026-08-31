@@ -459,6 +459,13 @@ def render_cap_prefix(text, budget):
         return ''
     total = 0
     for index, ch in enumerate(text):
+        # Also bound the SOURCE length by `budget`. A zero-render-width byte (a
+        # standalone BEL renders to nothing) advances no render budget, so a run of
+        # them would let the scan -- and the retained _raw -- walk a whole multi-MB
+        # paste (ten million BEL bytes took ~5.7s); no preview needs more than
+        # `budget` source characters either.
+        if index >= budget:
+            return text[:index]
         cp = ord(ch)
         if cp in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= cp <= 0x7E:
             width = 1                        # printable ASCII + the passthrough controls

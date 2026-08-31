@@ -1326,10 +1326,14 @@ class SecureTerminal(QPlainTextEdit):
         self._line_col = 0
         self._sgr_reset()                 # replay SGR colours from a clean slate
         if self._raw:
-            # Only the recent tail, so a mode toggle after a flood cannot freeze
-            # the UI re-rendering (and reveal-expanding) megabytes of scrollback.
-            self._feed_line(tail_from_escape_boundary(self._raw,
-                                                      self._RERENDER_TAIL))
+            # Live output is uncapped, so a mode toggle after a flood replays only the
+            # recent tail -- re-rendering (and reveal-expanding) megabytes of scrollback
+            # would freeze the UI. A PREVIEW's _raw is already render-capped by
+            # render_cap_prefix (bounded, kept from the HEAD), so it replays in FULL:
+            # the tail limit would show the END, hiding the line 1 the review keeps.
+            self._feed_line(self._raw if self._preview
+                            else tail_from_escape_boundary(self._raw,
+                                                           self._RERENDER_TAIL))
 
     def current_mode(self):
         return self._mode

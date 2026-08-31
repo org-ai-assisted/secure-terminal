@@ -240,7 +240,13 @@ class ReviewBar(QWidget):
         the de-obfuscated, dangerous lines are all shown; it just does not imply one
         atomic delivery."""
         sanitizer = self._kind['strip'] if action == 'stripped' else self._kind['keep']
-        sent = sanitizer(self._raw)
+        # Bound the materialization: sanitizing an UNBOUNDED paste here (a 50MB clipboard
+        # -> ~8.6s / ~0.5GB) would freeze or OOM the UI on a mere button hover, BEFORE the
+        # mirror's render cap ever runs. Sanitize only a bounded source prefix -- the
+        # sanitizers are per-character and length-non-increasing, so this stays a true
+        # prefix of the delivered form, and render_preview caps the render further; the
+        # truncation notice already fires from the raw-path render in show_review.
+        sent = sanitizer(self._raw[:self._mirror._RAW_MAX])
         if self._kind.get('paste_newline'):
             term = self._term
             if term is not None and hasattr(term, '_bracketed_paste_active') \
