@@ -441,6 +441,37 @@ def render_output(text, mode='detail'):
     return ''.join(out)
 
 
+def render_cap_prefix(text, budget):
+    """Longest prefix of `text` whose DETAIL render is at most `budget` characters.
+
+    The review preview uses this to bound its RENDERED size. `detail` mode expands
+    every non-ASCII / control character into a verbose <U+XXXX NAME> badge (~8-99
+    chars), so a SOURCE-length cap alone does not stop a large unicode paste from
+    building a multi-megabyte Qt document and freezing the mandatory review (one
+    million Cyrillic characters render to a ~32-million-character document). Sized by
+    DETAIL cost, the widest mode, so the same capped prefix stays bounded if the
+    preview is later re-rendered in any other mode. The scan stops at `budget`, so it
+    never walks a whole multi-MB paste; it reuses _detail_badge, so the badge width
+    stays exact and cannot drift from render_output. An escape sequence (dropped by
+    render_output) is counted as a badge here -- an over-estimate, so the real render
+    is only ever smaller, never larger, than `budget`."""
+    if budget <= 0:
+        return ''
+    total = 0
+    for index, ch in enumerate(text):
+        cp = ord(ch)
+        if cp in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= cp <= 0x7E:
+            width = 1                        # printable ASCII + the passthrough controls
+        elif cp == 0x07:
+            width = 0                        # a standalone BEL is dropped, never badged
+        else:
+            width = len(_detail_badge(cp))   # <U+XXXX NAME>, the expanding case
+        if total + width > budget:
+            return text[:index]
+        total += width
+    return text
+
+
 # The alternate-screen enable sequences (private DEC modes). A program that
 # switches to the alternate screen buffer is a full-screen (TUI) app -- htop,
 # vim, less -- which line mode, having no escape parser, cannot draw. Detecting

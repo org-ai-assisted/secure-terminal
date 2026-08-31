@@ -200,22 +200,22 @@ class ReviewBar(QWidget):
                  for label, n in classify_paste(raw)]
         summary = (self._kind['summary'] % ', '.join(parts)
                    if parts else self._kind['summary_empty'])
-        # The mirror caps its render at _RAW_MAX (render_preview) so a multi-MB paste
-        # cannot hang the pane. Delivery still sends the WHOLE text, so a truncated
-        # preview must SAY so in unspoofable chrome (this label, not the terminal
-        # pane a paste could forge): the user can then reject what they cannot verify.
-        if len(raw) > self._mirror._RAW_MAX:
-            summary += ('  [preview truncated to %d of %d chars -- the FULL paste '
-                        'will be delivered; Reject if you cannot verify it]'
-                        % (self._mirror._RAW_MAX, len(raw)))
-        self._summary.setText(summary)
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
         # each review opens on the raw text, with no button focused or hovered
         self._preview_action = None
         self._focused = None
         self._hovered = None
-        self._render_mirror(term)
+        self._render_mirror(term)         # caps a huge render; sets _preview_truncated
+        # The mirror bounds its RENDER (render_preview) so a multi-MB paste -- unicode
+        # badges expand ~30x -- cannot hang the pane. Delivery still sends the WHOLE
+        # text, so a truncated preview must SAY so in unspoofable chrome (this label,
+        # not the terminal pane a paste could forge): the user can then reject what
+        # they cannot fully verify. Keyed off the actual render, not a raw length.
+        if getattr(self._mirror, '_preview_truncated', False):
+            summary += ('  [preview truncated -- the FULL paste will be delivered; '
+                        'Reject if you cannot verify it]')
+        self._summary.setText(summary)
 
         self._remaining = max(0, int(delay))
         self._gate(self._remaining > 0)
