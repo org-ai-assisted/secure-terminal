@@ -4675,8 +4675,12 @@ class SecureTerminal(QPlainTextEdit):
         return QRect(r.x(), r.y(), 2, r.height())
 
     def _cursor_color(self):
+        # OSC 12 sets the cursor colour (_osc_color stores it under 'cursor'); prefer
+        # it. Fall back to OSC 10's default fg, then the theme fg -- so an OSC 12 update
+        # actually re-tints the cursor, and OSC 10 no longer hijacks it.
         _bg, theme_fg = THEMES.get(self._theme, THEMES['dark'])
-        return QColor(self._osc_palette.get('fg', theme_fg))
+        return QColor(self._osc_palette.get(
+            'cursor', self._osc_palette.get('fg', theme_fg)))
 
     def _update_cursor_region(self):
         r = self._cursor_rect()
