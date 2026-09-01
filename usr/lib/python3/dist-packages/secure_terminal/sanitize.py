@@ -1529,32 +1529,78 @@ def paste_is_multiline(text):
     return '\n' in text[:-1] or '\r' in text[:-1]
 
 
+# The review bar's per-class breakdown, ordered worst-first (matches
+# _MARKING_SEVERITY) with the benign box-drawing / block class ranked LAST. The
+# same order the paste table and summary present.
+PASTE_DETAIL_CLASSES = ('bidi', 'control', 'invisible', 'confusable',
+                        'combining', 'nonascii', 'structural')
+
+
+def _paste_class(ch):
+    """Detail class of a to-be-pasted character, or None when it is plain ASCII or
+    a tab/newline (not a finding). One of PASTE_DETAIL_CLASSES. The SINGLE per-char
+    predicate shared by classify_paste (folds to four buckets) and
+    classify_paste_detail (keeps all seven), so the summary, the table and the
+    on-screen risk marking can never disagree about what a character is.
+
+    is_structural is tested FIRST, so a benign box-drawing / block glyph counts as
+    'structural' (its own low-risk row) rather than 'nonascii'; the two confusable
+    diagonals U+2571/U+2573 are excluded from is_structural and so still fall
+    through to marking_class -> 'confusable'."""
+    cp = ord(ch)
+    if ch in ('\n', '\r', '\t') or 0x20 <= cp <= 0x7E:
+        return None
+    if is_structural(cp):
+        return 'structural'
+    return marking_class(cp)
+
+
 def classify_paste(text):
     """Name and count the classes of non-plain-ASCII characters in a paste, so a
     warning can say exactly what is hidden in it ("2 bidirectional controls, 1
     invisible character") instead of a bare "contains unicode" -- the user has a
     right to know what a copied string really carries. Returns an ordered list of
     (label, count) for the classes present, most alarming first; label is a
-    singular noun the caller pluralizes."""
+    singular noun the caller pluralizes. Four buckets: confusable, combining,
+    structural and other non-ASCII all read 'non-ASCII character' (the finer
+    seven-class split is classify_paste_detail)."""
+    fold = {'bidi': 'bidirectional control', 'control': 'control character',
+            'invisible': 'invisible character'}
     counts = {}
     for ch in text:
-        cp = ord(ch)
-        if ch in ('\n', '\r', '\t') or 0x20 <= cp <= 0x7E:
+        c = _paste_class(ch)
+        if c is None:
             continue
-        # The SAME predicates the display marking uses, so the warning text and the
-        # on-screen risk colour can never disagree about what a character is.
-        if is_bidi_control(cp):
-            key = 'bidirectional control'
-        elif cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
-            key = 'control character'
-        elif is_invisible(ch):
-            key = 'invisible character'
-        else:
-            key = 'non-ASCII character'   # homoglyphs and other printable non-ASCII
+        key = fold.get(c, 'non-ASCII character')
         counts[key] = counts.get(key, 0) + 1
     order = ('bidirectional control', 'control character',
              'invisible character', 'non-ASCII character')
     return [(label, counts[label]) for label in order if label in counts]
+
+
+def classify_paste_detail(text):
+    """Full breakdown for the paste/copy review bar: a per-class count for every
+    class in PASTE_DETAIL_CLASSES (including zeros, so the table can show what is
+    NOT present) plus the paste's structure facts. UI-agnostic -- the caller owns
+    the display labels, glyphs, colours and row order. `ends_with_submit` is True
+    when the paste ends in a CR/LF that would submit at a shell prompt; `lines`
+    counts commands the same way paste_is_multiline does (a lone trailing submit
+    newline is NOT a second line), so `multiline` == (lines > 1)."""
+    counts = dict.fromkeys(PASTE_DETAIL_CLASSES, 0)
+    for ch in text:
+        c = _paste_class(ch)
+        if c is not None:
+            counts[c] += 1
+    inner = text.replace('\r\n', '\n')[:-1]
+    lines = inner.count('\n') + inner.count('\r') + 1
+    return {
+        'counts': counts,
+        'lines': lines,
+        'multiline': lines > 1,
+        'ends_with_submit': text.endswith(('\n', '\r')),
+        'chars': len(text),
+        'bytes': len(text.encode('utf-8', 'surrogatepass')),
+    }
 
 
 def color_256(idx):
