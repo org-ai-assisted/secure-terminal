@@ -508,13 +508,21 @@ def _argv_for_command(command):
       - a string -> split like a shell word list ("ssh -p 22 host");
       - none/empty -> [] (the deliberate "no command" case; caller substitutes shell);
       - a MALFORMED string (unbalanced quote), a whitespace-only string (" " -> no
-        words), or one whose FIRST word is empty ('""' -> ['']) -> None (FAIL CLOSED).
+        words), or one whose FIRST word is empty ('""' -> ['']) -> None (FAIL CLOSED);
+      - a list/tuple whose FIRST element is empty/whitespace-only (`-- ""` -> ['']) ->
+        None too (FAIL CLOSED), mirroring the string path -- a list names no program.
     None is distinct from [] on purpose: a locked-down launch (run ONLY this program)
     must not drop to a shell on a typo, a whitespace command, or an empty program name.
     The caller exits the child rather than spawn a shell for None; raising here instead
     would traceback in the pty.fork child, which the parent masks as a normal exit."""
     if isinstance(command, (list, tuple)):
-        return [str(a) for a in command]
+        argv = [str(a) for a in command]
+        # An empty list is the deliberate "no command" case ([] -> shell); but a list
+        # whose FIRST element is empty/whitespace ('' from `-- ""`) names no program and
+        # must fail closed, exactly like the string path -- else it drops to a shell.
+        if argv and not argv[0].strip():
+            return None
+        return argv
     if not command:
         return []
     try:
@@ -3715,6 +3723,13 @@ class SecureTerminal(QPlainTextEdit):
             self._pending_copy = None
             self._review_active = False
             self.paste_review_resolved.emit()
+        # SECURITY: a PENDING OSC-52 clipboard-read consent -- a dialog the exited program
+        # opened, still up during the paste-delay countdown -- must not survive into the new
+        # shell: clicking Allow would then reply the system clipboard into an UNRELATED
+        # shell's pty. Drop the pending state, and also forget an allow-always grant, since
+        # the new shell is a different context that must re-consent.
+        self._clipboard_read = None
+        self._clipboard_read_always = False
         # Tear down the exited child's pty (the master fd still opens; the read that
         # brought us here raised EIO). SIGHUP the child: EIO means every pty-slave
         # holder is gone, but a program that CLOSED the tty yet keeps running would
@@ -4793,13 +4808,14 @@ class SecureTerminal(QPlainTextEdit):
             # middle of a wider window instead of at the true right edge.
             old_cols = self._cols
             self._set_winsize(*self._grid_size())
-            if self._cols != old_cols:
-                # REFLOW retained line output to the new width: a long line emitted at
-                # the old width otherwise horizontal-scrolls (Box/Show are NoWrap by
-                # design). _rerender replays _raw through _feed_line, whose hard-wrap is
-                # self._cols, so it re-wraps to the new width; Detail/Reveal re-lay-out
-                # under WidgetWidth as before. Debounced so a resize drag does not
-                # re-render per pixel.
+            # REFLOW retained line output to the new width: a long line emitted at the old
+            # width otherwise horizontal-scrolls (Box/Show are NoWrap by design). _rerender
+            # replays _raw through _feed_line, whose hard-wrap is self._cols, so it re-wraps
+            # to the new width; Detail/Reveal re-lay-out under WidgetWidth. Debounced so a
+            # resize drag does not re-render per pixel. Only on a genuine width CHANGE
+            # (old_cols != 0: nothing to reflow before the first sizing), and only once the
+            # timer exists (a resize can fire during construction, before __init__ sets it).
+            if old_cols and self._cols != old_cols and getattr(self, '_reflow_timer', None):
                 self._reflow_timer.start(self._zoom_debounce_ms)
 
     def _cp_at(self, pos):

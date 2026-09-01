@@ -5228,8 +5228,9 @@ def _parse_launch_args(argv):
 
     # Fail CLOSED on a malformed -e STRING, before Qt starts: a locked-down launch
     # (run ONLY this program) must not silently drop to a login shell on a bad quote.
-    # A LIST command (-- prog args) is verbatim (never shlex'd), so it is exempt;
-    # empty/None is the deliberate 'no command -> shell'. Mirrors _argv_for_command.
+    # A LIST command (-- prog args) is verbatim (never shlex'd) EXCEPT its first element
+    # must still name a program -- `-- ""` (['']) fails closed too; empty/None is the
+    # deliberate 'no command -> shell'. Mirrors _argv_for_command.
     for spec in launch.tabs:
         cmd = spec.get('command')
         if isinstance(cmd, str) and cmd:
@@ -5242,6 +5243,13 @@ def _parse_launch_args(argv):
                 sys.stderr.write('secure-terminal: -e command names no program '
                                  '(empty / whitespace only)\n')
                 raise SystemExit(2)
+        elif isinstance(cmd, (list, tuple)) and cmd and not str(cmd[0]).strip():
+            # A `-- PROGRAM` list whose FIRST element is empty/whitespace ('' from
+            # `-- ""`) names no program: fail closed like the string path, rather than
+            # let _argv_for_command's list path silently drop to a login shell.
+            sys.stderr.write('secure-terminal: -- command names no program '
+                             '(empty / whitespace only)\n')
+            raise SystemExit(2)
 
     def _empty(spec):
         return not any(spec.get(k) is not None
