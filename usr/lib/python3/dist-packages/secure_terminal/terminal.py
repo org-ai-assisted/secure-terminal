@@ -3980,31 +3980,13 @@ class SecureTerminal(QPlainTextEdit):
 
     def toPlainText(self):
         # Overrides QPlainTextEdit.toPlainText so every external text getter (save
-        # transcript, session cap, ctl-dump IPC) yields ASCII, not the display box.
-        # Walks the per-run SOURCE code points (the shared _doc_runs seam, as
-        # transcript_text does) so a SYNTHETIC placeholder -- the box a Zalgo stack
-        # (> _ZALGO_MARK_MAX marks) is neutralized to even in Show mode -- maps to '_',
-        # while a real U+25A1/U+2423 the program printed in Show (its cp IS its own) is
-        # kept. The old pure-string map had no cp context, so it leaked the synthetic
-        # box as literal U+25A1. Blocks are newline-separated exactly like
-        # super().toPlainText(); Qt's own rendering does not go through this method.
+        # transcript, session cap, ctl-dump IPC) yields ASCII EXCEPT the box/glyphs
+        # Show mode keeps: in the default Box mode a neutralized byte collapses to an
+        # ASCII '_', while Show is the explicit opt-in to the visible U+25A1 box (the
+        # SAFE stand-in the user chose to see -- the raw zero-width/bidi byte never
+        # reaches here either way). Qt's own rendering does not go through this method.
         self._force_current_frame()  # never read a stale (debounced/gated) document
-        doc = self.document()
-        out = []
-        cur = QTextCursor(doc)
-        block = doc.begin()
-        first = True
-        while block.isValid():
-            if not first:
-                out.append('\n')
-            first = False
-            for a, b, cp in self._doc_runs(block):
-                cur.setPosition(a)
-                cur.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
-                out.append(self._export_selection_fragment(cur.selectedText(), cp,
-                                                           ascii_export=True))
-            block = block.next()
-        return ''.join(out)
+        return self._export_ascii(super().toPlainText())
 
     def _write_transcript_file(self):
         """Write this tab's transcript to the configured SECURE_TERMINAL_TRANSCRIPT_FILE,
@@ -4130,27 +4112,22 @@ class SecureTerminal(QPlainTextEdit):
             block = block.next()
         return ''.join(out)
 
-    def _export_selection_fragment(self, text, cp, ascii_export=False):
+    def _export_selection_fragment(self, text, cp):
         """Map ONE selected run's display text to what leaves the widget, using its
         recorded SOURCE code point to tell a synthetic marker from a real glyph the
         program printed -- the distinction _export_ascii, a pure string map with no
         code-point context, cannot make.
 
         Outside Show mode _export_ascii is exact (every non-ASCII byte is a marker),
-        so defer to it. In Show mode a real U+2423/U+25A1 the child printed is kept as
-        its glyph (its cp IS its own, matching transcript_text's guard); a SYNTHETIC
-        SPACE_MARK -- our stand-in for a neutralized non-ASCII space, cp is the SOURCE
-        byte -- is mapped to '_'. A synthetic BOX (a neutralized zero-width/bidi/control,
-        cp != 0x25a1) diverges by DESTINATION: on the COPY path (ascii_export False) it
-        is KEPT -- in Show the user opted into seeing the box, so copying the selection
-        copies the visible box; but an ASCII getter (toPlainText, ascii_export True) maps
-        it to '_' so it never leaks literal U+25A1. A real U+25A1 is kept either way."""
+        so defer to it. In Show mode a real U+2423 the child printed is kept as its
+        glyph (its cp IS 0x2423, matching transcript_text's guard); only the
+        SYNTHETIC SPACE_MARK -- our stand-in for a neutralized non-ASCII space, whose
+        cp is the SOURCE byte, not 0x2423 -- is mapped to '_'. BOX is left as-is in
+        Show, exactly as _export_ascii does, so a real U+25A1 is preserved too."""
         if self._mode != 'show':
             return self._export_ascii(text)
-        if ascii_export and BOX in text and cp != 0x25a1:
-            text = text.replace(BOX, '_')
         if SPACE_MARK in text and cp != 0x2423:
-            text = text.replace(SPACE_MARK, '_')
+            return text.replace(SPACE_MARK, '_')
         return text
 
     def _selection_text(self):
