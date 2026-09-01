@@ -4001,7 +4001,8 @@ class SecureTerminal(QPlainTextEdit):
             for a, b, cp in self._doc_runs(block):
                 cur.setPosition(a)
                 cur.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
-                out.append(self._export_selection_fragment(cur.selectedText(), cp))
+                out.append(self._export_selection_fragment(cur.selectedText(), cp,
+                                                           ascii_export=True))
             block = block.next()
         return ''.join(out)
 
@@ -4129,7 +4130,7 @@ class SecureTerminal(QPlainTextEdit):
             block = block.next()
         return ''.join(out)
 
-    def _export_selection_fragment(self, text, cp):
+    def _export_selection_fragment(self, text, cp, ascii_export=False):
         """Map ONE selected run's display text to what leaves the widget, using its
         recorded SOURCE code point to tell a synthetic marker from a real glyph the
         program printed -- the distinction _export_ascii, a pure string map with no
@@ -4137,14 +4138,16 @@ class SecureTerminal(QPlainTextEdit):
 
         Outside Show mode _export_ascii is exact (every non-ASCII byte is a marker),
         so defer to it. In Show mode a real U+2423/U+25A1 the child printed is kept as
-        its glyph (its cp IS its own, matching transcript_text's guard); only a
-        SYNTHETIC marker -- our stand-in for a neutralized byte, whose cp is the SOURCE
-        byte, not the marker's own code point -- is mapped to '_'. A synthetic BOX
-        reaches Show too: a Zalgo stack past _ZALGO_MARK_MAX is neutralized to BOX even
-        in Show, so an ASCII getter must not leak it as literal U+25A1."""
+        its glyph (its cp IS its own, matching transcript_text's guard); a SYNTHETIC
+        SPACE_MARK -- our stand-in for a neutralized non-ASCII space, cp is the SOURCE
+        byte -- is mapped to '_'. A synthetic BOX (a neutralized zero-width/bidi/control,
+        cp != 0x25a1) diverges by DESTINATION: on the COPY path (ascii_export False) it
+        is KEPT -- in Show the user opted into seeing the box, so copying the selection
+        copies the visible box; but an ASCII getter (toPlainText, ascii_export True) maps
+        it to '_' so it never leaks literal U+25A1. A real U+25A1 is kept either way."""
         if self._mode != 'show':
             return self._export_ascii(text)
-        if BOX in text and cp != 0x25a1:
+        if ascii_export and BOX in text and cp != 0x25a1:
             text = text.replace(BOX, '_')
         if SPACE_MARK in text and cp != 0x2423:
             text = text.replace(SPACE_MARK, '_')
