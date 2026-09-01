@@ -208,8 +208,18 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                     target = self.buffer[self.cursor.y - 1].get(self.columns - 1)
                 else:
                     target = None
-                if target is not None and len(target.data) > _TUI_COMBINE_CAP:
+                if target is not None and len(target.data) >= _TUI_COMBINE_CAP:
                     continue                  # target cell already at the cap
+                if target is None:
+                    # Nothing precedes the cursor (the very screen origin, 0,0), so there
+                    # is no cell to attach to -- and pyte's draw() drops BOTH a leading
+                    # combining mark (its x and y merge branches both fail at the origin)
+                    # and a zero-width non-combining char (`else: break`) outright, marking
+                    # nothing. A leading zero-width is exactly the spoofing position that
+                    # must not go unmarked, so occupy THIS cell instead; tui_cell renders
+                    # the placeholder.
+                    self._mark_own_cell(ch)
+                    continue
                 if not combining:
                     # pyte's draw() takes `else: break` for a character that is
                     # zero-width but NOT a combining mark -- U+200D, U+FE0F, the
@@ -220,14 +230,7 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                     # is supposed to keep. Merge it into the preceding cell the way
                     # pyte does for a combining mark, so tui_cell sees a cell whose
                     # data is not purely printable and renders the placeholder.
-                    if target is not None:
-                        self._merge_invisible(target, ch)
-                    else:
-                        # Nothing precedes it (cursor at the very start of the
-                        # screen), so there is no cell to attach to. Occupy THIS
-                        # cell instead: a leading invisible is exactly the
-                        # spoofing position that must not go unmarked.
-                        self._mark_own_cell(ch)
+                    self._merge_invisible(target, ch)
                     continue
             super().draw(ch)
 
@@ -243,7 +246,7 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         row = self.buffer[self.cursor.y]
         existing = row.get(self.cursor.x)
         if existing is not None:
-            if len(existing.data) <= _TUI_COMBINE_CAP:
+            if len(existing.data) < _TUI_COMBINE_CAP:
                 row[self.cursor.x] = existing._replace(data=existing.data + ch)
                 self.dirty.add(self.cursor.y)
             return                       # merged (or at the cap): the cell is not re-occupied
@@ -435,6 +438,15 @@ _OSC_TERMINATED = re.compile(rb'\x07|\x1b\\')
 # does not get the phishing-notice treatment (the sequence is still stripped by ANSI_RE).
 _OSC8 = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)'
                    rb'(.{0,8192}?)\x1b\]8;;(?:\x07|\x1b\\)', re.DOTALL)
+# An OSC 8 hyperlink is TWO separately-terminated OSCs (opener ESC]8;;<uri>BEL + text,
+# then closer ESC]8;;BEL). When the opener+text lands in one read and the closer in the
+# next, the opener alone is already terminated, so the plain carry below would NOT hold
+# it and _OSC8 never sees the pair -- the anti-phishing notice is evaded. Match an OPEN
+# opener (non-empty URI) vs a bare closer so an unclosed opener can be carried until its
+# closer arrives; the non-empty-URI class means a closer never matches _OSC8_OPEN, and an
+# opener never matches _OSC8_CLOSE, so the two cannot be confused.
+_OSC8_OPEN = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;[^\x07\x1b]+(?:\x07|\x1b\\)')
+_OSC8_CLOSE = re.compile(rb'\x1b\]8;;(?:\x07|\x1b\\)')
 # OSC numeric code -> feature key, so a CLI-mode notice can name the exact type.
 _OSC_CODE_KEY = {}
 for _k, _lbl, _codes, *_rest in OSC_FEATURES:
@@ -1185,7 +1197,11 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- appearance: theme + zoom ---------------------------------------------
     def apply_theme(self, theme):
-        theme = theme if theme in THEMES else 'dark'
+        # Unknown theme -> the app default 'light', matching the constructor (theme=
+        # 'light' + its identical fallback). The old 'dark' here meant a bad name gave
+        # a DIFFERENT theme depending on whether it arrived at construction or via a
+        # later apply (a corrupt session, a settings dialog forwarding an unknown name).
+        theme = theme if theme in THEMES else 'light'
         changed = theme != getattr(self, '_theme', None)
         base, text = THEMES[theme]
         self._theme = theme
@@ -3017,11 +3033,17 @@ class SecureTerminal(QPlainTextEdit):
         fg = self.has_foreground_program()
         if self._bracket_had_fg and not fg and self._screen is not None:
             self._screen.mode.discard(_BRACKETED_PASTE_MODE)
-        if fg and not self._bracket_had_fg:
-            # A foreground program just took the tty: a HELD multi-line paste belonged
-            # to the shell prompt it was pasted at, not to this program, so drop the
-            # remainder proactively (the paste gesture also refuses while fg, but this
-            # clears it the moment the program appears -- e.g. line 1 was sudo -i).
+        if fg != self._bracket_had_fg:
+            # ANY foreground-program transition invalidates a HELD multi-line paste's
+            # reviewed context, so drop the remainder proactively:
+            #  - rising (bare prompt -> program): the held lines belonged to the shell
+            #    prompt they were pasted at, not this program -- e.g. line 1 was sudo -i
+            #    (the paste gesture also refuses while fg, but this clears it the moment
+            #    the program appears).
+            #  - falling (program -> bare prompt): a non-bracketed TUI child force-reviews
+            #    a multiline paste and stages the remainder as ITS input; once it exits, a
+            #    paste gesture at the RETURNING shell prompt would insert those
+            #    program-reviewed lines as shell commands. Drop them when it is gone.
             self._staged_paste = []
         self._bracket_had_fg = fg
         text = self._decoder.decode(data)
@@ -3267,7 +3289,10 @@ class SecureTerminal(QPlainTextEdit):
             # buffer). A process flooding alternating ?1049h/?1049l in one read could
             # otherwise force thousands of full-screen deepcopies and freeze the GUI,
             # so bound the snapshot/restore work per read: past the cap, feed the
-            # remainder as ordinary bytes (a real program redraws its own frame).
+            # remainder as ordinary bytes (a real program redraws its own frame). This
+            # SAME cap bounds the per-marker find() scans below to at most
+            # _ALT_TRANSITIONS_MAX linear passes -- total O(cap*n) = O(n), NOT the O(n^2)
+            # an unbounded per-marker rescan would be; the loop is not a scan-DoS.
             if transitions >= self._ALT_TRANSITIONS_MAX:
                 self._feed_bytes(data[pos:])
                 break
@@ -3335,12 +3360,29 @@ class SecureTerminal(QPlainTextEdit):
         # earliest of: the last UNTERMINATED "\x1b]" introducer, or a trailing lone
         # "\x1b" (which may begin an introducer in the next read). Bounded: an
         # unterminated flood past the cap is let go rather than buffered forever.
+        # NB: _osc_carry feeds ONLY sanitized side-effects (title/notify, gated
+        # clipboard/cwd) -- never the render pipeline -- so a carry retained across a
+        # display-mode toggle (apply_mode/_rerender) is correct reassembly, not an
+        # unsanitized-render leak. Do NOT clear it on _rerender (reached by cosmetic
+        # apply_colors/markings/theme too, which would drop a legit in-flight OSC);
+        # apply_tui, the real CLI<->TUI boundary, already clears it.
         data = self._osc_carry + data
         self._osc_carry = b''
         carry_at = len(data) if data.endswith(b'\x1b') else -1
         intro = data.rfind(b'\x1b]')
         if intro != -1 and not _OSC_TERMINATED.search(data[intro + 2:]):
             carry_at = intro
+        # An OSC 8 hyperlink spans two SEPARATELY-terminated OSCs; the plain carry above
+        # only holds an UNterminated introducer, so a terminated opener whose closer is in
+        # the next read is not held and _OSC8 never sees the pair. Hold back an OPEN opener
+        # (non-empty URI, no closer after it yet) so the split pair reassembles and the
+        # phishing notice still fires. Bounded by the same _OSC_CARRY_MAX check below.
+        if self._osc['osc_hyperlink']:
+            opens = list(_OSC8_OPEN.finditer(data))
+            if opens and not _OSC8_CLOSE.search(data, opens[-1].end()):
+                op = opens[-1].start()
+                if carry_at < 0 or op < carry_at:
+                    carry_at = op
         if carry_at == len(data):
             carry_at = len(data) - 1          # the trailing lone ESC
         if carry_at >= 0 and (len(data) - carry_at) <= self._OSC_CARRY_MAX:
@@ -3355,7 +3397,13 @@ class SecureTerminal(QPlainTextEdit):
                     # display text can differ from where the link points, so seeing
                     # both is the whole anti-phishing value. (pyte has no per-cell
                     # hyperlink model, so inline-clickable rendering is future work.)
-                    self.notified.emit('link: ' + (text or uri) + ' -> ' + uri)
+                    # The label passes only sanitize_title (printable ASCII), so it can
+                    # embed a fake ' -> uri' to spoof the target. sanitize_title collapses
+                    # whitespace runs to one space, so every spacing variant normalizes to
+                    # ' -> '; strip it from the label so the ONLY arrow in the notice is
+                    # the real separator before the true target.
+                    label = (text or uri).replace(' -> ', ' ')
+                    self.notified.emit('link: ' + label + ' -> ' + uri)
         for match in _OSC_ANY.finditer(data):
             code = int(match.group(1))
             params = match.group(2)
@@ -3870,11 +3918,31 @@ class SecureTerminal(QPlainTextEdit):
         return text.replace(BOX, '_').replace(SPACE_MARK, '_')
 
     def toPlainText(self):
-        # Overrides QPlainTextEdit.toPlainText so every external text getter
-        # (save transcript, session cap) yields ASCII, not the
-        # display box. Qt's own rendering does not go through this method.
+        # Overrides QPlainTextEdit.toPlainText so every external text getter (save
+        # transcript, session cap, ctl-dump IPC) yields ASCII, not the display box.
+        # Walks the per-run SOURCE code points (the shared _doc_runs seam, as
+        # transcript_text does) so a SYNTHETIC placeholder -- the box a Zalgo stack
+        # (> _ZALGO_MARK_MAX marks) is neutralized to even in Show mode -- maps to '_',
+        # while a real U+25A1/U+2423 the program printed in Show (its cp IS its own) is
+        # kept. The old pure-string map had no cp context, so it leaked the synthetic
+        # box as literal U+25A1. Blocks are newline-separated exactly like
+        # super().toPlainText(); Qt's own rendering does not go through this method.
         self._force_current_frame()  # never read a stale (debounced/gated) document
-        return self._export_ascii(super().toPlainText())
+        doc = self.document()
+        out = []
+        cur = QTextCursor(doc)
+        block = doc.begin()
+        first = True
+        while block.isValid():
+            if not first:
+                out.append('\n')
+            first = False
+            for a, b, cp in self._doc_runs(block):
+                cur.setPosition(a)
+                cur.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
+                out.append(self._export_selection_fragment(cur.selectedText(), cp))
+            block = block.next()
+        return ''.join(out)
 
     def _write_transcript_file(self):
         """Write this tab's transcript to the configured SECURE_TERMINAL_TRANSCRIPT_FILE,
@@ -4007,15 +4075,18 @@ class SecureTerminal(QPlainTextEdit):
         code-point context, cannot make.
 
         Outside Show mode _export_ascii is exact (every non-ASCII byte is a marker),
-        so defer to it. In Show mode a real U+2423 the child printed is kept as its
-        glyph (its cp IS 0x2423, matching transcript_text's guard); only the
-        SYNTHETIC SPACE_MARK -- our stand-in for a neutralized non-ASCII space, whose
-        cp is the SOURCE byte, not 0x2423 -- is mapped to '_'. BOX is left as-is in
-        Show, exactly as _export_ascii does, so a real U+25A1 is preserved too."""
+        so defer to it. In Show mode a real U+2423/U+25A1 the child printed is kept as
+        its glyph (its cp IS its own, matching transcript_text's guard); only a
+        SYNTHETIC marker -- our stand-in for a neutralized byte, whose cp is the SOURCE
+        byte, not the marker's own code point -- is mapped to '_'. A synthetic BOX
+        reaches Show too: a Zalgo stack past _ZALGO_MARK_MAX is neutralized to BOX even
+        in Show, so an ASCII getter must not leak it as literal U+25A1."""
         if self._mode != 'show':
             return self._export_ascii(text)
+        if BOX in text and cp != 0x25a1:
+            text = text.replace(BOX, '_')
         if SPACE_MARK in text and cp != 0x2423:
-            return text.replace(SPACE_MARK, '_')
+            text = text.replace(SPACE_MARK, '_')
         return text
 
     def _selection_text(self):
@@ -4610,6 +4681,11 @@ class SecureTerminal(QPlainTextEdit):
             # _line_pending() deferring the re-export -- same reason as the CLI path.
             if not (ctrl and key == Qt.Key.Key_U):
                 self._line_dirty = False
+            if ctrl and key == Qt.Key.Key_C:
+                # SIGINT abandons a held multi-line paste, exactly as the CLI-mode Ctrl+C
+                # path does -- else a stale staged line leaks into a later paste gesture.
+                # Only Ctrl+C clears it; accept-line and Ctrl+U do not.
+                self._staged_paste = []
 
         seq = SecureTerminal._TUI_KEYS.get(key)
         text = event.text()
@@ -5134,6 +5210,13 @@ class SecureTerminal(QPlainTextEdit):
         # A new delivery supersedes any half-delivered held paste: drop the remainder
         # so a stale line can never trail a later paste.
         self._staged_paste = []
+        # Collapse a Windows CRLF PAIR to one newline BEFORE sanitizing: sanitize maps
+        # EACH of \r and \n to '\r', so a raw '\r\n' would become '\r\r' -- an empty
+        # staged element the user must Enter past. A GENUINE Unix blank line ('\n\n') is
+        # left intact so it survives as a real empty command below. Done here, not in
+        # per-character sanitize (whose homomorphism forbids a cross-char rewrite);
+        # mirrors paste_is_multiline's collapse.
+        raw = raw.replace('\r\n', '\n')
         # 'unicode' keeps printable non-ASCII (still no control/bidi/zero-width);
         # 'stripped' is ASCII only. Both are safe to send as UTF-8.
         safe = (sanitize_paste_unicode(raw) if action == 'unicode'
@@ -5167,10 +5250,11 @@ class SecureTerminal(QPlainTextEdit):
             lines = safe.split('\r')
             if len(lines) > 1:
                 safe = lines[0]
-                # Deliver line 1; HOLD the rest, DROPPING empty lines -- a blank line in
-                # the paste (or the second half of a Windows CRLF, which sanitize maps to
-                # '\r\r') is a no-op command, not worth a paste gesture to skip.
-                self._staged_paste = [ln for ln in lines[1:] if ln]
+                # Deliver line 1; HOLD the rest. Empty lines are PRESERVED: each staged
+                # line waits for the user's OWN Enter, so a blank line is a legitimate
+                # empty command (writes nothing, the user's Enter submits it). CRLF was
+                # already collapsed above, so a Windows paste stages no spurious empty.
+                self._staged_paste = lines[1:]
                 if self._staged_paste:
                     self._advise(
                         '%d more pasted line%s held -- press Paste to insert the next '
