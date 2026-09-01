@@ -74,7 +74,13 @@ def send_request(group, request, timeout=1.5):
         # real reply is a non-empty dict ({'ok': ...}), so map empty -> None and let
         # the caller retry (_wait_primary / _handoff) rather than mistake it for a
         # valid pidless reply.
-        return json.loads(reply.decode('utf-8')) if reply else None
+        if not reply:
+            return None
+        parsed = json.loads(reply.decode('utf-8'))
+        # Every real reply is a dict ({'ok': ...}); callers use reply.get(). A same-UID
+        # squatter could frame a non-dict (json.loads('[]') -> a list) that .get() would
+        # AttributeError on -- return None so the caller sees a clean "no instance".
+        return parsed if isinstance(parsed, dict) else None
     # RecursionError: json.loads raises it (not ValueError) on a deeply-nested reply -- a
     # squatter answering our probe could else crash this short-lived ctl/launch client.
     except (OSError, ValueError, RecursionError):

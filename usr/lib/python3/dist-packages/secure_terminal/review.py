@@ -299,9 +299,14 @@ class ReviewBar(QWidget):
         self._radio_keep.setChecked(False)
         self._radio_group.setExclusive(True)
         # Show the held text in the editable field; block the change signal so
-        # populating it here does not recurse into _on_edit.
+        # populating it here does not recurse into _on_edit. Cap what the QPlainTextEdit
+        # loads to the mirror's budget: the paste/copy path pre-caps _raw at the terminal
+        # source, but the CLIPBOARD path passes the whole clipboard, so an unbounded
+        # setPlainText (a 20M-char clipboard) freezes the UI / balloons memory. self._raw
+        # stays FULL so an un-edited Replace still sanitizes the entire clipboard; the
+        # over-cap truncation is already DISCLOSED by _refresh_review's notice.
         self._edit.blockSignals(True)
-        self._edit.setPlainText(raw)
+        self._edit.setPlainText(raw[:self._mirror._RAW_MAX])
         self._edit.blockSignals(False)
         self._refresh_review()
         self._update_deliver()
@@ -406,7 +411,15 @@ class ReviewBar(QWidget):
         # the cap as a definite total.
         multiline = detail['multiline']
         plus = '+' if truncated else ''
-        note = ' &nbsp;(multi-line -- runs more than one command)' if multiline else ''
+        # Only the PASTE direction executes the lines; a copy/clipboard review runs
+        # nothing, so reserve the "runs more than one command" wording for paste (gated
+        # like the "If accepted" row below) and use neutral wording elsewhere.
+        if not multiline:
+            note = ''
+        elif self._kind.get('paste_newline'):
+            note = ' &nbsp;(multi-line -- runs more than one command)'
+        else:
+            note = ' &nbsp;(multi-line)'
         lines_val = '%d%s%s' % (detail['lines'], plus, note)
         struct = [_row(_LINES_GLYPH,
                        palette['invisible']['fg'] if multiline else _MUTED_FG,

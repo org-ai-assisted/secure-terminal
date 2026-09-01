@@ -3163,7 +3163,7 @@ class MainWindow(QMainWindow):
 
     def open_transcript(self):
         term = self.current()
-        if term is None:
+        if term is None or not self._tab_is_live(term):
             return
         # Hand this tab's transcript to the system default text viewer/editor (xdg-open via
         # Qt), no save dialog. transcript_text() is lossless plain ASCII -- Box names each
@@ -3173,10 +3173,16 @@ class MainWindow(QMainWindow):
         # one file (rather than a fresh temp each time) keeps sensitive history from
         # accumulating on disk.
         state_dir = session._state_dir()
-        os.makedirs(state_dir, exist_ok=True)
         path = os.path.join(state_dir, 'transcript.txt')
-        with open(path, 'w', encoding='utf-8') as handle:
-            handle.write(term.transcript_text())
+        # Guard the write like save_transcript does: an OSError (ENOSPC/EACCES on the
+        # makedirs or the write) must NOT propagate out of this Qt slot and take the
+        # whole window (all tabs) down with it.
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write(term.transcript_text())
+        except OSError:
+            return
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _apply_locks(self):

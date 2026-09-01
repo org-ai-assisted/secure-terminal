@@ -64,6 +64,13 @@ _AUTOSTART_BASENAME = 'sclip-clipboard-watch.desktop'
 ## and lets the terminal ping / start / stop it. See ipc.socket_path.
 INSTANCE_GROUP = 'clipboard-watch'
 
+## The review only scans/displays the first SecureTerminal._RAW_MAX chars, so bound the
+## per-change TRIGGER scan (tag_text / classify_paste, both O(n) with an O(n) allocation)
+## to the same prefix -- an unbounded scan over a 20M-char clipboard would freeze the app
+## on every copy. The full text still reaches the review (so an un-edited Replace
+## sanitizes the whole clipboard); only the trigger DECISION is prefix-bounded.
+_TRIGGER_SCAN_CAP = 1_000_000
+
 
 def _deceptive(text):
     """True when text carries an ACTIVE deception -- an invisible / bidi / control
@@ -169,7 +176,13 @@ class _ClipboardReview:
         self._theme = theme
 
     def dispatch_pending_clipboard(self, action, text=None):
-        self._controller.resolve(self._raw if text is None else text, action)
+        # Thread the ORIGINAL reviewed text (the clipboard-still-holds-it TOCTOU check)
+        # and the DELIVERED text (the user's edit, or the original) SEPARATELY: resolve
+        # compares the clipboard against the original but WRITES the edited value.
+        # Conflating them made an edited Replace silently no-op (edited != the original
+        # still on the clipboard -> the write was skipped, leaving the unsafe text).
+        self._controller.resolve(self._raw, action,
+                                 self._raw if text is None else text)
 
 
 class _ReviewPopup(QWidget):
@@ -229,7 +242,7 @@ class ClipboardWatcher:
         if text == self._dismissed:        # the user already chose to keep this
             return
         trigger = _any_nonascii if self._any_mode else _deceptive
-        if not trigger(text):
+        if not trigger(text[:_TRIGGER_SCAN_CAP]):
             return                         # clean (or innocent) -> stay silent
         self._show_review(text)
 
@@ -243,16 +256,22 @@ class ClipboardWatcher:
         self._popup.raise_()
         self._popup.activateWindow()
 
-    def resolve(self, raw, action):
-        """Apply the user's choice (called from _ClipboardReview.dispatch)."""
+    def resolve(self, original, action, edited=None):
+        """Apply the user's choice (called from _ClipboardReview.dispatch). `original`
+        is the reviewed text expected to still be on the clipboard (the TOCTOU guard);
+        `edited` is what to WRITE when Replacing -- the user's edit, defaulting to the
+        original when the field was left untouched."""
+        if edited is None:
+            edited = original
         if action == 'reject':
-            self._dismissed = raw          # keep it; do not nag about the same text
-        elif self._clipboard.text() == raw:
+            self._dismissed = original     # keep it; do not nag about the same text
+        elif self._clipboard.text() == original:
             # Replace ONLY while the flagged text is still on the clipboard. If the
             # user copied something else after the popup opened, that newer content
             # must not be silently clobbered by the stale review (a TOCTOU write).
+            # Compare against the ORIGINAL but sanitize + write the EDITED value.
             safe = (sanitize_clipboard_unicode if action == 'unicode'
-                    else sanitize_clipboard)(raw)
+                    else sanitize_clipboard)(edited)
             self._last_written = safe      # so the resulting dataChanged is ignored
             self._clipboard.setText(safe)
         self._popup.bar.hide_review()
