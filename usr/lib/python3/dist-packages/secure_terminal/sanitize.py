@@ -1348,8 +1348,13 @@ def ensure_utf8_ctype(environ=None):
     env = os.environ if environ is None else environ
     # POSIX precedence: LC_ALL overrides LC_CTYPE overrides LANG.
     effective = env.get('LC_ALL') or env.get('LC_CTYPE') or env.get('LANG')
-    if effective and effective.rsplit('.', 1)[-1].lower() in ('utf-8', 'utf8'):
-        return                            # already UTF-8: do not override the user locale
+    if effective:
+        # A locale is lang_TERRITORY.CODESET[@modifier]; strip the @modifier BEFORE the
+        # codeset test, else a UTF-8 locale carrying one (sr_RS.UTF-8@latin) reads as
+        # non-UTF-8 and gets needlessly clobbered.
+        codeset = effective.split('@', 1)[0].rsplit('.', 1)[-1].lower()
+        if codeset in ('utf-8', 'utf8'):
+            return                        # already UTF-8: do not override the user locale
     # C.UTF-8 exists on glibc + musl with no locale-gen; sets the ENCODING only (no language).
     if env.get('LC_ALL'):
         # A non-UTF-8 LC_ALL would OVERRIDE any LC_CTYPE we set, so retarget LC_ALL itself.
