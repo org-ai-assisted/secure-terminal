@@ -892,7 +892,12 @@ class SecureTerminal(QPlainTextEdit):
         # _mode and _tui are now known: pick the per-mode wrap before any history
         # render, so restored scrollback is drawn once under the final wrap mode.
         self._sync_wrap_mode()
-        self._command = command
+        # Normalize an empty command ('' / [] -- e.g. `-e ''`) to None: _argv_for_command
+        # substitutes a login shell for it, so it IS a bare-prompt login-shell tab. Every
+        # login-shell-vs-program check below is `self._command is None`, and the panic
+        # button's "never kill a bare shell" guard is one of them -- leaving _command as ''
+        # (falsy but not None) would let terminate_foreground SIGKILL an idle shell.
+        self._command = command if command else None
         self._command_malformed = False   # set by _start: a malformed/whitespace command
         self._command_exec_failed = False  # set by _start: the -e program could not exec
         self._spawn_comm = None            # set by _start: /proc comm of the spawned child,
