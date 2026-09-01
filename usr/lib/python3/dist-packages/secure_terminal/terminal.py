@@ -894,6 +894,7 @@ class SecureTerminal(QPlainTextEdit):
         self._sync_wrap_mode()
         self._command = command
         self._command_malformed = False   # set by _start: a malformed/whitespace command
+        self._command_exec_failed = False  # set by _start: the -e program could not exec
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -2839,6 +2840,18 @@ class SecureTerminal(QPlainTextEdit):
         # shell. The CLI (_parse_launch_args) additionally exits with a message pre-Qt.
         argv = _argv_for_command(command)
         self._command_malformed = argv is None
+        # Exec-detection pipe: distinguish a program that ran and exited 127 (restart as
+        # a shell, a real terminal's disposition) from a program that could NEVER exec --
+        # a missing / non-executable -e binary -- which must fail CLOSED (close the tab,
+        # no shell), like a malformed command. The write end is close-on-exec: a
+        # successful execvp() closes it silently, so the parent reads EOF; a failed
+        # execvp() writes one byte before _exit, so the parent reads it and knows the
+        # child never became the requested program. This is subprocess.Popen's own
+        # exec-failure handshake -- exit status 127 alone cannot tell the two apart.
+        # os.pipe() fds are close-on-exec by default (PEP 446): both survive fork() into
+        # the child, and a successful execvp() closes exec_w for us -- exactly what the
+        # handshake needs.
+        exec_r, exec_w = os.pipe()
         pid, fd = pty.fork()
         if pid == 0:  # pragma: no cover
             # (no cover: this branch runs in the pty.fork child and immediately
@@ -2884,8 +2897,30 @@ class SecureTerminal(QPlainTextEdit):
             try:
                 os.execvp(argv[0], argv)
             except OSError:
+                # The requested program could not be run (missing / non-executable).
+                # Signal the parent through the exec-detection pipe BEFORE exiting so it
+                # fails the tab closed instead of dropping to a login shell -- a real
+                # program that ran and exited 127 leaves this pipe empty (closed on a
+                # successful exec) and still restarts as a shell.
+                try:
+                    os.write(exec_w, b'x')
+                except OSError:
+                    # Best-effort: a one-byte write to a pipe whose read end the parent
+                    # is actively blocked on does not fail in practice. If it somehow
+                    # did, the parent reads EOF and treats the exec as successful -- but
+                    # we _exit(127) either way, so there is nothing to recover; never let
+                    # a write error escape the child as an uncaught traceback.
+                    pass
                 os._exit(127)
         self._pid = pid
+        # Parent: the write end is the child's; a successful exec closes it (CLOEXEC) ->
+        # read EOF; a failed exec writes one byte -> read it. The read blocks only until
+        # the child execs (immediate), matching subprocess's exec-failure handshake.
+        os.close(exec_w)
+        try:
+            self._command_exec_failed = bool(os.read(exec_r, 1))
+        finally:
+            os.close(exec_r)
         SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
         self._fd = fd
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -3546,10 +3581,14 @@ class SecureTerminal(QPlainTextEdit):
         tab keeps the exited program's output above the new prompt as scrollback; a
         TUI tab's transient alt-screen frame is discarded (as a real terminal drops it
         on rmcup) and the grid shows the handover banner then the new shell."""
-        if self._command is None or self._fd is None or self._command_malformed:
-            # _command_malformed: the launch command was malformed / whitespace-only, so
-            # its child exited 127 -- do NOT drop to a login shell (a locked-down launch
-            # must fail closed). The caller closes the tab instead.
+        if (self._command is None or self._fd is None or self._command_malformed
+                or self._command_exec_failed):
+            # Fail CLOSED -- do NOT drop to a login shell; the caller closes the tab:
+            #  - _command_malformed: the launch command was malformed / whitespace-only.
+            #  - _command_exec_failed: the command was well-formed but its program could
+            #    not exec (missing / non-executable binary). A locked-down -e launch with
+            #    a bad path must not silently become an interactive shell. A program that
+            #    genuinely RAN and exited (even 127) leaves this flag False and restarts.
             return False
         # SECURITY: drop any pending paste/copy review FIRST. Its held (reviewed) text
         # must never become dispatchable to the NEW shell -- a reviewed multiline paste
