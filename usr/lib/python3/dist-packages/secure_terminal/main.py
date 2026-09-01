@@ -5238,8 +5238,9 @@ def _parse_launch_args(argv):
             except ValueError as exc:
                 sys.stderr.write('secure-terminal: malformed -e command: %s\n' % exc)
                 raise SystemExit(2)
-            if not parsed:
-                sys.stderr.write('secure-terminal: -e command is empty (whitespace only)\n')
+            if not parsed or not parsed[0]:
+                sys.stderr.write('secure-terminal: -e command names no program '
+                                 '(empty / whitespace only)\n')
                 raise SystemExit(2)
 
     def _empty(spec):

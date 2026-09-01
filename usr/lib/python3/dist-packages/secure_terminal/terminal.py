@@ -488,12 +488,12 @@ def _argv_for_command(command):
       - a list/tuple -> used verbatim (the "-- prog args" CLI form, no shell reparse);
       - a string -> split like a shell word list ("ssh -p 22 host");
       - none/empty -> [] (the deliberate "no command" case; caller substitutes shell);
-      - a MALFORMED string (unbalanced quote), or a non-empty string that shell-splits
-        to NOTHING (whitespace only, e.g. " ") -> None (FAIL CLOSED).
+      - a MALFORMED string (unbalanced quote), a whitespace-only string (" " -> no
+        words), or one whose FIRST word is empty ('""' -> ['']) -> None (FAIL CLOSED).
     None is distinct from [] on purpose: a locked-down launch (run ONLY this program)
-    must not drop to a shell on a typo or a whitespace command. The caller exits the
-    child rather than spawn a shell for None; raising here instead would traceback in
-    the pty.fork child, which the parent masks as a normal exit."""
+    must not drop to a shell on a typo, a whitespace command, or an empty program name.
+    The caller exits the child rather than spawn a shell for None; raising here instead
+    would traceback in the pty.fork child, which the parent masks as a normal exit."""
     if isinstance(command, (list, tuple)):
         return [str(a) for a in command]
     if not command:
@@ -502,9 +502,10 @@ def _argv_for_command(command):
         parsed = shlex.split(command)
     except ValueError:
         return None
-    # A non-empty string that yields no words is whitespace-only: a command WAS given
-    # but names no program, so fail closed rather than fall through to the shell.
-    return parsed if parsed else None
+    # A non-empty string that shell-splits to no words (whitespace only) or whose first
+    # word is empty ('""') names no program: a command WAS given but is unrunnable, so
+    # fail closed rather than fall through to the shell.
+    return parsed if (parsed and parsed[0]) else None
 
 
 # Directories a bell sound file may live in. Restricting to these keeps the
