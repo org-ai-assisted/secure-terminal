@@ -56,7 +56,7 @@ def _makedirs_private(path):
     try:
         os.chmod(path, 0o700)               # umask may have widened mkdir's mode
     except OSError:
-        pass
+        pass                                # best-effort; a chmod failure must not crash provisioning
 
 
 def ensure_socket_dir():
