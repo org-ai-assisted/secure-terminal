@@ -2960,6 +2960,14 @@ class MainWindow(QMainWindow):
         """Review whatever is on the clipboard now, in-process (no daemon needed).
         Held on self so the popup survives until the user resolves it."""
         from secure_terminal import clipboard_watch   # noqa: PLC0415
+        # Re-invoking this while a previous review popup is still open would reassign
+        # self._clip_reviewer and silently GC the first ClipboardWatcher (and its
+        # unresolved popup) -- the pending review would vanish with no notice. If one is
+        # still open, re-raise it instead of discarding it.
+        existing = getattr(self, '_clip_reviewer', None)
+        if existing is not None and existing.review_is_open():
+            existing.raise_popup()
+            return
         self._clip_reviewer = clipboard_watch.ClipboardWatcher(
             QApplication.instance(), theme=self._default_theme,
             any_mode=self._clip_warn_any, watch=False)
@@ -2997,6 +3005,16 @@ class MainWindow(QMainWindow):
         stray Enter cannot wave them through, and the default is Deny-once. Four
         choices -- allow or deny, ONCE (this request) or ALWAYS (remembered for the
         tab). Closing the dialog denies once. The choice is recorded on the tab."""
+        # Only the ACTIVE tab may raise this consent, mirroring _show_review's gate: a
+        # background tab popping a modal over the focused one is context-confusion (the
+        # user could approve believing it belongs to the tab they are looking at). Resolve
+        # the pending request as deny-once WITHOUT a prompt -- grant_clipboard_read resets
+        # the tab to un-decided, so a later read (once the tab is focused) asks properly. A
+        # bare return would strand the tab in 'pending' forever (no reply, no re-ask).
+        if term is not self.current():
+            if self._tab_is_live(term):
+                term.grant_clipboard_read(SecureTerminal.CLIP_DENY_ONCE)
+            return
         index = self.tabs.indexOf(term)
         name = self._user_titles.get(term) or (
             self.tabs.tabText(index) if index != -1 else 'this tab')

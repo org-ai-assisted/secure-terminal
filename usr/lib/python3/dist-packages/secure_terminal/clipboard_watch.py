@@ -231,6 +231,18 @@ class ClipboardWatcher:
         if text:
             self._show_review(text)
 
+    def review_is_open(self):
+        """True while a review popup is showing and UNRESOLVED (resolve() hides it).
+        Lets a second 'Review clipboard now' re-raise the existing popup instead of
+        reassigning the holder and silently GC'ing the first, unresolved one."""
+        return self._popup.isVisible()
+
+    def raise_popup(self):
+        """Bring an already-open review popup to the front (used when a second review
+        is requested while the first is still unresolved)."""
+        self._popup.raise_()
+        self._popup.activateWindow()
+
     def _on_change(self):
         if not self._enabled:
             return
@@ -387,7 +399,10 @@ class ClipboardWatchApp:
         type-validated. Ops: ping (running probe), quit, set-warn-any (live trigger)."""
         try:
             request = json.loads(payload.decode('utf-8'))
-        except (ValueError, UnicodeDecodeError):
+        # RecursionError: json.loads raises it (not ValueError) on deeply-nested JSON,
+        # which would else SIGABRT this same-UID daemon. main.py's IPC dispatch catches
+        # it too; the sibling here must not be the one uncaught crash path.
+        except (ValueError, UnicodeDecodeError, RecursionError):
             return {'ok': False, 'error': 'malformed request'}
         if not isinstance(request, dict):
             return {'ok': False, 'error': 'malformed request'}

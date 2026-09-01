@@ -190,6 +190,10 @@ class ReviewBar(QWidget):
         self._window = window
         self._term = None
         self._raw = ''
+        # The beyond-cap tail: raw[_RAW_MAX:] held OUT of the edit widget (which loads only
+        # the visible prefix), so an edit re-adopts prefix+tail and self._raw stays FULL --
+        # the tail keeps delivering and scan_truncated stays honest (see _on_edit).
+        self._raw_tail = ''
         # The chosen delivery MODE ('stripped'/'unicode'), or None until a radio is
         # picked. Picking one previews its delivered form in the mirror and ARMS the
         # single deliver button (disabled until then), so the delivered form is always
@@ -327,7 +331,11 @@ class ReviewBar(QWidget):
         # source, but the CLIPBOARD path passes the whole clipboard, so an unbounded
         # setPlainText (a 20M-char clipboard) freezes the UI / balloons memory. self._raw
         # stays FULL so an un-edited Replace still sanitizes the entire clipboard; the
-        # over-cap truncation is already DISCLOSED by _refresh_review's notice.
+        # over-cap truncation is already DISCLOSED by _refresh_review's notice. The
+        # beyond-cap tail is stashed in self._raw_tail so an edit of the visible prefix
+        # re-adopts prefix+tail (keeping self._raw FULL) instead of silently DROPPING the
+        # tail -- which would flip scan_truncated to a false-green "nothing hidden".
+        self._raw_tail = raw[self._mirror._RAW_MAX:]
         self._edit.blockSignals(True)
         self._edit.setPlainText(raw[:self._mirror._RAW_MAX])
         self._edit.blockSignals(False)
@@ -340,8 +348,11 @@ class ReviewBar(QWidget):
     def _on_edit(self):
         """The user edited the held text: adopt it and refresh everything from it, so
         the summary, breakdown, mirror -- and what delivery sends -- all track the
-        edited buffer."""
-        self._raw = self._edit.toPlainText()
+        edited buffer. The edit widget holds only the visible prefix (capped at _RAW_MAX);
+        re-append the stashed beyond-cap tail so self._raw stays FULL -- otherwise the
+        first edit truncates it, flipping scan_truncated to a false-green 'nothing hidden'
+        that hides a beyond-cap char, and silently dropping the tail from delivery."""
+        self._raw = self._edit.toPlainText() + self._raw_tail
         self._refresh_review()          # keeps the selected mode; re-previews its outcome
         # Editing changes what would be delivered, so RE-ARM the countdown when a mode is
         # picked: the edited content must be reviewed for the delay too, never delivered
