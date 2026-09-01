@@ -40,7 +40,7 @@ path that lets it cross.
 
 from PyQt6.QtCore import Qt, QTimer, QEvent
 from PyQt6.QtWidgets import (
-    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton,
+    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton, QPlainTextEdit,
 )
 
 from secure_terminal.sanitize import (
@@ -212,6 +212,17 @@ class ReviewBar(QWidget):
         row.addWidget(self._unicode)
         outer.addLayout(row)
 
+        # The held text, EDITABLE before delivery: the user can trim the risky part.
+        # Every edit re-runs the classifier (summary + breakdown) and re-renders the
+        # mirror, and delivery sends EXACTLY this buffer (re-sanitized per the chosen
+        # action), so what is shown is what crosses -- an edit cannot bypass the
+        # neutralization. NoWrap so a long line is not visually re-flowed under the eye.
+        self._edit = QPlainTextEdit(self)
+        self._edit.setMaximumHeight(70)
+        self._edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._edit.textChanged.connect(self._on_edit)
+        outer.addWidget(self._edit)
+
         # The breakdown beneath the summary: a Structure section (lines, the never-auto-
         # run guarantee, length) and a per-class hidden-character table. Rich text so a
         # glyph can carry its risk colour; selectable so the user can copy any of it.
@@ -246,25 +257,53 @@ class ReviewBar(QWidget):
         self._term = term
         self._raw = raw
         self._kind = _KINDS.get(kind, _KINDS['paste'])
-
-        # classify_paste[_detail] are the uncapped materializations in show_review: on a
-        # 50-100MB clipboard a full scan runs for tens of seconds on the Qt thread BEFORE
-        # the bar (and its Reject button) can appear, while terminal input is already
-        # suspended -- a hung window the user cannot even reject from. Cap the input to
-        # the same budget the mirror uses; a hidden char beyond the cap is then uncounted,
-        # but the truncation notice below fires (raw > _RAW_MAX), so the partial count is
-        # disclosed, not silent.
-        capped = raw[:self._mirror._RAW_MAX]
-        detail = classify_paste_detail(capped)
-        parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
-                 for label, n in classify_paste(capped)]
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
         # each review opens on the raw text, with no button focused or hovered
         self._preview_action = None
         self._focused = None
         self._hovered = None
-        self._render_mirror(term)         # caps a huge render; sets _preview_truncated
+        # Show the held text in the editable field; block the change signal so
+        # populating it here does not recurse into _on_edit.
+        self._edit.blockSignals(True)
+        self._edit.setPlainText(raw)
+        self._edit.blockSignals(False)
+        self._refresh_review()
+        self._remaining = max(0, int(delay))
+        self._gate(self._remaining > 0)
+        self._tick_labels()
+        if self._remaining > 0:
+            self._countdown.start(1000)
+        self.setVisible(True)
+        self._reject.setDefault(True)
+        self._reject.setFocus()
+
+    def _on_edit(self):
+        """The user edited the held text: adopt it and refresh everything from it, so
+        the summary, breakdown, mirror -- and what delivery sends -- all track the
+        edited buffer."""
+        self._raw = self._edit.toPlainText()
+        self._preview_action = None
+        self._refresh_review()
+
+    def _refresh_review(self):
+        """Recompute the summary, breakdown and mirror from the CURRENT held text
+        (self._raw). Called on show and on every edit, so the bar always reflects
+        exactly what delivery will send.
+
+        classify_paste[_detail] cap their input to the mirror's budget: on a 50-100MB
+        clipboard a full scan would run for tens of seconds on the Qt thread while
+        terminal input is already suspended -- a hung window the user cannot even reject
+        from. A hidden char beyond the cap is then uncounted, but the truncation notice
+        fires (raw > _RAW_MAX), so the partial count is DISCLOSED, not silent."""
+        term = self._term
+        if term is None:
+            return
+        capped = self._raw[:self._mirror._RAW_MAX]
+        detail = classify_paste_detail(capped)
+        parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
+                 for label, n in classify_paste(capped)]
+        self._render_mirror(term)         # renders self._raw; sets _preview_truncated
         truncated = bool(getattr(self._mirror, '_preview_truncated', False))
         hidden = sum(detail['counts'].values())
         # A confident ASCII-only all-clear (green dot + positive summary) ONLY when the
@@ -278,12 +317,10 @@ class ReviewBar(QWidget):
                        if parts else self._kind['summary_empty'])
             dot_fg = RISK_FG
         self._dot.setStyleSheet('background-color:%s; border-radius:7px;' % dot_fg)
-        # The mirror bounds its RENDER (render_preview) so a multi-MB paste cannot hang
-        # the pane, and the scan above reads only the same first _RAW_MAX chars. Delivery
-        # still sends the WHOLE text, so a truncated review must SAY that both the shown
-        # text AND the hidden-char count are partial, in unspoofable chrome (this label,
-        # not the terminal pane a paste could forge). full_note names the real action
-        # per direction (paste delivers / copy reaches the clipboard).
+        # Delivery sends the WHOLE buffer, so a truncated review must SAY that both the
+        # shown text AND the counts are partial, in unspoofable chrome (this label, not
+        # the terminal pane a paste could forge). full_note names the real action per
+        # direction (paste delivers / copy reaches the clipboard).
         if truncated:
             summary += ('  [truncated: only the first {:,} characters are shown and '
                         'scanned for hidden characters -- {}; Reject if you cannot '
@@ -291,15 +328,6 @@ class ReviewBar(QWidget):
                                                   self._kind['full_note']))
         self._summary.setText(summary)
         self._set_detail(detail, term, truncated)
-
-        self._remaining = max(0, int(delay))
-        self._gate(self._remaining > 0)
-        self._tick_labels()
-        if self._remaining > 0:
-            self._countdown.start(1000)
-        self.setVisible(True)
-        self._reject.setDefault(True)
-        self._reject.setFocus()
 
     def _set_detail(self, detail, term, truncated):
         """Populate the breakdown label from a classify_paste_detail result: a Structure
@@ -317,9 +345,13 @@ class ReviewBar(QWidget):
                     '<td>&nbsp;%s&nbsp;&nbsp;</td><td>%s</td></tr>'
                     % (color, glyph, name, value))
 
+        # On a truncated review the counts are of the SCANNED PREFIX, not the full
+        # paste (which still delivers whole), so mark them ">= N" rather than present
+        # the cap as a definite total.
         multiline = detail['multiline']
-        lines_val = ('%d &nbsp;(multi-line -- runs more than one command)'
-                     % detail['lines'] if multiline else '%d' % detail['lines'])
+        plus = '+' if truncated else ''
+        note = ' &nbsp;(multi-line -- runs more than one command)' if multiline else ''
+        lines_val = '%d%s%s' % (detail['lines'], plus, note)
         struct = [_row(_LINES_GLYPH,
                        palette['invisible']['fg'] if multiline else _MUTED_FG,
                        'Lines', lines_val)]
@@ -333,8 +365,11 @@ class ReviewBar(QWidget):
             note = ('your program receives it as text' if bracketed
                     else 'waits on the command line -- press Enter to run')
             struct.append(_row(_SAFE_GLYPH, SAFE_FG, 'If accepted', note))
-        struct.append(_row('', _MUTED_FG, 'Length', '%d characters (%d bytes)'
-                           % (detail['chars'], detail['bytes'])))
+        length = ('%d+ characters (scanned prefix; full paste is larger)'
+                  % detail['chars'] if truncated
+                  else '%d characters (%d bytes)'
+                  % (detail['chars'], detail['bytes']))
+        struct.append(_row('', _MUTED_FG, 'Length', length))
 
         counts = detail['counts']
         if sum(counts.values()) == 0 and not truncated:
@@ -485,7 +520,9 @@ class ReviewBar(QWidget):
             return
         self._term = None
         self._countdown.stop()
-        getattr(term, self._kind['dispatch'])(action)
+        # Deliver the CURRENT (possibly edited) buffer, not the originally held text --
+        # still sanitized on the way out, so an edit cannot bypass the neutralization.
+        getattr(term, self._kind['dispatch'])(action, self._raw)
         # HIDE the bar directly: this bar made a definitive choice on the term it was
         # showing, so it must close. We cannot rely on the paste_review_resolved ->
         # _hide_paste_review path here, because that path guards on reviewed_term()

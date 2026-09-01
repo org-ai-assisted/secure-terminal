@@ -4193,13 +4193,15 @@ class SecureTerminal(QPlainTextEdit):
             self.unreviewed_risk.emit()
         self._set_clipboard(sanitize_clipboard_unicode(text))
 
-    def dispatch_pending_copy(self, action):
+    def dispatch_pending_copy(self, action, edited=None):
         """Resolve a held copy review: 'stripped' copies ASCII only, 'unicode'
         keeps printable non-ASCII, 'reject' copies nothing. Re-enables input and
-        tells the window to hide the review bar. A no-op if none pending."""
+        tells the window to hide the review bar. A no-op if none pending. `edited`,
+        when given, is the review bar's edited buffer, copied in place of the
+        originally held selection (still sanitized on the way out)."""
         if not self._review_active:
             return
-        text = self._pending_copy
+        text = self._pending_copy if edited is None else edited
         self._pending_copy = None
         self._review_active = False
         self.paste_review_resolved.emit()
@@ -5197,13 +5199,16 @@ class SecureTerminal(QPlainTextEdit):
             self.unreviewed_risk.emit()
         self._dispatch_paste(raw, 'unicode' if warn == 'never' else 'stripped')
 
-    def dispatch_pending_paste(self, action):
+    def dispatch_pending_paste(self, action, text=None):
         """Resolve a held paste review: 'stripped' or 'unicode' sends it (sanitized
         accordingly), 'reject' drops it. Re-enables input and tells the window to
-        hide the review bar either way. A no-op if no review is pending."""
+        hide the review bar either way. A no-op if no review is pending. `text`, when
+        given, is the review bar's EDITED buffer, delivered in place of the originally
+        held paste -- still sanitized on the way out, so an edit cannot bypass the
+        neutralization."""
         if not self._review_active:
             return
-        raw = self._pending_paste
+        raw = self._pending_paste if text is None else text
         self._pending_paste = None
         self._review_active = False
         self.paste_review_resolved.emit()

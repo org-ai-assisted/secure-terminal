@@ -168,8 +168,8 @@ class _ClipboardReview:
         self._raw = raw
         self._theme = theme
 
-    def dispatch_pending_clipboard(self, action):
-        self._controller.resolve(self._raw, action)
+    def dispatch_pending_clipboard(self, action, text=None):
+        self._controller.resolve(self._raw if text is None else text, action)
 
 
 class _ReviewPopup(QWidget):
