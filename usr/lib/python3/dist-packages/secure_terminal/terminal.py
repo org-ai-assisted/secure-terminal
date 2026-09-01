@@ -2905,6 +2905,11 @@ class SecureTerminal(QPlainTextEdit):
                 try:
                     os.write(exec_w, b'x')
                 except OSError:
+                    # Best-effort: a one-byte write to a pipe whose read end the parent
+                    # is actively blocked on does not fail in practice. If it somehow
+                    # did, the parent reads EOF and treats the exec as successful -- but
+                    # we _exit(127) either way, so there is nothing to recover; never let
+                    # a write error escape the child as an uncaught traceback.
                     pass
                 os._exit(127)
         self._pid = pid
