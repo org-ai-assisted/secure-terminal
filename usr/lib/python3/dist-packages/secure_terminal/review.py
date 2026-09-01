@@ -38,7 +38,7 @@ choice is dispatched back to the tab that held the text, the only path that lets
 cross.
 """
 
-from typing import Any, Callable, NotRequired, TypedDict, cast
+from typing import Callable, NotRequired, TypedDict, cast
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
