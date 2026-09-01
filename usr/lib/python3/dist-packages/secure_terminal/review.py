@@ -38,6 +38,8 @@ choice is dispatched back to the tab that held the text, the only path that lets
 cross.
 """
 
+from typing import Any, Callable, NotRequired, TypedDict, cast
+
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton, QPlainTextEdit,
@@ -108,12 +110,31 @@ _MIRROR_HINT = 'Choose how to deliver above to preview exactly what it sends.'
 # a homoglyph-obfuscated command could hide behind. `paste_newline` maps the shell's
 # carriage return to a newline for display and drops the trailing auto-submit CR at a
 # bare prompt, so the paste preview matches what actually reaches the pty.
-_KINDS = {
+class _Kind(TypedDict):
+    """One trust direction's wording + sanitizers. Typed so self._kind['strip'] reads as a
+    callable and the text keys as str (mypy) instead of a heterogeneous dict[str, object]."""
+    summary: str
+    summary_empty: str
+    full_note: str
+    subject: str
+    reject: str
+    reject_tip: str
+    deliver: str
+    stripped: str
+    unicode: str
+    dispatch: str
+    strip: Callable[[str], str]
+    keep: Callable[[str], str]
+    paste_newline: NotRequired[bool]
+
+
+_KINDS: dict[str, _Kind] = {
     'paste': {
         'summary': 'This paste hides %s.',
         # shown in "always" mode for a clean paste: no hidden characters to name.
         'summary_empty': 'Review this paste before it reaches the shell.',
         'full_note': 'the FULL paste still delivers',
+        'subject': 'this paste',
         'reject': 'Reject',
         'reject_tip': 'Do not paste (Enter or Esc)',
         'deliver': 'Paste',
@@ -128,6 +149,7 @@ _KINDS = {
         'summary': 'This copy would carry %s onto the clipboard.',
         'summary_empty': 'Review this copy before it reaches the clipboard.',
         'full_note': 'the FULL copy still reaches the clipboard',
+        'subject': 'this copy',
         'reject': "Don't copy",
         'reject_tip': 'Do not copy (Enter or Esc)',
         'deliver': 'Copy',
@@ -147,6 +169,7 @@ _KINDS = {
         'summary': 'This clipboard text hides %s.',
         'summary_empty': 'Review the clipboard text.',
         'full_note': 'the FULL clipboard text is still used',
+        'subject': 'this clipboard text',
         'reject': 'Leave it',
         'reject_tip': 'Leave the clipboard unchanged (Enter or Esc)',
         'deliver': 'Replace',
@@ -299,9 +322,14 @@ class ReviewBar(QWidget):
         self._radio_keep.setChecked(False)
         self._radio_group.setExclusive(True)
         # Show the held text in the editable field; block the change signal so
-        # populating it here does not recurse into _on_edit.
+        # populating it here does not recurse into _on_edit. Cap what the QPlainTextEdit
+        # loads to the mirror's budget: the paste/copy path pre-caps _raw at the terminal
+        # source, but the CLIPBOARD path passes the whole clipboard, so an unbounded
+        # setPlainText (a 20M-char clipboard) freezes the UI / balloons memory. self._raw
+        # stays FULL so an un-edited Replace still sanitizes the entire clipboard; the
+        # over-cap truncation is already DISCLOSED by _refresh_review's notice.
         self._edit.blockSignals(True)
-        self._edit.setPlainText(raw)
+        self._edit.setPlainText(raw[:self._mirror._RAW_MAX])
         self._edit.blockSignals(False)
         self._refresh_review()
         self._update_deliver()
@@ -345,11 +373,18 @@ class ReviewBar(QWidget):
         # render caps by RENDERED size (render_truncated -> the pane shows only a prefix;
         # detail badges expand ~30x, so this trips far earlier). A non-ASCII paste well
         # under the char cap trips ONLY the render cap -- its counts are COMPLETE and must
-        # never read as a partial scan. Render the RAW here only to read _preview_truncated;
-        # the visible content is painted AFTER, so the raw is never actually shown.
+        # never read as a partial scan.
         scan_truncated = len(self._raw) > self._mirror._RAW_MAX
-        self._render_mirror(term, self._raw)
-        render_truncated = bool(getattr(self._mirror, '_preview_truncated', False))
+        # Paint what the pane SHOWS -- the selected mode's delivered form, or the hint until a
+        # mode is picked -- and read render-truncation from THAT, never a throwaway raw render:
+        # the delivered form (e.g. a stripped 'hello') or the hint is usually far shorter, so a
+        # raw-based flag would falsely claim the VISIBLE pane is clipped. (grok)
+        if self._selected_action in ('stripped', 'unicode'):
+            self._render_mirror(term, self._delivered(self._selected_action))
+            render_truncated = bool(getattr(self._mirror, '_preview_truncated', False))
+        else:
+            self._render_mirror(term, _MIRROR_HINT, markings=False)
+            render_truncated = False        # the hint is fixed text -- never truncated
         hidden = sum(detail['counts'].values())
         # A confident ASCII-only all-clear needs the whole paste SCANNED; render truncation
         # does not undercount (the scan already covered it), so it does not block the claim.
@@ -372,18 +407,11 @@ class ReviewBar(QWidget):
                         'you cannot verify the rest]'.format(self._mirror._RAW_MAX,
                                                              self._kind['full_note']))
         elif render_truncated:
-            summary += ('  [the preview below shows only the first part of this paste, but '
-                        'the whole of it WAS scanned for hidden characters -- {}]'
-                        .format(self._kind['full_note']))
+            summary += ('  [the preview below shows only the first part of {}, but the whole '
+                        'of it WAS scanned for hidden characters -- {}]'
+                        .format(self._kind['subject'], self._kind['full_note']))
         self._summary.setText(summary)
         self._set_detail(detail, term, scan_truncated)
-        # Paint what the pane SHOWS: the selected mode's delivered form once a radio is
-        # picked, or -- until then -- the hint (so the mirror is never mistaken for the
-        # outcome). This overwrites the raw render above before the widget repaints.
-        if self._selected_action in ('stripped', 'unicode'):
-            self._render_mirror(term, self._delivered(self._selected_action))
-        else:
-            self._render_mirror(term, _MIRROR_HINT, markings=False)
 
     def _set_detail(self, detail, term, truncated):
         """Populate the breakdown label from a classify_paste_detail result: a Structure
@@ -393,8 +421,10 @@ class ReviewBar(QWidget):
         disagree; absent classes stay muted, so what is NOT present is explicit. Rich
         text via <font> tags, which Qt's QLabel renders reliably."""
         theme = getattr(term, '_theme', 'dark')
-        palette = SecureTerminal.MARKING_COLORS.get(
-            theme, SecureTerminal.MARKING_COLORS['dark'])
+        # MARKING_COLORS is an untyped nested class attribute -> its values read as object;
+        # name the concrete shape here so palette[class]['fg'] indexes cleanly (mypy).
+        palette = cast('dict[str, dict[str, str]]', SecureTerminal.MARKING_COLORS.get(
+            theme, SecureTerminal.MARKING_COLORS['dark']))
 
         def _row(glyph, color, name, value):
             return ('<tr><td><font color="%s">%s</font></td>'
@@ -406,7 +436,15 @@ class ReviewBar(QWidget):
         # the cap as a definite total.
         multiline = detail['multiline']
         plus = '+' if truncated else ''
-        note = ' &nbsp;(multi-line -- runs more than one command)' if multiline else ''
+        # Only the PASTE direction executes the lines; a copy/clipboard review runs
+        # nothing, so reserve the "runs more than one command" wording for paste (gated
+        # like the "If accepted" row below) and use neutral wording elsewhere.
+        if not multiline:
+            note = ''
+        elif self._kind.get('paste_newline'):
+            note = ' &nbsp;(multi-line -- runs more than one command)'
+        else:
+            note = ' &nbsp;(multi-line)'
         lines_val = '%d%s%s' % (detail['lines'], plus, note)
         struct = [_row(_LINES_GLYPH,
                        palette['invisible']['fg'] if multiline else _MUTED_FG,
@@ -465,14 +503,22 @@ class ReviewBar(QWidget):
         # mirror's render cap ever runs. Sanitize only a bounded source prefix -- the
         # sanitizers are per-character and length-non-increasing, so this stays a true
         # prefix of the delivered form, and render_preview caps the render further; the
-        # truncation notice already fires from the raw-path render in show_review.
+        # truncation notice already fires from _refresh_review.
         raw = self._raw[:self._mirror._RAW_MAX]
+        # Whole-paste check BEFORE the collapse (which shrinks len): the trailing-submit
+        # strip below applies only when the preview is the FULL paste.
+        whole = len(raw) >= len(self._raw)
+        # Collapse a Windows CRLF PAIR to one newline BEFORE sanitizing, exactly as
+        # _dispatch_paste does: sanitize maps EACH of \r and \n to '\r', so an uncollapsed
+        # '\r\n' becomes '\r\r' -- a phantom blank line the mirror would show but delivery
+        # never sends, contradicting the Lines count (which also collapses). (claude)
+        raw = raw.replace('\r\n', '\n')
         sent = sanitizer(raw)
         if self._kind.get('paste_newline'):
             term = self._term
             if term is not None and hasattr(term, '_bracketed_paste_active') \
                     and not term._bracketed_paste_active() \
-                    and len(raw) >= len(self._raw):
+                    and whole:
                 # Strip the trailing submit CR ONLY when the preview shows the WHOLE
                 # paste. On a TRUNCATED preview the trailing byte is mid-paste content
                 # -- an embedded newline that WILL auto-run the lines before it -- not
@@ -558,7 +604,10 @@ class ReviewBar(QWidget):
             self._deliver.setToolTip('Choose "%s" or "%s" first'
                                      % (_RADIO_STRIP, _RADIO_KEEP))
             return
-        base = self._kind[self._selected_action]
+        # literal keys: _selected_action is 'stripped'/'unicode' here, but a TypedDict
+        # index needs a literal, not the variable.
+        base = (self._kind['stripped'] if self._selected_action == 'stripped'
+                else self._kind['unicode'])
         if self._remaining > 0:
             self._deliver.setText('%s (%d)' % (base, self._remaining))
             self._deliver.setEnabled(False)

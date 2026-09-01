@@ -83,6 +83,7 @@ import shlex
 import unicodedata
 
 import pyte
+import pyte.charsets
 import pyte.graphics
 import pyte.modes
 # pyte's own hard dependency, so no new package: it is what pyte's draw() uses to
@@ -522,6 +523,10 @@ def _argv_for_command(command):
         # must fail closed, exactly like the string path -- else it drops to a shell.
         if argv and not argv[0].strip():
             return None
+        # An embedded NUL can never be a valid program/arg -- os.execvp raises ValueError
+        # on it. Reject pre-fork (fail closed) rather than rely on the child catching it.
+        if any('\x00' in a for a in argv):
+            return None
         return argv
     if not command:
         return []
@@ -531,8 +536,11 @@ def _argv_for_command(command):
         return None
     # A non-empty string that shell-splits to no words (whitespace only) or whose first
     # word is empty ('""') names no program: a command WAS given but is unrunnable, so
-    # fail closed rather than fall through to the shell.
-    return parsed if (parsed and parsed[0]) else None
+    # fail closed rather than fall through to the shell. A NUL in any word is unrunnable
+    # too (execvp ValueError), so fail closed on it as well.
+    if not (parsed and parsed[0]):
+        return None
+    return None if any('\x00' in w for w in parsed) else parsed
 
 
 # Directories a bell sound file may live in. Restricting to these keeps the
@@ -1151,7 +1159,7 @@ class SecureTerminal(QPlainTextEdit):
         # count: re-wrap an old long line at the new width instead of horizontal-scroll.
         self._reflow_timer = QTimer(self)
         self._reflow_timer.setSingleShot(True)
-        self._reflow_timer.timeout.connect(self._rerender)
+        self._reflow_timer.timeout.connect(self._reflow)
 
         # restored scrollback from a previous session, shown as history above
         # the fresh shell (line mode; a TUI tab repaints over it on first draw).
@@ -1364,11 +1372,21 @@ class SecureTerminal(QPlainTextEdit):
         if len(self._raw) > self._RAW_MAX:
             self._raw = tail_from_escape_boundary(self._raw, self._RAW_MAX)
 
-    def _rerender(self):
+    def _reflow(self):
+        """Debounced width-change re-render: replay the FULL retained _raw so a resize
+        never drops older scrollback (the QTimer slot cannot carry the full= kwarg)."""
+        self._rerender(full=True)
+
+    def _rerender(self, full=False):
         """Re-display existing output under the current display mode. While a
         full-screen program owns the grid the pyte screen is simply repainted;
         otherwise (CLI, or TUI at a shell prompt) the retained raw output is
-        replayed through the render pipeline from a clean document."""
+        replayed through the render pipeline from a clean document.
+
+        full=True replays the ENTIRE retained _raw (bounded at _RAW_MAX), used by the
+        debounced width-reflow so a resize never DROPS older scrollback; the default
+        keeps only the _RERENDER_TAIL for hot mode/colour toggles that cannot afford
+        re-expanding megabytes of scrollback."""
         # A re-render follows a mode / grid change: repick the per-mode wrap first,
         # so the rebuilt document lays out under the correct wrap (Detail/Reveal wrap
         # to the width; Box/Show and the grid do not).
@@ -1404,7 +1422,11 @@ class SecureTerminal(QPlainTextEdit):
             # would freeze the UI. A PREVIEW's _raw is already render-capped by
             # render_cap_prefix (bounded, kept from the HEAD), so it replays in FULL:
             # the tail limit would show the END, hiding the line 1 the review keeps.
-            self._feed_line(self._raw if self._preview
+            # A width REFLOW (full=True) also replays in full: a debounced one-shot
+            # resize can afford it, and the tail sub-cap would silently DELETE older
+            # scrollback on every resize (the retained _raw is already bounded at
+            # _RAW_MAX, and the document caps at _scrollback blocks regardless).
+            self._feed_line(self._raw if (self._preview or full)
                             else tail_from_escape_boundary(self._raw,
                                                            self._RERENDER_TAIL))
 
@@ -2963,10 +2985,12 @@ class SecureTerminal(QPlainTextEdit):
                     pass
             try:
                 os.execvp(argv[0], argv)
-            except OSError:
-                # The requested program could not be run (missing / non-executable).
-                # Signal the parent through the exec-detection pipe BEFORE exiting so it
-                # fails the tab closed instead of dropping to a login shell -- a real
+            except (OSError, ValueError):
+                # The requested program could not be run (missing / non-executable, or
+                # ValueError from an embedded NUL in argv). Signal the parent through the
+                # exec-detection pipe BEFORE exiting so it fails the tab closed instead
+                # of dropping to a login shell (a bare `except OSError` let a NUL-bearing
+                # argv escape unsignalled -> fail-open) -- a real
                 # program that ran and exited 127 leaves this pipe empty (closed on a
                 # successful exec) and still restarts as a shell.
                 try:
@@ -3017,6 +3041,14 @@ class SecureTerminal(QPlainTextEdit):
                 # the whole mode set to a fresh screen's default here (also drops a stale
                 # hidden cursor / autowrap-off); the buffer + scrollback are untouched.
                 self._screen.mode = set(_DEFAULT_DEC_MODES)
+                # Same threat class for the CHARSET designation: a program that selected
+                # DEC special-graphics (ESC ( 0) leaves g0_charset/charset set on the
+                # reused screen, so the new shell's ASCII (q,x,j,k,l,m,n) would render as
+                # box-drawing glyphs. Reset to a fresh screen's charset defaults without
+                # clearing the buffer (mirrors pyte Screen.reset's charset lines).
+                self._screen.charset = 0
+                self._screen.g0_charset = pyte.charsets.LAT1_MAP
+                self._screen.g1_charset = pyte.charsets.VT100_MAP
             else:
                 self._make_screen()
 
@@ -3440,11 +3472,12 @@ class SecureTerminal(QPlainTextEdit):
                     # both is the whole anti-phishing value. (pyte has no per-cell
                     # hyperlink model, so inline-clickable rendering is future work.)
                     # The label passes only sanitize_title (printable ASCII), so it can
-                    # embed a fake ' -> uri' to spoof the target. sanitize_title collapses
-                    # whitespace runs to one space, so every spacing variant normalizes to
-                    # ' -> '; strip it from the label so the ONLY arrow in the notice is
-                    # the real separator before the true target.
-                    label = (text or uri).replace(' -> ', ' ')
+                    # embed a fake '-> uri' to spoof the target. sanitize_title keeps '->'
+                    # verbatim and only collapses whitespace, so a label omitting a space
+                    # on either side (realsite->evil) would survive a spaced-only strip.
+                    # Strip EVERY '->' regardless of surrounding whitespace, so the ONLY
+                    # arrow in the notice is the real separator before the true target.
+                    label = re.sub(r'\s*->\s*', ' ', text or uri)
                     self.notified.emit('link: ' + label + ' -> ' + uri)
         for match in _OSC_ANY.finditer(data):
             code = int(match.group(1))
@@ -3692,6 +3725,28 @@ class SecureTerminal(QPlainTextEdit):
         self._flush_paint()                # paint the last CLI line before we go
         self._release_pty(hangup=True)
 
+    def _grid_text(self):
+        """The retained grid -- scrollback history + the current screen -- as plain
+        SOURCE-text lines. Used to reseed _raw after a keep_screen restart so a later
+        CLI switch reproduces the exited program's VISIBLE output (the clean final
+        frame) rather than the raw redraw stream a TUI program leaves in _raw, which a
+        CLI replay would render as garbage. SGR colour is not carried (a re-render of
+        already-exited output); the text is, and _feed_line re-sanitizes it on replay.
+        Uses the same screen.buffer / history.top / columns accessors as the grid
+        render path."""
+        scr = self._screen
+        if scr is None:
+            return ''
+        lines = []
+        for row in list(scr.history.top):
+            lines.append(''.join(row[x].data for x in range(scr.columns)).rstrip())
+        for y in range(scr.lines):
+            row = scr.buffer[y]
+            lines.append(''.join(row[x].data for x in range(scr.columns)).rstrip())
+        while lines and not lines[-1]:          # trim trailing blank rows
+            lines.pop()
+        return '\r\n'.join(lines)
+
     def restart_as_shell(self):
         """A launched program (-- PROGRAM tab) exited: drop to a fresh login shell
         IN PLACE instead of closing the tab, so a finished program (a session, an
@@ -3782,10 +3837,12 @@ class SecureTerminal(QPlainTextEdit):
             # WITHOUT a fresh screen (keep_screen), so the document is NOT cleared, then
             # seed the banner into the surviving grid and render -- the exited program's
             # output stays visible above the handover banner and the new prompt.
-            # (_raw carries only the banner, so a later CLI<->TUI re-seed shows the
-            # banner alone; the immediate scrollback lives on the retained screen.)
+            # Reseed _raw from the retained grid's CLEAN text (not the raw redraw stream,
+            # which a CLI replay would garble), so a later CLI<->TUI switch reproduces the
+            # exited program's visible scrollback instead of only the banner; _feed_stream
+            # appends the banner to _raw + grid.
             self._start(None, keep_screen=True)
-            self._raw = _banner
+            self._raw = self._grid_text()
             self._feed_stream(_banner.encode('utf-8', 'replace'))
             self._render_tui()
         else:
@@ -4345,9 +4402,16 @@ class SecureTerminal(QPlainTextEdit):
         to /proc/self/comm), exe reflects the actual executable and CANNOT be rewritten by
         the child, so it is a trustworthy process-identity signal."""
         try:
-            return os.readlink('/proc/%d/exe' % pid)
+            target = os.readlink('/proc/%d/exe' % pid)
         except OSError:
             return None
+        # The kernel appends ' (deleted)' when the binary was unlinked or replaced
+        # (an apt upgrade of bash/dash unlinks the old inode). The spawn-time baseline
+        # was captured BEFORE that, so a raw compare would see the suffix only on the
+        # LIVE read and mis-ID an idle, never-exec'd shell as a foreground program --
+        # which the panic Terminate would then kill. Strip it so both reads normalize.
+        deleted = ' (deleted)'
+        return target[:-len(deleted)] if target.endswith(deleted) else target
 
     def _child_execd(self):
         """True when a LOGIN-shell tab's direct child has been REPLACED via the shell
@@ -4890,6 +4954,10 @@ class SecureTerminal(QPlainTextEdit):
         \\uXXXX ESCAPE, not the raw glyph -- putting a bidi override or homoglyph
         on the clipboard is the very hazard this terminal guards against."""
         dlg = QDialog(self)
+        # Destroy on close instead of just hiding: without this the parented QDialog's
+        # C++ object outlives the dropped Python ref, so one hidden dialog leaks per
+        # character-inspect for the tab's lifetime.
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.setWindowTitle('Character U+%04X' % cp)
         dlg.setMinimumWidth(340)        # roomy enough to read the description
         col = QVBoxLayout(dlg)
