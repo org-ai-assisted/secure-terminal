@@ -1254,16 +1254,18 @@ class SecureTerminal(QPlainTextEdit):
     def _clamp_int(value, lo, hi, default):
         """int(value) clamped to [lo, hi], or `default` when it is not a usable
         integer. This is the "crash-safe at the SINK" contract the apply_* setters
-        rely on: besides OverflowError from a too-large value (which the clamp
-        already tamed), int() ITSELF raises ValueError since Python 3.11 for a digit
-        string longer than sys.int_info.default_max_str_digits (4300), and TypeError
-        for a non-string non-number -- both BEFORE any clamp runs. A caller trusting
-        the sink (a ctl/IPC entry, a hand-edited session, a config field) must never
-        crash the widget on such input; an unparseable value carries no magnitude, so
-        keep the current setting rather than raise."""
+        rely on: int() raises for several unusable inputs, ALL caught here so no
+        setter ever propagates the crash -- ValueError for a >4300-digit string
+        (Python 3.11 sys.int_info.default_max_str_digits) or a non-numeric string,
+        TypeError for a non-string non-number, and OverflowError for a non-finite
+        float (int(float('inf')), reachable as JSON `Infinity` in a config/session/
+        IPC value). Each raises BEFORE any clamp runs. A caller trusting the sink (a
+        ctl/IPC entry, a hand-edited session, a config field) must never crash the
+        widget; an unparseable value carries no magnitude, so keep the current
+        setting rather than raise."""
         try:
             n = int(value)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             return default
         return max(lo, min(n, hi))
 
