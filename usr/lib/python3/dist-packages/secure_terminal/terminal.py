@@ -483,13 +483,16 @@ def tui_available():
 
 
 def _argv_for_command(command):
-    """Build the child's argv from `command`: a list/tuple is used verbatim (the
-    "-- prog args" CLI form, no shell reparse), a string is split like a shell word
-    list ("ssh -p 22 host"), none/empty -> []. A MALFORMED string (e.g. an unbalanced
-    quote) also yields [] rather than raising: raised in the pty.fork child it would
-    print an uncaught traceback the parent then masks as a normal exit -- so fall back
-    to the login shell exactly as an empty command does. Caller substitutes the shell
-    for an empty argv."""
+    """Build the child's argv from `command`, distinguishing three cases so a broken
+    command NEVER silently becomes a login shell:
+      - a list/tuple -> used verbatim (the "-- prog args" CLI form, no shell reparse);
+      - a string -> split like a shell word list ("ssh -p 22 host");
+      - none/empty -> [] (the deliberate "no command" case; caller substitutes shell);
+      - a MALFORMED string (e.g. an unbalanced quote) -> None (FAIL CLOSED).
+    None is distinct from [] on purpose: a locked-down launch (run ONLY this program)
+    must not drop to a shell on a typo. The caller exits the child rather than spawn a
+    shell for None; raising here instead would traceback in the pty.fork child, which
+    the parent masks as a normal exit."""
     if isinstance(command, (list, tuple)):
         return [str(a) for a in command]
     if not command:
@@ -497,7 +500,7 @@ def _argv_for_command(command):
     try:
         return shlex.split(command)
     except ValueError:
-        return []
+        return None
 
 
 # Directories a bell sound file may live in. Restricting to these keeps the
@@ -2850,7 +2853,13 @@ class SecureTerminal(QPlainTextEdit):
             # fingerprint. Programs then emit truecolor instead of down-mapping.
             os.environ['COLORTERM'] = 'truecolor'
             os.environ.setdefault('PAGER', 'cat')
-            argv = _argv_for_command(command)   # [] for none/malformed -> login shell
+            argv = _argv_for_command(command)
+            if argv is None:
+                # A MALFORMED command (bad quoting) must not become a login shell --
+                # fail closed for a locked-down -e. The CLI (_parse_launch_args) already
+                # exits with a message before Qt; this is the last-ditch guard for a
+                # command reaching here by another path (IPC / a hand-edited session).
+                os._exit(127)
             if not argv:
                 argv = [os.environ.get('SHELL') or '/bin/bash']
             if self._cwd:
@@ -5074,13 +5083,23 @@ class SecureTerminal(QPlainTextEdit):
         Under an interactive shell's normal JOB CONTROL a launched program / subshell /
         sudo -i root shell runs in its own pgrp, so has_foreground_program() reads True
         and we refuse; tui_active() additionally catches any full-screen program (vim,
-        a pager, ssh's session) regardless of job control. RESIDUAL: a non-TUI
-        stdin-reader under a shell with job control OFF (atypical: `set +m`) shares the
-        shell's pgrp, so neither check sees it -- there is no reliable per-process
-        signal there (a /proc child-scan false-positives on background jobs). If a
-        program owns the tty the reviewed context is gone, so DROP the remainder rather
-        than deliver a reviewed line into it. An empty held line (a blank line in the
-        paste) writes nothing but is still consumed."""
+        a pager, ssh's session) regardless of job control. RESIDUAL (accepted): a shell
+        BUILTIN that reads stdin -- `read`, or a here-doc the shell itself consumes --
+        runs IN the shell process (no fork), so it shares the shell's pgrp and neither
+        check sees it; a held line inserted while it blocks is swallowed as that read's
+        INPUT, not landed at a fresh prompt. NOT limited to `set +m`: a builtin never
+        forks, so job control cannot separate it. No reliable signal distinguishes an
+        idle prompt from a blocked `read` -- pgrp is identical (both are the shell); the
+        tty line-discipline (ICANON) fails too, measured across shells: dash's PROMPT is
+        already canonical (== its read), and bash/zsh `read -n`/`read -e` read RAW like
+        the prompt, so ICANON both false-positives (dash) and is evadable (`read -n`).
+        Bounded impact: the WHOLE paste is reviewed (nothing hidden), a held line into a
+        bare `read` is DATA not a command, and only a line 1 crafted to read-and-exec
+        (`read x; eval $x`, itself visible in the review) turns it into execution; what
+        is lost is the per-line abort at a prompt. If a program owns the tty the
+        reviewed context is gone, so DROP the remainder rather than deliver a reviewed
+        line into it. An empty held line (a blank line in the paste) writes nothing but
+        is still consumed."""
         if self.tui_active() or self.has_foreground_program():
             self._staged_paste = []
             return

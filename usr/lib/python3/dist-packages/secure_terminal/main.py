@@ -5226,6 +5226,19 @@ def _parse_launch_args(argv):
     if command is not None:
         launch.tabs[-1]['command'] = command
 
+    # Fail CLOSED on a malformed -e STRING, before Qt starts: a locked-down launch
+    # (run ONLY this program) must not silently drop to a login shell on a bad quote.
+    # A LIST command (-- prog args) is verbatim (never shlex'd), so it is exempt;
+    # empty/None is the deliberate 'no command -> shell'. Mirrors _argv_for_command.
+    for spec in launch.tabs:
+        cmd = spec.get('command')
+        if isinstance(cmd, str) and cmd:
+            try:
+                shlex.split(cmd)
+            except ValueError as exc:
+                sys.stderr.write('secure-terminal: malformed -e command: %s\n' % exc)
+                raise SystemExit(2)
+
     def _empty(spec):
         return not any(spec.get(k) is not None
                        for k in ('title', 'tui', 'mode', 'command',
