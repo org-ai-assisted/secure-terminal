@@ -53,7 +53,8 @@ import termios
 import argparse
 
 from secure_terminal.sanitize import (
-    render_output, cap_zalgo_show, feed_chunk_carry, DISPLAY_MODES, sanitize_paste)
+    render_output, cap_zalgo_show, feed_chunk_carry, DISPLAY_MODES, sanitize_paste,
+    ensure_utf8_ctype)
 
 # Bracketed-paste framing the OUTER terminal wraps a paste in once DECSET 2004 is
 # enabled. Stripped before the child sees it (the child runs TERM=dumb and never
@@ -203,6 +204,9 @@ def _run(argv, mode):
         # the behaviour is exercised end-to-end by the CLI tests instead.)
         os.environ['TERM'] = 'dumb'
         os.environ.setdefault('PAGER', 'cat')
+        # The decode side assumes UTF-8; make the child emit UTF-8. No-op when the
+        # ambient locale is already UTF-8.
+        ensure_utf8_ctype()
         try:
             os.execvp(argv[0], argv)
         except OSError:

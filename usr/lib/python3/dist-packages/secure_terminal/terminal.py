@@ -84,6 +84,7 @@ import unicodedata
 
 import pyte
 import pyte.graphics
+import pyte.modes
 # pyte's own hard dependency, so no new package: it is what pyte's draw() uses to
 # decide a character's cell width, and _SafeHistoryScreen.draw has to agree with
 # that decision to know which characters pyte would silently drop.
@@ -208,8 +209,18 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                     target = self.buffer[self.cursor.y - 1].get(self.columns - 1)
                 else:
                     target = None
-                if target is not None and len(target.data) > _TUI_COMBINE_CAP:
+                if target is not None and len(target.data) >= _TUI_COMBINE_CAP:
                     continue                  # target cell already at the cap
+                if target is None:
+                    # Nothing precedes the cursor (the very screen origin, 0,0), so there
+                    # is no cell to attach to -- and pyte's draw() drops BOTH a leading
+                    # combining mark (its x and y merge branches both fail at the origin)
+                    # and a zero-width non-combining char (`else: break`) outright, marking
+                    # nothing. A leading zero-width is exactly the spoofing position that
+                    # must not go unmarked, so occupy THIS cell instead; tui_cell renders
+                    # the placeholder.
+                    self._mark_own_cell(ch)
+                    continue
                 if not combining:
                     # pyte's draw() takes `else: break` for a character that is
                     # zero-width but NOT a combining mark -- U+200D, U+FE0F, the
@@ -220,14 +231,7 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                     # is supposed to keep. Merge it into the preceding cell the way
                     # pyte does for a combining mark, so tui_cell sees a cell whose
                     # data is not purely printable and renders the placeholder.
-                    if target is not None:
-                        self._merge_invisible(target, ch)
-                    else:
-                        # Nothing precedes it (cursor at the very start of the
-                        # screen), so there is no cell to attach to. Occupy THIS
-                        # cell instead: a leading invisible is exactly the
-                        # spoofing position that must not go unmarked.
-                        self._mark_own_cell(ch)
+                    self._merge_invisible(target, ch)
                     continue
             super().draw(ch)
 
@@ -243,7 +247,7 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         row = self.buffer[self.cursor.y]
         existing = row.get(self.cursor.x)
         if existing is not None:
-            if len(existing.data) <= _TUI_COMBINE_CAP:
+            if len(existing.data) < _TUI_COMBINE_CAP:
                 row[self.cursor.x] = existing._replace(data=existing.data + ch)
                 self.dirty.add(self.cursor.y)
             return                       # merged (or at the cap): the cell is not re-occupied
@@ -321,6 +325,7 @@ from secure_terminal.sanitize import (
     sanitize_paste_unicode, sanitize_clipboard, sanitize_clipboard_unicode,
     sanitize_clipboard_display,
     paste_findings, paste_is_multiline, paste_no_autosubmit, tui_cell,
+    ensure_utf8_ctype,
     sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, display_len,
     MARK_KEY, WRAP_NL, BOX,
@@ -435,6 +440,15 @@ _OSC_TERMINATED = re.compile(rb'\x07|\x1b\\')
 # does not get the phishing-notice treatment (the sequence is still stripped by ANSI_RE).
 _OSC8 = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)'
                    rb'(.{0,8192}?)\x1b\]8;;(?:\x07|\x1b\\)', re.DOTALL)
+# An OSC 8 hyperlink is TWO separately-terminated OSCs (opener ESC]8;;<uri>BEL + text,
+# then closer ESC]8;;BEL). When the opener+text lands in one read and the closer in the
+# next, the opener alone is already terminated, so the plain carry below would NOT hold
+# it and _OSC8 never sees the pair -- the anti-phishing notice is evaded. Match an OPEN
+# opener (non-empty URI) vs a bare closer so an unclosed opener can be carried until its
+# closer arrives; the non-empty-URI class means a closer never matches _OSC8_OPEN, and an
+# opener never matches _OSC8_CLOSE, so the two cannot be confused.
+_OSC8_OPEN = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;[^\x07\x1b]+(?:\x07|\x1b\\)')
+_OSC8_CLOSE = re.compile(rb'\x1b\]8;;(?:\x07|\x1b\\)')
 # OSC numeric code -> feature key, so a CLI-mode notice can name the exact type.
 _OSC_CODE_KEY = {}
 for _k, _lbl, _codes, *_rest in OSC_FEATURES:
@@ -475,6 +489,11 @@ _SYNC_END = '\x1b[?2026l'
 # program's `\x1b[?2004h` lands as 2004 << 5 -- test for that, not the bare 2004.
 _BRACKETED_PASTE_MODE = 2004 << 5
 
+# The DEC private modes a FRESH pyte screen carries (autowrap + cursor visible). Used to
+# reset a REUSED screen's modes on restart_as_shell(keep_screen) so no per-child mode --
+# above all the bracketed-paste bit -- leaks from the exited program into the new shell.
+_DEFAULT_DEC_MODES = frozenset((pyte.modes.DECAWM, pyte.modes.DECTCEM))
+
 
 def tui_available():
     # python3-pyte is a hard dependency (see debian/control), so TUI mode is
@@ -489,13 +508,21 @@ def _argv_for_command(command):
       - a string -> split like a shell word list ("ssh -p 22 host");
       - none/empty -> [] (the deliberate "no command" case; caller substitutes shell);
       - a MALFORMED string (unbalanced quote), a whitespace-only string (" " -> no
-        words), or one whose FIRST word is empty ('""' -> ['']) -> None (FAIL CLOSED).
+        words), or one whose FIRST word is empty ('""' -> ['']) -> None (FAIL CLOSED);
+      - a list/tuple whose FIRST element is empty/whitespace-only (`-- ""` -> ['']) ->
+        None too (FAIL CLOSED), mirroring the string path -- a list names no program.
     None is distinct from [] on purpose: a locked-down launch (run ONLY this program)
     must not drop to a shell on a typo, a whitespace command, or an empty program name.
     The caller exits the child rather than spawn a shell for None; raising here instead
     would traceback in the pty.fork child, which the parent masks as a normal exit."""
     if isinstance(command, (list, tuple)):
-        return [str(a) for a in command]
+        argv = [str(a) for a in command]
+        # An empty list is the deliberate "no command" case ([] -> shell); but a list
+        # whose FIRST element is empty/whitespace ('' from `-- ""`) names no program and
+        # must fail closed, exactly like the string path -- else it drops to a shell.
+        if argv and not argv[0].strip():
+            return None
+        return argv
     if not command:
         return []
     try:
@@ -900,8 +927,8 @@ class SecureTerminal(QPlainTextEdit):
         self._command = command if command else None
         self._command_malformed = False   # set by _start: a malformed/whitespace command
         self._command_exec_failed = False  # set by _start: the -e program could not exec
-        self._spawn_comm = None            # set by _start: /proc comm of the spawned child,
-        #                                    baseline to detect a login shell replaced via `exec`
+        self._spawn_exe = None             # set by _start: /proc exe of the spawned child (an
+        #                                    unforgeable baseline: detect an `exec`-replaced shell)
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -1120,6 +1147,11 @@ class SecureTerminal(QPlainTextEdit):
         self._zoom_timer.setSingleShot(True)
         self._zoom_timer.timeout.connect(self._apply_font)
         self._zoom_debounce_ms = 40
+        # Debounced reflow of retained LINE output when a resize changes the column
+        # count: re-wrap an old long line at the new width instead of horizontal-scroll.
+        self._reflow_timer = QTimer(self)
+        self._reflow_timer.setSingleShot(True)
+        self._reflow_timer.timeout.connect(self._rerender)
 
         # restored scrollback from a previous session, shown as history above
         # the fresh shell (line mode; a TUI tab repaints over it on first draw).
@@ -1185,7 +1217,11 @@ class SecureTerminal(QPlainTextEdit):
 
     # -- appearance: theme + zoom ---------------------------------------------
     def apply_theme(self, theme):
-        theme = theme if theme in THEMES else 'dark'
+        # Unknown theme -> the app default 'light', matching the constructor (theme=
+        # 'light' + its identical fallback). The old 'dark' here meant a bad name gave
+        # a DIFFERENT theme depending on whether it arrived at construction or via a
+        # later apply (a corrupt session, a settings dialog forwarding an unknown name).
+        theme = theme if theme in THEMES else 'light'
         changed = theme != getattr(self, '_theme', None)
         base, text = THEMES[theme]
         self._theme = theme
@@ -2858,7 +2894,7 @@ class SecureTerminal(QPlainTextEdit):
         return 'xterm-256color', tdir
 
     # -- child process over a pseudo-terminal ---------------------------------
-    def _start(self, command):
+    def _start(self, command, keep_screen=False):
         term, terminfo_dir = self._child_term()
         # Parse in the PARENT so a malformed / whitespace-degenerate command (argv is
         # None) is known here, on EVERY path (CLI, IPC, GUI new-tab, session restore):
@@ -2906,6 +2942,10 @@ class SecureTerminal(QPlainTextEdit):
             # fingerprint. Programs then emit truecolor instead of down-mapping.
             os.environ['COLORTERM'] = 'truecolor'
             os.environ.setdefault('PAGER', 'cat')
+            # The decode side assumes UTF-8; make the child emit UTF-8 (else a wide-char
+            # program renders each byte as <ffffffff>). No-op when the ambient locale is
+            # already UTF-8.
+            ensure_utf8_ctype()
             if argv is None:
                 # Malformed / whitespace-degenerate command (argv computed in the
                 # parent): fail closed -- exit 127, never a shell. restart_as_shell()
@@ -2948,11 +2988,12 @@ class SecureTerminal(QPlainTextEdit):
             self._command_exec_failed = bool(os.read(exec_r, 1))
         finally:
             os.close(exec_r)
-        # Baseline the child's /proc comm now that the exec has succeeded: this is the
-        # identity of the shell (or -- PROGRAM) we launched, captured before the user
-        # can `exec` anything. has_foreground_program compares the live comm against it
-        # to catch a login shell REPLACED via the `exec` builtin (same pid + pgrp).
-        self._spawn_comm = None if self._command_exec_failed else self._read_comm(pid)
+        # Baseline the child's /proc exe now that the exec has succeeded: this is the real
+        # binary of the shell (or -- PROGRAM) we launched, captured before the user can
+        # `exec` anything. has_foreground_program compares the live exe against it to catch
+        # a login shell REPLACED via the `exec` builtin (same pid + pgrp). exe is used, not
+        # comm, because comm is child-writable (spoofable) and exe is not.
+        self._spawn_exe = None if self._command_exec_failed else self._read_exe(pid)
         SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
         self._fd = fd
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -2960,7 +3001,24 @@ class SecureTerminal(QPlainTextEdit):
         self._notifier = QSocketNotifier(fd, QSocketNotifier.Type.Read, self)
         self._notifier.activated.connect(self._on_readable)
         if self._tui:
-            self._make_screen()
+            if keep_screen and self._screen is not None:
+                # restart_as_shell: preserve the exited program's primary buffer +
+                # scrollback for the new shell. A fresh _make_screen would clear() the
+                # document. Rebind only the parser to the surviving screen and re-apply
+                # the winsize to the NEW pty.
+                self._stream = _Utf8CharsetByteStream(self._screen)
+                self._set_winsize(*self._tui_grid_size())
+                # SECURITY: the reused screen carries the EXITED program's DEC private
+                # modes; a fresh _make_screen would not. A stale bracketed-paste bit
+                # (DEC 2004) would make a later NON-bracketed program read as bracketed,
+                # so _bracketed_paste_active() trusts it to buffer a paste inert -- and a
+                # multiline paste's embedded \r SKIPS the mandatory staging and auto-runs.
+                # The read-path fg-exit clear does not fire on this restart path, so reset
+                # the whole mode set to a fresh screen's default here (also drops a stale
+                # hidden cursor / autowrap-off); the buffer + scrollback are untouched.
+                self._screen.mode = set(_DEFAULT_DEC_MODES)
+            else:
+                self._make_screen()
 
     def _on_readable(self):
         self._read_and_render()
@@ -3017,11 +3075,17 @@ class SecureTerminal(QPlainTextEdit):
         fg = self.has_foreground_program()
         if self._bracket_had_fg and not fg and self._screen is not None:
             self._screen.mode.discard(_BRACKETED_PASTE_MODE)
-        if fg and not self._bracket_had_fg:
-            # A foreground program just took the tty: a HELD multi-line paste belonged
-            # to the shell prompt it was pasted at, not to this program, so drop the
-            # remainder proactively (the paste gesture also refuses while fg, but this
-            # clears it the moment the program appears -- e.g. line 1 was sudo -i).
+        if fg != self._bracket_had_fg:
+            # ANY foreground-program transition invalidates a HELD multi-line paste's
+            # reviewed context, so drop the remainder proactively:
+            #  - rising (bare prompt -> program): the held lines belonged to the shell
+            #    prompt they were pasted at, not this program -- e.g. line 1 was sudo -i
+            #    (the paste gesture also refuses while fg, but this clears it the moment
+            #    the program appears).
+            #  - falling (program -> bare prompt): a non-bracketed TUI child force-reviews
+            #    a multiline paste and stages the remainder as ITS input; once it exits, a
+            #    paste gesture at the RETURNING shell prompt would insert those
+            #    program-reviewed lines as shell commands. Drop them when it is gone.
             self._staged_paste = []
         self._bracket_had_fg = fg
         text = self._decoder.decode(data)
@@ -3267,7 +3331,10 @@ class SecureTerminal(QPlainTextEdit):
             # buffer). A process flooding alternating ?1049h/?1049l in one read could
             # otherwise force thousands of full-screen deepcopies and freeze the GUI,
             # so bound the snapshot/restore work per read: past the cap, feed the
-            # remainder as ordinary bytes (a real program redraws its own frame).
+            # remainder as ordinary bytes (a real program redraws its own frame). This
+            # SAME cap bounds the per-marker find() scans below to at most
+            # _ALT_TRANSITIONS_MAX linear passes -- total O(cap*n) = O(n), NOT the O(n^2)
+            # an unbounded per-marker rescan would be; the loop is not a scan-DoS.
             if transitions >= self._ALT_TRANSITIONS_MAX:
                 self._feed_bytes(data[pos:])
                 break
@@ -3335,12 +3402,29 @@ class SecureTerminal(QPlainTextEdit):
         # earliest of: the last UNTERMINATED "\x1b]" introducer, or a trailing lone
         # "\x1b" (which may begin an introducer in the next read). Bounded: an
         # unterminated flood past the cap is let go rather than buffered forever.
+        # NB: _osc_carry feeds ONLY sanitized side-effects (title/notify, gated
+        # clipboard/cwd) -- never the render pipeline -- so a carry retained across a
+        # display-mode toggle (apply_mode/_rerender) is correct reassembly, not an
+        # unsanitized-render leak. Do NOT clear it on _rerender (reached by cosmetic
+        # apply_colors/markings/theme too, which would drop a legit in-flight OSC);
+        # apply_tui, the real CLI<->TUI boundary, already clears it.
         data = self._osc_carry + data
         self._osc_carry = b''
         carry_at = len(data) if data.endswith(b'\x1b') else -1
         intro = data.rfind(b'\x1b]')
         if intro != -1 and not _OSC_TERMINATED.search(data[intro + 2:]):
             carry_at = intro
+        # An OSC 8 hyperlink spans two SEPARATELY-terminated OSCs; the plain carry above
+        # only holds an UNterminated introducer, so a terminated opener whose closer is in
+        # the next read is not held and _OSC8 never sees the pair. Hold back an OPEN opener
+        # (non-empty URI, no closer after it yet) so the split pair reassembles and the
+        # phishing notice still fires. Bounded by the same _OSC_CARRY_MAX check below.
+        if self._osc['osc_hyperlink']:
+            opens = list(_OSC8_OPEN.finditer(data))
+            if opens and not _OSC8_CLOSE.search(data, opens[-1].end()):
+                op = opens[-1].start()
+                if carry_at < 0 or op < carry_at:
+                    carry_at = op
         if carry_at == len(data):
             carry_at = len(data) - 1          # the trailing lone ESC
         if carry_at >= 0 and (len(data) - carry_at) <= self._OSC_CARRY_MAX:
@@ -3355,7 +3439,13 @@ class SecureTerminal(QPlainTextEdit):
                     # display text can differ from where the link points, so seeing
                     # both is the whole anti-phishing value. (pyte has no per-cell
                     # hyperlink model, so inline-clickable rendering is future work.)
-                    self.notified.emit('link: ' + (text or uri) + ' -> ' + uri)
+                    # The label passes only sanitize_title (printable ASCII), so it can
+                    # embed a fake ' -> uri' to spoof the target. sanitize_title collapses
+                    # whitespace runs to one space, so every spacing variant normalizes to
+                    # ' -> '; strip it from the label so the ONLY arrow in the notice is
+                    # the real separator before the true target.
+                    label = (text or uri).replace(' -> ', ' ')
+                    self.notified.emit('link: ' + label + ' -> ' + uri)
         for match in _OSC_ANY.finditer(data):
             code = int(match.group(1))
             params = match.group(2)
@@ -3609,10 +3699,11 @@ class SecureTerminal(QPlainTextEdit):
         disposition. Returns True when it restarts. A no-op (False) for a plain
         login-shell tab (self._command is None): typing `exit` there closes the tab,
         as a real terminal does. Keeps every widget setting (theme/zoom/mode/...);
-        only the exited child's pty and its half-parsed stream state are reset. A CLI
-        tab keeps the exited program's output above the new prompt as scrollback; a
-        TUI tab's transient alt-screen frame is discarded (as a real terminal drops it
-        on rmcup) and the grid shows the handover banner then the new shell."""
+        only the exited child's pty and its half-parsed stream state are reset. Both a
+        CLI tab AND a TUI tab keep the exited program's primary-screen output above the
+        new prompt as scrollback; a TUI program's transient ALT-screen frame is discarded
+        (as a real terminal drops it on rmcup), then the grid shows the handover banner
+        and the new shell."""
         if (self._command is None or self._fd is None or self._command_malformed
                 or self._command_exec_failed):
             # Fail CLOSED -- do NOT drop to a login shell; the caller closes the tab:
@@ -3632,12 +3723,27 @@ class SecureTerminal(QPlainTextEdit):
             self._pending_copy = None
             self._review_active = False
             self.paste_review_resolved.emit()
+        # SECURITY: a PENDING OSC-52 clipboard-read consent -- a dialog the exited program
+        # opened, still up during the paste-delay countdown -- must not survive into the new
+        # shell: clicking Allow would then reply the system clipboard into an UNRELATED
+        # shell's pty. Drop the pending state, and also forget an allow-always grant, since
+        # the new shell is a different context that must re-consent.
+        self._clipboard_read = None
+        self._clipboard_read_always = False
         # Tear down the exited child's pty (the master fd still opens; the read that
         # brought us here raised EIO). SIGHUP the child: EIO means every pty-slave
         # holder is gone, but a program that CLOSED the tty yet keeps running would
         # otherwise be left orphaned + invisible when we fork the new shell -- SIGHUP
         # reaps it (a no-op ESRCH for one that truly exited), matching close_tab.
         self._release_pty(hangup=True)
+        # rmcup: if the exited program was on the ALT screen, restore the pre-program
+        # PRIMARY screen (+ its scrollback) so its transient full-screen frame is dropped
+        # but the shell output that preceded it survives. A program that stayed on the
+        # primary screen (a build log, `-- cat file`) needs no restore -- its output is
+        # already on the screen kept below via keep_screen. Done BEFORE the stream-state
+        # reset clears _alt_saved.
+        if self._alt_screen:
+            self._alt_leave()
         # Reset the half-parsed per-child stream state so the new shell's very first
         # bytes are not corrupted by a stale carry, a stuck alt-screen bit, or the
         # exited program's mouse-tracking request.
@@ -3671,11 +3777,14 @@ class SecureTerminal(QPlainTextEdit):
         self._command = None
         _banner = '\r\n[secure-terminal] program exited -- new shell\r\n'
         if self._grid_mode():
-            # TUI: _start below makes a FRESH pyte screen (clearing the doc -- the
-            # alt-screen program's transient frame is dropped, as a real terminal does
-            # on rmcup). Seed the banner into that fresh grid AFTER the fork and render
-            # it, so the tab is not blank until the shell's first prompt.
-            self._start(None)
+            # TUI: keep the exited program's PRIMARY screen + scrollback (its alt frame,
+            # if any, was already dropped via _alt_leave above). Fork the new shell
+            # WITHOUT a fresh screen (keep_screen), so the document is NOT cleared, then
+            # seed the banner into the surviving grid and render -- the exited program's
+            # output stays visible above the handover banner and the new prompt.
+            # (_raw carries only the banner, so a later CLI<->TUI re-seed shows the
+            # banner alone; the immediate scrollback lives on the retained screen.)
+            self._start(None, keep_screen=True)
             self._raw = _banner
             self._feed_stream(_banner.encode('utf-8', 'replace'))
             self._render_tui()
@@ -3870,9 +3979,12 @@ class SecureTerminal(QPlainTextEdit):
         return text.replace(BOX, '_').replace(SPACE_MARK, '_')
 
     def toPlainText(self):
-        # Overrides QPlainTextEdit.toPlainText so every external text getter
-        # (save transcript, session cap) yields ASCII, not the
-        # display box. Qt's own rendering does not go through this method.
+        # Overrides QPlainTextEdit.toPlainText so every external text getter (save
+        # transcript, session cap, ctl-dump IPC) yields ASCII EXCEPT the box/glyphs
+        # Show mode keeps: in the default Box mode a neutralized byte collapses to an
+        # ASCII '_', while Show is the explicit opt-in to the visible U+25A1 box (the
+        # SAFE stand-in the user chose to see -- the raw zero-width/bidi byte never
+        # reaches here either way). Qt's own rendering does not go through this method.
         self._force_current_frame()  # never read a stale (debounced/gated) document
         return self._export_ascii(super().toPlainText())
 
@@ -4097,13 +4209,15 @@ class SecureTerminal(QPlainTextEdit):
             self.unreviewed_risk.emit()
         self._set_clipboard(sanitize_clipboard_unicode(text))
 
-    def dispatch_pending_copy(self, action):
+    def dispatch_pending_copy(self, action, edited=None):
         """Resolve a held copy review: 'stripped' copies ASCII only, 'unicode'
         keeps printable non-ASCII, 'reject' copies nothing. Re-enables input and
-        tells the window to hide the review bar. A no-op if none pending."""
+        tells the window to hide the review bar. A no-op if none pending. `edited`,
+        when given, is the review bar's edited buffer, copied in place of the
+        originally held selection (still sanitized on the way out)."""
         if not self._review_active:
             return
-        text = self._pending_copy
+        text = self._pending_copy if edited is None else edited
         self._pending_copy = None
         self._review_active = False
         self.paste_review_resolved.emit()
@@ -4225,32 +4339,34 @@ class SecureTerminal(QPlainTextEdit):
             return ''
 
     @staticmethod
-    def _read_comm(pid):
-        """The command name from /proc/<pid>/comm (the kernel's process identity, as
-        `ps`/konsole read it), or None. Cooperation-free and immune to what the child
-        advertises over the tty."""
+    def _read_exe(pid):
+        """The path /proc/<pid>/exe points at -- the real binary the kernel exec'd for
+        this pid -- or None. UNLIKE /proc/<pid>/comm (which the child forges with a write
+        to /proc/self/comm), exe reflects the actual executable and CANNOT be rewritten by
+        the child, so it is a trustworthy process-identity signal."""
         try:
-            with open('/proc/%d/comm' % pid, 'rb') as fh:
-                return fh.read().rstrip(b'\n').decode('utf-8', 'replace')
+            return os.readlink('/proc/%d/exe' % pid)
         except OSError:
             return None
 
     def _child_execd(self):
         """True when a LOGIN-shell tab's direct child has been REPLACED via the shell
         `exec` builtin (exec vim, exec ssh ...). `exec` does not fork, so the pid and
-        pgrp are unchanged and the tcgetpgrp heuristic still reads 'bare shell prompt'
-        -- but the child's /proc comm now names a different program. Comparing the live
-        comm against the spawn-time baseline is a definitive process-identity signal
-        (what konsole reads to name a foreground program), so an exec'd program is a
-        real foreground program: the panic button acts on it and the mode-toggle
-        re-export refuses to type into it. A shell builtin that merely READS stdin
-        without exec (read/select/here-doc) is NOT an exec -- same process, so this
-        stays False for it; that case has no reliable signal and is the documented
-        paste residual (see _insert_next_staged)."""
-        if self._pid is None or self._spawn_comm is None:
+        pgrp are unchanged and the tcgetpgrp heuristic still reads 'bare shell prompt' --
+        but /proc/<pid>/exe now points at a DIFFERENT binary. exe is the kernel's record
+        of the real executable and CANNOT be rewritten by the child -- unlike comm, which
+        a write to /proc/self/comm forges (that spoof both killed an idle shell via the
+        panic button AND hid a stuck exec'd program from it) -- so comparing the live exe
+        to the spawn-time baseline is a trustworthy signal that the shell was replaced.
+        The panic button then acts on the exec'd program and the mode-toggle re-export
+        refuses to type into it. Residual (inherent, narrow): an exec of the SAME binary
+        as the login shell is indistinguishable from the shell itself, exactly like a
+        stdin-reading builtin (read/select/here-doc) that shares the process and has no
+        reliable signal -- the documented paste residual (see _insert_next_staged)."""
+        if self._pid is None or self._spawn_exe is None:
             return False
-        comm = self._read_comm(self._pid)
-        return comm is not None and comm != self._spawn_comm
+        exe = self._read_exe(self._pid)
+        return exe is not None and exe != self._spawn_exe
 
     def has_foreground_program(self):
         """True when a program holds the foreground, i.e. there is something for
@@ -4610,6 +4726,11 @@ class SecureTerminal(QPlainTextEdit):
             # _line_pending() deferring the re-export -- same reason as the CLI path.
             if not (ctrl and key == Qt.Key.Key_U):
                 self._line_dirty = False
+            if ctrl and key == Qt.Key.Key_C:
+                # SIGINT abandons a held multi-line paste, exactly as the CLI-mode Ctrl+C
+                # path does -- else a stale staged line leaks into a later paste gesture.
+                # Only Ctrl+C clears it; accept-line and Ctrl+U do not.
+                self._staged_paste = []
 
         seq = SecureTerminal._TUI_KEYS.get(key)
         text = event.text()
@@ -4665,7 +4786,17 @@ class SecureTerminal(QPlainTextEdit):
             # with trailing fill to that width. Left at the fork-time default
             # (80), that fill (and the clickable void it creates) lands in the
             # middle of a wider window instead of at the true right edge.
+            old_cols = self._cols
             self._set_winsize(*self._grid_size())
+            # REFLOW retained line output to the new width: a long line emitted at the old
+            # width otherwise horizontal-scrolls (Box/Show are NoWrap by design). _rerender
+            # replays _raw through _feed_line, whose hard-wrap is self._cols, so it re-wraps
+            # to the new width; Detail/Reveal re-lay-out under WidgetWidth. Debounced so a
+            # resize drag does not re-render per pixel. Only on a genuine width CHANGE
+            # (old_cols != 0: nothing to reflow before the first sizing), and only once the
+            # timer exists (a resize can fire during construction, before __init__ sets it).
+            if old_cols and self._cols != old_cols and getattr(self, '_reflow_timer', None):
+                self._reflow_timer.start(self._zoom_debounce_ms)
 
     def _cp_at(self, pos):
         """The source code point of a neutralized/revealed character under a
@@ -4899,6 +5030,15 @@ class SecureTerminal(QPlainTextEdit):
         self.setTextCursor(cur)
         self._render_timer.start(16)
 
+    def _home_hscroll(self):
+        """Pin the horizontal scrollbar to the left so the left document margin stays
+        visible. The base QPlainTextEdit scrolls the caret into view on a press/drag,
+        pushing that margin off-screen (all lines jump left) until a render or the
+        release snaps it back. The render paths already home the hbar every frame, so a
+        click/drag must too, or the view jitters left for as long as the button is held."""
+        hbar = self.horizontalScrollBar()
+        hbar.setValue(hbar.minimum())
+
     def mousePressEvent(self, event):
         # When the child grabs the mouse (tracking + SGR), a plain press is REPORTED
         # to it rather than starting a local selection; Shift is the local override.
@@ -4927,6 +5067,7 @@ class SecureTerminal(QPlainTextEdit):
                 # selection at the click instead of extending from the pinned cursor.
                 self.setTextCursor(self.cursorForPosition(event.position().toPoint()))
         super().mousePressEvent(event)
+        self._home_hscroll()          # keep the left margin pinned during the press
 
     def mouseReleaseEvent(self, event):
         # Balance EACH reported press with the release of THAT button (report it even if
@@ -4985,6 +5126,8 @@ class SecureTerminal(QPlainTextEdit):
                 event.accept()
                 return
         super().mouseMoveEvent(event)
+        if self._mouse_selecting:     # keep the margin pinned through a local drag-select
+            self._home_hscroll()
 
     def focusInEvent(self, event):
         # DEC 1004 focus reporting is the same output-armed input channel as button
@@ -5084,13 +5227,16 @@ class SecureTerminal(QPlainTextEdit):
             self.unreviewed_risk.emit()
         self._dispatch_paste(raw, 'unicode' if warn == 'never' else 'stripped')
 
-    def dispatch_pending_paste(self, action):
+    def dispatch_pending_paste(self, action, text=None):
         """Resolve a held paste review: 'stripped' or 'unicode' sends it (sanitized
         accordingly), 'reject' drops it. Re-enables input and tells the window to
-        hide the review bar either way. A no-op if no review is pending."""
+        hide the review bar either way. A no-op if no review is pending. `text`, when
+        given, is the review bar's EDITED buffer, delivered in place of the originally
+        held paste -- still sanitized on the way out, so an edit cannot bypass the
+        neutralization."""
         if not self._review_active:
             return
-        raw = self._pending_paste
+        raw = self._pending_paste if text is None else text
         self._pending_paste = None
         self._review_active = False
         self.paste_review_resolved.emit()
@@ -5134,6 +5280,13 @@ class SecureTerminal(QPlainTextEdit):
         # A new delivery supersedes any half-delivered held paste: drop the remainder
         # so a stale line can never trail a later paste.
         self._staged_paste = []
+        # Collapse a Windows CRLF PAIR to one newline BEFORE sanitizing: sanitize maps
+        # EACH of \r and \n to '\r', so a raw '\r\n' would become '\r\r' -- an empty
+        # staged element the user must Enter past. A GENUINE Unix blank line ('\n\n') is
+        # left intact so it survives as a real empty command below. Done here, not in
+        # per-character sanitize (whose homomorphism forbids a cross-char rewrite);
+        # mirrors paste_is_multiline's collapse.
+        raw = raw.replace('\r\n', '\n')
         # 'unicode' keeps printable non-ASCII (still no control/bidi/zero-width);
         # 'stripped' is ASCII only. Both are safe to send as UTF-8.
         safe = (sanitize_paste_unicode(raw) if action == 'unicode'
@@ -5167,10 +5320,11 @@ class SecureTerminal(QPlainTextEdit):
             lines = safe.split('\r')
             if len(lines) > 1:
                 safe = lines[0]
-                # Deliver line 1; HOLD the rest, DROPPING empty lines -- a blank line in
-                # the paste (or the second half of a Windows CRLF, which sanitize maps to
-                # '\r\r') is a no-op command, not worth a paste gesture to skip.
-                self._staged_paste = [ln for ln in lines[1:] if ln]
+                # Deliver line 1; HOLD the rest. Empty lines are PRESERVED: each staged
+                # line waits for the user's OWN Enter, so a blank line is a legitimate
+                # empty command (writes nothing, the user's Enter submits it). CRLF was
+                # already collapsed above, so a Windows paste stages no spurious empty.
+                self._staged_paste = lines[1:]
                 if self._staged_paste:
                     self._advise(
                         '%d more pasted line%s held -- press Paste to insert the next '

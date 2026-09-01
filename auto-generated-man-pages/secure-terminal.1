@@ -95,6 +95,15 @@ Show a \fB<U+XXXX>\fR codepoint badge (hover for its name)\.
 .TP
 \fBdetail\fR
 Like reveal but with the codepoint's Unicode name inline, \fB<U+XXXX NAME>\fR, so a homoglyph reads as its identity rather than a bare number (the safe default)\.
+.SH "REVIEW BAR"
+When text crossing the terminal boundary would carry unicode or control characters \-\- a paste coming IN, or a selection copied OUT with Ctrl+C \-\- the tab HOLDS it and shows a review bar docked at the bottom; no byte reaches the shell (or the clipboard) until you choose\. The bar shows a one\-line summary, a per\-class breakdown of what is hidden (look\-alikes, invisible/zero\-width, bidirectional controls, control characters, combining marks, box\-drawing, other non\-ASCII), a structure summary (line count, whether it would run on its own, length), and a mirror pane rendering exactly what each choice would deliver\. The held text is editable: trim the risky part and the summary, breakdown and mirror update, and delivery sends exactly the edited buffer (re\-sanitized, so an edit cannot bypass the neutralization)\. Choose Reject, the ASCII form (look\-alikes stripped) or the unicode form (printable non\-ASCII kept)\. A paste never runs on its own: the trailing submit byte is removed so the command waits at the prompt for your own Enter\.
+.P
+\fBpaste_warn\fR and \fBcopy_warn\fR (each \fBunicode\fR by default; also \fBalways\fR or \fBnever\fR) control when the bar appears in each direction\. The two directions are NOT symmetric, by design:
+.IP "\(bu" 4
+A paste is inspected as the raw clipboard bytes, in every display mode\.
+.IP "\(bu" 4
+A Ctrl+C copy is inspected as the ON\-SCREEN selection\. In the box, reveal and detail display modes the selection is already sanitized to ASCII, so nothing risky can reach the clipboard and no review is needed; only in show mode, where real glyphs are kept, does a copy raise the bar\. A mouse selection (the X11 PRIMARY buffer) and drag\-and\-drop are always hard\-stripped to ASCII, so a middle\-click paste of a selection is safe without a review\. This is why a copy may raise the bar while pasting the same text back does not: what reached the clipboard was already safe\.
+.IP "" 0
 .SH "CONFIGURATION"
 Settings are \fBKEY=value\fR lines spread over \fB*\.conf\fR drop\-in files, read from these directories, lowest precedence first:
 .IP "" 4

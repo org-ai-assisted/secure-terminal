@@ -38,13 +38,15 @@ countdown. The choice is dispatched back to the tab that held the text, the only
 path that lets it cross.
 """
 
-from PyQt6.QtCore import Qt, QTimer, QEvent
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton,
+    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton, QPlainTextEdit,
+    QRadioButton, QButtonGroup,
 )
 
 from secure_terminal.sanitize import (
-    classify_paste, sanitize_paste, sanitize_paste_unicode,
+    classify_paste, classify_paste_detail,
+    sanitize_paste, sanitize_paste_unicode,
     sanitize_clipboard, sanitize_clipboard_display, sanitize_clipboard_unicode,
     paste_no_autosubmit,
 )
@@ -59,6 +61,46 @@ from secure_terminal.terminal import SecureTerminal
 SAFE_FG = '#1f8a54'
 RISK_FG = '#d83933'
 
+# The seven hidden-character classes for the review table, most-alarming first
+# (box-drawing last). Each row: (marking-class key, a monochrome technical glyph, a
+# plain-language label). The glyph is coloured by the class's ON-SCREEN marking colour
+# (SecureTerminal.MARKING_COLORS) so the table and the terminal never disagree, and the
+# text label is ALWAYS shown, so a missing glyph font degrades to readable text rather
+# than a blank. 'structural' (box-drawing) carries no risk tint on screen, so its glyph
+# and count use the muted colour.
+# key -> (code point, plain-language label), most-alarming first (box-drawing last).
+# The glyph is built with chr() so the SOURCE stays ASCII (house convention, like
+# sanitize.BOX = chr 0x25A1); the text label is ALWAYS shown beside it, so a missing
+# glyph font degrades to readable text rather than a blank.
+_CLASS_ROWS = tuple(
+    (key, chr(cp), label) for key, cp, label in (
+        ('bidi',       0x2194, 'Bidirectional control'),   # left-right arrow: reorders
+        ('control',    0x2400, 'Control character'),        # symbol for NULL
+        ('invisible',  0x2423, 'Invisible / zero-width'),   # open box (blank)
+        ('confusable', 0x2248, 'Look-alike (homoglyph)'),   # almost-equal: looks like ASCII
+        ('combining',  0x25CC, 'Combining (Zalgo)'),        # dotted circle: combining base
+        # an accented Latin letter: itself non-ASCII and in every common font (a CJK
+        # sample would tofu without a CJK font the app does not require).
+        ('nonascii',   0x00C0, 'Other non-ASCII'),
+        ('structural', 0x253C, 'Box-drawing / blocks'),     # box-drawing cross
+    )
+)
+# Absent classes, the box-drawing row, and the informational Length row: no risk, muted.
+_MUTED_FG = '#888888'
+_LINES_GLYPH = chr(0x00B6)   # pilcrow, for the Lines row
+_SAFE_GLYPH = chr(0x2713)    # check: the never-auto-run guarantee is met
+# Shown (safe-green) when a reviewed paste hides nothing -- a positive all-clear so an
+# ASCII-only paste held for another reason (a multi-line paste) reads as safe.
+_CLEAN_MSG = 'ASCII-only -- nothing hidden.'
+# Radio-first choice: the two delivery MODES, shown as radios with NO default. Picking
+# one previews its delivered form in the mirror and arms the single deliver button, so
+# the delivered form is ALWAYS seen before delivery is possible.
+_RADIO_STRIP = 'Strip to ASCII'
+_RADIO_KEEP = 'Keep unicode'
+# Shown in the mirror before a mode is picked, so the pane is never mistaken for the
+# outcome (the old default-raw preview was read as "what will happen").
+_MIRROR_HINT = 'Choose how to deliver above to preview exactly what it sends.'
+
 # Everything that differs between the two directions. `dispatch` is the tab method
 # the choice is routed to; `strip`/`keep` are the sanitizers the mirror uses to
 # render EXACTLY what each action button would deliver (focusing a delivery button
@@ -71,8 +113,10 @@ _KINDS = {
         'summary': 'This paste hides %s.',
         # shown in "always" mode for a clean paste: no hidden characters to name.
         'summary_empty': 'Review this paste before it reaches the shell.',
+        'full_note': 'the FULL paste still delivers',
         'reject': 'Reject',
         'reject_tip': 'Do not paste (Enter or Esc)',
+        'deliver': 'Paste',
         'stripped': 'Paste (ASCII)',
         'unicode': 'Paste (unicode)',
         'dispatch': 'dispatch_pending_paste',
@@ -83,8 +127,10 @@ _KINDS = {
     'copy': {
         'summary': 'This copy would carry %s onto the clipboard.',
         'summary_empty': 'Review this copy before it reaches the clipboard.',
+        'full_note': 'the FULL copy still reaches the clipboard',
         'reject': "Don't copy",
         'reject_tip': 'Do not copy (Enter or Esc)',
+        'deliver': 'Copy',
         'stripped': 'Copy (ASCII)',
         'unicode': 'Copy (unicode)',
         'dispatch': 'dispatch_pending_copy',
@@ -100,8 +146,10 @@ _KINDS = {
     'clipboard': {
         'summary': 'This clipboard text hides %s.',
         'summary_empty': 'Review the clipboard text.',
+        'full_note': 'the FULL clipboard text is still used',
         'reject': 'Leave it',
         'reject_tip': 'Leave the clipboard unchanged (Enter or Esc)',
+        'deliver': 'Replace',
         'stripped': 'Replace (ASCII)',
         'unicode': 'Replace (unicode)',
         'dispatch': 'dispatch_pending_clipboard',
@@ -119,22 +167,16 @@ class ReviewBar(QWidget):
         self._window = window
         self._term = None
         self._raw = ''
-        # which delivery action's OUTCOME the mirror is previewing (None = the raw
-        # held text). Focusing/hovering a delivery button shows exactly what it would
-        # send, so an obfuscated command's de-obfuscated, auto-submitting form cannot
-        # stay hidden behind the button label. _focused/_hovered track the delivery
-        # buttons' keyboard-focus and mouse-hover so the preview is derived
-        # focus-first (see eventFilter) and never goes stale.
-        self._preview_action = None
-        self._focused = None
-        self._hovered = None
+        # The chosen delivery MODE ('stripped'/'unicode'), or None until a radio is
+        # picked. Picking one previews its delivered form in the mirror and ARMS the
+        # single deliver button (disabled until then), so the delivered form is always
+        # seen before delivery is possible. _delay is the anti-fat-finger countdown
+        # (seconds) started on each mode pick; the deliver button stays disabled while it
+        # runs. Reject is never gated.
+        self._selected_action = None
         self._kind = _KINDS['paste']
         self._remaining = 0
-        # True while the anti-fat-finger countdown is up: the delivery buttons stay
-        # ENABLED (so focusing/hovering one previews its delivered form -- the whole
-        # point of the countdown window), but a delivery CLICK is ignored until it
-        # elapses. Reject is never gated.
-        self._gated = False
+        self._delay = 0
         self._countdown = QTimer(self)
         self._countdown.timeout.connect(self._tick)
         self.setObjectName('reviewbar')
@@ -147,36 +189,75 @@ class ReviewBar(QWidget):
         # summary row: a red dot, the "what is hidden" headline, and the choices
         row = QHBoxLayout()
         row.setSpacing(8)
-        dot = QLabel(self)
-        dot.setFixedSize(14, 14)
-        dot.setStyleSheet('background-color:%s; border-radius:7px;' % RISK_FG)
-        row.addWidget(dot)
+        # The risk dot recolours per review: RISK_FG when something is hidden, SAFE_FG
+        # for an ASCII-only all-clear (set in show_review), so the dot never contradicts
+        # the summary.
+        self._dot = QLabel(self)
+        self._dot.setFixedSize(14, 14)
+        self._dot.setStyleSheet('background-color:%s; border-radius:7px;' % RISK_FG)
+        row.addWidget(self._dot)
+        # Selectable so the user can copy the summary + table text to ask about it.
         self._summary = QLabel('', self)
         self._summary.setStyleSheet('font-weight:bold;')
         self._summary.setWordWrap(True)
+        self._summary.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self._summary, 1)
-        # Only Reject is coloured (green): it is the one unconditionally-safe choice
-        # (nothing crosses). The two DELIVERY buttons carry NO colour on purpose --
-        # neither delivery is safe in general (stripping DE-OBFUSCATES a homoglyph
-        # command, keeping preserves the deception), so a "safe" tint on either would
-        # mislead. The mirror (delivered-form-on-focus) is where the truth is shown.
+        # Only Reject is coloured (safe-green): it is the one unconditionally-safe choice
+        # (nothing crosses) and is never gated -- Enter/Esc always back out. The single
+        # DELIVER button carries NO colour (neither delivery is safe in general -- a strip
+        # DE-OBFUSCATES a homoglyph command, a keep preserves the deception) and stays
+        # DISABLED until a mode radio is picked and the countdown elapses; the mirror is
+        # where the truth (the delivered form) is shown.
         self._reject = QPushButton('Reject', self)
         self._reject.setStyleSheet('color:%s; font-weight:600;' % SAFE_FG)
         self._reject.clicked.connect(lambda: self._choose('reject'))
         row.addWidget(self._reject)
-        self._stripped = QPushButton('Paste (ASCII)', self)
-        self._stripped.clicked.connect(lambda: self._choose('stripped'))
-        row.addWidget(self._stripped)
-        self._unicode = QPushButton('Paste (unicode)', self)
-        self._unicode.clicked.connect(lambda: self._choose('unicode'))
-        row.addWidget(self._unicode)
+        self._deliver = QPushButton('Paste', self)
+        self._deliver.setEnabled(False)
+        self._deliver.clicked.connect(self._deliver_clicked)
+        row.addWidget(self._deliver)
         outer.addLayout(row)
 
-        # Focusing or hovering a delivery button previews its OUTCOME in the mirror.
-        # The action buttons are countdown-gated, so the user has time to focus one
-        # and SEE what it delivers before it becomes clickable.
-        self._stripped.installEventFilter(self)
-        self._unicode.installEventFilter(self)
+        # The held text, EDITABLE before delivery: the user can trim the risky part.
+        # Every edit re-runs the classifier (summary + breakdown) and re-renders the
+        # mirror, and delivery sends EXACTLY this buffer (re-sanitized per the chosen
+        # action), so what is shown is what crosses -- an edit cannot bypass the
+        # neutralization. NoWrap so a long line is not visually re-flowed under the eye.
+        self._edit = QPlainTextEdit(self)
+        self._edit.setMaximumHeight(70)
+        self._edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._edit.textChanged.connect(self._on_edit)
+        outer.addWidget(self._edit)
+
+        # The breakdown beneath the summary: a Structure section (lines, the never-auto-
+        # run guarantee, length) and a per-class hidden-character table. Rich text so a
+        # glyph can carry its risk colour; selectable so the user can copy any of it.
+        # Populated per review in _set_detail (empty text collapses it to nothing).
+        self._detail = QLabel('', self)
+        self._detail.setTextFormat(Qt.TextFormat.RichText)
+        self._detail.setWordWrap(True)
+        self._detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        outer.addWidget(self._detail)
+
+        # The delivery MODE, chosen by radio with NO default: picking one previews its
+        # delivered form in the mirror (below) and arms the deliver button. Exclusive.
+        radio_row = QHBoxLayout()
+        radio_row.setSpacing(12)
+        radio_row.addWidget(QLabel('Deliver as:', self))
+        self._radio_strip = QRadioButton(_RADIO_STRIP, self)
+        self._radio_keep = QRadioButton(_RADIO_KEEP, self)
+        self._radio_group = QButtonGroup(self)
+        self._radio_group.setExclusive(True)
+        self._radio_group.addButton(self._radio_strip)
+        self._radio_group.addButton(self._radio_keep)
+        self._radio_strip.clicked.connect(lambda: self._on_radio('stripped'))
+        self._radio_keep.clicked.connect(lambda: self._on_radio('unicode'))
+        radio_row.addWidget(self._radio_strip)
+        radio_row.addWidget(self._radio_keep)
+        radio_row.addStretch(1)
+        outer.addLayout(radio_row)
 
         # The single mirror pane: a read-only terminal view that renders the held
         # text through the SAME pipeline as the tab, so risk-class colouring and
@@ -195,48 +276,151 @@ class ReviewBar(QWidget):
         self._term = term
         self._raw = raw
         self._kind = _KINDS.get(kind, _KINDS['paste'])
-
-        # classify_paste is the one uncapped materialization left in show_review: on a
-        # 50-100MB clipboard it scans for tens of seconds on the Qt thread BEFORE the
-        # bar (and its Reject button) can appear, while terminal input is already
-        # suspended -- a hung window the user cannot even reject from. Cap its input to
-        # the same budget the mirror uses; a hidden char beyond the cap is then
-        # uncounted, but the truncation notice below fires (raw > _RAW_MAX), so the
-        # partial count is disclosed, not silent.
-        parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
-                 for label, n in classify_paste(raw[:self._mirror._RAW_MAX])]
-        summary = (self._kind['summary'] % ', '.join(parts)
-                   if parts else self._kind['summary_empty'])
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
-        # each review opens on the raw text, with no button focused or hovered
-        self._preview_action = None
-        self._focused = None
-        self._hovered = None
-        self._render_mirror(term)         # caps a huge render; sets _preview_truncated
-        # The mirror bounds its RENDER (render_preview) so a multi-MB paste -- unicode
-        # badges expand ~30x -- cannot hang the pane, and classify_paste above scans
-        # only the same first _RAW_MAX chars. Delivery still sends the WHOLE text, so a
-        # truncated review must SAY that BOTH the shown text AND the hidden-char count
-        # are partial, in unspoofable chrome (this label, not the terminal pane a paste
-        # could forge) -- otherwise a definite-looking "0 hidden" count past the cutoff
-        # would understate. The user can then reject what they cannot verify. Keyed off
-        # the actual render, not a raw length.
-        if getattr(self._mirror, '_preview_truncated', False):
-            summary += ('  [truncated: only the first {:,} characters are shown and '
-                        'scanned for hidden characters -- the FULL paste still '
-                        'delivers; Reject if you cannot verify the rest]'
-                        .format(self._mirror._RAW_MAX))
-        self._summary.setText(summary)
-
-        self._remaining = max(0, int(delay))
-        self._gate(self._remaining > 0)
-        self._tick_labels()
-        if self._remaining > 0:
-            self._countdown.start(1000)
+        # each review opens with NO mode picked: the mirror shows the hint and the
+        # deliver button is disabled until a radio is chosen.
+        self._selected_action = None
+        self._delay = max(0, int(delay))
+        self._remaining = 0
+        self._countdown.stop()
+        # Clear both radios. An exclusive group will not let setChecked(False) uncheck
+        # the checked one, so drop exclusivity to clear, then restore it.
+        self._radio_group.setExclusive(False)
+        self._radio_strip.setChecked(False)
+        self._radio_keep.setChecked(False)
+        self._radio_group.setExclusive(True)
+        # Show the held text in the editable field; block the change signal so
+        # populating it here does not recurse into _on_edit.
+        self._edit.blockSignals(True)
+        self._edit.setPlainText(raw)
+        self._edit.blockSignals(False)
+        self._refresh_review()
+        self._update_deliver()
         self.setVisible(True)
         self._reject.setDefault(True)
         self._reject.setFocus()
+
+    def _on_edit(self):
+        """The user edited the held text: adopt it and refresh everything from it, so
+        the summary, breakdown, mirror -- and what delivery sends -- all track the
+        edited buffer."""
+        self._raw = self._edit.toPlainText()
+        self._refresh_review()          # keeps the selected mode; re-previews its outcome
+
+    def _refresh_review(self):
+        """Recompute the summary, breakdown and mirror from the CURRENT held text
+        (self._raw). Called on show and on every edit, so the bar always reflects
+        exactly what delivery will send.
+
+        classify_paste[_detail] cap their input to the mirror's budget: on a 50-100MB
+        clipboard a full scan would run for tens of seconds on the Qt thread while
+        terminal input is already suspended -- a hung window the user cannot even reject
+        from. A hidden char beyond the cap is then uncounted, but the truncation notice
+        fires (raw > _RAW_MAX), so the partial count is DISCLOSED, not silent."""
+        term = self._term
+        if term is None:
+            return
+        capped = self._raw[:self._mirror._RAW_MAX]
+        detail = classify_paste_detail(capped)
+        parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
+                 for label, n in classify_paste(capped)]
+        # Render the RAW purely to detect truncation (the render overflow -- badge
+        # expansion can trip it even for a source under the cap); the visible content is
+        # painted AFTER, so the raw is never actually shown.
+        self._render_mirror(term, self._raw)
+        truncated = bool(getattr(self._mirror, '_preview_truncated', False))
+        hidden = sum(detail['counts'].values())
+        # A confident ASCII-only all-clear (green dot + positive summary) ONLY when the
+        # WHOLE paste was scanned: a truncated scan cannot promise nothing hides past the
+        # cap, so it keeps the cautious summary and the truncation notice below.
+        if hidden == 0 and not truncated:
+            summary = _CLEAN_MSG
+            dot_fg = SAFE_FG
+        else:
+            summary = (self._kind['summary'] % ', '.join(parts)
+                       if parts else self._kind['summary_empty'])
+            dot_fg = RISK_FG
+        self._dot.setStyleSheet('background-color:%s; border-radius:7px;' % dot_fg)
+        # Delivery sends the WHOLE buffer, so a truncated review must SAY that both the
+        # shown text AND the counts are partial, in unspoofable chrome (this label, not
+        # the terminal pane a paste could forge). full_note names the real action per
+        # direction (paste delivers / copy reaches the clipboard).
+        if truncated:
+            summary += ('  [truncated: only the first {:,} characters are shown and '
+                        'scanned for hidden characters -- {}; Reject if you cannot '
+                        'verify the rest]'.format(self._mirror._RAW_MAX,
+                                                  self._kind['full_note']))
+        self._summary.setText(summary)
+        self._set_detail(detail, term, truncated)
+        # Paint what the pane SHOWS: the selected mode's delivered form once a radio is
+        # picked, or -- until then -- the hint (so the mirror is never mistaken for the
+        # outcome). This overwrites the raw render above before the widget repaints.
+        if self._selected_action in ('stripped', 'unicode'):
+            self._render_mirror(term, self._delivered(self._selected_action))
+        else:
+            self._render_mirror(term, _MIRROR_HINT, markings=False)
+
+    def _set_detail(self, detail, term, truncated):
+        """Populate the breakdown label from a classify_paste_detail result: a Structure
+        section (lines, the never-auto-run guarantee for a paste, length) and a per-class
+        hidden-character table. Each present class's glyph carries its ON-SCREEN marking
+        colour (SecureTerminal.MARKING_COLORS) so the table and the terminal never
+        disagree; absent classes stay muted, so what is NOT present is explicit. Rich
+        text via <font> tags, which Qt's QLabel renders reliably."""
+        theme = getattr(term, '_theme', 'dark')
+        palette = SecureTerminal.MARKING_COLORS.get(
+            theme, SecureTerminal.MARKING_COLORS['dark'])
+
+        def _row(glyph, color, name, value):
+            return ('<tr><td><font color="%s">%s</font></td>'
+                    '<td>&nbsp;%s&nbsp;&nbsp;</td><td>%s</td></tr>'
+                    % (color, glyph, name, value))
+
+        # On a truncated review the counts are of the SCANNED PREFIX, not the full
+        # paste (which still delivers whole), so mark them ">= N" rather than present
+        # the cap as a definite total.
+        multiline = detail['multiline']
+        plus = '+' if truncated else ''
+        note = ' &nbsp;(multi-line -- runs more than one command)' if multiline else ''
+        lines_val = '%d%s%s' % (detail['lines'], plus, note)
+        struct = [_row(_LINES_GLYPH,
+                       palette['invisible']['fg'] if multiline else _MUTED_FG,
+                       'Lines', lines_val)]
+        if self._kind.get('paste_newline'):
+            # never-auto-run is UNCONDITIONAL for a reviewed paste: at a shell prompt the
+            # trailing submit CR is stripped (paste_no_autosubmit); a bracketed program
+            # receives the paste as inert text. Either way it cannot run on its own, so
+            # this row always states the safe guarantee (only the wording varies).
+            bracketed = (hasattr(term, '_bracketed_paste_active')
+                         and term._bracketed_paste_active())
+            note = ('your program receives it as text' if bracketed
+                    else 'waits on the command line -- press Enter to run')
+            struct.append(_row(_SAFE_GLYPH, SAFE_FG, 'If accepted', note))
+        length = ('%d+ characters (scanned prefix; full paste is larger)'
+                  % detail['chars'] if truncated
+                  else '%d characters (%d bytes)'
+                  % (detail['chars'], detail['bytes']))
+        struct.append(_row('', _MUTED_FG, 'Length', length))
+
+        counts = detail['counts']
+        if sum(counts.values()) == 0 and not truncated:
+            chars_html = '<font color="%s">(none)</font>' % _MUTED_FG
+        else:
+            crows = []
+            for key, glyph, label in _CLASS_ROWS:
+                n = counts.get(key, 0)
+                present = n > 0
+                color = (palette[key]['fg'] if present and key != 'structural'
+                         else _MUTED_FG)
+                count_txt = ('<b>%d</b>' % n) if present else str(n)
+                crows.append(_row(glyph, color, label, count_txt))
+            chars_html = ('<table cellspacing="0" cellpadding="1">%s</table>'
+                          % ''.join(crows))
+        self._detail.setText(
+            '<b>Structure</b>'
+            '<table cellspacing="0" cellpadding="1">%s</table>'
+            '<b>Hidden characters</b>%s' % (''.join(struct), chars_html))
 
     def _delivered(self, action):
         """The full sanitized text `action` would deliver, formatted for display -- so
@@ -281,15 +465,13 @@ class ReviewBar(QWidget):
             sent = sent.replace('\r', '\n')
         return sent
 
-    def _render_mirror(self, term):
-        """Render into the mirror pane the way the reviewed tab would -- its CURRENT
-        display mode, theme, font and zoom. When a delivery action is being previewed
-        (_preview_action set by focusing/hovering its button) the mirror shows that
-        action's DELIVERED form; otherwise the RAW held text. Risk-class colouring is
-        forced ON (markings=True) even if the tab has it off -- the review pane exists
-        to REVEAL risk. The line path is used deliberately: a review surface must SHOW
-        control/hidden characters (named, tinted, click-to-inspect), not run them
-        through a pyte grid that would consume them."""
+    def _render_mirror(self, term, content, markings=True):
+        """Render `content` into the mirror the way the reviewed tab would -- its CURRENT
+        display mode, theme, font and zoom. Risk-class colouring is forced ON (markings)
+        even if the tab has it off -- the review pane exists to REVEAL risk. The line path
+        is used deliberately: a review surface must SHOW control/hidden characters (named,
+        tinted, click-to-inspect), not run them through a pyte grid that would consume
+        them. Also sets self._mirror._preview_truncated for the caller."""
         theme = getattr(term, '_theme', 'dark')
         family = term.current_font_family() \
             if hasattr(term, 'current_font_family') else None
@@ -299,40 +481,7 @@ class ReviewBar(QWidget):
             self._mirror.set_font_family(family)
         if hasattr(term, 'current_zoom'):
             self._mirror.apply_zoom(term.current_zoom())   # follow the tab's zoom
-        text = self._delivered(self._preview_action) \
-            if self._preview_action in ('stripped', 'unicode') else self._raw
-        self._mirror.render_preview(text, mode=mode, markings=True)
-
-    def _set_preview(self, action):
-        """Switch the mirror between the raw held text (action=None) and a delivery
-        action's outcome, re-rendering only on a real change."""
-        if action == self._preview_action or self._term is None:
-            return
-        self._preview_action = action
-        self._render_mirror(self._term)
-
-    def eventFilter(self, obj, event):
-        # Track focus and hover on the two delivery buttons from their events, then
-        # derive the previewed action FOCUS-FIRST. Keyboard Enter/Space commits the
-        # FOCUSED button, so the mirror must show that button's outcome whenever one
-        # is focused -- otherwise un-hovering a button while its sibling keeps focus
-        # would leave the mirror stale on the un-hovered outcome, letting Enter
-        # dispatch a payload the mirror is not showing. Re-derived on EVERY event so
-        # the preview can never go stale.
-        action = ('stripped' if obj is self._stripped
-                  else 'unicode' if obj is self._unicode else None)
-        if action is not None:
-            et = event.type()
-            if et == QEvent.Type.FocusIn:
-                self._focused = action
-            elif et == QEvent.Type.FocusOut and self._focused == action:
-                self._focused = None
-            elif et == QEvent.Type.Enter:
-                self._hovered = action
-            elif et == QEvent.Type.Leave and self._hovered == action:
-                self._hovered = None
-            self._set_preview(self._focused or self._hovered)
-        return super().eventFilter(obj, event)
+        self._mirror.render_preview(content, mode=mode, markings=markings)
 
     def rerender_mirror(self):
         """Re-render the mirror to follow a live change (mode/theme/font/zoom) on
@@ -341,7 +490,7 @@ class ReviewBar(QWidget):
         mode/theme/font setters."""
         if self._term is None:
             return
-        self._render_mirror(self._term)
+        self._refresh_review()
 
     def hide_review(self):
         """Hide the bar and stop the countdown; called when the text is resolved."""
@@ -355,20 +504,59 @@ class ReviewBar(QWidget):
         return self._term
 
     # -- internals ------------------------------------------------------------
+    def _on_radio(self, action):
+        """A delivery MODE was picked: preview its delivered form in the mirror and start
+        the anti-fat-finger countdown that arms the deliver button. Switching modes
+        re-previews and restarts the countdown, so the shown outcome and the armed button
+        always match."""
+        self._selected_action = action
+        self._remaining = self._delay
+        if self._remaining > 0:
+            self._countdown.start(1000)
+        else:
+            self._countdown.stop()
+        self._refresh_review()          # mirror now shows this mode's delivered form
+        self._update_deliver()
+
+    def _update_deliver(self):
+        """Sync the deliver button to the current state: disabled with a hint until a
+        mode is picked, then a countdown, then enabled. Its label names the chosen mode
+        so the button and the previewed outcome cannot disagree."""
+        if self._selected_action not in ('stripped', 'unicode'):
+            self._deliver.setText(self._kind['deliver'])
+            self._deliver.setEnabled(False)
+            self._deliver.setToolTip('Choose "%s" or "%s" first'
+                                     % (_RADIO_STRIP, _RADIO_KEEP))
+            return
+        base = self._kind[self._selected_action]
+        if self._remaining > 0:
+            self._deliver.setText('%s (%d)' % (base, self._remaining))
+            self._deliver.setEnabled(False)
+            self._deliver.setToolTip('Review the preview -- ready in %d s'
+                                     % self._remaining)
+        else:
+            self._deliver.setText(base)
+            self._deliver.setEnabled(True)
+            self._deliver.setToolTip('')
+
+    def _deliver_clicked(self):
+        """The deliver button: send the selected mode. The button is disabled until a
+        mode is picked and the countdown elapses, but re-check in case a click races the
+        timer."""
+        if self._selected_action in ('stripped', 'unicode') and self._remaining <= 0:
+            self._choose(self._selected_action)
+
     def _choose(self, action):
         # Single-shot: clear _term before dispatching so a second click (a
         # double-click, or Esc right after) is a no-op.
         term = self._term
         if term is None:
             return
-        # Anti-fat-finger: while the countdown is up, a DELIVERY choice is ignored (the
-        # buttons stay enabled only so the preview works). Reject is never gated -- it
-        # is the safe choice, and Esc/Enter must always be able to back out.
-        if self._gated and action in ('stripped', 'unicode'):
-            return
         self._term = None
         self._countdown.stop()
-        getattr(term, self._kind['dispatch'])(action)
+        # Deliver the CURRENT (possibly edited) buffer, not the originally held text --
+        # still sanitized on the way out, so an edit cannot bypass the neutralization.
+        getattr(term, self._kind['dispatch'])(action, self._raw)
         # HIDE the bar directly: this bar made a definitive choice on the term it was
         # showing, so it must close. We cannot rely on the paste_review_resolved ->
         # _hide_paste_review path here, because that path guards on reviewed_term()
@@ -377,25 +565,11 @@ class ReviewBar(QWidget):
         # the bar would stay open after the click.
         self.hide_review()
 
-    def _gate(self, disabled):
-        # Do NOT setEnabled(False): a DISABLED Qt button cannot take keyboard focus and
-        # does not reliably receive hover, so the delivered-form preview (focus/hover a
-        # delivery button) would be dead during the very countdown it exists for. Keep
-        # the buttons enabled -- so the preview works -- and gate the CLICK in _choose.
-        # The "(N)" countdown suffix on the labels is the visible not-yet cue.
-        self._gated = disabled
-
-    def _tick_labels(self):
-        suffix = ' (%d)' % self._remaining if self._remaining > 0 else ''
-        self._stripped.setText(self._kind['stripped'] + suffix)
-        self._unicode.setText(self._kind['unicode'] + suffix)
-
     def _tick(self):
         if self._remaining > 0:
             self._remaining -= 1
-        self._tick_labels()
+        self._update_deliver()
         if self._remaining <= 0:
-            self._gate(False)
             self._countdown.stop()
 
     def keyPressEvent(self, event):
