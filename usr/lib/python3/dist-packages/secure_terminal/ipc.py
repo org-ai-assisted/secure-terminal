@@ -21,6 +21,7 @@ import os
 import json
 import socket
 import struct
+import time
 
 _APP = 'secure-terminal'
 _MAX_REQUEST = 1 << 20         # 1 MiB frame cap (defensive)
@@ -40,9 +41,31 @@ def socket_path(group='default'):
     return os.path.join(socket_dir(), safe + '.sock')
 
 
+def _makedirs_private(path):
+    """Create `path` and any MISSING parents, each newly-created component at 0o700
+    (mode set explicitly, so umask cannot widen it). An EXISTING component is left
+    untouched -- it may be a system-owned dir (e.g. /run/user/UID) at its own correct
+    mode, which we must not chmod."""
+    parent = os.path.dirname(path)
+    if parent and parent != path and not os.path.isdir(parent):
+        _makedirs_private(parent)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        return                              # already present -> leave its mode alone
+    try:
+        os.chmod(path, 0o700)               # umask may have widened mkdir's mode
+    except OSError:
+        pass
+
+
 def ensure_socket_dir():
     directory = socket_dir()
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+    # os.makedirs(mode=) applies the mode ONLY to the leaf and lets umask widen any
+    # intermediate dir it must create (e.g. a missing $XDG_RUNTIME_DIR base) -- a
+    # world-traversable parent, contradicting the same-UID-only 0700 contract. Create
+    # each missing component explicitly at 0700 instead.
+    _makedirs_private(directory)
     try:
         os.chmod(directory, 0o700)          # enforce owner-only even if pre-existing
     except OSError:
@@ -67,7 +90,11 @@ def send_request(group, request, timeout=1.5):
         return None                         # no server, or a stale socket
     try:
         client.sendall(frame(json.dumps(request).encode('utf-8')))
-        reply = _recv_framed(client)
+        # A cumulative deadline, not a per-recv timeout: settimeout() restarts its window
+        # on every recv, so a trickling same-UID peer (one byte just under the timeout,
+        # repeatedly) could hold this short-lived ctl/launch client open far past `timeout`.
+        # Bound the WHOLE receive by one wall-clock deadline instead.
+        reply = _recv_framed(client, time.monotonic() + timeout)
         # An empty read is a FAILED exchange, not a reply: a primary that has bound
         # the socket but whose Qt event loop is not yet servicing connections accepts
         # the connect (socket_is_live) and can close it with no framed answer. Every
@@ -108,20 +135,30 @@ def socket_is_live(group='default', timeout=0.5):
         client.close()
 
 
-def _recv_framed(sock):
-    head = _recv_exactly(sock, 4)
+def _recv_framed(sock, deadline):
+    head = _recv_exactly(sock, 4, deadline)
     if head is None:
         return b''
     (length,) = struct.unpack('<I', head)
     if length <= 0 or length > _MAX_REQUEST:
         return b''
-    return _recv_exactly(sock, length) or b''
+    return _recv_exactly(sock, length, deadline) or b''
 
 
-def _recv_exactly(sock, count):
+def _recv_exactly(sock, count, deadline):
+    """Read exactly `count` bytes, bounded by an overall wall-clock `deadline`
+    (time.monotonic seconds). Returns None on EOF or once the deadline passes, so a
+    peer that trickles bytes cannot keep the caller blocked past it."""
     buf = b''
     while len(buf) < count:
-        chunk = sock.recv(count - len(buf))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None                     # overall deadline exceeded
+        sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(count - len(buf))
+        except (TimeoutError, socket.timeout):
+            return None                     # no byte within the remaining budget
         if not chunk:
             return None
         buf += chunk
