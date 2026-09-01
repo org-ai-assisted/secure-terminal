@@ -44,7 +44,8 @@ from PyQt6.QtWidgets import (
 )
 
 from secure_terminal.sanitize import (
-    classify_paste, sanitize_paste, sanitize_paste_unicode,
+    classify_paste, classify_paste_detail,
+    sanitize_paste, sanitize_paste_unicode,
     sanitize_clipboard, sanitize_clipboard_display, sanitize_clipboard_unicode,
     paste_no_autosubmit,
 )
@@ -59,6 +60,36 @@ from secure_terminal.terminal import SecureTerminal
 SAFE_FG = '#1f8a54'
 RISK_FG = '#d83933'
 
+# The seven hidden-character classes for the review table, most-alarming first
+# (box-drawing last). Each row: (marking-class key, a monochrome technical glyph, a
+# plain-language label). The glyph is coloured by the class's ON-SCREEN marking colour
+# (SecureTerminal.MARKING_COLORS) so the table and the terminal never disagree, and the
+# text label is ALWAYS shown, so a missing glyph font degrades to readable text rather
+# than a blank. 'structural' (box-drawing) carries no risk tint on screen, so its glyph
+# and count use the muted colour.
+# key -> (code point, plain-language label), most-alarming first (box-drawing last).
+# The glyph is built with chr() so the SOURCE stays ASCII (house convention, like
+# sanitize.BOX = chr 0x25A1); the text label is ALWAYS shown beside it, so a missing
+# glyph font degrades to readable text rather than a blank.
+_CLASS_ROWS = tuple(
+    (key, chr(cp), label) for key, cp, label in (
+        ('bidi',       0x2194, 'Bidirectional control'),   # left-right arrow: reorders
+        ('control',    0x2400, 'Control character'),        # symbol for NULL
+        ('invisible',  0x2423, 'Invisible / zero-width'),   # open box (blank)
+        ('confusable', 0x2248, 'Look-alike (homoglyph)'),   # almost-equal: looks like ASCII
+        ('combining',  0x25CC, 'Combining (Zalgo)'),        # dotted circle: combining base
+        ('nonascii',   0x6587, 'Other non-ASCII'),          # a CJK sample: honest foreign
+        ('structural', 0x253C, 'Box-drawing / blocks'),     # box-drawing cross
+    )
+)
+# Absent classes, the box-drawing row, and the informational Length row: no risk, muted.
+_MUTED_FG = '#888888'
+_LINES_GLYPH = chr(0x00B6)   # pilcrow, for the Lines row
+_SAFE_GLYPH = chr(0x2713)    # check: the never-auto-run guarantee is met
+# Shown (safe-green) when a reviewed paste hides nothing -- a positive all-clear so an
+# ASCII-only paste held for another reason (a multi-line paste) reads as safe.
+_CLEAN_MSG = 'ASCII-only -- nothing hidden.'
+
 # Everything that differs between the two directions. `dispatch` is the tab method
 # the choice is routed to; `strip`/`keep` are the sanitizers the mirror uses to
 # render EXACTLY what each action button would deliver (focusing a delivery button
@@ -71,6 +102,7 @@ _KINDS = {
         'summary': 'This paste hides %s.',
         # shown in "always" mode for a clean paste: no hidden characters to name.
         'summary_empty': 'Review this paste before it reaches the shell.',
+        'full_note': 'the FULL paste still delivers',
         'reject': 'Reject',
         'reject_tip': 'Do not paste (Enter or Esc)',
         'stripped': 'Paste (ASCII)',
@@ -83,6 +115,7 @@ _KINDS = {
     'copy': {
         'summary': 'This copy would carry %s onto the clipboard.',
         'summary_empty': 'Review this copy before it reaches the clipboard.',
+        'full_note': 'the FULL copy still reaches the clipboard',
         'reject': "Don't copy",
         'reject_tip': 'Do not copy (Enter or Esc)',
         'stripped': 'Copy (ASCII)',
@@ -100,6 +133,7 @@ _KINDS = {
     'clipboard': {
         'summary': 'This clipboard text hides %s.',
         'summary_empty': 'Review the clipboard text.',
+        'full_note': 'the FULL clipboard text is still used',
         'reject': 'Leave it',
         'reject_tip': 'Leave the clipboard unchanged (Enter or Esc)',
         'stripped': 'Replace (ASCII)',
@@ -147,13 +181,19 @@ class ReviewBar(QWidget):
         # summary row: a red dot, the "what is hidden" headline, and the choices
         row = QHBoxLayout()
         row.setSpacing(8)
-        dot = QLabel(self)
-        dot.setFixedSize(14, 14)
-        dot.setStyleSheet('background-color:%s; border-radius:7px;' % RISK_FG)
-        row.addWidget(dot)
+        # The risk dot recolours per review: RISK_FG when something is hidden, SAFE_FG
+        # for an ASCII-only all-clear (set in show_review), so the dot never contradicts
+        # the summary.
+        self._dot = QLabel(self)
+        self._dot.setFixedSize(14, 14)
+        self._dot.setStyleSheet('background-color:%s; border-radius:7px;' % RISK_FG)
+        row.addWidget(self._dot)
+        # Selectable so the user can copy the summary + table text to ask about it.
         self._summary = QLabel('', self)
         self._summary.setStyleSheet('font-weight:bold;')
         self._summary.setWordWrap(True)
+        self._summary.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self._summary, 1)
         # Only Reject is coloured (green): it is the one unconditionally-safe choice
         # (nothing crosses). The two DELIVERY buttons carry NO colour on purpose --
@@ -171,6 +211,17 @@ class ReviewBar(QWidget):
         self._unicode.clicked.connect(lambda: self._choose('unicode'))
         row.addWidget(self._unicode)
         outer.addLayout(row)
+
+        # The breakdown beneath the summary: a Structure section (lines, the never-auto-
+        # run guarantee, length) and a per-class hidden-character table. Rich text so a
+        # glyph can carry its risk colour; selectable so the user can copy any of it.
+        # Populated per review in _set_detail (empty text collapses it to nothing).
+        self._detail = QLabel('', self)
+        self._detail.setTextFormat(Qt.TextFormat.RichText)
+        self._detail.setWordWrap(True)
+        self._detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        outer.addWidget(self._detail)
 
         # Focusing or hovering a delivery button previews its OUTCOME in the mirror.
         # The action buttons are countdown-gated, so the user has time to focus one
@@ -196,17 +247,17 @@ class ReviewBar(QWidget):
         self._raw = raw
         self._kind = _KINDS.get(kind, _KINDS['paste'])
 
-        # classify_paste is the one uncapped materialization left in show_review: on a
-        # 50-100MB clipboard it scans for tens of seconds on the Qt thread BEFORE the
-        # bar (and its Reject button) can appear, while terminal input is already
-        # suspended -- a hung window the user cannot even reject from. Cap its input to
-        # the same budget the mirror uses; a hidden char beyond the cap is then
-        # uncounted, but the truncation notice below fires (raw > _RAW_MAX), so the
-        # partial count is disclosed, not silent.
+        # classify_paste[_detail] are the uncapped materializations in show_review: on a
+        # 50-100MB clipboard a full scan runs for tens of seconds on the Qt thread BEFORE
+        # the bar (and its Reject button) can appear, while terminal input is already
+        # suspended -- a hung window the user cannot even reject from. Cap the input to
+        # the same budget the mirror uses; a hidden char beyond the cap is then uncounted,
+        # but the truncation notice below fires (raw > _RAW_MAX), so the partial count is
+        # disclosed, not silent.
+        capped = raw[:self._mirror._RAW_MAX]
+        detail = classify_paste_detail(capped)
         parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
-                 for label, n in classify_paste(raw[:self._mirror._RAW_MAX])]
-        summary = (self._kind['summary'] % ', '.join(parts)
-                   if parts else self._kind['summary_empty'])
+                 for label, n in classify_paste(capped)]
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
         # each review opens on the raw text, with no button focused or hovered
@@ -214,20 +265,32 @@ class ReviewBar(QWidget):
         self._focused = None
         self._hovered = None
         self._render_mirror(term)         # caps a huge render; sets _preview_truncated
-        # The mirror bounds its RENDER (render_preview) so a multi-MB paste -- unicode
-        # badges expand ~30x -- cannot hang the pane, and classify_paste above scans
-        # only the same first _RAW_MAX chars. Delivery still sends the WHOLE text, so a
-        # truncated review must SAY that BOTH the shown text AND the hidden-char count
-        # are partial, in unspoofable chrome (this label, not the terminal pane a paste
-        # could forge) -- otherwise a definite-looking "0 hidden" count past the cutoff
-        # would understate. The user can then reject what they cannot verify. Keyed off
-        # the actual render, not a raw length.
-        if getattr(self._mirror, '_preview_truncated', False):
+        truncated = bool(getattr(self._mirror, '_preview_truncated', False))
+        hidden = sum(detail['counts'].values())
+        # A confident ASCII-only all-clear (green dot + positive summary) ONLY when the
+        # WHOLE paste was scanned: a truncated scan cannot promise nothing hides past the
+        # cap, so it keeps the cautious summary and the truncation notice below.
+        if hidden == 0 and not truncated:
+            summary = _CLEAN_MSG
+            dot_fg = SAFE_FG
+        else:
+            summary = (self._kind['summary'] % ', '.join(parts)
+                       if parts else self._kind['summary_empty'])
+            dot_fg = RISK_FG
+        self._dot.setStyleSheet('background-color:%s; border-radius:7px;' % dot_fg)
+        # The mirror bounds its RENDER (render_preview) so a multi-MB paste cannot hang
+        # the pane, and the scan above reads only the same first _RAW_MAX chars. Delivery
+        # still sends the WHOLE text, so a truncated review must SAY that both the shown
+        # text AND the hidden-char count are partial, in unspoofable chrome (this label,
+        # not the terminal pane a paste could forge). full_note names the real action
+        # per direction (paste delivers / copy reaches the clipboard).
+        if truncated:
             summary += ('  [truncated: only the first {:,} characters are shown and '
-                        'scanned for hidden characters -- the FULL paste still '
-                        'delivers; Reject if you cannot verify the rest]'
-                        .format(self._mirror._RAW_MAX))
+                        'scanned for hidden characters -- {}; Reject if you cannot '
+                        'verify the rest]'.format(self._mirror._RAW_MAX,
+                                                  self._kind['full_note']))
         self._summary.setText(summary)
+        self._set_detail(detail, term, truncated)
 
         self._remaining = max(0, int(delay))
         self._gate(self._remaining > 0)
@@ -237,6 +300,60 @@ class ReviewBar(QWidget):
         self.setVisible(True)
         self._reject.setDefault(True)
         self._reject.setFocus()
+
+    def _set_detail(self, detail, term, truncated):
+        """Populate the breakdown label from a classify_paste_detail result: a Structure
+        section (lines, the never-auto-run guarantee for a paste, length) and a per-class
+        hidden-character table. Each present class's glyph carries its ON-SCREEN marking
+        colour (SecureTerminal.MARKING_COLORS) so the table and the terminal never
+        disagree; absent classes stay muted, so what is NOT present is explicit. Rich
+        text via <font> tags, which Qt's QLabel renders reliably."""
+        theme = getattr(term, '_theme', 'dark')
+        palette = SecureTerminal.MARKING_COLORS.get(
+            theme, SecureTerminal.MARKING_COLORS['dark'])
+
+        def _row(glyph, color, name, value):
+            return ('<tr><td><font color="%s">%s</font></td>'
+                    '<td>&nbsp;%s&nbsp;&nbsp;</td><td>%s</td></tr>'
+                    % (color, glyph, name, value))
+
+        multiline = detail['multiline']
+        lines_val = ('%d &nbsp;(multi-line -- runs more than one command)'
+                     % detail['lines'] if multiline else '%d' % detail['lines'])
+        struct = [_row(_LINES_GLYPH,
+                       palette['invisible']['fg'] if multiline else _MUTED_FG,
+                       'Lines', lines_val)]
+        if self._kind.get('paste_newline'):
+            # never-auto-run is UNCONDITIONAL for a reviewed paste: at a shell prompt the
+            # trailing submit CR is stripped (paste_no_autosubmit); a bracketed program
+            # receives the paste as inert text. Either way it cannot run on its own, so
+            # this row always states the safe guarantee (only the wording varies).
+            bracketed = (hasattr(term, '_bracketed_paste_active')
+                         and term._bracketed_paste_active())
+            note = ('your program receives it as text' if bracketed
+                    else 'waits on the command line -- press Enter to run')
+            struct.append(_row(_SAFE_GLYPH, SAFE_FG, 'If accepted', note))
+        struct.append(_row('', _MUTED_FG, 'Length', '%d characters (%d bytes)'
+                           % (detail['chars'], detail['bytes'])))
+
+        counts = detail['counts']
+        if sum(counts.values()) == 0 and not truncated:
+            chars_html = '<font color="%s">(none)</font>' % _MUTED_FG
+        else:
+            crows = []
+            for key, glyph, label in _CLASS_ROWS:
+                n = counts.get(key, 0)
+                present = n > 0
+                color = (palette[key]['fg'] if present and key != 'structural'
+                         else _MUTED_FG)
+                count_txt = ('<b>%d</b>' % n) if present else str(n)
+                crows.append(_row(glyph, color, label, count_txt))
+            chars_html = ('<table cellspacing="0" cellpadding="1">%s</table>'
+                          % ''.join(crows))
+        self._detail.setText(
+            '<b>Structure</b>'
+            '<table cellspacing="0" cellpadding="1">%s</table>'
+            '<b>Hidden characters</b>%s' % (''.join(struct), chars_html))
 
     def _delivered(self, action):
         """The full sanitized text `action` would deliver, formatted for display -- so
