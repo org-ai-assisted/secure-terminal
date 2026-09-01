@@ -483,21 +483,29 @@ def tui_available():
 
 
 def _argv_for_command(command):
-    """Build the child's argv from `command`: a list/tuple is used verbatim (the
-    "-- prog args" CLI form, no shell reparse), a string is split like a shell word
-    list ("ssh -p 22 host"), none/empty -> []. A MALFORMED string (e.g. an unbalanced
-    quote) also yields [] rather than raising: raised in the pty.fork child it would
-    print an uncaught traceback the parent then masks as a normal exit -- so fall back
-    to the login shell exactly as an empty command does. Caller substitutes the shell
-    for an empty argv."""
+    """Build the child's argv from `command`, distinguishing three cases so a broken
+    command NEVER silently becomes a login shell:
+      - a list/tuple -> used verbatim (the "-- prog args" CLI form, no shell reparse);
+      - a string -> split like a shell word list ("ssh -p 22 host");
+      - none/empty -> [] (the deliberate "no command" case; caller substitutes shell);
+      - a MALFORMED string (unbalanced quote), a whitespace-only string (" " -> no
+        words), or one whose FIRST word is empty ('""' -> ['']) -> None (FAIL CLOSED).
+    None is distinct from [] on purpose: a locked-down launch (run ONLY this program)
+    must not drop to a shell on a typo, a whitespace command, or an empty program name.
+    The caller exits the child rather than spawn a shell for None; raising here instead
+    would traceback in the pty.fork child, which the parent masks as a normal exit."""
     if isinstance(command, (list, tuple)):
         return [str(a) for a in command]
     if not command:
         return []
     try:
-        return shlex.split(command)
+        parsed = shlex.split(command)
     except ValueError:
-        return []
+        return None
+    # A non-empty string that shell-splits to no words (whitespace only) or whose first
+    # word is empty ('""') names no program: a command WAS given but is unrunnable, so
+    # fail closed rather than fall through to the shell.
+    return parsed if (parsed and parsed[0]) else None
 
 
 # Directories a bell sound file may live in. Restricting to these keeps the
@@ -885,6 +893,7 @@ class SecureTerminal(QPlainTextEdit):
         # render, so restored scrollback is drawn once under the final wrap mode.
         self._sync_wrap_mode()
         self._command = command
+        self._command_malformed = False   # set by _start: a malformed/whitespace command
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -2823,6 +2832,13 @@ class SecureTerminal(QPlainTextEdit):
     # -- child process over a pseudo-terminal ---------------------------------
     def _start(self, command):
         term, terminfo_dir = self._child_term()
+        # Parse in the PARENT so a malformed / whitespace-degenerate command (argv is
+        # None) is known here, on EVERY path (CLI, IPC, GUI new-tab, session restore):
+        # it must never become a login shell. restart_as_shell() refuses a malformed
+        # tab, so the 127-exiting child below closes the tab instead of dropping to a
+        # shell. The CLI (_parse_launch_args) additionally exits with a message pre-Qt.
+        argv = _argv_for_command(command)
+        self._command_malformed = argv is None
         pid, fd = pty.fork()
         if pid == 0:  # pragma: no cover
             # (no cover: this branch runs in the pty.fork child and immediately
@@ -2850,7 +2866,12 @@ class SecureTerminal(QPlainTextEdit):
             # fingerprint. Programs then emit truecolor instead of down-mapping.
             os.environ['COLORTERM'] = 'truecolor'
             os.environ.setdefault('PAGER', 'cat')
-            argv = _argv_for_command(command)   # [] for none/malformed -> login shell
+            if argv is None:
+                # Malformed / whitespace-degenerate command (argv computed in the
+                # parent): fail closed -- exit 127, never a shell. restart_as_shell()
+                # refuses this tab (self._command_malformed), so it CLOSES rather than
+                # dropping to a login shell on IPC / GUI / a hand-edited session path.
+                os._exit(127)
             if not argv:
                 argv = [os.environ.get('SHELL') or '/bin/bash']
             if self._cwd:
@@ -3525,7 +3546,10 @@ class SecureTerminal(QPlainTextEdit):
         tab keeps the exited program's output above the new prompt as scrollback; a
         TUI tab's transient alt-screen frame is discarded (as a real terminal drops it
         on rmcup) and the grid shows the handover banner then the new shell."""
-        if self._command is None or self._fd is None:
+        if self._command is None or self._fd is None or self._command_malformed:
+            # _command_malformed: the launch command was malformed / whitespace-only, so
+            # its child exited 127 -- do NOT drop to a login shell (a locked-down launch
+            # must fail closed). The caller closes the tab instead.
             return False
         # SECURITY: drop any pending paste/copy review FIRST. Its held (reviewed) text
         # must never become dispatchable to the NEW shell -- a reviewed multiline paste
@@ -5074,13 +5098,23 @@ class SecureTerminal(QPlainTextEdit):
         Under an interactive shell's normal JOB CONTROL a launched program / subshell /
         sudo -i root shell runs in its own pgrp, so has_foreground_program() reads True
         and we refuse; tui_active() additionally catches any full-screen program (vim,
-        a pager, ssh's session) regardless of job control. RESIDUAL: a non-TUI
-        stdin-reader under a shell with job control OFF (atypical: `set +m`) shares the
-        shell's pgrp, so neither check sees it -- there is no reliable per-process
-        signal there (a /proc child-scan false-positives on background jobs). If a
-        program owns the tty the reviewed context is gone, so DROP the remainder rather
-        than deliver a reviewed line into it. An empty held line (a blank line in the
-        paste) writes nothing but is still consumed."""
+        a pager, ssh's session) regardless of job control. RESIDUAL (accepted): a shell
+        BUILTIN that reads stdin -- `read`, or a here-doc the shell itself consumes --
+        runs IN the shell process (no fork), so it shares the shell's pgrp and neither
+        check sees it; a held line inserted while it blocks is swallowed as that read's
+        INPUT, not landed at a fresh prompt. NOT limited to `set +m`: a builtin never
+        forks, so job control cannot separate it. No reliable signal distinguishes an
+        idle prompt from a blocked `read` -- pgrp is identical (both are the shell); the
+        tty line-discipline (ICANON) fails too, measured across shells: dash's PROMPT is
+        already canonical (== its read), and bash/zsh `read -n`/`read -e` read RAW like
+        the prompt, so ICANON both false-positives (dash) and is evadable (`read -n`).
+        Bounded impact: the WHOLE paste is reviewed (nothing hidden), a held line into a
+        bare `read` is DATA not a command, and only a line 1 crafted to read-and-exec
+        (`read x; eval $x`, itself visible in the review) turns it into execution; what
+        is lost is the per-line abort at a prompt. If a program owns the tty the
+        reviewed context is gone, so DROP the remainder rather than deliver a reviewed
+        line into it. An empty held line (a blank line in the paste) writes nothing but
+        is still consumed."""
         if self.tui_active() or self.has_foreground_program():
             self._staged_paste = []
             return
