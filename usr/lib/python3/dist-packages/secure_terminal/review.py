@@ -78,7 +78,9 @@ _CLASS_ROWS = tuple(
         ('invisible',  0x2423, 'Invisible / zero-width'),   # open box (blank)
         ('confusable', 0x2248, 'Look-alike (homoglyph)'),   # almost-equal: looks like ASCII
         ('combining',  0x25CC, 'Combining (Zalgo)'),        # dotted circle: combining base
-        ('nonascii',   0x6587, 'Other non-ASCII'),          # a CJK sample: honest foreign
+        # an accented Latin letter: itself non-ASCII and in every common font (a CJK
+        # sample would tofu without a CJK font the app does not require).
+        ('nonascii',   0x00C0, 'Other non-ASCII'),
         ('structural', 0x253C, 'Box-drawing / blocks'),     # box-drawing cross
     )
 )
