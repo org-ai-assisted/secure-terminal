@@ -895,6 +895,8 @@ class SecureTerminal(QPlainTextEdit):
         self._command = command
         self._command_malformed = False   # set by _start: a malformed/whitespace command
         self._command_exec_failed = False  # set by _start: the -e program could not exec
+        self._spawn_comm = None            # set by _start: /proc comm of the spawned child,
+        #                                    baseline to detect a login shell replaced via `exec`
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -1248,8 +1250,25 @@ class SecureTerminal(QPlainTextEdit):
             if self._grid_mode():
                 self._render_timer.start(16)   # repaint at the new glyph size
 
+    @staticmethod
+    def _clamp_int(value, lo, hi, default):
+        """int(value) clamped to [lo, hi], or `default` when it is not a usable
+        integer. This is the "crash-safe at the SINK" contract the apply_* setters
+        rely on: besides OverflowError from a too-large value (which the clamp
+        already tamed), int() ITSELF raises ValueError since Python 3.11 for a digit
+        string longer than sys.int_info.default_max_str_digits (4300), and TypeError
+        for a non-string non-number -- both BEFORE any clamp runs. A caller trusting
+        the sink (a ctl/IPC entry, a hand-edited session, a config field) must never
+        crash the widget on such input; an unparseable value carries no magnitude, so
+        keep the current setting rather than raise."""
+        try:
+            n = int(value)
+        except (ValueError, TypeError):
+            return default
+        return max(lo, min(n, hi))
+
     def apply_zoom(self, percent):
-        self._zoom = max(10, min(1000, int(percent)))
+        self._zoom = self._clamp_int(percent, 10, 1000, self._zoom)
         # Leading-edge debounce. Each apply is a full setFont relayout + a pyte
         # resize whose SIGWINCH makes the child (a TUI) repaint its whole frame, so
         # applying on every Ctrl+wheel / key-repeat notch churns the screen (the
@@ -1271,7 +1290,8 @@ class SecureTerminal(QPlainTextEdit):
     def set_font_size(self, points):
         """Set the BASE font point size (the zoom then scales it). Clamped to a
         sane range so a stored/typed value cannot make the glyph unreadable."""
-        self._base_point_size = max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, int(points)))
+        self._base_point_size = self._clamp_int(points, FONT_SIZE_MIN, FONT_SIZE_MAX,
+                                                self._base_point_size)
         self._apply_font()
 
     def current_font_size(self):
@@ -1354,7 +1374,7 @@ class SecureTerminal(QPlainTextEdit):
         # session, a /scrollback <huge> command, or a ctl request) raises OverflowError
         # here. Clamp the upper bound at the SINK so every caller is crash-safe in one
         # spot, not per-caller.
-        lines = max(0, min(int(lines), 2147483647))
+        lines = self._clamp_int(lines, 0, 2147483647, self._scrollback)
         # No change: the cap is already this value, so setMaximumBlockCount would
         # prune nothing and the grid model stays in sync -- there is nothing to
         # rebuild. This is the COMMON path: _apply_global re-applies the SAME
@@ -1392,7 +1412,7 @@ class SecureTerminal(QPlainTextEdit):
         # value WRAPS (does not raise) to a negative -- review.py floors it to 0, which SKIPS
         # the countdown and enables the paste buttons at once, defeating the paste_delay gate.
         # The /paste-delay command gate is isascii()+isdigit() with no magnitude bound.
-        self._paste_delay = max(0, min(int(seconds), 2147483647))
+        self._paste_delay = self._clamp_int(seconds, 0, 2147483647, self._paste_delay)
 
     def current_paste_delay(self):
         return self._paste_delay
@@ -1403,7 +1423,7 @@ class SecureTerminal(QPlainTextEdit):
         # one-time "output suppressed" notice fires. Clamp the int32 upper bound at the
         # SINK too, completing the setter class (apply_scrollback/apply_paste_delay): a
         # value beyond int32 cannot silently over/underflow a downstream C int here.
-        self._escape_limit = max(0, min(int(limit), 2147483647))
+        self._escape_limit = self._clamp_int(limit, 0, 2147483647, self._escape_limit)
 
     def current_escape_limit(self):
         return self._escape_limit
@@ -2921,6 +2941,11 @@ class SecureTerminal(QPlainTextEdit):
             self._command_exec_failed = bool(os.read(exec_r, 1))
         finally:
             os.close(exec_r)
+        # Baseline the child's /proc comm now that the exec has succeeded: this is the
+        # identity of the shell (or -- PROGRAM) we launched, captured before the user
+        # can `exec` anything. has_foreground_program compares the live comm against it
+        # to catch a login shell REPLACED via the `exec` builtin (same pid + pgrp).
+        self._spawn_comm = None if self._command_exec_failed else self._read_comm(pid)
         SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
         self._fd = fd
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -4192,12 +4217,42 @@ class SecureTerminal(QPlainTextEdit):
         except OSError:
             return ''
 
+    @staticmethod
+    def _read_comm(pid):
+        """The command name from /proc/<pid>/comm (the kernel's process identity, as
+        `ps`/konsole read it), or None. Cooperation-free and immune to what the child
+        advertises over the tty."""
+        try:
+            with open('/proc/%d/comm' % pid, 'rb') as fh:
+                return fh.read().rstrip(b'\n').decode('utf-8', 'replace')
+        except OSError:
+            return None
+
+    def _child_execd(self):
+        """True when a LOGIN-shell tab's direct child has been REPLACED via the shell
+        `exec` builtin (exec vim, exec ssh ...). `exec` does not fork, so the pid and
+        pgrp are unchanged and the tcgetpgrp heuristic still reads 'bare shell prompt'
+        -- but the child's /proc comm now names a different program. Comparing the live
+        comm against the spawn-time baseline is a definitive process-identity signal
+        (what konsole reads to name a foreground program), so an exec'd program is a
+        real foreground program: the panic button acts on it and the mode-toggle
+        re-export refuses to type into it. A shell builtin that merely READS stdin
+        without exec (read/select/here-doc) is NOT an exec -- same process, so this
+        stays False for it; that case has no reliable signal and is the documented
+        paste residual (see _insert_next_staged)."""
+        if self._pid is None or self._spawn_comm is None:
+            return False
+        comm = self._read_comm(self._pid)
+        return comm is not None and comm != self._spawn_comm
+
     def has_foreground_program(self):
         """True when a program holds the foreground, i.e. there is something for
         Terminate to act on. The direct child (_pid) in the foreground means the
         shell is at its bare prompt for a LOGIN-shell tab (nothing to terminate) --
         but for a `-- PROGRAM` tab _pid IS that program (nano, htop), so it is
-        exactly the foreground program to terminate."""
+        exactly the foreground program to terminate. A login-shell tab whose child was
+        replaced via the `exec` builtin also counts: same pid/pgrp, but _child_execd()
+        catches it by process identity."""
         pgrp = self._foreground_pgrp()
         if pgrp is None:
             return False
@@ -4206,7 +4261,8 @@ class SecureTerminal(QPlainTextEdit):
         except ProcessLookupError:
             return False                  # child already gone (auto-reaped)
         if child_pgrp is not None and pgrp == child_pgrp:
-            return self._command is not None   # a launched program, not a shell prompt
+            # A launched program (_command set), or a login shell REPLACED via `exec`.
+            return self._command is not None or self._child_execd()
         if pgrp == os.getpgrp():
             # The tty is still owned by OUR process group: between pty.fork() and
             # the child's execvp the shell has not yet taken the terminal, so
@@ -4235,12 +4291,15 @@ class SecureTerminal(QPlainTextEdit):
         # to terminate), but for a `-- PROGRAM` tab that child IS the program to kill.
         # getpgid can race the child's death (it may exit between the enable-poll and
         # the click) -- a gone child means nothing to signal (as has_foreground_program).
+        # A login shell REPLACED via `exec` (_child_execd) is NOT a bare prompt: the
+        # exec'd program owns the shell's pgrp, so fall through and killpg it -- else
+        # the panic button silently no-ops on exactly the stuck program it exists for.
         if self._pid is not None and self._command is None:
             try:
                 child_pgrp = os.getpgid(self._pid)
             except ProcessLookupError:
                 return False
-            if pgrp == child_pgrp:
+            if pgrp == child_pgrp and not self._child_execd():
                 return False
         try:
             os.killpg(pgrp, signal.SIGTERM)
