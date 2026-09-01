@@ -84,6 +84,7 @@ import unicodedata
 
 import pyte
 import pyte.graphics
+import pyte.modes
 # pyte's own hard dependency, so no new package: it is what pyte's draw() uses to
 # decide a character's cell width, and _SafeHistoryScreen.draw has to agree with
 # that decision to know which characters pyte would silently drop.
@@ -487,6 +488,11 @@ _SYNC_END = '\x1b[?2026l'
 # screen.mode shifted left by 5 (so they cannot collide with ANSI modes), so the
 # program's `\x1b[?2004h` lands as 2004 << 5 -- test for that, not the bare 2004.
 _BRACKETED_PASTE_MODE = 2004 << 5
+
+# The DEC private modes a FRESH pyte screen carries (autowrap + cursor visible). Used to
+# reset a REUSED screen's modes on restart_as_shell(keep_screen) so no per-child mode --
+# above all the bracketed-paste bit -- leaks from the exited program into the new shell.
+_DEFAULT_DEC_MODES = frozenset((pyte.modes.DECAWM, pyte.modes.DECTCEM))
 
 
 def tui_available():
@@ -913,8 +919,8 @@ class SecureTerminal(QPlainTextEdit):
         self._command = command if command else None
         self._command_malformed = False   # set by _start: a malformed/whitespace command
         self._command_exec_failed = False  # set by _start: the -e program could not exec
-        self._spawn_comm = None            # set by _start: /proc comm of the spawned child,
-        #                                    baseline to detect a login shell replaced via `exec`
+        self._spawn_exe = None             # set by _start: /proc exe of the spawned child (an
+        #                                    unforgeable baseline: detect an `exec`-replaced shell)
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -1133,6 +1139,11 @@ class SecureTerminal(QPlainTextEdit):
         self._zoom_timer.setSingleShot(True)
         self._zoom_timer.timeout.connect(self._apply_font)
         self._zoom_debounce_ms = 40
+        # Debounced reflow of retained LINE output when a resize changes the column
+        # count: re-wrap an old long line at the new width instead of horizontal-scroll.
+        self._reflow_timer = QTimer(self)
+        self._reflow_timer.setSingleShot(True)
+        self._reflow_timer.timeout.connect(self._rerender)
 
         # restored scrollback from a previous session, shown as history above
         # the fresh shell (line mode; a TUI tab repaints over it on first draw).
@@ -2969,11 +2980,12 @@ class SecureTerminal(QPlainTextEdit):
             self._command_exec_failed = bool(os.read(exec_r, 1))
         finally:
             os.close(exec_r)
-        # Baseline the child's /proc comm now that the exec has succeeded: this is the
-        # identity of the shell (or -- PROGRAM) we launched, captured before the user
-        # can `exec` anything. has_foreground_program compares the live comm against it
-        # to catch a login shell REPLACED via the `exec` builtin (same pid + pgrp).
-        self._spawn_comm = None if self._command_exec_failed else self._read_comm(pid)
+        # Baseline the child's /proc exe now that the exec has succeeded: this is the real
+        # binary of the shell (or -- PROGRAM) we launched, captured before the user can
+        # `exec` anything. has_foreground_program compares the live exe against it to catch
+        # a login shell REPLACED via the `exec` builtin (same pid + pgrp). exe is used, not
+        # comm, because comm is child-writable (spoofable) and exe is not.
+        self._spawn_exe = None if self._command_exec_failed else self._read_exe(pid)
         SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
         self._fd = fd
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -2988,6 +3000,15 @@ class SecureTerminal(QPlainTextEdit):
                 # the winsize to the NEW pty.
                 self._stream = _Utf8CharsetByteStream(self._screen)
                 self._set_winsize(*self._tui_grid_size())
+                # SECURITY: the reused screen carries the EXITED program's DEC private
+                # modes; a fresh _make_screen would not. A stale bracketed-paste bit
+                # (DEC 2004) would make a later NON-bracketed program read as bracketed,
+                # so _bracketed_paste_active() trusts it to buffer a paste inert -- and a
+                # multiline paste's embedded \r SKIPS the mandatory staging and auto-runs.
+                # The read-path fg-exit clear does not fire on this restart path, so reset
+                # the whole mode set to a fresh screen's default here (also drops a stale
+                # hidden cursor / autowrap-off); the buffer + scrollback are untouched.
+                self._screen.mode = set(_DEFAULT_DEC_MODES)
             else:
                 self._make_screen()
 
@@ -4323,32 +4344,34 @@ class SecureTerminal(QPlainTextEdit):
             return ''
 
     @staticmethod
-    def _read_comm(pid):
-        """The command name from /proc/<pid>/comm (the kernel's process identity, as
-        `ps`/konsole read it), or None. Cooperation-free and immune to what the child
-        advertises over the tty."""
+    def _read_exe(pid):
+        """The path /proc/<pid>/exe points at -- the real binary the kernel exec'd for
+        this pid -- or None. UNLIKE /proc/<pid>/comm (which the child forges with a write
+        to /proc/self/comm), exe reflects the actual executable and CANNOT be rewritten by
+        the child, so it is a trustworthy process-identity signal."""
         try:
-            with open('/proc/%d/comm' % pid, 'rb') as fh:
-                return fh.read().rstrip(b'\n').decode('utf-8', 'replace')
+            return os.readlink('/proc/%d/exe' % pid)
         except OSError:
             return None
 
     def _child_execd(self):
         """True when a LOGIN-shell tab's direct child has been REPLACED via the shell
         `exec` builtin (exec vim, exec ssh ...). `exec` does not fork, so the pid and
-        pgrp are unchanged and the tcgetpgrp heuristic still reads 'bare shell prompt'
-        -- but the child's /proc comm now names a different program. Comparing the live
-        comm against the spawn-time baseline is a definitive process-identity signal
-        (what konsole reads to name a foreground program), so an exec'd program is a
-        real foreground program: the panic button acts on it and the mode-toggle
-        re-export refuses to type into it. A shell builtin that merely READS stdin
-        without exec (read/select/here-doc) is NOT an exec -- same process, so this
-        stays False for it; that case has no reliable signal and is the documented
-        paste residual (see _insert_next_staged)."""
-        if self._pid is None or self._spawn_comm is None:
+        pgrp are unchanged and the tcgetpgrp heuristic still reads 'bare shell prompt' --
+        but /proc/<pid>/exe now points at a DIFFERENT binary. exe is the kernel's record
+        of the real executable and CANNOT be rewritten by the child -- unlike comm, which
+        a write to /proc/self/comm forges (that spoof both killed an idle shell via the
+        panic button AND hid a stuck exec'd program from it) -- so comparing the live exe
+        to the spawn-time baseline is a trustworthy signal that the shell was replaced.
+        The panic button then acts on the exec'd program and the mode-toggle re-export
+        refuses to type into it. Residual (inherent, narrow): an exec of the SAME binary
+        as the login shell is indistinguishable from the shell itself, exactly like a
+        stdin-reading builtin (read/select/here-doc) that shares the process and has no
+        reliable signal -- the documented paste residual (see _insert_next_staged)."""
+        if self._pid is None or self._spawn_exe is None:
             return False
-        comm = self._read_comm(self._pid)
-        return comm is not None and comm != self._spawn_comm
+        exe = self._read_exe(self._pid)
+        return exe is not None and exe != self._spawn_exe
 
     def has_foreground_program(self):
         """True when a program holds the foreground, i.e. there is something for
@@ -4768,7 +4791,16 @@ class SecureTerminal(QPlainTextEdit):
             # with trailing fill to that width. Left at the fork-time default
             # (80), that fill (and the clickable void it creates) lands in the
             # middle of a wider window instead of at the true right edge.
+            old_cols = self._cols
             self._set_winsize(*self._grid_size())
+            if self._cols != old_cols:
+                # REFLOW retained line output to the new width: a long line emitted at
+                # the old width otherwise horizontal-scrolls (Box/Show are NoWrap by
+                # design). _rerender replays _raw through _feed_line, whose hard-wrap is
+                # self._cols, so it re-wraps to the new width; Detail/Reveal re-lay-out
+                # under WidgetWidth as before. Debounced so a resize drag does not
+                # re-render per pixel.
+                self._reflow_timer.start(self._zoom_debounce_ms)
 
     def _cp_at(self, pos):
         """The source code point of a neutralized/revealed character under a
