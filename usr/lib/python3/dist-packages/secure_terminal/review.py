@@ -12,30 +12,30 @@ clipboard). When such text carries unicode or control characters, the terminal
 HOLDS it and asks the window to show this bar (docked at the bottom, like the find
 bar).
 
-The bar shows a one-line summary of what is hidden plus a SINGLE mirror pane: a
+The bar shows a one-line summary of what is hidden, a per-class breakdown table and a
+Structure section (line count, the never-auto-run guarantee, length), an EDITABLE
+held-text field (trim the risky part before delivery), and a SINGLE mirror pane: a
 read-only terminal view that renders through the SAME pipeline as the tab it came
 from, so a homoglyph is tinted and each character is click-to-inspect exactly as in
 the terminal. The pane FOLLOWS the reviewed tab live -- its display mode
-(box/show/reveal/detail), theme, font and zoom -- so flipping the tab's mode with
-the normal shortcut re-renders it (rerender_mirror). There is no preview-only render
-branch, so a "works live, wrong in the review box" divergence cannot recur.
-Risk-class colouring stays ON regardless of the tab's markings setting: revealing
-risk is the pane's whole job.
+(box/show/reveal/detail), theme, font and zoom (rerender_mirror). There is no
+preview-only render branch, so a "works live, wrong in the review box" divergence
+cannot recur. Risk-class colouring stays ON regardless of the tab's markings setting:
+revealing risk is the pane's whole job.
 
-Crucially the pane shows what each choice DELIVERS, not just the raw text: by
-default it shows the held text, but FOCUSING or HOVERING a delivery button
-re-renders it to that button's exact delivered form (_delivered). So focusing
-"Paste (ASCII)" reveals `rm -rf /` when the raw looked like a harmless `ram` --
-the de-obfuscation a strip performs cannot hide behind a label. Three choices:
-Reject / Don't copy / Leave it (default, and what Enter/Esc do while the text is
-held), the ASCII action (stripped), and the unicode action (printable unicode
-kept). ONLY Reject is coloured (safe-green): it is the one unconditionally-safe
-choice. The two delivery buttons are UNCOLOURED on purpose -- neither is safe in
-general (stripping de-obfuscates, keeping preserves deception), so a green there
-would mislead; the mirror shows the truth. For a paste both action buttons are
-countdown-gated so a stray click cannot run it; a copy (not executed) has no
-countdown. The choice is dispatched back to the tab that held the text, the only
-path that lets it cross.
+The delivery choice is RADIO-FIRST, no default: pick "Strip to ASCII" or "Keep
+unicode". Until a mode is picked the mirror shows only a hint, so it is never mistaken
+for the outcome; picking a mode renders that mode's exact DELIVERED form (_delivered)
+-- so "Strip to ASCII" reveals `rm -rf /` when the raw looked like a harmless `ram`:
+the de-obfuscation a strip performs cannot hide behind a label. A single deliver button
+(Paste / Copy / Replace) stays DISABLED, and carries NO colour (neither delivery is
+unconditionally safe -- a strip de-obfuscates, a keep preserves deception), until a
+mode is picked AND its anti-fat-finger countdown elapses -- so the delivered form is
+ALWAYS seen before delivery is possible, and editing the held text re-arms the
+countdown. ONLY Reject is coloured (safe-green): the one unconditionally-safe choice,
+never gated (Esc rejects from anywhere). A copy (not executed) has no countdown. The
+choice is dispatched back to the tab that held the text, the only path that lets it
+cross.
 """
 
 from PyQt6.QtCore import Qt, QTimer
@@ -227,6 +227,11 @@ class ReviewBar(QWidget):
         self._edit = QPlainTextEdit(self)
         self._edit.setMaximumHeight(70)
         self._edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        # Tab moves focus OUT of the field (to the radios / buttons) instead of inserting
+        # a tab, so a keyboard-only user can reach the delivery radios -- a QPlainTextEdit
+        # otherwise swallows Tab. (Enter still inserts a newline here, as any text editor;
+        # Esc rejects from anywhere -- keyPressEvent.)
+        self._edit.setTabChangesFocus(True)
         self._edit.textChanged.connect(self._on_edit)
         outer.addWidget(self._edit)
 
@@ -271,8 +276,11 @@ class ReviewBar(QWidget):
     # -- lifecycle ------------------------------------------------------------
     def show_review(self, term, raw, delay, kind='paste'):
         """Show the bar for `term`'s held text `raw`, in the given direction
-        ('paste' or 'copy'), gating the action buttons for `delay` seconds. Focus
-        lands on Reject so Enter/Esc reject and nothing crosses until a choice."""
+        ('paste' or 'copy'). No mode is picked yet, so the deliver button is disabled; the
+        anti-fat-finger countdown starts on the first mode pick (`delay` seconds). Focus
+        lands on Reject; Esc rejects from anywhere, and Enter rejects from a button (the
+        default button) -- but inserts a newline while focus is in the editable held-text
+        field, as in any text editor. Nothing crosses until a delivery is chosen."""
         self._term = term
         self._raw = raw
         self._kind = _KINDS.get(kind, _KINDS['paste'])
@@ -307,6 +315,13 @@ class ReviewBar(QWidget):
         edited buffer."""
         self._raw = self._edit.toPlainText()
         self._refresh_review()          # keeps the selected mode; re-previews its outcome
+        # Editing changes what would be delivered, so RE-ARM the countdown when a mode is
+        # picked: the edited content must be reviewed for the delay too, never delivered
+        # instantly on the original text's already-elapsed countdown.
+        if self._selected_action in ('stripped', 'unicode'):
+            self._arm_countdown()
+        else:
+            self._update_deliver()
 
     def _refresh_review(self):
         """Recompute the summary, breakdown and mirror from the CURRENT held text
@@ -325,16 +340,20 @@ class ReviewBar(QWidget):
         detail = classify_paste_detail(capped)
         parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
                  for label, n in classify_paste(capped)]
-        # Render the RAW purely to detect truncation (the render overflow -- badge
-        # expansion can trip it even for a source under the cap); the visible content is
-        # painted AFTER, so the raw is never actually shown.
+        # TWO different truncations, not one. The classifier caps by SOURCE character count
+        # (scan_truncated -> the hidden-char count and the length are PARTIAL). The mirror
+        # render caps by RENDERED size (render_truncated -> the pane shows only a prefix;
+        # detail badges expand ~30x, so this trips far earlier). A non-ASCII paste well
+        # under the char cap trips ONLY the render cap -- its counts are COMPLETE and must
+        # never read as a partial scan. Render the RAW here only to read _preview_truncated;
+        # the visible content is painted AFTER, so the raw is never actually shown.
+        scan_truncated = len(self._raw) > self._mirror._RAW_MAX
         self._render_mirror(term, self._raw)
-        truncated = bool(getattr(self._mirror, '_preview_truncated', False))
+        render_truncated = bool(getattr(self._mirror, '_preview_truncated', False))
         hidden = sum(detail['counts'].values())
-        # A confident ASCII-only all-clear (green dot + positive summary) ONLY when the
-        # WHOLE paste was scanned: a truncated scan cannot promise nothing hides past the
-        # cap, so it keeps the cautious summary and the truncation notice below.
-        if hidden == 0 and not truncated:
+        # A confident ASCII-only all-clear needs the whole paste SCANNED; render truncation
+        # does not undercount (the scan already covered it), so it does not block the claim.
+        if hidden == 0 and not scan_truncated:
             summary = _CLEAN_MSG
             dot_fg = SAFE_FG
         else:
@@ -342,17 +361,22 @@ class ReviewBar(QWidget):
                        if parts else self._kind['summary_empty'])
             dot_fg = RISK_FG
         self._dot.setStyleSheet('background-color:%s; border-radius:7px;' % dot_fg)
-        # Delivery sends the WHOLE buffer, so a truncated review must SAY that both the
-        # shown text AND the counts are partial, in unspoofable chrome (this label, not
-        # the terminal pane a paste could forge). full_note names the real action per
-        # direction (paste delivers / copy reaches the clipboard).
-        if truncated:
-            summary += ('  [truncated: only the first {:,} characters are shown and '
-                        'scanned for hidden characters -- {}; Reject if you cannot '
-                        'verify the rest]'.format(self._mirror._RAW_MAX,
-                                                  self._kind['full_note']))
+        # Disclose each truncation for what it is (unspoofable chrome, not the pane a paste
+        # could forge). SCAN truncation understates the count -- Reject if you cannot verify
+        # the rest. RENDER truncation only shortens the PANE; the scan is complete, so it is
+        # a milder note. full_note names the real action (paste delivers / copy reaches the
+        # clipboard).
+        if scan_truncated:
+            summary += ('  [truncated: only the first {:,} characters were scanned for '
+                        'hidden characters, so the count may be partial -- {}; Reject if '
+                        'you cannot verify the rest]'.format(self._mirror._RAW_MAX,
+                                                             self._kind['full_note']))
+        elif render_truncated:
+            summary += ('  [the preview below shows only the first part of this paste, but '
+                        'the whole of it WAS scanned for hidden characters -- {}]'
+                        .format(self._kind['full_note']))
         self._summary.setText(summary)
-        self._set_detail(detail, term, truncated)
+        self._set_detail(detail, term, scan_truncated)
         # Paint what the pane SHOWS: the selected mode's delivered form once a radio is
         # picked, or -- until then -- the hint (so the mirror is never mistaken for the
         # outcome). This overwrites the raw render above before the widget repaints.
@@ -504,19 +528,25 @@ class ReviewBar(QWidget):
         return self._term
 
     # -- internals ------------------------------------------------------------
-    def _on_radio(self, action):
-        """A delivery MODE was picked: preview its delivered form in the mirror and start
-        the anti-fat-finger countdown that arms the deliver button. Switching modes
-        re-previews and restarts the countdown, so the shown outcome and the armed button
-        always match."""
-        self._selected_action = action
+    def _arm_countdown(self):
+        """(Re)start the anti-fat-finger countdown that gates the deliver button. Called on
+        every mode pick AND every edit, so the CURRENTLY-shown outcome always gets the full
+        delay before it can be delivered -- editing to new content after the button already
+        enabled must NOT inherit the elapsed countdown of the original held text."""
         self._remaining = self._delay
         if self._remaining > 0:
             self._countdown.start(1000)
         else:
             self._countdown.stop()
-        self._refresh_review()          # mirror now shows this mode's delivered form
         self._update_deliver()
+
+    def _on_radio(self, action):
+        """A delivery MODE was picked: preview its delivered form in the mirror and start
+        the countdown that arms the deliver button. Switching modes re-previews and
+        restarts the countdown, so the shown outcome and the armed button always match."""
+        self._selected_action = action
+        self._refresh_review()          # mirror now shows this mode's delivered form
+        self._arm_countdown()
 
     def _update_deliver(self):
         """Sync the deliver button to the current state: disabled with a hint until a
