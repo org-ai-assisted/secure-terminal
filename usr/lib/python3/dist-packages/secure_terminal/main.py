@@ -5234,9 +5234,12 @@ def _parse_launch_args(argv):
         cmd = spec.get('command')
         if isinstance(cmd, str) and cmd:
             try:
-                shlex.split(cmd)
+                parsed = shlex.split(cmd)
             except ValueError as exc:
                 sys.stderr.write('secure-terminal: malformed -e command: %s\n' % exc)
+                raise SystemExit(2)
+            if not parsed:
+                sys.stderr.write('secure-terminal: -e command is empty (whitespace only)\n')
                 raise SystemExit(2)
 
     def _empty(spec):

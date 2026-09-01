@@ -488,19 +488,23 @@ def _argv_for_command(command):
       - a list/tuple -> used verbatim (the "-- prog args" CLI form, no shell reparse);
       - a string -> split like a shell word list ("ssh -p 22 host");
       - none/empty -> [] (the deliberate "no command" case; caller substitutes shell);
-      - a MALFORMED string (e.g. an unbalanced quote) -> None (FAIL CLOSED).
+      - a MALFORMED string (unbalanced quote), or a non-empty string that shell-splits
+        to NOTHING (whitespace only, e.g. " ") -> None (FAIL CLOSED).
     None is distinct from [] on purpose: a locked-down launch (run ONLY this program)
-    must not drop to a shell on a typo. The caller exits the child rather than spawn a
-    shell for None; raising here instead would traceback in the pty.fork child, which
-    the parent masks as a normal exit."""
+    must not drop to a shell on a typo or a whitespace command. The caller exits the
+    child rather than spawn a shell for None; raising here instead would traceback in
+    the pty.fork child, which the parent masks as a normal exit."""
     if isinstance(command, (list, tuple)):
         return [str(a) for a in command]
     if not command:
         return []
     try:
-        return shlex.split(command)
+        parsed = shlex.split(command)
     except ValueError:
         return None
+    # A non-empty string that yields no words is whitespace-only: a command WAS given
+    # but names no program, so fail closed rather than fall through to the shell.
+    return parsed if parsed else None
 
 
 # Directories a bell sound file may live in. Restricting to these keeps the
@@ -888,6 +892,7 @@ class SecureTerminal(QPlainTextEdit):
         # render, so restored scrollback is drawn once under the final wrap mode.
         self._sync_wrap_mode()
         self._command = command
+        self._command_malformed = False   # set by _start: a malformed/whitespace command
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -2826,6 +2831,13 @@ class SecureTerminal(QPlainTextEdit):
     # -- child process over a pseudo-terminal ---------------------------------
     def _start(self, command):
         term, terminfo_dir = self._child_term()
+        # Parse in the PARENT so a malformed / whitespace-degenerate command (argv is
+        # None) is known here, on EVERY path (CLI, IPC, GUI new-tab, session restore):
+        # it must never become a login shell. restart_as_shell() refuses a malformed
+        # tab, so the 127-exiting child below closes the tab instead of dropping to a
+        # shell. The CLI (_parse_launch_args) additionally exits with a message pre-Qt.
+        argv = _argv_for_command(command)
+        self._command_malformed = argv is None
         pid, fd = pty.fork()
         if pid == 0:  # pragma: no cover
             # (no cover: this branch runs in the pty.fork child and immediately
@@ -2853,12 +2865,11 @@ class SecureTerminal(QPlainTextEdit):
             # fingerprint. Programs then emit truecolor instead of down-mapping.
             os.environ['COLORTERM'] = 'truecolor'
             os.environ.setdefault('PAGER', 'cat')
-            argv = _argv_for_command(command)
             if argv is None:
-                # A MALFORMED command (bad quoting) must not become a login shell --
-                # fail closed for a locked-down -e. The CLI (_parse_launch_args) already
-                # exits with a message before Qt; this is the last-ditch guard for a
-                # command reaching here by another path (IPC / a hand-edited session).
+                # Malformed / whitespace-degenerate command (argv computed in the
+                # parent): fail closed -- exit 127, never a shell. restart_as_shell()
+                # refuses this tab (self._command_malformed), so it CLOSES rather than
+                # dropping to a login shell on IPC / GUI / a hand-edited session path.
                 os._exit(127)
             if not argv:
                 argv = [os.environ.get('SHELL') or '/bin/bash']
@@ -3534,7 +3545,10 @@ class SecureTerminal(QPlainTextEdit):
         tab keeps the exited program's output above the new prompt as scrollback; a
         TUI tab's transient alt-screen frame is discarded (as a real terminal drops it
         on rmcup) and the grid shows the handover banner then the new shell."""
-        if self._command is None or self._fd is None:
+        if self._command is None or self._fd is None or self._command_malformed:
+            # _command_malformed: the launch command was malformed / whitespace-only, so
+            # its child exited 127 -- do NOT drop to a login shell (a locked-down launch
+            # must fail closed). The caller closes the tab instead.
             return False
         # SECURITY: drop any pending paste/copy review FIRST. Its held (reviewed) text
         # must never become dispatchable to the NEW shell -- a reviewed multiline paste
