@@ -1334,6 +1334,30 @@ def paste_no_autosubmit(safe):
     return safe.rstrip('\r')
 
 
+def ensure_utf8_ctype(environ=None):
+    r"""Make the pty child speak UTF-8, so its output is what secure-terminal decodes.
+
+    secure-terminal decodes every child byte as UTF-8 (the incremental UTF-8 decoders in
+    terminal.py / cli.py). Under a C/POSIX (or unset) locale a wide-char child EMITS
+    non-UTF-8: a failed mbrtowc renders each byte as <ffffffff> (WEOF, i.e. a euro sign
+    E2 82 AC prints as three such tokens) and the shell's line editor echoes bytes as
+    octal escapes. So the child must AGREE to speak UTF-8. Set a UTF-8 ctype ONLY when the
+    ambient locale is not already UTF-8, so a user's real UTF-8 locale/language is never
+    clobbered. Mutates `environ` (default os.environ) IN THE PTY CHILD, before exec. Lives
+    here (not terminal.py) so cli.py -- which never imports Qt -- can share it. Idempotent."""
+    env = os.environ if environ is None else environ
+    # POSIX precedence: LC_ALL overrides LC_CTYPE overrides LANG.
+    effective = env.get('LC_ALL') or env.get('LC_CTYPE') or env.get('LANG')
+    if effective and effective.rsplit('.', 1)[-1].lower() in ('utf-8', 'utf8'):
+        return                            # already UTF-8: do not override the user locale
+    # C.UTF-8 exists on glibc + musl with no locale-gen; sets the ENCODING only (no language).
+    if env.get('LC_ALL'):
+        # A non-UTF-8 LC_ALL would OVERRIDE any LC_CTYPE we set, so retarget LC_ALL itself.
+        env['LC_ALL'] = 'C.UTF-8'
+    else:
+        env['LC_CTYPE'] = 'C.UTF-8'
+
+
 def sanitize_paste_unicode(text):
     """Like sanitize_paste but KEEP printable non-ASCII (the euro sign, accents,
     CJK) instead of dropping it, for a deliberate "paste with unicode". The

@@ -324,6 +324,7 @@ from secure_terminal.sanitize import (
     sanitize_paste_unicode, sanitize_clipboard, sanitize_clipboard_unicode,
     sanitize_clipboard_display,
     paste_findings, paste_is_multiline, paste_no_autosubmit, tui_cell,
+    ensure_utf8_ctype,
     sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, display_len,
     MARK_KEY, WRAP_NL, BOX,
@@ -2874,7 +2875,7 @@ class SecureTerminal(QPlainTextEdit):
         return 'xterm-256color', tdir
 
     # -- child process over a pseudo-terminal ---------------------------------
-    def _start(self, command):
+    def _start(self, command, keep_screen=False):
         term, terminfo_dir = self._child_term()
         # Parse in the PARENT so a malformed / whitespace-degenerate command (argv is
         # None) is known here, on EVERY path (CLI, IPC, GUI new-tab, session restore):
@@ -2922,6 +2923,10 @@ class SecureTerminal(QPlainTextEdit):
             # fingerprint. Programs then emit truecolor instead of down-mapping.
             os.environ['COLORTERM'] = 'truecolor'
             os.environ.setdefault('PAGER', 'cat')
+            # The decode side assumes UTF-8; make the child emit UTF-8 (else a wide-char
+            # program renders each byte as <ffffffff>). No-op when the ambient locale is
+            # already UTF-8.
+            ensure_utf8_ctype()
             if argv is None:
                 # Malformed / whitespace-degenerate command (argv computed in the
                 # parent): fail closed -- exit 127, never a shell. restart_as_shell()
@@ -2976,7 +2981,15 @@ class SecureTerminal(QPlainTextEdit):
         self._notifier = QSocketNotifier(fd, QSocketNotifier.Type.Read, self)
         self._notifier.activated.connect(self._on_readable)
         if self._tui:
-            self._make_screen()
+            if keep_screen and self._screen is not None:
+                # restart_as_shell: preserve the exited program's primary buffer +
+                # scrollback for the new shell. A fresh _make_screen would clear() the
+                # document. Rebind only the parser to the surviving screen and re-apply
+                # the winsize to the NEW pty.
+                self._stream = _Utf8CharsetByteStream(self._screen)
+                self._set_winsize(*self._tui_grid_size())
+            else:
+                self._make_screen()
 
     def _on_readable(self):
         self._read_and_render()
@@ -3657,10 +3670,11 @@ class SecureTerminal(QPlainTextEdit):
         disposition. Returns True when it restarts. A no-op (False) for a plain
         login-shell tab (self._command is None): typing `exit` there closes the tab,
         as a real terminal does. Keeps every widget setting (theme/zoom/mode/...);
-        only the exited child's pty and its half-parsed stream state are reset. A CLI
-        tab keeps the exited program's output above the new prompt as scrollback; a
-        TUI tab's transient alt-screen frame is discarded (as a real terminal drops it
-        on rmcup) and the grid shows the handover banner then the new shell."""
+        only the exited child's pty and its half-parsed stream state are reset. Both a
+        CLI tab AND a TUI tab keep the exited program's primary-screen output above the
+        new prompt as scrollback; a TUI program's transient ALT-screen frame is discarded
+        (as a real terminal drops it on rmcup), then the grid shows the handover banner
+        and the new shell."""
         if (self._command is None or self._fd is None or self._command_malformed
                 or self._command_exec_failed):
             # Fail CLOSED -- do NOT drop to a login shell; the caller closes the tab:
@@ -3686,6 +3700,14 @@ class SecureTerminal(QPlainTextEdit):
         # otherwise be left orphaned + invisible when we fork the new shell -- SIGHUP
         # reaps it (a no-op ESRCH for one that truly exited), matching close_tab.
         self._release_pty(hangup=True)
+        # rmcup: if the exited program was on the ALT screen, restore the pre-program
+        # PRIMARY screen (+ its scrollback) so its transient full-screen frame is dropped
+        # but the shell output that preceded it survives. A program that stayed on the
+        # primary screen (a build log, `-- cat file`) needs no restore -- its output is
+        # already on the screen kept below via keep_screen. Done BEFORE the stream-state
+        # reset clears _alt_saved.
+        if self._alt_screen:
+            self._alt_leave()
         # Reset the half-parsed per-child stream state so the new shell's very first
         # bytes are not corrupted by a stale carry, a stuck alt-screen bit, or the
         # exited program's mouse-tracking request.
@@ -3719,11 +3741,14 @@ class SecureTerminal(QPlainTextEdit):
         self._command = None
         _banner = '\r\n[secure-terminal] program exited -- new shell\r\n'
         if self._grid_mode():
-            # TUI: _start below makes a FRESH pyte screen (clearing the doc -- the
-            # alt-screen program's transient frame is dropped, as a real terminal does
-            # on rmcup). Seed the banner into that fresh grid AFTER the fork and render
-            # it, so the tab is not blank until the shell's first prompt.
-            self._start(None)
+            # TUI: keep the exited program's PRIMARY screen + scrollback (its alt frame,
+            # if any, was already dropped via _alt_leave above). Fork the new shell
+            # WITHOUT a fresh screen (keep_screen), so the document is NOT cleared, then
+            # seed the banner into the surviving grid and render -- the exited program's
+            # output stays visible above the handover banner and the new prompt.
+            # (_raw carries only the banner, so a later CLI<->TUI re-seed shows the
+            # banner alone; the immediate scrollback lives on the retained screen.)
+            self._start(None, keep_screen=True)
             self._raw = _banner
             self._feed_stream(_banner.encode('utf-8', 'replace'))
             self._render_tui()
@@ -4975,6 +5000,15 @@ class SecureTerminal(QPlainTextEdit):
         self.setTextCursor(cur)
         self._render_timer.start(16)
 
+    def _home_hscroll(self):
+        """Pin the horizontal scrollbar to the left so the left document margin stays
+        visible. The base QPlainTextEdit scrolls the caret into view on a press/drag,
+        pushing that margin off-screen (all lines jump left) until a render or the
+        release snaps it back. The render paths already home the hbar every frame, so a
+        click/drag must too, or the view jitters left for as long as the button is held."""
+        hbar = self.horizontalScrollBar()
+        hbar.setValue(hbar.minimum())
+
     def mousePressEvent(self, event):
         # When the child grabs the mouse (tracking + SGR), a plain press is REPORTED
         # to it rather than starting a local selection; Shift is the local override.
@@ -5003,6 +5037,7 @@ class SecureTerminal(QPlainTextEdit):
                 # selection at the click instead of extending from the pinned cursor.
                 self.setTextCursor(self.cursorForPosition(event.position().toPoint()))
         super().mousePressEvent(event)
+        self._home_hscroll()          # keep the left margin pinned during the press
 
     def mouseReleaseEvent(self, event):
         # Balance EACH reported press with the release of THAT button (report it even if
@@ -5061,6 +5096,8 @@ class SecureTerminal(QPlainTextEdit):
                 event.accept()
                 return
         super().mouseMoveEvent(event)
+        if self._mouse_selecting:     # keep the margin pinned through a local drag-select
+            self._home_hscroll()
 
     def focusInEvent(self, event):
         # DEC 1004 focus reporting is the same output-armed input channel as button
