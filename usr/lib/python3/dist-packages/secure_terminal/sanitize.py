@@ -1019,7 +1019,22 @@ def _ascii_fold_map():
     Unicode confusables data shipped by python3-confusable-homoglyphs (a hard
     dependency). Empty dict if the package is somehow absent -- never a crash. Single
     source of truth for both the confusable SET (_ascii_confusables, its keys) and the
-    [ASCII-fold] action (ascii_fold, its values)."""
+    [ASCII-fold] action (ascii_fold, its values).
+
+    SCOPE -- single non-ASCII char -> single ASCII char ONLY, deliberately NOT the full
+    Unicode confusables skeleton (measured against the shipped data: 6998 non-ASCII
+    sources; this keeps the 1472 with a single-ASCII look-alike). The two excluded
+    classes are out of scope by design, not an oversight:
+      - MULTI-char ASCII confusables (261: ellipsis U+2026 -> '...', curly quote -> "''",
+        double-punctuation) -- a per-CHARACTER fold cannot emit N chars without breaking
+        the T3 homomorphism sanitize(a+b)==sanitize(a)+sanitize(b) the Z3 proof depends
+        on, and they are typographic punctuation Strip already drops (never cross
+        undetected), not the letter/digit spoof the fold exists to reveal.
+      - NON-ASCII-target confusables (5265, the majority: a char that looks like ANOTHER
+        non-ASCII char) -- these do not pose as ASCII, so an ASCII-fold has nothing to
+        reveal. The look-alike still shows tinted + is dropped by Strip.
+    So the curated set captures 100% of the single-char ASCII-posing homoglyphs, which
+    is the whole threat this fold addresses."""
     global _ASCII_FOLD_MAP
     if _ASCII_FOLD_MAP is None:
         mapping = {}
