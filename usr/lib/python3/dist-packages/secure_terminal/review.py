@@ -305,9 +305,11 @@ class ReviewBar(QWidget):
         self._sync_appearance()
         # Open in the default keep-printable form; set_source emits `changed`, which
         # runs _on_edit -> refresh + arm-countdown, so the table + deliver state are
-        # populated without a separate call.
+        # populated without a separate call. set_source applies the full display clean
+        # (drop invisibles + cap combining), so the status count below -- read from the
+        # ACTUAL box -- reflects every drop, not just the invisibles.
+        self._editor.set_source(raw[:_BOX_MAX])
         self._set_status_keep(raw[:_BOX_MAX])
-        self._editor.set_source(sanitize_clipboard_unicode(raw[:_BOX_MAX]))
         self.setVisible(True)
         self._editor.setFocus()
 
@@ -475,8 +477,8 @@ class ReviewBar(QWidget):
         if confirm != QMessageBox.StandardButton.Yes:
             return
         self._active_mode = 'keep'
+        self._editor.set_source(self._raw[:_BOX_MAX])
         self._set_status_keep(self._raw[:_BOX_MAX])
-        self._editor.set_source(sanitize_clipboard_unicode(self._raw[:_BOX_MAX]))
 
     def _tail_note(self):
         """A status suffix disclosing that the un-shown tail is neutralized to the SAME
@@ -493,8 +495,12 @@ class ReviewBar(QWidget):
 
     def _set_status_keep(self, source):
         """Set the status line for the keep-printable state (open + restore): how many
-        hidden characters the keep-printable drop removed from `source`."""
-        dropped = len(source) - len(sanitize_clipboard_unicode(source))
+        characters the box dropped from `source`. Counted against the ACTUAL box content
+        (call AFTER set_source), so it includes BOTH the invisible/bidi/control drop AND
+        the editor's combining-run cap -- a plain sanitize_clipboard_unicode count would
+        miss the cap and read '0 dropped' on a Zalgo flood the box actually shrank, and
+        contradict the same bar's hidden-character table."""
+        dropped = len(source) - len(self._editor.source())
         self._status.setText('Keeping printable unicode -- %d hidden character%s dropped.'
                              % (dropped, '' if dropped == 1 else 's'))
 
