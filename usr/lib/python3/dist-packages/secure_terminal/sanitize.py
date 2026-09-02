@@ -902,9 +902,13 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                     elif num == 1:
                         for j in range(0, min(col + 1, len(cells))):
                             cells[j] = (' ', cells[j][1])
-                    elif num == 2:
-                        cells = []
-                        col = 0
+                    elif num == 2:                      # erase whole line; per
+                        # ECMA-48 the cursor does NOT move (like n=0/n=1). Blank
+                        # every cell but keep col; INV col <= len holds because
+                        # col <= len(cells) already, so the line is exactly col
+                        # blanks with the cursor at its end -- a following write
+                        # lands at its column instead of being homed to 0.
+                        cells = [(' ', state)] * col
                 # A cursor/erase op clears the pending autowrap (the implicit
                 # col == max_line "phantom" past the last column), so a following
                 # printable overwrites the last cell instead of wrapping a row.
