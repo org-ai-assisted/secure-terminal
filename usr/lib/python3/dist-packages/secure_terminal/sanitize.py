@@ -944,7 +944,12 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                 j = i + len(PROMPT_START)
                 if col != 0 and _printable_follows(raw, j):
                     completed.append(cells)
-                    wraps.append(False)
+                    # A line filled to the width is in the pending-wrap state, so
+                    # ending it here is a SOFT autowrap (the prompt continues on
+                    # the next row) -- flag it True so copy rejoins the rows, same
+                    # as a printable that triggers the deferred wrap. A partial
+                    # line (col < width) is a real break, not a wrap.
+                    wraps.append(bool(max_line) and col >= max_line)
                     cells, col = [], 0
                 i = j
                 continue
