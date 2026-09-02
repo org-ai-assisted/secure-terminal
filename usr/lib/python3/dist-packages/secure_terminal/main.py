@@ -764,7 +764,7 @@ class MainWindow(QMainWindow):
 
         # Tabs still awaiting a deferred session restore (see below). Completed
         # before the session is saved on quit, so no tab is ever dropped.
-        self._deferred_restore = []
+        self._deferred_restore: list = []
         self._pending_restore = {}       # placeholder widget -> saved tab info
         # Launch-CLI tabs take precedence over a restored session: opening
         # `secure-terminal --title x -- htop` should give you exactly that.
@@ -1158,6 +1158,7 @@ class MainWindow(QMainWindow):
             self._on_instance_connection()
 
     def _on_instance_connection(self):
+        assert self._server is not None   # newConnection only fires on a live server
         conn = self._server.nextPendingConnection()
         if conn is None:
             return
@@ -3991,7 +3992,7 @@ class MainWindow(QMainWindow):
         # may send one ident, and a collision with an action it did not mention is
         # still a collision. Checking the mapping alone accepted
         # {'copy': 'Ctrl+Q'} and left both copy and quit on Ctrl+Q.
-        seen = {}
+        seen: dict = {}
         for ident, entry in self._shortcuts.items():
             if ident in mapping:
                 continue                          # the submitted value wins below
@@ -4871,7 +4872,8 @@ class MainWindow(QMainWindow):
         self._toolbar_tier = tier
         # _toolbar is a QToolBar by the time a tier is applied (pyrefly types it Optional
         # from its None default in __init__).
-        self._toolbar.setToolButtonStyle(  # pyrefly: ignore[missing-attribute]
+        assert self._toolbar is not None   # a tier is applied only after the toolbar is built
+        self._toolbar.setToolButtonStyle(
             Qt.ToolButtonStyle.ToolButtonTextBesideIcon if tier == 'full'
             else Qt.ToolButtonStyle.ToolButtonIconOnly)
         for label in self._compact_hide:
@@ -5216,7 +5218,8 @@ def _parse_launch_args(argv):
         cut = argv.index('--')
         command = list(argv[cut + 1:])       # verbatim argv, no shell reparse
         argv = argv[:cut]
-    groups, current = [], []
+    groups: list = []
+    current: list = []
     for token in argv:
         if token == '--tab':
             groups.append(current)
@@ -5267,6 +5270,14 @@ def _parse_launch_args(argv):
                 sys.stderr.write('secure-terminal: -e command names no program '
                                  '(empty / whitespace only)\n')
                 raise SystemExit(2)
+        elif isinstance(cmd, str):
+            # An EXPLICIT but empty -e ("") names no program. A locked-down launcher
+            # (run ONLY this program) must fail closed here -- exactly like the `-- ""`
+            # list form below -- rather than let _argv_for_command drop to a LOGIN SHELL.
+            # An ABSENT -e is command=None (the deliberate 'no command -> shell'); only
+            # the explicit empty STRING, uniquely from `-e ""`, fails closed.
+            sys.stderr.write('secure-terminal: -e command names no program (empty)\n')
+            raise SystemExit(2)
         elif isinstance(cmd, (list, tuple)) and cmd and not str(cmd[0]).strip():
             # A `-- PROGRAM` list whose FIRST element is empty/whitespace ('' from
             # `-- ""`) names no program: fail closed like the string path, rather than

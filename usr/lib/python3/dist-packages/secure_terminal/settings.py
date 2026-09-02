@@ -108,7 +108,7 @@ def _parse_into(path, out):
     # Parse into a temp then merge on FULL success: text is decoded in buffers, so a
     # bad byte after the first ~8 KiB would otherwise leave the lines already read
     # applied -- a partial drop-in, not the documented "ignored".
-    parsed = {}
+    parsed: dict[str, str] = {}
     try:
         with open(path, encoding='utf-8') as handle:
             _parse_lines(handle, parsed)
@@ -124,7 +124,7 @@ def _read_user_base():
     re-parse of a corrupt file (a single bad byte yields no keys) followed by a
     rewrite would delete every other setting. A missing file is an empty base (the
     write creates it). Never raises."""
-    out = {}
+    out: dict[str, str] = {}
     try:
         with open(user_config_file(), encoding='utf-8') as handle:
             _parse_lines(handle, out)
@@ -137,7 +137,7 @@ def _read_user_base():
 
 def _load_dir(directory):
     """Merge every *.conf in one directory (lexical order) into a fresh dict."""
-    out = {}
+    out: dict[str, str] = {}
     try:
         files = sorted(glob.glob(os.path.join(directory, '*.conf')))
     except OSError:

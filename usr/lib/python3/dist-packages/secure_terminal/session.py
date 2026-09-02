@@ -96,7 +96,7 @@ def save(tabs, window=None, active=None):
         for stale in _log_indices():
             if stale >= len(tabs):
                 _remove(_log_path(stale))
-        payload = {'tabs': index}
+        payload: dict[str, object] = {'tabs': index}
         if isinstance(window, str) and window:
             payload['window'] = window
         if isinstance(active, int) and 0 <= active < len(index):
