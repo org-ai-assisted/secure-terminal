@@ -64,4 +64,7 @@ dist-ai-tests:
   ## runs `git log --color` for the compatibility-page git row -- absent, the gate
   ## FATAL-exits (R-220). The other fixture programs (coreutils/grep/sed/tar/gzip/
   ## findutils/diffutils/mawk) are Debian base; git is not guaranteed, so pin it here.
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git"
+  ## procps (pgrep/pkill) backs safe-pgrep/safe-pkill, which the shots reaper HARD-REQUIRES
+  ## (R-220, refuses to fall back to a self-matching bare pgrep -f); not guaranteed in the
+  ## CI base image, so pin it.
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git procps"
