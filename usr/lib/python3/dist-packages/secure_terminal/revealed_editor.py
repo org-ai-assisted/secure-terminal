@@ -32,7 +32,7 @@ defensive re-drop happen only on DELIVER, in review.py.
 """
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QFont
+from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QFont, QGuiApplication
 from PyQt6.QtWidgets import QPlainTextEdit
 
 from secure_terminal.sanitize import (
@@ -65,6 +65,18 @@ class RevealedEditor(QPlainTextEdit):
         self._font_family = DEFAULT_FONT_FAMILY
         self._zoom = 100
         self.setUndoRedoEnabled(False)
+        # self._text is the ONLY authority for what the box holds (source() + deliver
+        # read it); the base QPlainTextEdit document is a pure RENDER of it, rebuilt only
+        # by _render(). Every base-editor mutation path that could edit the document
+        # OUTSIDE our handlers -- and thereby desync _text from what is shown (Deliver
+        # would then cross stale text) -- is shut off here: the context menu (its Cut /
+        # Paste / Delete actions), and drag-and-drop (a drop-in, or a drag-MOVE that
+        # deletes the dragged text from the doc). The remaining paths are all routed
+        # through _text: keyPressEvent (mutating chords handled, others swallowed),
+        # insertFromMimeData (paste, re-sanitized), and mousePressEvent (which collapses
+        # any selection BEFORE the base sees the press, so no drag-move can start).
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.setAcceptDrops(False)
         # NoWrap: a revealed line of wide badges must keep its glyph columns stable,
         # and the box is short; the scrollbar-as-needed exposes an over-wide line
         # for manual inspection without an auto-follow hiding the row start.
@@ -201,13 +213,71 @@ class RevealedEditor(QPlainTextEdit):
         self._render()
         self.changed.emit()
 
+    def _edit_range(self):
+        """The source [start, end) an edit acts on: the base cursor's SELECTION mapped
+        to source indices (via the same boundary-snapping as a click), or the caret
+        (an empty range at _pos) when nothing is selected. Reading the selection off
+        the base cursor -- which it maintains for free from a mouse drag or Ctrl+A --
+        lets a type-over / cut / delete REPLACE the selection through _text, so the
+        base can never edit the rendered doc behind the model's back."""
+        cur = self.textCursor()
+        if cur.hasSelection():
+            a = self._source_index_for_doc_pos(cur.selectionStart())
+            b = self._source_index_for_doc_pos(cur.selectionEnd())
+            return min(a, b), max(a, b)
+        return self._pos, self._pos
+
     def _insert(self, chunk):
-        """Insert `chunk` (already display-sanitized) at the caret, advancing past
-        it. Newlines in the chunk make real line breaks in the box."""
-        if not chunk:
+        """Insert `chunk` (already display-sanitized) at the caret, REPLACING any
+        selection first (type-over / paste-over), and advance past it. Newlines in the
+        chunk make real line breaks in the box. An empty chunk with a selection still
+        deletes the selection (typing a dropped invisible over a selection replaces
+        it with nothing, as any editor); an empty chunk with no selection is a no-op."""
+        start, end = self._edit_range()
+        if start == end and not chunk:
             return
-        self._replace(self._text[:self._pos] + chunk + self._text[self._pos:],
-                      self._pos + len(chunk))
+        self._replace(self._text[:start] + chunk + self._text[end:], start + len(chunk))
+
+    def _paste_clipboard(self):
+        """Ctrl+V: insert the clipboard through the SAME sanitize + selection-replace
+        path as any other paste-into-the-box (insertFromMimeData), so a clipboard
+        paste can neither smuggle a hidden character nor edit the doc behind _text."""
+        board = QGuiApplication.clipboard()
+        self._insert(self._display_clean(board.text() if board is not None else ''))
+
+    def _cut(self):
+        """Ctrl+X: DELETE the selection through _text -- a trim, not a clipboard cut.
+        Deliberately writes NOTHING to the OS clipboard: the box holds text that has
+        not yet been reviewed to cross a trust boundary, so a reflexive Ctrl+X must not
+        exfiltrate it (and the base cut would also desync _text). Copy (Ctrl+C, the
+        inert rendered form) stays available for a deliberate copy-out."""
+        start, end = self._edit_range()
+        if end > start:
+            self._replace(self._text[:start] + self._text[end:], start)
+
+    def _delete_word(self, forward):
+        """Ctrl+Backspace / Ctrl+Delete: delete the selection if any, else the word to
+        one side of the caret, through _text (never the base's own word-delete, which
+        would edit the doc behind the model)."""
+        start, end = self._edit_range()
+        if end > start:
+            self._replace(self._text[:start] + self._text[end:], start)
+            return
+        text = self._text
+        if forward:
+            i = self._pos
+            while i < len(text) and text[i].isspace():
+                i += 1
+            while i < len(text) and not text[i].isspace():
+                i += 1
+            self._replace(text[:self._pos] + text[i:], self._pos)
+        else:
+            i = self._pos
+            while i > 0 and text[i - 1].isspace():
+                i -= 1
+            while i > 0 and not text[i - 1].isspace():
+                i -= 1
+            self._replace(text[:i] + text[self._pos:], i)
 
     def _line_bounds(self):
         """(start, end) source indices of the line the caret is on (end excludes the
@@ -228,19 +298,33 @@ class RevealedEditor(QPlainTextEdit):
             return
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         if ctrl:
-            # Leave Ctrl chords (copy, select-all) to the base editor: they read the
-            # rendered document, never mutate the source model.
-            super().keyPressEvent(event)
+            # WHITELIST, not blacklist: only the base ops that CANNOT mutate the
+            # document (select-all, copy the rendered selection) fall through to the
+            # base; the mutating chords are routed through _text; and EVERY other Ctrl
+            # chord is swallowed, so no base edit action can ever reach the document
+            # unhandled (a blacklist of named chords would leave the next one open).
+            if key in (Qt.Key.Key_A, Qt.Key.Key_C, Qt.Key.Key_Insert):
+                super().keyPressEvent(event)      # select-all / copy: no mutation
+            elif key == Qt.Key.Key_V:
+                self._paste_clipboard()
+            elif key == Qt.Key.Key_X:
+                self._cut()
+            elif key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+                self._delete_word(forward=(key == Qt.Key.Key_Delete))
             return
         if key in (Qt.Key.Key_Backspace,):
-            if self._pos > 0:
-                self._replace(self._text[:self._pos - 1] + self._text[self._pos:],
-                              self._pos - 1)
+            start, end = self._edit_range()
+            if end > start:
+                self._replace(self._text[:start] + self._text[end:], start)
+            elif start > 0:
+                self._replace(self._text[:start - 1] + self._text[start:], start - 1)
             return
         if key in (Qt.Key.Key_Delete,):
-            if self._pos < len(self._text):
-                self._replace(self._text[:self._pos] + self._text[self._pos + 1:],
-                              self._pos)
+            start, end = self._edit_range()
+            if end > start:
+                self._replace(self._text[:start] + self._text[end:], start)
+            elif start < len(self._text):
+                self._replace(self._text[:start] + self._text[start + 1:], start)
             return
         if key in (Qt.Key.Key_Left,):
             self._pos = max(0, self._pos - 1)
@@ -303,7 +387,16 @@ class RevealedEditor(QPlainTextEdit):
         """Place the caret at the SOURCE character nearest the click. Qt lands the
         native caret at a document offset that can be mid-badge; snap it to the
         source index whose rendered caret offset is closest, so the caret always
-        sits on a cell boundary."""
+        sits on a cell boundary.
+
+        Collapse any selection BEFORE the base sees the press: the base starts a
+        drag-MOVE (which deletes the dragged text from the doc, desyncing _text) only
+        when a press lands ON an existing selection, so clearing it first means a press
+        can only ever begin a fresh click or a drag-SELECT, never a move."""
+        cur = self.textCursor()
+        if cur.hasSelection():
+            cur.clearSelection()
+            self.setTextCursor(cur)
         super().mousePressEvent(event)
         doc_pos = self.textCursor().position()
         self._pos = self._source_index_for_doc_pos(doc_pos)
