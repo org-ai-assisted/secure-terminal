@@ -123,6 +123,9 @@ class _Kind(TypedDict):
     deliver_tip: str
     dispatch: str
     paste_newline: NotRequired[bool]
+    # The "If accepted" note for a non-paste direction (copy/clipboard); paste computes
+    # its note dynamically from the child's tty mode, so it needs no static entry.
+    accept_note: NotRequired[str]
 
 
 _KINDS: dict[str, _Kind] = {
@@ -151,6 +154,7 @@ _KINDS: dict[str, _Kind] = {
         'deliver': 'Copy',
         'deliver_tip': 'Copy exactly the box above to the clipboard',
         'dispatch': 'dispatch_pending_copy',
+        'accept_note': 'placed on the system clipboard (nothing runs)',
     },
     # The standalone clipboard sanitizer (clipboard_watch.py): text already ON the
     # system clipboard, reviewed before it is pasted elsewhere. Not a terminal
@@ -167,6 +171,7 @@ _KINDS: dict[str, _Kind] = {
         'deliver': 'Replace',
         'deliver_tip': 'Replace the clipboard with exactly the box above',
         'dispatch': 'dispatch_pending_clipboard',
+        'accept_note': 'replaces the clipboard contents (nothing runs)',
     },
 }
 
@@ -440,11 +445,13 @@ class ReviewBar(QWidget):
         struct = [_row(_LINES_GLYPH,
                        palette['invisible']['fg'] if multiline else _MUTED_FG,
                        'Lines', lines_val)]
+        # "If accepted" is shown in EVERY direction so the guarantee never appears and
+        # disappears as the user switches between paste and copy -- only the note differs.
         if self._kind.get('paste_newline'):
-            # never-auto-run always holds -- we never inject a submit: a bracketed program
-            # buffers the paste as inert text; every non-bracketed delivery has its trailing
-            # submit CR stripped (paste_no_autosubmit). But WHERE the bytes land differs, and
-            # the row must not over-promise a waiting command line that isn't there:
+            # PASTE. never-auto-run always holds -- we never inject a submit: a bracketed
+            # program buffers the paste as inert text; every non-bracketed delivery has its
+            # trailing submit CR stripped (paste_no_autosubmit). But WHERE the bytes land
+            # differs, and the row must not over-promise a waiting command line that isn't there:
             #  - bracketed: the foreground program receives it as inert text.
             #  - a bare shell prompt (canonical line discipline): the line is cooked and held,
             #    so it truly waits for the user's own Enter.
@@ -468,7 +475,11 @@ class ReviewBar(QWidget):
             else:
                 glyph, colour, note = (_SAFE_GLYPH, SAFE_FG,
                                        'waits on the command line -- press Enter to run')
-            struct.append(_row(glyph, colour, 'If accepted', note))
+        else:
+            # COPY / CLIPBOARD: the text is placed as clipboard DATA, never executed, so
+            # the guarantee is unconditional -- a fixed, direction-appropriate note.
+            glyph, colour, note = (_SAFE_GLYPH, SAFE_FG, self._kind['accept_note'])
+        struct.append(_row(glyph, colour, 'If accepted', note))
         length = ('%d+ characters (shown box; the full text is larger)'
                   % detail['chars'] if truncated
                   else '%d characters (%d bytes)'
