@@ -171,13 +171,18 @@ HOLDS it and shows a review bar docked at the bottom; no byte reaches the shell
 per-class breakdown of what is hidden (look-alikes, invisible/zero-width,
 bidirectional controls, control characters, combining marks, box-drawing, other
 non-ASCII), a structure summary (line count, whether it would run on its own,
-length), and a mirror pane rendering exactly what each choice would deliver. The
-held text is editable: trim the risky part and the summary, breakdown and mirror
-update, and delivery sends exactly the edited buffer (re-sanitized, so an edit
-cannot bypass the neutralization). Choose Reject, the ASCII form (look-alikes
-stripped) or the unicode form (printable non-ASCII kept). A paste never runs on
-its own: the trailing submit byte is removed so the command waits at the prompt
-for your own Enter.
+length), and one editable box holding the text FULLY REVEALED -- nothing is
+silently pre-dropped, so a trap cannot hide by being cleaned away before you see
+it; every hidden character stays in place, named and risk-class-coloured. While
+the box still holds any invisible, reordering or control character the Deliver
+button is disabled and red ("blocked -- N hidden"): clear it with a transform --
+Strip unicode (ASCII only), ASCII-fold (replace look-alikes with the plain letter
+they imitate) or Keep printable unicode (drop the invisible/reordering characters,
+keep the rest) -- or by editing the box directly, and Restore original re-reveals
+the untouched text. Delivery sends exactly the box (re-sanitized, so an edit cannot
+bypass the neutralization); Reject discards it. A paste never runs on its own: the
+trailing submit byte is removed so the command waits at the prompt for your own
+Enter.
 
 `paste_warn` and `copy_warn` (each `unicode` by default; also `always` or
 `never`) control when the bar appears in each direction. The two directions are

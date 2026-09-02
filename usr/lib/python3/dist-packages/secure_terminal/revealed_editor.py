@@ -36,7 +36,7 @@ from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QFont, QGuiApplica
 from PyQt6.QtWidgets import QPlainTextEdit
 
 from secure_terminal.sanitize import (
-    feed_line_edits, cells_to_runs, sanitize_clipboard_unicode,
+    feed_line_edits, cells_to_runs, sanitize_clipboard_unicode, reveal_display,
     MARK_KEY, THEMES, DISPLAY_MODES, BASE_POINT_SIZE,
     display_len, _cell_display, _collapse_zalgo_runs,
     _is_mark, _COMBINING_RUN_MAX,
@@ -133,6 +133,18 @@ class RevealedEditor(QPlainTextEdit):
         through the same sanitizer here as a belt-and-braces guard so the box can
         never hold an invisible/control the model would not render 1:1."""
         self._text = self._display_clean(text)
+        self._pos = len(self._text)
+        self._render()
+        self.changed.emit()
+
+    def set_source_revealed(self, text):
+        """Load `text` FULLY REVEALED (reveal_display): keep every deception character
+        -- invisibles, bidi, control, look-alikes -- so it renders as a named badge in
+        place and the user SEES the whole trap, instead of pre-cleaning it. Caret at the
+        end. This is the review box's default on open; a later typed/pasted edit goes
+        through the cleaning set_source/insert path, so the user cannot ADD a hidden
+        character even though the ORIGINAL's hidden characters are shown as evidence."""
+        self._text = self._cap_combining(reveal_display(text))
         self._pos = len(self._text)
         self._render()
         self.changed.emit()

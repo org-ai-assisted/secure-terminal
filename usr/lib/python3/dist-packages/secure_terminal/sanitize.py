@@ -1464,6 +1464,30 @@ def sanitize_clipboard(text):
                    if ch in '\n\t' or 0x20 <= ord(ch) <= 0x7E)
 
 
+# The four control bytes the line-cell builder (feed_line_edits) CONSUMES or acts on
+# rather than storing as one overwrite cell -- so they are not source<->cell 1:1 and
+# cannot ride the revealed edit box (which needs each source char to be exactly one
+# cell for atomic-token editing + caret mapping): CR (col reset), BS (cursor back),
+# BEL (dropped), ESC (escape parsing). Every OTHER character -- including the whole
+# deception set (bidi, zero-width, other C0/C1 control, look-alikes, combining) -- IS
+# stored 1:1 and renders as a badge, so the reveal box can show it in place.
+_NON_CELL_CONTROL = '\r\b\x07\x1b'
+
+
+def reveal_display(text):
+    r"""The review BOX's REVEAL-default source: keep EVERY deception character so it
+    renders as a named badge IN PLACE -- invisibles, bidi overrides, other control
+    bytes, look-alikes, combining marks, foreign text all stay, so the box shows the
+    whole trap instead of silently pre-cleaning it (the point of the review). Only the
+    characters the cell model cannot represent 1:1 are normalized: a Windows CRLF pair
+    collapses to one '\n' (matching the paste path), and a lone CR/BS/BEL/ESC is dropped
+    (feed_line_edits consumes those rather than storing a cell, and delivery re-sanitizes
+    them regardless). Newlines are preserved. The kept invisibles are neutralized on
+    DELIVER, not here -- here they are EVIDENCE the user must see before choosing."""
+    text = text.replace('\r\n', '\n')
+    return ''.join(ch for ch in text if ch not in _NON_CELL_CONTROL)
+
+
 # Box-drawing code points whose glyph is a pure horizontal / vertical stroke; every
 # other structural glyph (corners, junctions, diagonals) becomes '+', block elements
 # '#'. Used only to give the inert DISPLAY glyphs an ASCII stand-in on copy.

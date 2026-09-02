@@ -46,12 +46,12 @@ Delivery is dispatched back to the tab that held the text, the only path that le
 it cross.
 """
 
-from typing import Callable, NotRequired, TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import (
-    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton, QMessageBox,
+    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton,
 )
 
 from secure_terminal.sanitize import (
@@ -61,14 +61,16 @@ from secure_terminal.sanitize import (
 from secure_terminal.terminal import SecureTerminal
 from secure_terminal.revealed_editor import RevealedEditor
 
-# Semantic colours: the app's canonical safe-green and caution-red (the same values
-# the mode lamps and risk dots use). SAFE_FG tints ONLY the Reject button (the one
-# safe choice); RISK_FG is the risk dot. Chosen to clear the contrast guard
-# (sanitize.too_close) against BOTH the light and the dark theme background, so they
-# stay readable whatever the desktop palette -- unlike a foreground-only tint tuned
-# for one theme. Pinned as constants so test_review.py can assert the contrast.
-SAFE_FG = '#1f8a54'
-RISK_FG = '#d83933'
+# Semantic colours -- the app's green=safe traffic light, matching the main window
+# (which labels DETAIL/CLI "green, safe" and the review lamp red). All three clear the
+# contrast guard (sanitize.too_close) against BOTH theme backgrounds, so they stay
+# readable whatever the desktop palette. Pinned so test_review.py can assert the
+# contrast. Used on: Reject (green), the transform buttons (green = result is safe
+# ASCII, amber = result keeps printable unicode), and Deliver (red blocked / amber
+# unicode / no colour ASCII -- so a button's colour predicts what Deliver becomes).
+SAFE_FG = '#1f8a54'      # green -- a safe outcome (pure ASCII), and Reject
+CAUTION_FG = '#9a6a00'   # amber -- printable unicode kept (look-alikes survive)
+RISK_FG = '#d83933'      # red  -- the risk dot, and a Deliver blocked by hidden chars
 
 # The box loads (and edits) at most this many SOURCE characters of the paste. Well
 # beyond any human-reviewable paste, but bounded so the per-keystroke cell rebuild
@@ -99,6 +101,7 @@ _CLASS_ROWS = tuple(
 _MUTED_FG = '#888888'
 _LINES_GLYPH = chr(0x00B6)   # pilcrow, for the Lines row
 _SAFE_GLYPH = chr(0x2713)    # check: the never-auto-run guarantee is met
+_CAUTION_GLYPH = chr(0x25B2)  # up-triangle: accepted, but delivery is not a waiting command line
 # Shown (safe-green) when a reviewed paste hides nothing -- a positive all-clear so an
 # ASCII-only paste held for another reason (a multi-line paste) reads as safe.
 _CLEAN_MSG = 'ASCII-only -- nothing hidden.'
@@ -113,6 +116,7 @@ class _Kind(TypedDict):
     summary_empty: str
     full_note: str
     subject: str
+    noun: str
     reject: str
     reject_tip: str
     deliver: str
@@ -128,6 +132,7 @@ _KINDS: dict[str, _Kind] = {
         'summary_empty': 'Review this paste before it reaches the shell.',
         'full_note': 'the FULL paste still delivers',
         'subject': 'this paste',
+        'noun': 'paste',
         'reject': 'Reject',
         'reject_tip': 'Do not paste (Enter or Esc)',
         'deliver': 'Paste',
@@ -140,6 +145,7 @@ _KINDS: dict[str, _Kind] = {
         'summary_empty': 'Review this copy before it reaches the clipboard.',
         'full_note': 'the FULL copy still reaches the clipboard',
         'subject': 'this copy',
+        'noun': 'copy',
         'reject': "Don't copy",
         'reject_tip': 'Do not copy (Enter or Esc)',
         'deliver': 'Copy',
@@ -155,6 +161,7 @@ _KINDS: dict[str, _Kind] = {
         'summary_empty': 'Review the clipboard text.',
         'full_note': 'the FULL clipboard text is still used',
         'subject': 'this clipboard text',
+        'noun': 'clipboard text',
         'reject': 'Leave it',
         'reject_tip': 'Leave the clipboard unchanged (Enter or Esc)',
         'deliver': 'Replace',
@@ -197,7 +204,9 @@ class ReviewBar(QWidget):
         outer.setContentsMargins(8, 6, 8, 6)
         outer.setSpacing(6)
 
-        # summary row: a risk dot, the "what is hidden" headline, and Reject + Deliver.
+        # summary row: risk dot, the "what is hidden" headline, then the three DECISIONS
+        # -- Show original (reset to the revealed trap), Reject (safe backout), Deliver
+        # (content-driven). The transforms live in their own group below.
         row = QHBoxLayout()
         row.setSpacing(8)
         # The risk dot recolours per review: RISK_FG when something is hidden, SAFE_FG
@@ -214,61 +223,77 @@ class ReviewBar(QWidget):
         self._summary.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self._summary, 1)
-        # Only Reject is coloured (safe-green): the one unconditionally-safe choice
-        # (nothing crosses), never gated -- Enter/Esc always back out.
+        # Restore original: revert the box to the original paste, fully revealed
+        # (discards edits + transforms, re-blocks Deliver) -- the evidence escape hatch,
+        # one click, no confirm, so re-inspecting the trap is never gated. Named for what
+        # it does (reverts the content); "show" would wrongly read as a display toggle.
+        self._restore = QPushButton('Restore original', self)
+        self._restore.setToolTip('Revert the box to the original paste with every hidden '
+                                 'character revealed again (discards your edits and any '
+                                 'transformation). Re-blocks sending until you remove them.')
+        self._restore.clicked.connect(self._do_restore)
+        row.addWidget(self._restore)
+        # Only Reject is fixed green: the one unconditionally-safe choice (nothing
+        # crosses), never gated -- Enter/Esc always back out.
         self._reject = QPushButton('Reject', self)
         self._reject.setStyleSheet('color:%s; font-weight:600;' % SAFE_FG)
         self._reject.clicked.connect(lambda: self._choose('reject'))
         row.addWidget(self._reject)
-        # The Deliver button carries NO colour (delivery is never unconditionally safe
-        # -- a strip de-obfuscates, a keep preserves a look-alike); the box above shows
-        # exactly what it sends. Gated by the paste countdown.
+        # Deliver is CONTENT-DRIVEN (see _update_deliver): red + disabled while any hidden
+        # (invisible/bidi/control) character remains -- a trap literally cannot be sent
+        # while it is visible -- amber when only printable unicode (look-alikes) remains,
+        # no colour when pure ASCII. The paste countdown gates it on top.
         self._deliver = QPushButton('Paste', self)
         self._deliver.clicked.connect(self._deliver_clicked)
         row.addWidget(self._deliver)
         outer.addLayout(row)
 
-        # THE box: editable, revealed, multi-line -- the exact preview of what crosses.
-        # Every edit recomputes the summary + breakdown from it (recompute-on-change),
-        # and delivery sends exactly it (re-sanitized), so what is shown is what
-        # crosses -- an edit can never bypass the neutralization.
+        # THE box: editable, revealed, multi-line -- opens showing the WHOLE paste
+        # (invisibles/bidi as named badges, look-alikes tinted), nothing pre-dropped, so
+        # the trap is EVIDENCE you see before choosing. What is shown is what a Deliver
+        # sends (re-sanitized); an edit can never bypass the neutralization, and a typed
+        # or re-pasted character is cleaned so it cannot ADD a hidden one.
         self._editor = RevealedEditor(self)
         self._editor.setMaximumHeight(140)
         self._editor.changed.connect(self._on_edit)
         outer.addWidget(self._editor)
 
-        # The status line naming the active transform and how much it removed, so the
-        # default keep-printable state is self-explaining ("Keeping printable unicode --
-        # 2 hidden characters dropped"). The live per-class table below is the "what
-        # remains" readout; this line names the transform that produced the box.
+        # Status line: names the CURRENT box state and which classes a transform removed
+        # (never a bare ambiguous count). The badges in the box name each exact character.
         self._status = QLabel('', self)
         self._status.setStyleSheet('color:%s;' % _MUTED_FG)
         self._status.setWordWrap(True)
         outer.addWidget(self._status)
 
-        # The three in-place transforms (Deliver + Reject live in the summary row). Each
-        # rewrites the box, which re-runs the classifier + relabels the status line.
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        self._strip = QPushButton('Strip unicode', self)
-        self._strip.setToolTip('Delete every non-ASCII character, with NO mapping -- a '
-                               'look-alike is removed, not turned into the letter it '
-                               'imitates, so a spoofed word reads visibly broken.')
-        self._strip.clicked.connect(self._do_strip)
-        actions.addWidget(self._strip)
-        self._fold = QPushButton('ASCII-fold', self)
-        self._fold.setToolTip('Fold each look-alike to the ASCII character it imitates '
-                              '(Cyrillic a becomes Latin a), then clean -- reveals the '
-                              'plain ASCII the disguise was pretending to be.')
-        self._fold.clicked.connect(self._do_fold)
-        actions.addWidget(self._fold)
-        self._restore = QPushButton('Restore original paste', self)
-        self._restore.setToolTip('Revert the box to the original text (printable-unicode '
-                                 'form). Your edits in the box will be lost.')
-        self._restore.clicked.connect(self._do_restore)
-        actions.addWidget(self._restore)
-        actions.addStretch(1)
-        outer.addLayout(actions)
+        # The in-place transforms, under a NEUTRAL header (they change the text; they
+        # promise nothing). Each: a technical label + a plain gloss beneath, and a
+        # green/amber tint in the app's green=safe language -- Strip + ASCII-fold give a
+        # safe ASCII result (green), Keep printable leaves the look-alikes (amber). So the
+        # button colour predicts what Deliver becomes if you click it.
+        header = QLabel('Text transformations:', self)
+        header.setStyleSheet('color:%s; font-weight:600;' % _MUTED_FG)
+        outer.addWidget(header)
+        trow = QHBoxLayout()
+        trow.setSpacing(14)
+        self._strip = self._transform_button(
+            trow, 'Strip unicode', SAFE_FG, 'remove every non-ASCII character',
+            'Delete every non-ASCII character, with NO mapping -- a look-alike is removed, '
+            'not turned into the letter it imitates, so a spoofed word reads visibly '
+            'broken. Result is plain ASCII (safe to send).', self._do_strip)
+        self._fold = self._transform_button(
+            trow, 'ASCII-fold', SAFE_FG,
+            'replace look-alikes with the plain letter they imitate',
+            'Replace each look-alike with the ASCII character it imitates (Cyrillic a '
+            'becomes Latin a), then clean -- reveals the plain ASCII the disguise was '
+            'pretending to be. Result is plain ASCII (safe to send).', self._do_fold)
+        self._keep = self._transform_button(
+            trow, 'Keep printable unicode', CAUTION_FG,
+            'remove invisible/reordering characters, keep the rest',
+            'Remove the invisible / reordering / control characters, but KEEP every visible '
+            'letter including any look-alikes. The visible deception survives, so this '
+            'result is caution (amber), not fully safe.', self._do_keep)
+        trow.addStretch(1)
+        outer.addLayout(trow)
 
         # The breakdown beneath the box: a Structure section (lines, the never-auto-run
         # guarantee, length) and a per-class hidden-character table, recomputed from the
@@ -281,6 +306,24 @@ class ReviewBar(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         outer.addWidget(self._detail)
 
+    def _transform_button(self, row, label, colour, gloss, tip, slot):
+        """One transform: a tinted technical button (colour = its result's safety, in the
+        app's green=safe language) with a plain-language gloss beneath it, and the house
+        tooltip on hover. Added as its own column to `row`; returns the button."""
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        btn = QPushButton(label, self)
+        btn.setStyleSheet('color:%s; font-weight:600;' % colour)
+        btn.setToolTip(tip)
+        btn.clicked.connect(slot)
+        col.addWidget(btn)
+        cap = QLabel(gloss, self)
+        cap.setStyleSheet('color:%s; font-size:11px;' % _MUTED_FG)
+        cap.setWordWrap(True)
+        col.addWidget(cap)
+        row.addLayout(col)
+        return btn
+
     # -- lifecycle ------------------------------------------------------------
     def show_review(self, term, raw, delay, kind='paste'):
         """Show the bar for `term`'s held text `raw`, in the given direction ('paste',
@@ -291,7 +334,7 @@ class ReviewBar(QWidget):
         self._term = term
         self._raw = raw
         self._tail = raw[_BOX_MAX:]
-        self._active_mode = 'keep'          # opens keep-printable; the tail follows
+        self._active_mode = 'reveal'        # opens fully revealed; the tail follows
         self._kind = _KINDS.get(kind, _KINDS['paste'])
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
@@ -303,13 +346,12 @@ class ReviewBar(QWidget):
         # Follow the reviewed tab's theme + display mode, so the box reveals risk on
         # the same background and in the same mode as the console.
         self._sync_appearance()
-        # Open in the default keep-printable form; set_source emits `changed`, which
-        # runs _on_edit -> refresh + arm-countdown, so the table + deliver state are
-        # populated without a separate call. set_source applies the full display clean
-        # (drop invisibles + cap combining), so the status count below -- read from the
-        # ACTUAL box -- reflects every drop, not just the invisibles.
-        self._editor.set_source(raw[:_BOX_MAX])
-        self._set_status_keep(raw[:_BOX_MAX])
+        # Open FULLY REVEALED -- the whole trap is shown (invisibles/bidi as badges),
+        # nothing pre-dropped. set_source_revealed emits `changed`, which runs _on_edit
+        # -> refresh + arm-countdown, so the table + the content-driven Deliver state
+        # populate without a separate call.
+        self._editor.set_source_revealed(raw[:_BOX_MAX])
+        self._set_status_reveal()
         self.setVisible(True)
         self._editor.setFocus()
 
@@ -399,14 +441,34 @@ class ReviewBar(QWidget):
                        palette['invisible']['fg'] if multiline else _MUTED_FG,
                        'Lines', lines_val)]
         if self._kind.get('paste_newline'):
-            # never-auto-run is UNCONDITIONAL for a reviewed paste: at a shell prompt the
-            # trailing submit CR is stripped (paste_no_autosubmit); a bracketed program
-            # receives the paste as inert text. Either way it cannot run on its own.
+            # never-auto-run always holds -- we never inject a submit: a bracketed program
+            # buffers the paste as inert text; every non-bracketed delivery has its trailing
+            # submit CR stripped (paste_no_autosubmit). But WHERE the bytes land differs, and
+            # the row must not over-promise a waiting command line that isn't there:
+            #  - bracketed: the foreground program receives it as inert text.
+            #  - a bare shell prompt (canonical line discipline): the line is cooked and held,
+            #    so it truly waits for the user's own Enter.
+            #  - a foreground program in RAW mode (ICANON off) with no bracketed framing: the
+            #    program consumes the bytes AS KEYSTROKES the instant they arrive -- there is
+            #    no command line and no Enter to press. Still never auto-runs a shell command
+            #    (the trailing CR is gone), but it is not "waiting", so say so and tint amber.
             bracketed = (hasattr(term, '_bracketed_paste_active')
                          and term._bracketed_paste_active())
-            note = ('your program receives it as text' if bracketed
-                    else 'waits on the command line -- press Enter to run')
-            struct.append(_row(_SAFE_GLYPH, SAFE_FG, 'If accepted', note))
+            raw_fg = (not bracketed
+                      and hasattr(term, '_child_raw_mode')
+                      and hasattr(term, 'has_foreground_program')
+                      and term.has_foreground_program()
+                      and term._child_raw_mode())
+            if bracketed:
+                glyph, colour, note = (_SAFE_GLYPH, SAFE_FG,
+                                       'your program receives it as text')
+            elif raw_fg:
+                glyph, colour, note = (_CAUTION_GLYPH, CAUTION_FG,
+                                       'your program receives it immediately as keystrokes')
+            else:
+                glyph, colour, note = (_SAFE_GLYPH, SAFE_FG,
+                                       'waits on the command line -- press Enter to run')
+            struct.append(_row(glyph, colour, 'If accepted', note))
         length = ('%d+ characters (shown box; the full text is larger)'
                   % detail['chars'] if truncated
                   else '%d characters (%d bytes)'
@@ -433,15 +495,32 @@ class ReviewBar(QWidget):
             '<b>Hidden characters</b>%s' % (''.join(struct), chars_html))
 
     # -- the transforms -------------------------------------------------------
-    # The display sanitizer (newline-preserving) for each transform tier -- ONE source
-    # of truth, applied to the box AND to the un-shown tail on deliver, so a strip/fold
-    # can never neutralize the visible prefix but leave the tail at a weaker tier.
+    # The display sanitizer (newline-preserving) for each tier -- ONE source of truth,
+    # applied to the box AND to the un-shown tail on deliver, so a transform can never
+    # neutralize the visible prefix but leave the tail at a weaker tier. 'reveal' (the
+    # open default, look-alikes + invisibles shown) neutralizes the un-shown tail to
+    # keep-printable: a revealed box can only reach Deliver once its OWN invisibles are
+    # gone, so the tail follows the same printable-unicode floor.
     # dict VALUES are not descriptors, so these stay plain callables (no self binding).
     _TIER = {
+        'reveal': sanitize_clipboard_unicode,
         'keep': sanitize_clipboard_unicode,
         'strip': sanitize_clipboard,
         'fold': ascii_fold_display,
     }
+
+    def _do_keep(self):
+        """[Keep printable unicode]: remove the invisible / reordering / control
+        characters, KEEP the visible letters (incl. look-alikes) -> box becomes
+        deliverable at the amber 'unicode' tier."""
+        self._active_mode = 'keep'
+        before = self._editor.source()
+        removed = self._blocked_count(before)
+        self._editor.set_source(sanitize_clipboard_unicode(before))
+        self._status.setText('Removed %d hidden character%s (invisible / reordering / '
+                             'control)%s; kept the visible letters, including any '
+                             'look-alikes.'
+                             % (removed, '' if removed == 1 else 's', self._tail_note()))
 
     def _do_strip(self):
         """[Strip unicode]: delete every non-ASCII character, NO mapping. Applies to the
@@ -451,34 +530,50 @@ class ReviewBar(QWidget):
         after = sanitize_clipboard(before)
         removed = len(before) - len(after)
         self._editor.set_source(after)        # emits changed -> _on_edit refresh
-        self._status.setText('Showing ASCII only -- %d non-ASCII character%s removed%s.'
+        self._status.setText('Removed all %d non-ASCII character%s%s -- plain ASCII only.'
                              % (removed, '' if removed == 1 else 's', self._tail_note()))
 
     def _do_fold(self):
-        """[ASCII-fold]: fold each look-alike to the ASCII it imitates, then clean to
+        """[ASCII-fold]: replace each look-alike with the ASCII it imitates, then clean to
         ASCII. Applies to the box AND (on deliver) the tail; newlines preserved."""
         self._active_mode = 'fold'
         before = self._editor.source()
         after = ascii_fold_display(before)
         self._editor.set_source(after)
-        self._status.setText('Folded look-alikes to ASCII, then removed any remaining '
-                             'non-ASCII%s.' % self._tail_note())
+        self._status.setText('Replaced look-alikes with the plain ASCII they imitate, then '
+                             'removed any remaining non-ASCII%s.' % self._tail_note())
 
     def _do_restore(self):
-        """[Restore original paste]: revert the box to the original text's keep-printable
-        form. Confirms first, because it discards the user's edits."""
+        """[Restore original]: revert the box to the FULLY REVEALED original paste,
+        discarding edits/transforms and re-showing every hidden character (re-blocks
+        Deliver). The evidence escape hatch -- one click, no confirm, so re-inspecting
+        the trap is never gated."""
         if self._term is None:
             return
-        confirm = QMessageBox.question(
-            self, 'Restore original paste',
-            'Revert the box to the original text? Your edits in the box will be lost.',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-        self._active_mode = 'keep'
-        self._editor.set_source(self._raw[:_BOX_MAX])
-        self._set_status_keep(self._raw[:_BOX_MAX])
+        self._active_mode = 'reveal'
+        self._editor.set_source_revealed(self._raw[:_BOX_MAX])
+        self._set_status_reveal()
+
+    def _blocked_count(self, text):
+        """How many characters in `text` are the truly-hidden kind Keep-printable drops
+        (invisible / bidi / control) -- the classes that BLOCK Deliver. Length diff
+        against keep-printable, so it never disagrees with what a keep would remove."""
+        return len(text) - len(sanitize_clipboard_unicode(text))
+
+    def _set_status_reveal(self):
+        """Status for the reveal state (open + Restore original): the full text is shown;
+        name how many hidden characters block sending (the badges name each exact one).
+        Uses the direction's noun so a copy/clipboard review does not read 'paste'."""
+        noun = self._kind['noun']
+        n = self._blocked_count(self._editor.source())
+        if n:
+            self._status.setText('Showing the full %s -- %d hidden character%s '
+                                 '(invisible / reordering / control) block sending; each '
+                                 'is named in the box. Remove them (a Text transformation, '
+                                 'or delete the badges) to continue.'
+                                 % (noun, n, '' if n == 1 else 's'))
+        else:
+            self._status.setText('Showing the full %s -- nothing hidden.' % noun)
 
     def _tail_note(self):
         """A status suffix disclosing that the un-shown tail is neutralized to the SAME
@@ -492,17 +587,6 @@ class ReviewBar(QWidget):
         if not self._tail:
             return ''
         return self._TIER[self._active_mode](self._tail)
-
-    def _set_status_keep(self, source):
-        """Set the status line for the keep-printable state (open + restore): how many
-        characters the box dropped from `source`. Counted against the ACTUAL box content
-        (call AFTER set_source), so it includes BOTH the invisible/bidi/control drop AND
-        the editor's combining-run cap -- a plain sanitize_clipboard_unicode count would
-        miss the cap and read '0 dropped' on a Zalgo flood the box actually shrank, and
-        contradict the same bar's hidden-character table."""
-        dropped = len(source) - len(self._editor.source())
-        self._status.setText('Keeping printable unicode -- %d hidden character%s dropped.'
-                             % (dropped, '' if dropped == 1 else 's'))
 
     # -- appearance follow (main.py calls this on tab mode/theme/font/zoom change) --
     def rerender_mirror(self):
@@ -539,9 +623,30 @@ class ReviewBar(QWidget):
         self._update_deliver()
 
     def _update_deliver(self):
-        """Sync the Deliver button to the countdown: a countdown label + disabled while
-        it runs, then enabled. Its label names the direction (Paste / Copy / Replace)."""
-        base = self._kind['deliver']
+        """Sync the Deliver button to the box CONTENT (recomputed on every edit/transform)
+        and the countdown, in the app's green=safe language:
+          - any hidden (invisible/bidi/control) char left  -> RED, disabled,
+            '<verb> blocked - N hidden' -- a trap cannot be sent while it is visible;
+          - only printable unicode (look-alikes) left       -> amber, '<verb> unicode';
+          - pure ASCII                                       -> no colour, '<verb> ASCII'.
+        The paste countdown gates it ON TOP (disabled + a (N) suffix while it runs)."""
+        verb = self._kind['deliver']
+        box = self._editor.source()
+        blocked = self._blocked_count(box)
+        if blocked > 0:
+            self._deliver.setText('%s blocked - %d hidden' % (verb, blocked))
+            self._deliver.setEnabled(False)
+            self._deliver.setStyleSheet('color:%s; font-weight:600;' % RISK_FG)
+            self._deliver.setToolTip('Remove the %d hidden character%s first -- a Text '
+                                     'transformation, or delete the badges in the box.'
+                                     % (blocked, '' if blocked == 1 else 's'))
+            return
+        # not blocked: the OUTCOME is safe (ASCII) or caution (printable unicode kept).
+        if any(ord(c) > 0x7F for c in box):
+            base, colour = '%s unicode' % verb, CAUTION_FG
+        else:
+            base, colour = '%s ASCII' % verb, None
+        self._deliver.setStyleSheet('color:%s; font-weight:600;' % colour if colour else '')
         if self._remaining > 0:
             self._deliver.setText('%s (%d)' % (base, self._remaining))
             self._deliver.setEnabled(False)
@@ -559,9 +664,9 @@ class ReviewBar(QWidget):
             self._countdown.stop()
 
     def _deliver_clicked(self):
-        """The Deliver button: send the box. Disabled until the countdown elapses, but
-        re-check in case a click races the timer."""
-        if self._remaining <= 0:
+        """The Deliver button: send the box. Disabled while any hidden character remains
+        or the countdown runs, but re-check both in case a click races the state."""
+        if self._remaining <= 0 and self._blocked_count(self._editor.source()) == 0:
             self._choose('deliver')
 
     def _choose(self, choice):
