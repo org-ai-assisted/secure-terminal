@@ -1010,13 +1010,19 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
 # the Unicode confusables data shipped by python3-confusable-homoglyphs (a hard
 # dependency); if the package is somehow absent the set is empty and such a
 # character just stays in the generic 'nonascii' class -- never a crash.
-_ASCII_CONFUSABLES = None
+_ASCII_FOLD_MAP = None
 
 
-def _ascii_confusables():
-    global _ASCII_CONFUSABLES
-    if _ASCII_CONFUSABLES is None:
-        found = set()
+def _ascii_fold_map():
+    """Map each NON-ASCII confusable CHARACTER to the printable-ASCII character it
+    IMITATES (Cyrillic a U+0430 -> 'a', Greek omicron -> 'o'), built once from the
+    Unicode confusables data shipped by python3-confusable-homoglyphs (a hard
+    dependency). Empty dict if the package is somehow absent -- never a crash. Single
+    source of truth for both the confusable SET (_ascii_confusables, its keys) and the
+    [ASCII-fold] action (ascii_fold, its values)."""
+    global _ASCII_FOLD_MAP
+    if _ASCII_FOLD_MAP is None:
+        mapping = {}
         try:
             import json
             from confusable_homoglyphs import confusables as _cf
@@ -1030,12 +1036,39 @@ def _ascii_confusables():
                 for alt in alternatives:
                     glyph = alt.get('c', '')
                     if len(glyph) == 1 and 0x20 <= ord(glyph) <= 0x7E:
-                        found.add(ord(source))
+                        mapping[source] = glyph   # the ASCII it imitates
                         break
         except Exception:             # pylint: disable=broad-except
-            pass                      # no data -> no refinement; stays 'nonascii'
-        _ASCII_CONFUSABLES = frozenset(found)
+            pass                      # no data -> no refinement / no fold
+        _ASCII_FOLD_MAP = mapping
+    return _ASCII_FOLD_MAP
+
+
+_ASCII_CONFUSABLES = None
+
+
+def _ascii_confusables():
+    """The NON-ASCII code points that are CONFUSABLE with a printable ASCII character
+    -- the true homoglyphs (Cyrillic a, Greek omicron), as distinct from merely foreign
+    non-deceptive non-ASCII (CJK, emoji, an accented e). Derived from _ascii_fold_map so
+    the detection set and the fold mapping can never drift."""
+    global _ASCII_CONFUSABLES
+    if _ASCII_CONFUSABLES is None:
+        _ASCII_CONFUSABLES = frozenset(ord(ch) for ch in _ascii_fold_map())
     return _ASCII_CONFUSABLES
+
+
+def ascii_fold(text):
+    """Fold each look-alike to the ASCII character it IMITATES (Cyrillic a -> 'a'), then
+    strip to clean, paste-safe ASCII. Unlike sanitize_paste (which DROPS a look-alike,
+    leaving `exXmple.com` visibly broken), this REVEALS the ASCII the disguise imitates,
+    so a homoglyph-spoofed domain folds to the literal ASCII it was pretending to be. The
+    result is guaranteed unicode-clean and paste-safe: any residual non-ASCII (a
+    non-confusable foreign char, an invisible) is then dropped by sanitize_paste.
+    PER-CHARACTER (each char folds or is sanitized independently), preserving the T3
+    homomorphism property the Z3 proof depends on."""
+    fold = _ascii_fold_map()
+    return sanitize_paste(''.join(fold.get(ch, ch) for ch in text))
 
 
 # Risk class of a neutralized/revealed character, so its marking (the box
@@ -1189,7 +1222,7 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
     flood is one insert, not one per character. Returns (runs, prefix_len) where
     prefix_len is the display-character offset at which the current line begins,
     for placing the caret."""
-    runs = []                             # list of [ [text_parts], sgr_key ]
+    runs: list = []                       # list of [ [text_parts], sgr_key ]
 
     def add(disp, key):
         if runs and runs[-1][1] == key:
@@ -1595,7 +1628,7 @@ def classify_paste(text):
     seven-class split is classify_paste_detail)."""
     fold = {'bidi': 'bidirectional control', 'control': 'control character',
             'invisible': 'invisible character'}
-    counts = {}
+    counts: dict[str, int] = {}
     for ch in text:
         c = _paste_class(ch)
         if c is None:
