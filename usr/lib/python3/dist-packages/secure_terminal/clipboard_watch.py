@@ -373,6 +373,7 @@ class ClipboardWatchApp:
         return True
 
     def _on_ipc_connection(self):
+        assert self._server is not None   # newConnection only fires on a live server
         conn = self._server.nextPendingConnection()
         if conn is None:                    # pragma: no cover - Qt only signals with one pending
             return
