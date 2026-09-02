@@ -678,7 +678,10 @@ def _printable_follows(raw, i):
             m = ANSI_RE.match(raw, i)
             i = m.end() if m else i + 1
             continue
-        if ch >= ' ' and ch != '\x7f':
+        # Printable TEXT only: C0 controls (< 0x20), DEL, and the C1 range
+        # (0x80-0x9f) are controls, not prompt text -- a C1 byte (NEL 0x85, CSI
+        # 0x9b, ...) must not be misread as "printable follows" and trigger a flush.
+        if ch >= ' ' and ch != '\x7f' and not ('\x80' <= ch <= '\x9f'):
             return True
         i += 1
     return False
@@ -901,7 +904,7 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                         del cells[col:]                 # cursor -> end of line
                     elif num == 1:
                         for j in range(0, min(col + 1, len(cells))):
-                            cells[j] = (' ', cells[j][1])
+                            cells[j] = (' ', state)   # erase uses current SGR
                     elif num == 2:                      # erase whole line; per
                         # ECMA-48 the cursor does NOT move (like n=0/n=1). Blank
                         # every cell but keep col; INV col <= len holds because
