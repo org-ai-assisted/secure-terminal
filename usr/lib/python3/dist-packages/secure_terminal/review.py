@@ -175,6 +175,14 @@ class ReviewBar(QWidget):
         # The beyond-cap tail: raw[_BOX_MAX:], held OUT of the editable box but still
         # delivered so the whole paste crosses; the truncation notice discloses it.
         self._tail = ''
+        # The active transform tier the tail is neutralized to on deliver -- 'keep'
+        # (printable unicode), 'strip' (ASCII only) or 'fold' (look-alikes folded).
+        # The box carries the user's choice for its visible prefix; the tail is not
+        # editable, so it must be neutralized to the SAME tier, or a [Strip unicode]
+        # would silently leave a homoglyph in the un-shown tail (a paste past the box
+        # cap could then smuggle a look-alike past a strip). Set by the transform
+        # buttons + open/restore; a manual box edit leaves it (the chosen tier stands).
+        self._active_mode = 'keep'
         self._kind = _KINDS['paste']
         # The anti-fat-finger countdown gating Deliver for a PASTE (seconds). Re-armed
         # on every edit and transform; a copy passes delay 0 (no countdown).
@@ -283,6 +291,7 @@ class ReviewBar(QWidget):
         self._term = term
         self._raw = raw
         self._tail = raw[_BOX_MAX:]
+        self._active_mode = 'keep'          # opens keep-printable; the tail follows
         self._kind = _KINDS.get(kind, _KINDS['paste'])
         self._reject.setText(self._kind['reject'])
         self._reject.setToolTip(self._kind['reject_tip'])
@@ -347,8 +356,9 @@ class ReviewBar(QWidget):
         self._dot.setStyleSheet('background-color:%s; border-radius:7px;' % dot_fg)
         if truncated:
             summary += ('  [truncated: only the first {:,} characters are shown and '
-                        'editable here; the rest is NOT reviewed but still delivers -- '
-                        '{}; Reject if you cannot verify the rest]'
+                        'editable here; the rest is not shown but is neutralized to the '
+                        'SAME choice (keep / strip / fold) and still delivers -- {}; '
+                        'Reject if you cannot verify the rest]'
                         .format(_BOX_MAX, self._kind['full_note']))
         self._summary.setText(summary)
         self._set_detail(detail, term, truncated)
@@ -421,25 +431,36 @@ class ReviewBar(QWidget):
             '<b>Hidden characters</b>%s' % (''.join(struct), chars_html))
 
     # -- the transforms -------------------------------------------------------
+    # The display sanitizer (newline-preserving) for each transform tier -- ONE source
+    # of truth, applied to the box AND to the un-shown tail on deliver, so a strip/fold
+    # can never neutralize the visible prefix but leave the tail at a weaker tier.
+    # dict VALUES are not descriptors, so these stay plain callables (no self binding).
+    _TIER = {
+        'keep': sanitize_clipboard_unicode,
+        'strip': sanitize_clipboard,
+        'fold': ascii_fold_display,
+    }
+
     def _do_strip(self):
-        """[Strip unicode]: delete every non-ASCII character from the box, NO mapping.
-        Newlines are preserved (display form); the shell-submit mapping is applied on
-        deliver."""
+        """[Strip unicode]: delete every non-ASCII character, NO mapping. Applies to the
+        box AND (on deliver) the tail; newlines are preserved (display form)."""
+        self._active_mode = 'strip'
         before = self._editor.source()
         after = sanitize_clipboard(before)
         removed = len(before) - len(after)
         self._editor.set_source(after)        # emits changed -> _on_edit refresh
-        self._status.setText('Showing ASCII only -- %d non-ASCII character%s removed.'
-                             % (removed, '' if removed == 1 else 's'))
+        self._status.setText('Showing ASCII only -- %d non-ASCII character%s removed%s.'
+                             % (removed, '' if removed == 1 else 's', self._tail_note()))
 
     def _do_fold(self):
-        """[ASCII-fold]: fold each look-alike in the box to the ASCII it imitates, then
-        clean to ASCII (newlines preserved)."""
+        """[ASCII-fold]: fold each look-alike to the ASCII it imitates, then clean to
+        ASCII. Applies to the box AND (on deliver) the tail; newlines preserved."""
+        self._active_mode = 'fold'
         before = self._editor.source()
         after = ascii_fold_display(before)
         self._editor.set_source(after)
         self._status.setText('Folded look-alikes to ASCII, then removed any remaining '
-                             'non-ASCII.')
+                             'non-ASCII%s.' % self._tail_note())
 
     def _do_restore(self):
         """[Restore original paste]: revert the box to the original text's keep-printable
@@ -453,8 +474,22 @@ class ReviewBar(QWidget):
             QMessageBox.StandardButton.No)
         if confirm != QMessageBox.StandardButton.Yes:
             return
+        self._active_mode = 'keep'
         self._set_status_keep(self._raw[:_BOX_MAX])
         self._editor.set_source(sanitize_clipboard_unicode(self._raw[:_BOX_MAX]))
+
+    def _tail_note(self):
+        """A status suffix disclosing that the un-shown tail is neutralized to the SAME
+        tier -- empty when there is no tail, so the common (fully-shown) case is silent."""
+        return ' (the un-shown tail too)' if self._tail else ''
+
+    def _tail_delivered(self):
+        """The un-shown tail neutralized to the ACTIVE tier -- the same display
+        transform the box got, so the tail can never deliver at a weaker tier than the
+        button the user pressed. '' when the whole paste fits in the box."""
+        if not self._tail:
+            return ''
+        return self._TIER[self._active_mode](self._tail)
 
     def _set_status_keep(self, source):
         """Set the status line for the keep-printable state (open + restore): how many
@@ -534,14 +569,15 @@ class ReviewBar(QWidget):
         if choice == 'reject':
             getattr(term, self._kind['dispatch'])('reject')
         else:
-            # Deliver EXACTLY the box (plus the un-reviewed tail, so the full paste
-            # crosses), re-sanitized on the way out via the 'unicode' action: the
-            # printable-unicode drop is re-applied so a re-paste into the box cannot
-            # smuggle an invisible past review, and (for a paste) newlines become the
-            # shell's submit CR. The box's Keep / Strip / Fold edits ARE the choice; the
-            # dispatch just re-neutralizes.
+            # Deliver EXACTLY the box (what is shown IS what crosses) plus the un-shown
+            # tail NEUTRALIZED TO THE SAME TIER the box got (_tail_delivered) -- so a
+            # [Strip unicode] cannot leave a homoglyph in the tail past the box cap. The
+            # dispatch's 'unicode' action re-applies the printable-unicode drop as a final
+            # defense-in-depth (a re-paste into the box cannot smuggle an invisible past
+            # review) and, for a paste, maps newlines to the shell's submit CR. The box's
+            # Keep / Strip / Fold choice IS the sanitization; this just re-neutralizes.
             getattr(term, self._kind['dispatch'])(
-                'unicode', self._editor.source() + self._tail)
+                'unicode', self._editor.source() + self._tail_delivered())
         # HIDE the bar directly: this bar made a definitive choice on the term it was
         # showing, so it must close. We cannot rely on the paste_review_resolved ->
         # _hide_paste_review path here, because that path guards on reviewed_term()
