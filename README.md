@@ -53,27 +53,30 @@ It does nothing about the programs you deliberately run.
   that, **View -> Line editing** (or `line_edits=false`) turns them off -- see the
   `line_edits` entry in `usr/lib/secure-terminal.d/30_defaults.conf` for what you
   gain and what it costs.
-- **Sanitized paste, with a review.** Pasted text is stripped to printable
-  ASCII before it reaches the shell, so invisible or bidi characters never enter
-  your command line. When a paste actually contains unicode or control
-  characters, a review bar opens inside the window, holds the paste, and shows
-  it four ways side by side: the original as it looks, a
-  Detail rendering that names every hidden character inline, and exactly what
-  each send button would deliver (stripped to ASCII, or with printable unicode
-  kept). The panes are rendered by the terminal's own pipeline, so each hidden
-  character wears its risk-class colour and stays click-to-inspect. While the
-  paste is held, terminal input is suspended and both send buttons are
-  countdown-gated (configurable; Enter or Esc rejects), so a stray key cannot
-  wave a hostile paste through. In CLI mode a plain-ASCII paste is not
-  interrupted; the warning is configurable to always, only-on-unicode (the
-  default), or never.
+- **Sanitized paste, with a review.** When a paste contains unicode or control
+  characters, a review bar opens inside the window and holds the paste before it
+  reaches the shell. The paste opens FULLY REVEALED in one editable box -- nothing
+  is silently pre-dropped, so a trap cannot hide by being cleaned away before you
+  see it: every hidden character stays in place, named and risk-class-coloured by
+  the terminal's own renderer (a look-alike tinted, an invisible or a bidi override
+  shown as a named badge). While any hidden character is present the Deliver button
+  is disabled and red ("blocked -- N hidden"), so nothing unreviewed can cross. You
+  clear the trap with one of the labelled transforms -- Strip unicode (ASCII only),
+  ASCII-fold (replace look-alikes with the plain letter they imitate) or Keep
+  printable unicode (drop the invisible/reordering characters, keep the rest) -- or
+  by editing the box directly; Deliver then enables, amber for printable unicode or
+  uncoloured for plain ASCII. Restore original re-reveals the untouched paste at any
+  time. While the paste is held, terminal input is suspended and the paste's Deliver
+  is countdown-gated (configurable; Enter or Esc rejects), so a stray key cannot wave
+  a hostile paste through. In CLI mode a plain-ASCII paste is not interrupted; the
+  warning is configurable to always, only-on-unicode (the default), or never.
 - **The same review for copy, going the other way.** Text leaving via copy is
-  reviewed too, with the same bar: after `cat evil-log`, selecting and copying in
-  Show mode (where real glyphs are kept) would otherwise put a look-alike straight
-  on the system clipboard, so you choose to copy it stripped to ASCII, with
-  printable unicode kept, or not at all. Configured separately from the paste
-  warning (copy and paste are opposite trust directions): always, only-on-unicode
-  (the default), or never.
+  reviewed too, with the same revealed box: after `cat evil-log`, selecting and
+  copying in Show mode (where real glyphs are kept) would otherwise put a look-alike
+  straight on the system clipboard, so the copy opens fully revealed and the same
+  transforms clean it before it crosses -- stripped to ASCII, with printable unicode
+  kept, or not at all. Configured separately from the paste warning (copy and paste
+  are opposite trust directions): always, only-on-unicode (the default), or never.
 - **Tiny input allowlist.** You type printable ASCII plus a small set of control
   keys that the pseudo-terminal turns into signals:
 

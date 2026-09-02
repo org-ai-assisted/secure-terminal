@@ -99,14 +99,24 @@ source of truth for behaviour.
   block + the konsole-parity block.
 ## Paste review (text coming IN)
 
-- **In-window bar**, not a modal (one window). The preview panes are read-only
-  SecureTerminal instances (preview=True: no child, read-only), so they reuse the
-  terminal's own renderer - risk-class colouring and click-to-inspect for free.
+- **In-window bar**, not a modal (one window). The paste loads into ONE editable
+  box (`RevealedEditor`) that reuses the terminal's own cell renderer - risk-class
+  colouring and click-to-inspect for free.
+- **Evidence-first reveal**: the box opens FULLY REVEALED (`reveal_display` +
+  `set_source_revealed`) - nothing is silently pre-dropped, so a trap cannot hide by
+  being cleaned away before the user sees it; every hidden character stays in place,
+  named as a badge. Removing evidence on open was rejected for exactly this reason.
+- **Content-driven Deliver**: while the box still holds any invisible/bidi/control
+  (`_blocked_count > 0`) Deliver is disabled and red ("blocked -- N hidden"); the user
+  clears it with a transform (`_do_strip` / `_do_fold` / `_do_keep`) or a direct edit,
+  and `_do_restore` re-reveals the untouched original. Deliver then enables - amber for
+  printable unicode, uncoloured for ASCII.
 - **Async hold-and-gate**: a risky paste is HELD (`_pending_paste`,
   `paste_review_requested`); terminal input is suspended (keyPressEvent swallows
-  keys, Enter/Esc reject); the choice (stripped / with-unicode / reject) is
+  keys, Enter/Esc reject); the delivered box (plus its neutralized beyond-cap tail) is
   dispatched to the tab, the only path that lets a byte reach the shell.
-- Both send buttons are countdown-gated. Detail pane names each hidden character.
+- The paste's Deliver is countdown-gated. In detail mode the box names each hidden
+  character inline.
 - Config `paste_warn`: always / unicode (default) / never. `never` does NOT strip
   the text (so real unicode can be pasted deliberately); risky text crosses
   UNREVIEWED but a red risk lamp marks the crossing -- not silent. A multi-line
