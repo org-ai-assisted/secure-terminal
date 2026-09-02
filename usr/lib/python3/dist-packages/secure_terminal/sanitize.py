@@ -651,6 +651,13 @@ def _safe_int(digits, default=0):
 
 _LINE_CSI_RE = re.compile(r'\x1b\[([0-9]*)([CDGK])')
 _SGR_ONLY_RE = re.compile(r'\x1b\[([0-9;]*)m')
+# Unbounded-mode (max_line == 0) blank-pad cap for CUF/CHA. In bounded mode a
+# forward/absolute column jump pads up to max_line - 1; with no wrap width there
+# is still a real terminal's blank-pad to honour (a right-prompt lands at its
+# column), but an attacker-supplied jump (ESC[999999C, up to _MAX_NUM_DIGITS
+# digits) must not allocate an arbitrary blank run -- cap it at a sane maximum
+# line width (matches terminal.py _MAX_LINE).
+_UNBOUNDED_MAX_COL = 8192
 
 # Bracketed-paste enable (DECSET 2004): a shell's line editor emits it right
 # before each prompt (bash readline, zsh zle, fish, ...). We use it as the
@@ -879,14 +886,14 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                     # "\x1b[43C[pts/N]"). Pad up to the target column, bounded by
                     # the width, instead of collapsing the gap onto the last cell.
                     col = col + (num or 1)
-                    col = min(col, max_line - 1) if max_line else min(col, len(cells))
+                    col = min(col, max_line - 1) if max_line else min(col, _UNBOUNDED_MAX_COL)
                     while len(cells) < col:
                         cells.append((' ', state))
                 elif op == 'D':
                     col = max(0, col - (num or 1))
                 elif op == 'G':
                     col = max(0, (num or 1) - 1)          # absolute column (1-based)
-                    col = min(col, max_line - 1) if max_line else min(col, len(cells))
+                    col = min(col, max_line - 1) if max_line else min(col, _UNBOUNDED_MAX_COL)
                     while len(cells) < col:
                         cells.append((' ', state))
                 else:                                   # K: erase in line
