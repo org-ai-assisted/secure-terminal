@@ -451,7 +451,7 @@ _OSC8 = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)'
 _OSC8_OPEN = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;[^\x07\x1b]+(?:\x07|\x1b\\)')
 _OSC8_CLOSE = re.compile(rb'\x1b\]8;;(?:\x07|\x1b\\)')
 # OSC numeric code -> feature key, so a CLI-mode notice can name the exact type.
-_OSC_CODE_KEY = {}
+_OSC_CODE_KEY: dict = {}
 for _k, _lbl, _codes, *_rest in OSC_FEATURES:
     for _c in _codes.replace(' ', '').split(','):
         _OSC_CODE_KEY.setdefault(int(_c), _k)
@@ -1744,7 +1744,7 @@ class SecureTerminal(QPlainTextEdit):
         if isinstance(spec, str):
             items = spec.split(',')
         elif isinstance(spec, (list, tuple, set, frozenset)):
-            items = spec
+            items = list(spec)
         else:
             return set()
         return {c.strip() for c in items
@@ -2685,7 +2685,7 @@ class SecureTerminal(QPlainTextEdit):
     # subtle fg-only tint in both, so it is not mistaken for an attack. Light is the
     # shipped default, so its bands are the primary case (dark bands kept for users
     # who switch).
-    MARKING_COLORS = {
+    MARKING_COLORS: dict[str, dict[str, dict[str, str | None]]] = {
         'light': {
             'bidi':       {'fg': '#b3261e', 'bg': '#ffb3ab'},   # red    -- reorders text (worst)
             'control':    {'fg': '#0842a0', 'bg': '#aecbff'},   # blue   -- C0 / DEL / C1 controls
@@ -3838,11 +3838,14 @@ class SecureTerminal(QPlainTextEdit):
             # seed the banner into the surviving grid and render -- the exited program's
             # output stays visible above the handover banner and the new prompt.
             # Reseed _raw from the retained grid's CLEAN text (not the raw redraw stream,
-            # which a CLI replay would garble), so a later CLI<->TUI switch reproduces the
-            # exited program's visible scrollback instead of only the banner; _feed_stream
-            # appends the banner to _raw + grid.
+            # which a CLI replay would garble) PLUS the handover banner, so a later
+            # CLI<->TUI switch reproduces the exited program's visible scrollback WITH the
+            # separator -- else the new shell's prompt reads as the exited program's output.
+            # _feed_stream feeds only the pyte grid (self._stream), never self._raw, so the
+            # banner must be put on _raw here; feeding it below shows it in the live grid now.
             self._start(None, keep_screen=True)
-            self._raw = self._grid_text()
+            self._raw = self._grid_text() + _banner
+            self._cap_raw()
             self._feed_stream(_banner.encode('utf-8', 'replace'))
             self._render_tui()
         else:
@@ -4201,7 +4204,7 @@ class SecureTerminal(QPlainTextEdit):
             return ''
         doc = self.document()
         start, end = cursor.selectionStart(), cursor.selectionEnd()
-        parts = []
+        parts: list = []
         block = doc.findBlock(start)
         while block.isValid() and block.position() <= end:
             if parts and block.userState() != 1:      # 1 == wrap continuation
@@ -4509,7 +4512,7 @@ class SecureTerminal(QPlainTextEdit):
     # subprocess.run child -- a blanket SIGCHLD=SIG_IGN would auto-reap those too and make
     # their returncode read 0 (a fail-open: e.g. terminfo `tic ... check=True` would never
     # raise on a real failure).
-    _LIVE_PTY_PIDS = set()
+    _LIVE_PTY_PIDS: set[int] = set()
 
     @classmethod
     def reap_pty_children(cls):
