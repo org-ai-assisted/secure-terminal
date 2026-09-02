@@ -10,7 +10,7 @@ The review box is the exact preview of what will cross the terminal boundary AND
 the field the user edits it in -- one surface, not a hidden edit box plus a
 separate read-only mirror. Every character renders through the SAME cell pipeline
 the terminal uses (feed_line_edits builds the logical cells, cells_to_runs renders
-them detail-tinted, cells_display_col places the caret), so a homoglyph is tinted,
+them detail-tinted, a collapse-aware walk places the caret), so a homoglyph is tinted,
 a bidi override is named, an invisible is boxed -- the deception cannot hide in the
 box the way it hid in a plain edit widget.
 
@@ -36,9 +36,10 @@ from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QFont, QGuiApplica
 from PyQt6.QtWidgets import QPlainTextEdit
 
 from secure_terminal.sanitize import (
-    feed_line_edits, cells_to_runs, cells_display_col,
-    sanitize_clipboard_unicode, MARK_KEY, THEMES, DISPLAY_MODES,
-    BASE_POINT_SIZE,
+    feed_line_edits, cells_to_runs, sanitize_clipboard_unicode,
+    MARK_KEY, THEMES, DISPLAY_MODES, BASE_POINT_SIZE,
+    display_len, _cell_display, _collapse_zalgo_runs,
+    _is_mark, _COMBINING_RUN_MAX,
 )
 from secure_terminal.terminal import SecureTerminal, DEFAULT_FONT_FAMILY
 
@@ -142,12 +143,33 @@ class RevealedEditor(QPlainTextEdit):
         return self._text
 
     @staticmethod
-    def _display_clean(text):
-        """Display keep-printable: drop invisibles/bidi/control/default-ignorable,
-        keep printable look-alikes/accents/CJK, keep '\n'/'\t'. Newline-preserving
-        (unlike sanitize_paste*, which map '\n'->'\r' for the shell) because the box
-        is a display surface; the shell mapping is applied only on deliver."""
-        return sanitize_clipboard_unicode(text)
+    def _cap_combining(text):
+        """Cap each run of combining marks at _COMBINING_RUN_MAX, dropping the excess --
+        the SAME cap feed_line_edits applies when it builds the render cells. Without
+        it a Zalgo flood (a base + hundreds of marks) would live in self._text but be
+        DROPPED from the render, desyncing the source<->cell accounting the caret /
+        selection mapping depends on (source indices with no rendered cell). A run past
+        the cap is a flood, never real orthography (the heaviest legit stack is ~5)."""
+        out = []
+        run = 0
+        for ch in text:
+            if ord(ch) >= 0x0300 and _is_mark(ch):
+                run += 1
+                if run > _COMBINING_RUN_MAX:
+                    continue                  # drop the flood tail; keep the cap's worth
+            else:
+                run = 0
+            out.append(ch)
+        return ''.join(out)
+
+    @classmethod
+    def _display_clean(cls, text):
+        """Display keep-printable: drop invisibles/bidi/control/default-ignorable, keep
+        printable look-alikes/accents/CJK, keep '\n'/'\t', and cap combining-mark runs
+        (see _cap_combining) so the source stays 1:1 with the render cells. Newline-
+        preserving (unlike sanitize_paste*, which map '\n'->'\r' for the shell) because
+        the box is a display surface; the shell mapping is applied only on deliver."""
+        return cls._cap_combining(sanitize_clipboard_unicode(text))
 
     # -- rendering ------------------------------------------------------------
     def _build(self, text):
@@ -192,24 +214,53 @@ class RevealedEditor(QPlainTextEdit):
         self.ensureCursorVisible()
 
     def _offset(self, index):
-        """The document offset of source-string `index`: render the source PREFIX
-        (text[:index]) and take its full display width. Reuses cells_to_runs's own
-        prefix_len (offset where the current line begins) plus the current line's
-        width via cells_display_col, so the offset can never disagree with the render
-        -- the prefix renders as an exact prefix of the whole (deterministic,
-        left-to-right, no autowrap). Monotonic non-decreasing in `index`."""
-        completed, current = self._build(self._text[:index])
-        _runs, prefix = cells_to_runs(completed, current, self._mode,
-                                      colors=False, markings=self._markings)
-        return prefix + cells_display_col(current, len(current), self._mode)
+        """The document offset of source `index`: the display width up to the START of
+        the CELL that source `index` falls in, walking the FULL render's cell structure
+        (with the show-mode Zalgo collapse applied).
+
+        Monotonic non-decreasing in `index` -- which the binary search in
+        _source_index_for_doc_pos REQUIRES. The old approach rendered text[:index] and
+        took its width; in 'show' a prefix cutting a >_ZALGO_MARK_MAX combining run
+        showed the partial marks as separate cells (widths 1..N) while the full run
+        collapses to ONE box cell (width 1), so _offset dropped back across the cluster
+        (non-monotonic) and the search returned mid-cluster indices -- a click/selection
+        after the cluster resolved to the wrong source chars. Here a collapsed run is
+        ATOMIC: every source index inside it shares the cell-start offset, so the width
+        never drops. self._text is capped to _COMBINING_RUN_MAX (_cap_combining), so the
+        render cells account for EVERY source char (feed_line_edits never drops one) and
+        the len(ch) walk below is exact."""
+        completed, current = self._build(self._text)
+        lines = completed + [current]
+        src = 0
+        doc = 0
+        for line_index, cellline in enumerate(lines):
+            rendered = (_collapse_zalgo_runs(cellline) if self._mode == 'show'
+                        else cellline)
+            for ch, _key in rendered:
+                if index < src + len(ch):
+                    return doc            # index is inside this cell -> its start offset
+                src += len(ch)            # len(ch) > 1 only for a collapsed Zalgo cell
+                doc += display_len(_cell_display(ch, self._mode))
+            if line_index != len(lines) - 1:
+                # a '\n' separates this line from the next: one source char, one column
+                if index == src:
+                    return doc            # caret at end-of-line, before the break
+                src += 1
+                doc += 1
+        return doc
 
     def _caret_doc_pos(self):
         return self._offset(self._pos)
 
     # -- editing --------------------------------------------------------------
     def _replace(self, new_text, new_pos):
-        self._text = new_text
-        self._pos = max(0, min(new_pos, len(new_text)))
+        # Re-cap combining runs over the WHOLE new text: an insert can JOIN two runs
+        # (each under the cap) across the splice into an over-cap flood that neither
+        # piece was, which would then desync source<->cell accounting. Idempotent on
+        # already-capped text (deletes never introduce a run), so this only bites a
+        # Zalgo-flood edit; clamp the caret in case the cap dropped chars before it.
+        self._text = self._cap_combining(new_text)
+        self._pos = max(0, min(new_pos, len(self._text)))
         self._render()
         self.changed.emit()
 
