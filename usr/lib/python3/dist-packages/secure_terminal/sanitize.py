@@ -1071,6 +1071,17 @@ def ascii_fold(text):
     return sanitize_paste(''.join(fold.get(ch, ch) for ch in text))
 
 
+def ascii_fold_display(text):
+    """ascii_fold for the review BOX (a display surface): fold each look-alike to the
+    ASCII it imitates, then sanitize_clipboard so the result is clean ASCII with its
+    NEWLINES PRESERVED as '\\n'. ascii_fold maps '\\n'->'\\r' for the shell; the box
+    keeps '\\n' so it renders multi-line, and the '\\n'->'\\r' shell-submit mapping is
+    applied only on deliver. Shares the single fold map with ascii_fold, so the two
+    can never drift. PER-CHARACTER, preserving the T3 homomorphism property."""
+    fold = _ascii_fold_map()
+    return sanitize_clipboard(''.join(fold.get(ch, ch) for ch in text))
+
+
 # Risk class of a neutralized/revealed character, so its marking (the box
 # placeholder or the <U+XXXX> badge) can be coloured by WHY the character is
 # dangerous, not just that it is. Ordered worst-first.
