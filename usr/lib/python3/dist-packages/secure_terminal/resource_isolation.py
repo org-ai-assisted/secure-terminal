@@ -192,7 +192,7 @@ def place_pid(fd, pid):
     try:
         os.write(fd, str(pid).encode('ascii'))
     except OSError:
-        pass
+        pass          # cgroup gone/unwritable -> stay in the inherited cgroup, never block
 
 
 def remove_tab(path):
@@ -203,4 +203,4 @@ def remove_tab(path):
     try:
         os.rmdir(path)
     except OSError:
-        pass
+        pass          # still populated or already gone -> systemd reaps it at app exit
