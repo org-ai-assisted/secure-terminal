@@ -361,6 +361,23 @@ DEFAULT_FONT_FAMILY = 'Hack'
 FONT_SIZE_MIN = 6
 FONT_SIZE_MAX = 72
 
+
+def route_ctrl_wheel_zoom(widget, event):
+    """Ctrl+wheel -> one zoom step on the top-level window (the single owner of zoom
+    state), event consumed. Returns True when handled so a wheelEvent can `return`
+    early. Lets non-terminal chrome (advisory banner, review box) honour Ctrl+wheel
+    zoom without each re-deriving it. Plain wheel is left to the caller's super()."""
+    if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+        return False
+    delta = event.angleDelta().y()
+    if delta:
+        step = getattr(widget.window(), '_on_zoom_step', None)
+        if callable(step):
+            step(1 if delta > 0 else -1)
+    event.accept()
+    return True
+
+
 _CP_PROP = QTextFormat.Property.UserProperty + 1
 
 

@@ -41,7 +41,8 @@ from secure_terminal.sanitize import (
     display_len, _cell_display, _collapse_zalgo_runs,
     _is_mark, _COMBINING_RUN_MAX,
 )
-from secure_terminal.terminal import SecureTerminal, DEFAULT_FONT_FAMILY
+from secure_terminal.terminal import (
+    SecureTerminal, DEFAULT_FONT_FAMILY, route_ctrl_wheel_zoom)
 
 # The SGR state a plain (no-program-colour) review cell carries -- what
 # feed_line_edits stores when handed the default state dict. Reviewed text has no
@@ -125,6 +126,14 @@ class RevealedEditor(QPlainTextEdit):
         box reveals risk exactly as the console does. Unknown -> 'detail'."""
         self._mode = mode if mode in DISPLAY_MODES else 'detail'
         self._render()
+
+    def wheelEvent(self, event):
+        """Ctrl+wheel over the box zooms the tab (like the terminal), so the review
+        surface enlarges through the same input as everything else; a plain wheel
+        still scrolls the box."""
+        if route_ctrl_wheel_zoom(self, event):
+            return
+        super().wheelEvent(event)
 
     # -- content --------------------------------------------------------------
     def set_source(self, text):
