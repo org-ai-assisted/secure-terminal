@@ -77,6 +77,26 @@ profile secure-terminal /usr/bin/secure-terminal {
   unix (accept, connect, send, receive) type=stream
         peer=(label=@{profile_name}),
 
+  # Per-tab resource isolation (cgroup v2): the app creates a limited child cgroup
+  # per tab under its OWN delegated cgroup and places each tab's shell into it, so a
+  # fork bomb or memory runaway is bounded to that one tab. Scoped TIGHTLY to the
+  # app's OWN systemd app scope (app-...secure-terminal....scope, the * spanning
+  # systemd's `\x2d` escaping and any launcher prefix) -- NOT the whole user slice, so
+  # a compromised GUI (it parses untrusted program output) cannot move or throttle
+  # OTHER user processes via their cgroups; only its own tabs. A shell-launched
+  # instance lands in a shared session scope where base_setup() cannot relocate (the
+  # cgroup-v2 no-internal-process rule), so it fails open there and needs no grant.
+  # The subtree read picks up controllers + limits; the dir rule permits mkdir/rmdir
+  # of the main + tab-N leaves; the named files are the cgroup knobs written.
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/app-*secure*terminal*.scope/** r,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/app-*secure*terminal*.scope/**/ rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/app-*secure*terminal*.scope/cgroup.subtree_control rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/app-*secure*terminal*.scope/**/cgroup.procs rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/app-*secure*terminal*.scope/**/pids.max rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/app-*secure*terminal*.scope/**/memory.max rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/app-*secure*terminal*.scope/**/memory.swap.max rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/app-*secure*terminal*.scope/**/memory.oom.group rw,
+
   # the login shell and $SHELL lookup
   /etc/shells r,
   /etc/passwd r,
