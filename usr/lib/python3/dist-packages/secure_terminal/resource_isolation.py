@@ -101,7 +101,7 @@ def base_setup(root=CGROUP_ROOT, proc_cgroup=PROC_SELF_CGROUP):
         try:
             os.mkdir(main)
         except FileExistsError:
-            pass
+            pass                      # a prior instance already created the leaf
         _write(os.path.join(main, 'cgroup.procs'), str(os.getpid()))
         enabled = _read(os.path.join(base, 'cgroup.subtree_control')).split()
         missing = [name for name in CONTROLLERS if name not in enabled]
@@ -126,13 +126,13 @@ def effective_mem(base, meminfo=PROC_MEMINFO):
             if line.startswith('MemAvailable:'):
                 return int(line.split()[1]) * 1024
     except (OSError, ValueError, IndexError):
-        pass
+        pass                          # meminfo unreadable/malformed -> try the base cap
     try:
         raw = _read(os.path.join(base, 'memory.max')).strip()
         if raw != 'max':
             return int(raw)
     except (OSError, ValueError):
-        pass
+        pass                          # memory.max unreadable/non-numeric -> no budget
     return None
 
 
