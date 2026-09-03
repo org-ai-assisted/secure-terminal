@@ -343,6 +343,7 @@ from secure_terminal.sanitize import (
     _MOUSE_FOCUS_MODE, _MOUSE_SGR_MODE,
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
+from secure_terminal import resource_isolation
 
 # Custom char-format property carrying a marked cell's SOURCE code point, so the
 # widget can describe the real character on hover/click regardless of how it is
@@ -788,7 +789,7 @@ class SecureTerminal(QPlainTextEdit):
 
     def __init__(self, parent=None, command=None, tui=False, history='',
                  preview=False, cwd=None, mode='detail', colors=False,
-                 markings=True, line_edits=True, theme='light'):
+                 markings=True, line_edits=True, theme='light', cg_path=None):
         super().__init__(parent)
         # Deterministic screenshot mode (SECURE_TERMINAL_SHOT=1, a startup capture
         # MODE -- never a persisted per-tab setting): hide the caret and render the
@@ -830,6 +831,12 @@ class SecureTerminal(QPlainTextEdit):
         # working directory to start the shell in (restored session tab); None ->
         # inherit the app's cwd.
         self._cwd = cwd if isinstance(cwd, str) and cwd else None
+        # Per-tab cgroup v2 path (from resource_isolation.create_tab); None when
+        # isolation is unavailable. Every spawned child (and restart_as_shell's
+        # replacement) writes its own pid into this cgroup so a fork bomb or memory
+        # runaway is bounded to THIS tab. Owned by the window: created before the tab,
+        # removed on close. Fail-open -- None means the tab runs unlimited.
+        self._cg_path = cg_path
         # A preview instance renders text through the SAME pipeline (risk-class
         # colouring, the inspect popup, the contrast guard, theme and font) but runs
         # NO child: it spawns no pty and accepts no keyboard input, so the paste
@@ -2967,6 +2974,10 @@ class SecureTerminal(QPlainTextEdit):
         # the child, and a successful execvp() closes exec_w for us -- exactly what the
         # handshake needs.
         exec_r, exec_w = os.pipe()
+        # Write end of the tab's cgroup.procs (None when isolation is off). The CHILD
+        # writes its own pid here first thing, before it can fork, so a fork bomb is
+        # bounded to the tab from birth. O_CLOEXEC drops it on a successful execvp.
+        cg_fd = resource_isolation.open_procs(self._cg_path)
         # If pty.fork() itself fails (near the fd/proc limit, ENOMEM), the pipe fds
         # would leak for the life of the process -- compounding the very exhaustion
         # that triggered it. Close them and re-raise.
@@ -2975,12 +2986,18 @@ class SecureTerminal(QPlainTextEdit):
         except BaseException:
             os.close(exec_r)
             os.close(exec_w)
+            if cg_fd is not None:
+                os.close(cg_fd)
             raise
         if pid == 0:  # pragma: no cover
             # (no cover: this branch runs in the pty.fork child and immediately
             # execvp()s or os._exit()s, so the parent's coverage tracer never
             # receives its line data; the child setup is exercised end-to-end by
             # the widget tests that spawn a real command and read its output.)
+            # Join the tab cgroup BEFORE anything else so this child and every
+            # descendant are limited from the start; best-effort, never blocks exec.
+            if cg_fd is not None:
+                resource_isolation.place_pid(cg_fd, os.getpid())
             os.environ['TERM'] = term
             if terminfo_dir:
                 # prepend our dir; a trailing empty entry keeps the system defaults
@@ -3042,6 +3059,10 @@ class SecureTerminal(QPlainTextEdit):
                     pass
                 os._exit(127)
         self._pid = pid
+        # The child forked with its own copy of the cgroup.procs fd; drop the parent's
+        # so it does not leak one fd per spawn (restart_as_shell re-opens it each time).
+        if cg_fd is not None:
+            os.close(cg_fd)
         # Parent: the write end is the child's; a successful exec closes it (CLOEXEC) ->
         # read EOF; a failed exec writes one byte -> read it. The read blocks only until
         # the child execs (immediate), matching subprocess's exec-failure handshake.
@@ -3773,6 +3794,11 @@ class SecureTerminal(QPlainTextEdit):
         self._blink_timer.stop()           # nor a cursor-blink paint into teardown
         self._flush_paint()                # paint the last CLI line before we go
         self._release_pty(hangup=True)
+        # Remove this tab's cgroup once its child is hung up. Best-effort: a child
+        # still dying leaves the (soon-empty) cgroup for systemd to reap when the app
+        # scope goes away. NOT done on restart_as_shell -- that reuses the same cgroup.
+        resource_isolation.remove_tab(self._cg_path)
+        self._cg_path = None
 
     def _grid_text(self):
         """The retained grid -- scrollback history + the current screen -- as plain
