@@ -41,6 +41,7 @@ from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
     BASE_POINT_SIZE, FONT_SIZE_MIN, FONT_SIZE_MAX,
+    route_ctrl_wheel_zoom,
     _build_tui_keys, _build_line_edit_keys,
 )
 from secure_terminal.review import ReviewBar
@@ -126,6 +127,14 @@ _UI_BASE_POINT = None            # the un-scaled dialog font point size, capture
 TAB_PALETTE = ('#e5484d', '#e5a50a', '#1f8a54', '#3b9eff',
                '#a06cff', '#e06c9f', '#2ab0a0', '#c07a3a')
 ZOOM_STEP = 10
+
+# Show and TUI are persistent modes the user deliberately chose, not live alarms, so
+# their toolbar chip / status lamp / menu marker use this neutral grey instead of a
+# saturated red/amber. Saturated colour is reserved for actual EVENTS (a high-risk OSC
+# feature enabled, risky text crossed unreviewed) so those stand out instead of
+# competing with an always-on mode colour; green still marks the safe states, and the
+# risk of Show/TUI is carried by its tooltip and the absence of green.
+MODE_NEUTRAL = '#6b7280'
 
 # Responsive toolbar. Three display tiers (full / labeled / icons), each width
 # measured once in the active font; _relayout_toolbar picks the richest tier that
@@ -259,7 +268,7 @@ def _toggle_icon(theme_name, letter, color):
 
 def _dot_icon(color):
     """A filled circle in `color` -- the traffic-light lamp of the security
-    indicator (green safe / yellow TUI / red unicode-shown)."""
+    indicator (green safe / neutral for a chosen mode / red for a live event)."""
     pixmap = QPixmap(14, 14)
     pixmap.fill(QColor(0, 0, 0, 0))
     painter = QPainter(pixmap)
@@ -320,38 +329,55 @@ _QWIDGETSIZE_MAX = (1 << 24) - 1   # Qt's QWIDGETSIZE_MAX (no-maximum sentinel; 
 
 
 class InfoTip(QLabel):
-    """A persistent, selectable, zoom-aware replacement for the plain tooltip.
-    Unlike QToolTip you can move the pointer INTO it to select and copy the text,
-    and its font follows the current zoom, so a long risk explanation is readable
-    and quotable. It hides on Esc, or when the pointer leaves both it and the
-    widget it describes (polled, so no fragile enter/leave bookkeeping)."""
+    """A persistent, selectable, zoom- and theme-aware replacement for the plain
+    tooltip. Unlike QToolTip you can move the pointer INTO it to select and copy the
+    text; its font follows the current zoom and its colours follow the current theme,
+    so a long risk explanation is readable and quotable and reads as part of the app.
+    It hides on Esc, or when the pointer leaves both it and the widget it describes
+    (polled, so no fragile enter/leave bookkeeping)."""
+
+    # Gap between the tip and the widget it describes: keeps the tip OFF the widget
+    # so the widget stays clickable, and the leave-poll's hit tests are inflated by
+    # this much so crossing the gap to select text does not dismiss the tip.
+    _GAP = 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
         # a non-activating tool window: shows without stealing focus from the
         # terminal, stays on top, and (unlike a QToolTip) accepts mouse events so
-        # its text can be selected. Parented to the window for clean teardown.
+        # its text can be selected. Translucent so the rounded card has clean corners
+        # (a frameless top-level otherwise shows the square window corners behind the
+        # radius). Parented to the window for clean teardown.
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
                             | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
                                      | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         self.setWordWrap(True)
-        # Padding via the stylesheet (not setMargin) so the rounded border wraps
-        # the text snugly; a narrower cap keeps the tip a tidy column instead of a
-        # wide slab.
+        # Padding via the stylesheet (not setMargin) so the rounded card wraps the
+        # text snugly; a narrower cap keeps the tip a tidy column, not a wide slab.
         self.setMargin(0)
         self.setMaximumWidth(340)
-        self.setStyleSheet('QLabel{background:#fbf9f0;color:#23262b;'
-                           'border:1px solid #d0c9ad;border-radius:6px;'
-                           'padding:6px 9px}')
         self._source = None
         self._poll = QTimer(self)
         self._poll.setInterval(150)
         self._poll.timeout.connect(self._check_pointer)
 
-    def show_for(self, widget, text, global_pos, zoom):
+    def _apply_palette(self, theme):
+        """Colours from the active tab's theme -- an elevated surface over the
+        terminal background, not a fixed light card that jars on a dark terminal."""
+        if theme == 'dark':
+            bg, fg, border = '#252a31', '#e7ebf1', '#3b434f'
+        else:
+            bg, fg, border = '#fbfbfd', '#23262b', '#d3d9e2'
+        self.setStyleSheet('QLabel{background:%s;color:%s;'
+                           'border:1px solid %s;border-radius:8px;'
+                           'padding:8px 11px}' % (bg, fg, border))
+
+    def show_for(self, widget, text, zoom, theme):
         self._source = widget
+        self._apply_palette(theme)
         # Release any size lock from a previous tip so this text can size freely
         # (keep the 340px width cap that drives the word wrap; height unbounded).
         self.setMaximumSize(340, _QWIDGETSIZE_MAX)
@@ -372,7 +398,7 @@ class InfoTip(QLabel):
         # un-closable tip. Capping max = content makes maximize a no-op; the poll
         # then hides the tip normally on leave.
         self.setMaximumSize(self.size())
-        self.move(global_pos + QPoint(12, 18))
+        self._place(widget)
         self.show()
         # A frameless stay-on-top tool window can still be painted under a modal
         # dialog or a menu popup that opened after it; raise it so it floats above
@@ -382,14 +408,42 @@ class InfoTip(QLabel):
         self.raise_()
         self._poll.start()
 
+    def _place(self, widget):
+        """Anchor the tip to the SOURCE widget's rectangle, never over it, so the
+        widget stays clickable the instant it is hovered: below it by preference,
+        flipped above when there is no room (e.g. a bottom status-bar lamp), and
+        clamped to the screen so a wide tip never runs off-edge. The old placement
+        (cursor + (12,18)) landed the opaque tip on the hovered chip and swallowed
+        the next click."""
+        rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+        size = self.size()
+        screen = widget.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        below = rect.bottom() + 1 + self._GAP
+        above = rect.top() - self._GAP - size.height()
+        # Below the widget by preference; flip above only when below would run off the
+        # screen bottom AND there is room above (e.g. a status-bar lamp).
+        if below + size.height() > avail.bottom() and above >= avail.top():
+            y = above
+        else:
+            y = below
+        x = min(max(rect.left(), avail.left()), avail.right() - size.width() + 1)
+        y = min(max(y, avail.top()), avail.bottom() - size.height() + 1)
+        self.move(x, y)
+
     def _check_pointer(self):
         pos = QCursor.pos()
-        over_tip = self.isVisible() and self.geometry().contains(pos)
+        # Inflate both hit rects past the gap so moving the pointer from the widget
+        # into the tip (to select) never falls into the gap and dismisses it.
+        pad = self._GAP + 2
+        over_tip = (self.isVisible()
+                    and self.geometry().adjusted(-pad, -pad, pad, pad).contains(pos))
         over_src = False
         if self._source is not None:
             try:
                 top_left = self._source.mapToGlobal(QPoint(0, 0))
-                over_src = QRect(top_left, self._source.size()).contains(pos)
+                over_src = QRect(top_left, self._source.size()).adjusted(
+                    -pad, -pad, pad, pad).contains(pos)
             except RuntimeError:                       # the source was destroyed
                 self._source = None
         if not over_tip and not over_src:
@@ -451,10 +505,39 @@ class _ToolTipFilter(QObject):
                 return super().eventFilter(obj, event)
             text = obj.toolTip()
             if text:
-                self._tip.show_for(obj, text, event.globalPos(),
-                                   self._window.current_zoom_percent())
+                self._tip.show_for(obj, text,
+                                   self._window.current_zoom_percent(),
+                                   self._window.current_theme_key())
                 return True                            # suppress the plain tooltip
         return super().eventFilter(obj, event)
+
+
+_BANNER_LABEL_PX = 13
+_BANNER_BTN_PX = 15
+
+
+def _banner_css(zoom):
+    """The advisory banner stylesheet at a given zoom: colours fixed, font-size
+    scaled so the notice enlarges with Ctrl+/- and Ctrl+wheel like the rest of the
+    chrome."""
+    lbl = max(1, round(_BANNER_LABEL_PX * zoom / 100.0))
+    btn = max(1, round(_BANNER_BTN_PX * zoom / 100.0))
+    return ('#advisory{background:#fdf3d0;border-bottom:1px solid #e5c975}'
+            '#advisory QLabel{color:#6b5510;font-size:%dpx}'
+            '#advisory QPushButton{border:none;background:transparent;'
+            'color:#6b5510;font-size:%dpx;font-weight:700}'
+            '#advisory QPushButton:hover{color:#3a2e08}' % (lbl, btn))
+
+
+class _AdvisoryFrame(QFrame):
+    """The advisory banner frame. Ctrl+wheel over it zooms the tab (like the
+    terminal), so the notice enlarges through the same input as everything else; a
+    plain wheel is left to the base frame."""
+
+    def wheelEvent(self, event):
+        if route_ctrl_wheel_zoom(self, event):
+            return
+        super().wheelEvent(event)
 
 
 class FindBar(QWidget):
@@ -876,15 +959,10 @@ class MainWindow(QMainWindow):
         """A dismissible, yellowish advisory banner shown above the tabs. Its text
         is selectable/copyable but lives OUTSIDE any terminal document, so it is
         never mistaken for -- or copied as -- program output."""
-        frame = QFrame(self)
+        frame = _AdvisoryFrame(self)
         frame.setObjectName('advisory')
         frame.setVisible(False)
-        frame.setStyleSheet(
-            '#advisory{background:#fdf3d0;border-bottom:1px solid #e5c975}'
-            '#advisory QLabel{color:#6b5510;font-size:13px}'
-            '#advisory QPushButton{border:none;background:transparent;'
-            'color:#6b5510;font-size:15px;font-weight:700}'
-            '#advisory QPushButton:hover{color:#3a2e08}')
+        frame.setStyleSheet(_banner_css(getattr(self, '_default_zoom', 100)))
         row = QHBoxLayout(frame)
         row.setContentsMargins(14, 8, 8, 8)
         row.setSpacing(10)
@@ -985,11 +1063,18 @@ class MainWindow(QMainWindow):
             self._advisories.pop(term, None)
         self._refresh_banner()
 
+    def _style_banner(self, zoom):
+        """Rescale the advisory banner's fonts to `zoom`, so the notice tracks the
+        tab zoom through Ctrl+/- and Ctrl+wheel."""
+        self._banner.setStyleSheet(_banner_css(zoom))
+
     def _refresh_banner(self):
         """Show the current tab's pending advisory, or hide the banner if it has
-        none. Called on every tab switch so the banner always matches the tab."""
+        none. Called on every tab switch so the banner always matches the tab (and
+        its font the tab's zoom)."""
         entry = self._advisories.get(self.current())
         if entry:
+            self._style_banner(self.current_zoom_percent())
             self._banner_label.setText(entry[1])
             self._banner.setVisible(True)
         else:
@@ -2046,9 +2131,8 @@ class MainWindow(QMainWindow):
             tip.hide()
             tip._poll.stop()
             return
-        tip.show_for(
-            anchor, text, anchor.mapToGlobal(QPoint(0, anchor.height())),
-            self.current_zoom_percent())
+        tip.show_for(anchor, text, self.current_zoom_percent(),
+                     self.current_theme_key())
 
     def current_zoom_percent(self):
         """The active tab's zoom (percent), so tooltip text scales with it. Falls
@@ -2057,6 +2141,14 @@ class MainWindow(QMainWindow):
         if term is not None:
             return term.current_zoom()
         return getattr(self, '_default_zoom', 100)
+
+    def current_theme_key(self):
+        """The active tab's theme key, so the tooltip's colours match the terminal
+        it floats over. Falls back to the window default when there is no tab yet."""
+        term = self.current()
+        if term is not None:
+            return term.current_theme()
+        return getattr(self, '_default_theme', 'light')
 
     # -- copy / paste route through the current tab (paste stays sanitized) ----
     def copy_selection(self):
@@ -2163,6 +2255,7 @@ class MainWindow(QMainWindow):
         self.zoom_box.blockSignals(False)
         self._default_zoom = percent
         self._review_bar.rerender_mirror()   # an open review mirrors the tab's font
+        self._style_banner(percent)          # the advisory banner scales with zoom too
         self._persist()
 
     def _on_zoom_step(self, direction):
@@ -2481,14 +2574,15 @@ class MainWindow(QMainWindow):
 
     def _display_level(self):
         """The display (unicode) risk axis as (colour, short, detail). Show
-        renders deceptive glyphs (red). Reveal is safe AND lossless -- the exact
-        <U+XXXX> codepoint is shown (green). Box is safe too -- non-ASCII becomes
-        a coloured box, hard to miss (green); lossy, but nothing deceptive."""
+        renders deceptive glyphs, so its lamp is neutral (a chosen mode, not a live
+        event). Reveal is safe AND lossless -- the exact <U+XXXX> codepoint is shown
+        (green). Box is safe too -- non-ASCII becomes a coloured box, hard to miss
+        (green); lossy, but nothing deceptive."""
         term = self.current()
         mode = term.current_mode() if term is not None else 'detail'
         if mode == 'show':
-            return ('#d83933', 'Show',
-                    'Display: SHOW (red).\n\n'
+            return (MODE_NEUTRAL, 'Show',
+                    'Display: SHOW.\n\n'
                     'Non-ASCII output is drawn as its glyph. With colour markings on '
                     '(the default) each glyph is tinted by its risk class -- a '
                     'homoglyph in rose -- so a look-alike is flagged rather than '
@@ -2526,11 +2620,12 @@ class MainWindow(QMainWindow):
 
     def _mode_level(self):
         """The interpretation (mode) risk axis: TUI interprets escapes in a
-        confined screen (yellow); the strict CLI mode is green."""
+        confined screen (a chosen mode, so its lamp is neutral); the strict CLI mode
+        is green (safe)."""
         term = self.current()
         if term is not None and term.tui_active():
-            return ('#e5a50a', 'TUI',
-                    'Mode: TUI (yellow).\n\n'
+            return (MODE_NEUTRAL, 'TUI',
+                    'Mode: TUI.\n\n'
                     'Escape sequences are interpreted through a confined screen '
                     'model so full-screen programs (ssh, vim, htop, tmux) work. '
                     'Every cell is still character-filtered, and a program\'s '
@@ -3544,7 +3639,7 @@ class MainWindow(QMainWindow):
              'Like Reveal but verbose: <U+XXXX NAME>, the codepoint plus its '
              'official Unicode name inline (what unicode-show annotates), so a '
              'homoglyph reads as its identity, not just a number.'),
-            ('S&how', 'show', '#d83933',
+            ('S&how', 'show', MODE_NEUTRAL,
              'Render printable non-ASCII output as its glyph -- and, with colour '
              'markings on, tint each by its risk class (a homoglyph in rose), so a '
              'look-alike is flagged instead of blending in as ASCII. Still the least '
@@ -3728,7 +3823,7 @@ class MainWindow(QMainWindow):
         self.act_bell_sound_clear.triggered.connect(lambda: self.set_bell_sound(''))
         bell_menu.addAction(self.act_bell_sound_clear)
 
-        self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', '#e5a50a'),
+        self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', MODE_NEUTRAL),
                                'TUI mo&de', self, checkable=True)
         self.act_tui.setChecked(self._default_tui)
         self.act_tui.setToolTip(TUI_TOOLTIP)
@@ -4653,9 +4748,9 @@ class MainWindow(QMainWindow):
         group.setExclusive(True)
         buttons = {}
         # Style the FRAME (so its border and every descendant chip is covered);
-        # per-chip checked colour is an object-name rule in the same sheet, so a
-        # mode chip keeps its safety colour code (Box green, Reveal green,
-        # Show red).
+        # per-chip checked colour is an object-name rule in the same sheet, so each
+        # chip keeps its class colour: green for the safe modes (Box, Reveal, Detail),
+        # neutral grey for a chosen non-safe mode (Show, TUI).
         css = self._CHIP_CSS
         for key, label, colour, tip in specs:
             btn = QPushButton(label, frame)
@@ -4667,9 +4762,10 @@ class MainWindow(QMainWindow):
             # otherwise clicking it to change the mode stops the terminal's caret
             # from blinking (it looks like the cursor vanished).
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            # A safety-coloured dot (the old toolbar symbol) on the risk-bearing
-            # chips: green Box, green Reveal, red Show, yellow TUI. It shows the
-            # risk colour at a glance even when the chip is not the selected one.
+            # A class-coloured dot (the old toolbar symbol) on the risk-bearing
+            # chips: green for the safe modes, neutral grey for a chosen non-safe
+            # mode (Show, TUI). It shows the class at a glance even when the chip is
+            # not the selected one, without a saturated always-on alarm colour.
             if colour:
                 btn.setIcon(_dot_icon(colour))
             checked = colour or '#3b7ddd'
@@ -4687,9 +4783,8 @@ class MainWindow(QMainWindow):
                     'x1:0,y1:0,x2:0,y2:1,stop:0 %s,stop:0.55 %s,stop:1 %s)}'
                     % (key, shadow, shadow, checked, checked))
             if colour:
-                # hover previews the option's safety colour (a light tint), so a
-                # user sees that Show / TUI are the less-safe, red/yellow choices
-                # before committing the click.
+                # hover previews the option's class colour (a light tint): green for
+                # the safe modes, neutral grey for a chosen non-safe mode.
                 h = colour.lstrip('#')
                 tint = 'rgba(%d,%d,%d,0.22)' % (
                     int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
@@ -4749,7 +4844,7 @@ class MainWindow(QMainWindow):
             ('box', 'Box', '#1f8a54', self.act_box.toolTip()),
             ('reveal', 'Reveal', '#1f8a54', self.act_reveal.toolTip()),
             ('detail', 'Detail', '#1f8a54', self.act_detail.toolTip()),
-            ('show', 'Show', '#d83933', self.act_show.toolTip()),
+            ('show', 'Show', MODE_NEUTRAL, self.act_show.toolTip()),
         ), self.set_mode)
         bar.addWidget(uni_frame)
 
@@ -4760,7 +4855,7 @@ class MainWindow(QMainWindow):
              'CLI mode: program output is shown as safe display. Append-only and '
              'tamper-evident -- output can only be added, never moved or erased, '
              'so a hostile program cannot rewrite what you already saw.'),
-            ('tui', 'TUI', '#e5a50a', TUI_TOOLTIP),
+            ('tui', 'TUI', MODE_NEUTRAL, TUI_TOOLTIP),
         ), lambda k: self.set_tui(k == 'tui'))
         self._tui_frame = mode_frame
         bar.addWidget(mode_frame)
@@ -4778,11 +4873,12 @@ class MainWindow(QMainWindow):
                        'on' if self._default_colors else 'off')
         self._set_chip(self._tui_buttons, 'tui' if self._default_tui else 'cli')
 
-        # yellow risk indicator, shown only while TUI mode is active. A toolbar
+        # neutral mode indicator, shown only while TUI mode is active. A toolbar
         # widget is shown/hidden through the QAction addWidget() returns.
         self.tui_dot = QLabel(bar)
         self.tui_dot.setFixedSize(14, 14)
-        self.tui_dot.setStyleSheet('background-color:#e5a50a; border-radius:7px;')
+        self.tui_dot.setStyleSheet(
+            'background-color:%s; border-radius:7px;' % MODE_NEUTRAL)
         self.tui_dot.setToolTip(TUI_TOOLTIP)
         self.tui_dot_action = bar.addWidget(self.tui_dot)
         self.tui_dot_action.setVisible(False)
