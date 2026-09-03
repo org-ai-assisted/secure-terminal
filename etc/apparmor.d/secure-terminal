@@ -77,6 +77,24 @@ profile secure-terminal /usr/bin/secure-terminal {
   unix (accept, connect, send, receive) type=stream
         peer=(label=@{profile_name}),
 
+  # Per-tab resource isolation (cgroup v2): the app creates a limited child cgroup
+  # per tab under its OWN delegated cgroup and places each tab's shell into it, so a
+  # fork bomb or memory runaway is bounded to that one tab. Scoped to the user's own
+  # login-session subtree (user-<uid>.slice) -- covers both the graphical app.slice
+  # scope (under user@.service) and a session-*.scope launch, but never system
+  # cgroups nor another user's. Without these, base_setup()/create_tab() are DENIED
+  # and the feature silently fails open (tabs share the session limits) -- correct
+  # but unprotected, so allow the app its own subtree. Reads pick up the controllers
+  # and limits; the dir rule permits mkdir/rmdir of the main + tab-N leaves; the
+  # named files are the cgroup interface knobs written.
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/** r,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/ rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/cgroup.procs rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/cgroup.subtree_control rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/pids.max rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/memory.max rw,
+  /sys/fs/cgroup/user.slice/user-[0-9]*.slice/**/memory.oom.group rw,
+
   # the login shell and $SHELL lookup
   /etc/shells r,
   /etc/passwd r,

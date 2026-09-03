@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QFontDialog, QFontComboBox, QGroupBox, QToolButton,
 )
 
-from secure_terminal import settings, session, ipc
+from secure_terminal import settings, session, ipc, resource_isolation
 from secure_terminal.sanitize import (
     OSC_FEATURES, OSC_FEATURE_BY_KEY, luminance, sanitize_title)
 from secure_terminal.terminal import (
@@ -598,9 +598,17 @@ class FindBar(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, launch=None):
+    def __init__(self, launch=None, cg_base=None):
         super().__init__()
         self.setWindowTitle('secure-terminal')
+        # Per-tab resource-isolation base (from resource_isolation.base_setup(),
+        # computed once in the entry script and passed in; None when the host does
+        # not delegate cgroup v2 memory+pids, in which case tabs run unlimited and
+        # share the session's own limits). base_setup is NOT called here: it relocates
+        # THIS process's cgroup, a global side effect the in-process tests must not
+        # trigger -- so the real launcher supplies the base, tests default to None.
+        self._cg_base = cg_base
+        self._cg_seq = 0             # monotonic per-tab cgroup name, never reused
         # Set the icon on the WINDOW too, not only the QApplication default: some
         # window managers read _NET_WM_ICON off the individual window for the title
         # bar / taskbar, so app.setWindowIcon() alone can leave a generic icon.
@@ -1112,6 +1120,17 @@ class MainWindow(QMainWindow):
         if 0 <= index < self.tabs.count() and self.tabs.isTabEnabled(index):
             self.tabs.setCurrentIndex(index)
 
+    def _alloc_cgroup(self):
+        """Create a fresh per-tab cgroup and return its path, or None when isolation
+        is off (fail-open). The monotonic name never collides with a still-draining
+        closed tab. Passed as SecureTerminal(cg_path=...): the child joins it at fork,
+        so a fork bomb or memory runaway is bounded to that one tab."""
+        if self._cg_base is None:
+            return None
+        name = 'tab-%d' % self._cg_seq
+        self._cg_seq += 1
+        return resource_isolation.create_tab(self._cg_base, name)
+
     def new_tab(self, command=None, tui=None):
         # tui=None -> the window default; True/False forces the mode for this tab
         # so New Tab can offer CLI vs TUI at creation.
@@ -1130,7 +1149,8 @@ class MainWindow(QMainWindow):
         # terminfo entry (secure-terminal vs secure-terminal-noedit).
         term = SecureTerminal(tui=tui, command=command or None,
                               line_edits=self._default_line_edits,
-                              cwd=inherit_cwd or None)
+                              cwd=inherit_cwd or None,
+                              cg_path=self._alloc_cgroup())
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(self._default_font_family)
@@ -1183,7 +1203,8 @@ class MainWindow(QMainWindow):
             return
         term = SecureTerminal(tui=tui, command=_cmd or None,
                               line_edits=bool(_tab('line_edits',
-                                                   self._default_line_edits)))
+                                                   self._default_line_edits)),
+                              cg_path=self._alloc_cgroup())
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
         term.set_font_family(spec.get('font_family') or self._default_font_family)
@@ -1610,7 +1631,8 @@ class MainWindow(QMainWindow):
                                self._default_line_edits),
             markings=_locked('colored_markings', _saved_bool(info.get('markings', True), True),
                              self._default_markings),
-            theme=theme)
+            theme=theme,
+            cg_path=self._alloc_cgroup())
         term.apply_theme(theme)          # idempotent (ctor set it): no re-render
         zoom = _saved_int(info.get('zoom'), self._default_zoom)
         term.apply_zoom(_locked('zoom', zoom, self._default_zoom))
@@ -5696,7 +5718,7 @@ def _handoff(group, request, timeout=8.0):
         time.sleep(0.15)
 
 
-def main():
+def main(cg_base=None):
     _quiet_font_warnings()
     if sys.argv[1:2] == ['ctl']:
         return _ctl_main(sys.argv[2:])
@@ -5785,7 +5807,7 @@ def main():
             # another window (the reported duplicate-window regression).
             server, status = _bind_instance_server(launch.instance_group)
 
-    window = MainWindow(launch=launch)
+    window = MainWindow(launch=launch, cg_base=cg_base)
     # Install the terminate-on-signal handler only now, after the window exists:
     # its handler force-closes every window (see _install_signal_quit), so a
     # signal arriving mid-construction would otherwise flip _force_close on a

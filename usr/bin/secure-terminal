@@ -41,6 +41,18 @@ require(
 )
 
 from secure_terminal.main import main
+from secure_terminal.resource_isolation import base_setup
 
 if __name__ == '__main__':
-    sys.exit(main())
+    ## Prepare per-tab resource isolation ONCE, here in the launcher. base_setup()
+    ## relocates THIS process's cgroup (the cgroup v2 "no internal processes" rule) so
+    ## each tab can get its own limited child cgroup -- a one-time side effect that
+    ## belongs to the real app process, not the importable main() the in-process tests
+    ## drive. None when the host does not delegate memory+pids cgroup v2 controllers;
+    ## tabs then just share the session's own limits. Note it on stderr, once.
+    _cg_base = base_setup()
+    if _cg_base is None:
+        sys.stderr.write(
+            'secure-terminal: per-tab resource isolation unavailable (no cgroup v2 '
+            'delegation); tabs share the session limits\n')
+    sys.exit(main(cg_base=_cg_base))
