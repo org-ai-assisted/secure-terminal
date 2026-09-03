@@ -26,6 +26,8 @@ import os
 import re
 import json
 
+from secure_terminal.ipc import _makedirs_private   # 0o700 private-dir creator (reused)
+
 # A hard cap on the persisted scrollback of an "unlimited" tab, so a log file
 # cannot grow without bound on disk even when no line limit is set.
 UNLIMITED_PERSIST_LINES = 5000
@@ -38,6 +40,21 @@ def _state_dir():
     base = os.environ.get('XDG_STATE_HOME') or os.path.join(
         os.path.expanduser('~'), '.local', 'state')
     return os.path.join(base, 'secure-terminal')
+
+
+def ensure_state_dir():
+    """Create the state dir owner-only (0o700) and enforce that mode even on a
+    PRE-EXISTING dir. It holds sensitive terminal history (transcripts, scrollback,
+    session state); under a typical 022 umask a bare os.makedirs would leave it
+    world-readable. Mirrors ipc.ensure_socket_dir's hardening. Best-effort chmod --
+    a failure must not crash a save. Returns the path."""
+    directory = _state_dir()
+    _makedirs_private(directory)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    return directory
 
 
 def session_path():
@@ -74,7 +91,10 @@ def cap_text(text, scrollback):
 
 def _write_atomic(path, text):
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as handle:
+    # 0o600: session logs and state are sensitive terminal history; never create them
+    # world-readable (a bare open() would land at 0644 under a typical umask).
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
         handle.write(text)
     os.replace(tmp, path)
 
@@ -86,7 +106,7 @@ def save(tabs, window=None, active=None):
     is the index of the focused tab, so the next start reopens it. Never raises."""
     path = session_path()
     try:
-        os.makedirs(_state_dir(), exist_ok=True)
+        ensure_state_dir()
         index = []
         for position, tab in enumerate(tabs):
             entry = {key: value for key, value in tab.items() if key != 'text'}

@@ -1030,52 +1030,86 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
 # dependency); if the package is somehow absent the set is empty and such a
 # character just stays in the generic 'nonascii' class -- never a crash.
 _ASCII_FOLD_MAP = None
+_MULTICHAR_ASCII_FOLD = None
+
+
+def _build_fold_maps():
+    """Build both confusable fold tables in ONE pass over the Unicode confusables data
+    shipped by python3-confusable-homoglyphs (a hard dependency); both empty on any
+    load failure -- never a crash. Populates two DISJOINT maps (a source lands in
+    exactly one):
+
+      _ASCII_FOLD_MAP        NON-ASCII source char -> the SINGLE printable-ASCII char it
+                             imitates (Cyrillic a U+0430 -> 'a', Greek omicron -> 'o').
+                             Its keys are the single source of truth for the confusable
+                             SET (_ascii_confusables -> the display + paste 'confusable'
+                             class); this selection is kept byte-identical to the
+                             historical single-char loop so that set never shifts. 1472
+                             sources have a single-ASCII look-alike.
+      _MULTICHAR_ASCII_FOLD  NON-ASCII source char -> a MULTI-char printable-ASCII string
+                             it imitates (ellipsis U+2026 -> '...', a curly-quote pair,
+                             en/em dash -> '-'), for the 261 sources with NO single-char
+                             ASCII look-alike. FOLD-PATH ONLY (ascii_fold /
+                             ascii_fold_display): deliberately NOT merged into
+                             _ascii_confusables, so the SHOW-mode display tint and the T7
+                             paste/display class agreement are unchanged -- it only lets
+                             the fold REVEAL the ASCII such a char was posing as, on the
+                             paste/review surface. A per-character char->string map
+                             composed with the homomorphic sanitizer stays homomorphic,
+                             so emitting N chars does NOT break T3 (the theorem needs
+                             per-char INDEPENDENCE, not output arity 1).
+
+    NON-ASCII-target confusables (the 5265 majority: a char imitating ANOTHER non-ASCII
+    char) are in NEITHER map: they do not pose as ASCII, so a fold has nothing to reveal
+    -- they still show tinted and are dropped by Strip."""
+    global _ASCII_FOLD_MAP, _MULTICHAR_ASCII_FOLD
+    single, multi = {}, {}
+    try:
+        import json
+        from confusable_homoglyphs import confusables as _cf
+        data_path = os.path.join(os.path.dirname(_cf.__file__),
+                                 'confusables.json')
+        with open(data_path, encoding='utf-8') as handle:
+            data = json.load(handle)
+        for source, alternatives in data.items():
+            if len(source) != 1 or ord(source) <= 0x7F:
+                continue              # only NON-ASCII sources can pose as ASCII
+            for alt in alternatives:
+                glyph = alt.get('c', '')
+                if len(glyph) == 1 and 0x20 <= ord(glyph) <= 0x7E:
+                    single[source] = glyph        # the single ASCII char it imitates
+                    break
+            else:                     # no single-char ASCII look-alike
+                for alt in alternatives:
+                    glyph = alt.get('c', '')
+                    if len(glyph) >= 2 and all(0x20 <= ord(g) <= 0x7E
+                                               for g in glyph):
+                        multi[source] = glyph     # the multi-char ASCII it imitates
+                        break
+    except Exception:                 # pylint: disable=broad-except
+        pass                          # no data -> no refinement / no fold
+    _ASCII_FOLD_MAP, _MULTICHAR_ASCII_FOLD = single, multi
 
 
 def _ascii_fold_map():
-    """Map each NON-ASCII confusable CHARACTER to the printable-ASCII character it
-    IMITATES (Cyrillic a U+0430 -> 'a', Greek omicron -> 'o'), built once from the
-    Unicode confusables data shipped by python3-confusable-homoglyphs (a hard
-    dependency). Empty dict if the package is somehow absent -- never a crash. Single
-    source of truth for both the confusable SET (_ascii_confusables, its keys) and the
-    [ASCII-fold] action (ascii_fold, its values).
-
-    SCOPE -- single non-ASCII char -> single ASCII char ONLY, deliberately NOT the full
-    Unicode confusables skeleton (measured against the shipped data: 6998 non-ASCII
-    sources; this keeps the 1472 with a single-ASCII look-alike). The two excluded
-    classes are out of scope by design, not an oversight:
-      - MULTI-char ASCII confusables (261: ellipsis U+2026 -> '...', curly quote -> "''",
-        double-punctuation) -- a per-CHARACTER fold cannot emit N chars without breaking
-        the T3 homomorphism sanitize(a+b)==sanitize(a)+sanitize(b) the Z3 proof depends
-        on, and they are typographic punctuation Strip already drops (never cross
-        undetected), not the letter/digit spoof the fold exists to reveal.
-      - NON-ASCII-target confusables (5265, the majority: a char that looks like ANOTHER
-        non-ASCII char) -- these do not pose as ASCII, so an ASCII-fold has nothing to
-        reveal. The look-alike still shows tinted + is dropped by Strip.
-    So the curated set captures 100% of the single-char ASCII-posing homoglyphs, which
-    is the whole threat this fold addresses."""
-    global _ASCII_FOLD_MAP
+    """NON-ASCII source char -> the SINGLE printable-ASCII char it imitates. Its keys
+    are the single source of truth for _ascii_confusables (the display + paste
+    'confusable' class). Multi-char ASCII posers (ellipsis, curly quotes) are handled on
+    the fold path by _multichar_ascii_fold and kept OUT of this map, so the confusable
+    detection/tint set stays single-char. See _build_fold_maps."""
     if _ASCII_FOLD_MAP is None:
-        mapping = {}
-        try:
-            import json
-            from confusable_homoglyphs import confusables as _cf
-            data_path = os.path.join(os.path.dirname(_cf.__file__),
-                                     'confusables.json')
-            with open(data_path, encoding='utf-8') as handle:
-                data = json.load(handle)
-            for source, alternatives in data.items():
-                if len(source) != 1 or ord(source) <= 0x7F:
-                    continue          # only NON-ASCII sources can pose as ASCII
-                for alt in alternatives:
-                    glyph = alt.get('c', '')
-                    if len(glyph) == 1 and 0x20 <= ord(glyph) <= 0x7E:
-                        mapping[source] = glyph   # the ASCII it imitates
-                        break
-        except Exception:             # pylint: disable=broad-except
-            pass                      # no data -> no refinement / no fold
-        _ASCII_FOLD_MAP = mapping
+        _build_fold_maps()
     return _ASCII_FOLD_MAP
+
+
+def _multichar_ascii_fold():
+    """NON-ASCII source char -> the MULTI-char printable-ASCII string it imitates
+    (U+2026 ellipsis -> '...', a curly-quote pair, em/en dash -> '-'), for the sources
+    with no single-char ASCII look-alike. FOLD-PATH ONLY (ascii_fold /
+    ascii_fold_display); deliberately NOT in _ascii_confusables (SHOW-mode display + T7
+    agreement unchanged). See _build_fold_maps."""
+    _ascii_fold_map()             # both maps are built together; single build trigger
+    return _MULTICHAR_ASCII_FOLD
 
 
 _ASCII_CONFUSABLES = None
@@ -1096,13 +1130,17 @@ def ascii_fold(text):
     """Fold each look-alike to the ASCII character it IMITATES (Cyrillic a -> 'a'), then
     strip to clean, paste-safe ASCII. Unlike sanitize_paste (which DROPS a look-alike,
     leaving `exXmple.com` visibly broken), this REVEALS the ASCII the disguise imitates,
-    so a homoglyph-spoofed domain folds to the literal ASCII it was pretending to be. The
+    so a homoglyph-spoofed domain folds to the literal ASCII it was pretending to be. A
+    multi-char poser folds to the string it imitates (ellipsis U+2026 -> '...'). The
     result is guaranteed unicode-clean and paste-safe: any residual non-ASCII (a
     non-confusable foreign char, an invisible) is then dropped by sanitize_paste.
-    PER-CHARACTER (each char folds or is sanitized independently), preserving the T3
-    homomorphism property the Z3 proof depends on."""
-    fold = _ascii_fold_map()
-    return sanitize_paste(''.join(fold.get(ch, ch) for ch in text))
+    PER-CHARACTER (each char folds -- to one OR MORE ASCII chars -- or is sanitized
+    independently), preserving the T3 homomorphism property the Z3 proof depends on: a
+    per-char char->string map composed with the homomorphic sanitizer is still
+    homomorphic, so a multi-char fold is safe."""
+    single = _ascii_fold_map()
+    multi = _multichar_ascii_fold()
+    return sanitize_paste(''.join(multi.get(ch, single.get(ch, ch)) for ch in text))
 
 
 def ascii_fold_display(text):
@@ -1110,10 +1148,12 @@ def ascii_fold_display(text):
     ASCII it imitates, then sanitize_clipboard so the result is clean ASCII with its
     NEWLINES PRESERVED as '\\n'. ascii_fold maps '\\n'->'\\r' for the shell; the box
     keeps '\\n' so it renders multi-line, and the '\\n'->'\\r' shell-submit mapping is
-    applied only on deliver. Shares the single fold map with ascii_fold, so the two
-    can never drift. PER-CHARACTER, preserving the T3 homomorphism property."""
-    fold = _ascii_fold_map()
-    return sanitize_clipboard(''.join(fold.get(ch, ch) for ch in text))
+    applied only on deliver. Shares the two fold maps with ascii_fold, so the two can
+    never drift. PER-CHARACTER (a multi-char poser folds to its ASCII string, e.g.
+    ellipsis -> '...'), preserving the T3 homomorphism property."""
+    single = _ascii_fold_map()
+    multi = _multichar_ascii_fold()
+    return sanitize_clipboard(''.join(multi.get(ch, single.get(ch, ch)) for ch in text))
 
 
 # Risk class of a neutralized/revealed character, so its marking (the box

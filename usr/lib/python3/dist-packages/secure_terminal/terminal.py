@@ -378,6 +378,12 @@ def route_ctrl_wheel_zoom(widget, event):
     return True
 
 
+# Bracketed-paste prompt-start marker as BYTES, for the SGR-reset injection on the TUI
+# pyte feed (pyte is fed raw bytes; the CLI path resets on the str form in
+# _reset_leftover_sgr). '\x1b[0m' clears any stuck program colour before the prompt.
+_PROMPT_START_BYTES = PROMPT_START.encode('ascii')
+_SGR_RESET_BYTES = b'\x1b[0m'
+
 _CP_PROP = QTextFormat.Property.UserProperty + 1
 
 
@@ -1962,6 +1968,13 @@ class SecureTerminal(QPlainTextEdit):
         # would flash a blank frame). The document keeps the last frame until the
         # program's redraw arrives.
         self._screen.resize(rows, cols)
+        # pyte.Screen.resize() does NOT clamp the cursor on a shrink, so a subsequent
+        # \r-only redraw (an ordinary status/spinner) would write to a now-out-of-range
+        # row that render skips -- then reappears verbatim when the window grows back
+        # (a display-integrity/spoofing bug). Clamp it into the new grid, as the render
+        # paths (_grid_signatures, _place_grid_cursor) already do for their reads.
+        self._screen.cursor.y = min(self._screen.cursor.y, rows - 1)
+        self._screen.cursor.x = min(self._screen.cursor.x, cols - 1)
         self._set_winsize(cols, rows)
 
     def _pyte_qcolor(self, color, default, bright=False):
@@ -2954,7 +2967,15 @@ class SecureTerminal(QPlainTextEdit):
         # the child, and a successful execvp() closes exec_w for us -- exactly what the
         # handshake needs.
         exec_r, exec_w = os.pipe()
-        pid, fd = pty.fork()
+        # If pty.fork() itself fails (near the fd/proc limit, ENOMEM), the pipe fds
+        # would leak for the life of the process -- compounding the very exhaustion
+        # that triggered it. Close them and re-raise.
+        try:
+            pid, fd = pty.fork()
+        except BaseException:
+            os.close(exec_r)
+            os.close(exec_w)
+            raise
         if pid == 0:  # pragma: no cover
             # (no cover: this branch runs in the pty.fork child and immediately
             # execvp()s or os._exit()s, so the parent's coverage tracer never
@@ -3226,7 +3247,15 @@ class SecureTerminal(QPlainTextEdit):
             feed = self._alt_feed_carry + data
             k = _alt_partial_tail(feed)         # hold back ONLY a split-marker tail
             self._alt_feed_carry = feed[len(feed) - k:] if k else b''
-            self._feed_stream(feed[:len(feed) - k] if k else feed)
+            stream = feed[:len(feed) - k] if k else feed
+            # Guard the shell prompt against a finished command's stuck colour in TUI
+            # too (the CLI path does this in _reset_leftover_sgr): inject an SGR reset
+            # ahead of the bracketed-paste prompt-start so pyte renders the prompt in
+            # the default palette rather than the program's leftover colour.
+            if _PROMPT_START_BYTES in stream:
+                stream = stream.replace(
+                    _PROMPT_START_BYTES, _SGR_RESET_BYTES + _PROMPT_START_BYTES)
+            self._feed_stream(stream)
         else:
             self._alt_feed_carry = b''          # CLI mode does not stream-feed; drop any tail
         if sync_end:
@@ -3242,7 +3271,10 @@ class SecureTerminal(QPlainTextEdit):
         text = self._absorb_caret(text)         # drop a shell's duplicate ^C echo
 
         if self._grid_mode():
-            self._raw += text
+            # Keep the retained raw prompt-clean, like the CLI branch below, so a TUI
+            # re-render (replayed through _feed_stream from _raw) does not re-stick a
+            # finished command's leftover colour onto the prompt.
+            self._raw += self._reset_leftover_sgr(text)
             self._cap_raw()
             # hold the paint during a synchronized update (the model keeps updating);
             # _end_sync_update renders the completed frame.
