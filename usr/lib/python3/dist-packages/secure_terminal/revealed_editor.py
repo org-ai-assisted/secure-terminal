@@ -308,7 +308,13 @@ class RevealedEditor(QPlainTextEdit):
         start, end = self._edit_range()
         if start == end and not chunk:
             return
-        self._replace(self._text[:start] + chunk + self._text[end:], start + len(chunk))
+        # The caret must land at the true end of the INSERTED text, which _replace's
+        # _cap_combining may shorten: inserting combining marks into an already-capped
+        # run drops them silently, so start + len(chunk) over-counts and the caret skips
+        # into the following text (a later Backspace then edits the wrong character).
+        # Cap the prefix+chunk exactly as the stored text will be to get the real caret.
+        head = self._text[:start] + chunk
+        self._replace(head + self._text[end:], len(self._cap_combining(head)))
 
     def _paste_clipboard(self):
         """Ctrl+V: insert the clipboard through the SAME sanitize + selection-replace

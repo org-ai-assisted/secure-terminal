@@ -1171,7 +1171,17 @@ class MainWindow(QMainWindow):
                                     or 'tui' in self._locked) else spec['tui']
         # line_edits via the ctor: it must be set before the ctor forks the child,
         # or the shell is handed the wrong terminfo entry (see new_tab).
-        term = SecureTerminal(tui=tui, command=spec.get('command') or None,
+        _cmd = spec.get('command')
+        # An EXPLICIT empty command (over IPC, `_sanitize_tab_spec` only type-checks it)
+        # names no program. Fail closed -- open no tab -- exactly as the CLI's `-e ""` /
+        # `-- ""` do (SystemExit there), rather than let `command or None` below drop to a
+        # LOGIN SHELL: a locked-down launcher must not be bypassed via the socket. An
+        # ABSENT command is None (the deliberate 'no command -> shell') and is untouched.
+        if (isinstance(_cmd, str) and _cmd == '') or (
+                isinstance(_cmd, (list, tuple))
+                and (not _cmd or not str(_cmd[0]).strip())):
+            return
+        term = SecureTerminal(tui=tui, command=_cmd or None,
                               line_edits=bool(_tab('line_edits',
                                                    self._default_line_edits)))
         term.apply_theme(self._default_theme)
@@ -1793,6 +1803,13 @@ class MainWindow(QMainWindow):
         if index < 0:
             return
         term = self.tabs.widget(index)
+        # A not-yet-restored session placeholder is a bare QWidget; setTabEnabled(False)
+        # blocks it becoming current but NOT tabBarDoubleClicked, so a double-click here
+        # would reach _refresh_tab_label -> term.cwd_basename() (no such method) and the
+        # uncaught AttributeError in a Qt slot aborts the whole window. Guard like every
+        # other placeholder-aware path.
+        if not isinstance(term, SecureTerminal):
+            return
         current = self._user_titles.get(term, '')
         name, ok = QInputDialog.getText(
             self, 'Rename Tab', 'Tab name:',
@@ -3290,10 +3307,12 @@ class MainWindow(QMainWindow):
         path = os.path.join(state_dir, 'transcript.txt')
         # Guard the write like save_transcript does: an OSError (ENOSPC/EACCES on the
         # makedirs or the write) must NOT propagate out of this Qt slot and take the
-        # whole window (all tabs) down with it.
+        # whole window (all tabs) down with it. ensure_state_dir + 0o600 keep this
+        # sensitive history owner-only (a bare makedirs/open would be world-readable).
         try:
-            os.makedirs(state_dir, exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as handle:
+            session.ensure_state_dir()
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 handle.write(term.transcript_text())
         except OSError:
             return
