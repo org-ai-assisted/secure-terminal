@@ -280,7 +280,11 @@ _STRING_TERMINATOR = {
 # but untrusted output can -- exactly the threat this sanitizer holds). The body is
 # consumed to the sequence's final byte, matching ANSI_RE: a byte outside the
 # body-and-final grammar INTERRUPTS the sequence (the run ends and that byte resumes
-# as text, as ANSI_RE's interrupted-CSI arm does).
+# as text, as ANSI_RE's interrupted-CSI arm does). The body pattern restarts in the
+# params sub-state on each continuation chunk (no cross-chunk params-vs-intermediates
+# memory), so a >cap CSI split with a param byte AFTER an intermediate over-swallows
+# the rest of the run where whole-stream ANSI_RE would interrupt -- accepted: it only
+# over-DROPS untrusted bytes on a >4 KiB CSI, never leaks an escape.
 _NONSTRING_BODY = {
     '[': re.compile(r'[0-?]*[ -/]*'),   # CSI: parameter bytes 0x30-0x3F then intermediates
     '\x1b': re.compile(r'[ -/]*'),      # generic ESC: intermediate bytes 0x20-0x2F

@@ -673,8 +673,9 @@ def cli_terminfo_dir():
         return cache
     if src:
         try:
-            # 0700 so another user cannot plant a poisoned compiled entry we would
-            # then hand the child via TERMINFO_DIRS (also guarded by _owned_regular).
+            # 0700 on a freshly-created cache dir; an EXISTING dir's mode is left
+            # as-is (exist_ok), so _owned_regular -- not this mode -- is the real
+            # guard against a poisoned entry handed to the child via TERMINFO_DIRS.
             os.makedirs(cache, mode=0o700, exist_ok=True)
             subprocess.run(['tic', '-x', '-o', cache, src],
                            check=True, capture_output=True, timeout=15)
