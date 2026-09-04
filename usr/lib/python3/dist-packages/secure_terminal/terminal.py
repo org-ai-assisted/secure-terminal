@@ -1826,6 +1826,34 @@ class SecureTerminal(QPlainTextEdit):
     def any_osc_enabled(self):
         return any(self._osc.values())
 
+    def _notice_osc(self, text):
+        """Advise on each distinct OSC TYPE in text, at most once per call (the window
+        de-dups per tab). Symmetric across modes: in TUI a type the user ENABLED
+        (osc_enabled) is honored, not refused, so it does NOT advise; CLI honors nothing
+        (tui_active False), so every type advises. Both the CLI line path and the TUI
+        grid branch call this, so a refused OSC surfaces the same yellow banner either
+        way. The over-cap discard emit stays at the CLI call site -- it reads
+        feed_chunk_carry state this helper cannot see."""
+        if '\x1b]' not in text:
+            return
+        emitted = set()
+        for m in _OSC_CODE_RE.finditer(text):
+            code = int(m.group(1))
+            key = _OSC_CODE_KEY.get(code, 'osc_other')
+            if code == 52:
+                # osc_clipboard (write) and osc_clipboard_read share code 52;
+                # distinguish by the payload so the per-type notice is right.
+                tail = text[m.end():m.end() + 512]
+                end = min((p for p in (tail.find('\x07'), tail.find('\x1b'))
+                           if p >= 0), default=len(tail))
+                key = ('osc_clipboard_read' if tail[:end].rstrip().endswith('?')
+                       else 'osc_clipboard')
+            if self.tui_active() and self.osc_enabled(key):
+                continue
+            if key not in emitted:
+                emitted.add(key)
+                self.osc_used.emit(key)
+
     # -- bell (BEL 0x07) -------------------------------------------------------
     # Notification channels are INDEPENDENT (not mutually exclusive): a bell may
     # ring any combination. Empty set = silent (the safe default).
@@ -3354,6 +3382,11 @@ class SecureTerminal(QPlainTextEdit):
         text = self._absorb_caret(text)         # drop a shell's duplicate ^C echo
 
         if self._grid_mode():
+            # Advise on a refused OSC in TUI too, so the yellow banner is symmetric with
+            # CLI (an enabled type is honored by _handle_osc above and gated out of the
+            # advisory inside _notice_osc). `text` still carries the ESC] introducers
+            # here (pre escape-stripping), so the scan sees every OSC.
+            self._notice_osc(text)
             # Keep the retained raw prompt-clean, like the CLI branch below, so a TUI
             # re-render (replayed through _feed_stream from _raw) does not re-stick a
             # finished command's leftover colour onto the prompt.
@@ -3394,24 +3427,10 @@ class SecureTerminal(QPlainTextEdit):
         # false-fires on a shell's BEL-terminated title, split across reads or not.
         if self._bell_channels and has_bell(text):
             self._ring()
-        # An OSC (ESC ]) is stripped in CLI mode; flag each distinct TYPE seen so
-        # the window can notice it at most once per tab (not once per any OSC).
-        if '\x1b]' in text:
-            emitted = set()
-            for m in _OSC_CODE_RE.finditer(text):
-                code = int(m.group(1))
-                key = _OSC_CODE_KEY.get(code, 'osc_other')
-                if code == 52:
-                    # osc_clipboard (write) and osc_clipboard_read share code 52;
-                    # distinguish by the payload so the per-type notice is right.
-                    tail = text[m.end():m.end() + 512]
-                    end = min((p for p in (tail.find('\x07'), tail.find('\x1b'))
-                               if p >= 0), default=len(tail))
-                    key = ('osc_clipboard_read' if tail[:end].rstrip().endswith('?')
-                           else 'osc_clipboard')
-                if key not in emitted:
-                    emitted.add(key)
-                    self.osc_used.emit(key)
+        # An OSC (ESC ]) is refused in CLI mode; advise each distinct TYPE seen. The
+        # TUI grid branch calls the SAME helper, so the advisory is symmetric across
+        # modes (an OSC refused in CLI is equally refused in the fixed TUI grid).
+        self._notice_osc(text)
         # An over-cap OSC that just switched to the discard state had its introducer
         # truncated away before the scan above, so still surface the attempt (as a
         # generic OSC) -- else padding an OSC past the cap would evade the notice.
