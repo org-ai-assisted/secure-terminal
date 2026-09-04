@@ -1878,29 +1878,36 @@ class SecureTerminal(QPlainTextEdit):
                 text = text[:carry_at]
         if '\x1b]' not in text:
             return
+        # Parse OSCs left-to-right, ADVANCING past each terminator. finditer would re-match
+        # a literal "\x1b]" inside a payload as a separate OSC (a spurious duplicate advisory)
+        # AND, once code-52 classification scans to the true terminator, re-scan the whole
+        # remainder for every introducer -- O(n^2) on the GUI thread (a chunk of many
+        # "\x1b]52;" fragments freezes it for seconds). Advancing past the terminator makes
+        # each byte scanned once (O(n)) and treats a payload's bytes as payload, not OSCs.
         emitted = set()
-        for m in _OSC_CODE_RE.finditer(text):
+        pos = 0
+        while True:
+            m = _OSC_CODE_RE.search(text, pos)
+            if m is None:
+                break
             code = int(m.group(1))
             key = _OSC_CODE_KEY.get(code, 'osc_other')
+            term = _OSC_TERMINATED_STR.search(text, m.end())
+            payload_end = term.start() if term else len(text)
             if code == 52:
-                # osc_clipboard (write) and osc_clipboard_read share code 52;
-                # distinguish by the payload so the per-type notice is right.
-                # Classify from the WHOLE payload up to the TRUE terminator (BEL or ST),
-                # exactly as the enforcement path _handle_osc does -- so the advisory can
-                # never diverge from it. Truncating (an old 512-cap) or stopping at the first
-                # bare ESC would misread the '?' that marks a READ, flipping read<->write; a
-                # refused read misread as a write is then gated out by an enabled write. The
-                # text is already bounded by the reassembly cap, so the uncapped slice is safe.
-                tail = text[m.end():]
-                _mt = _OSC_TERMINATED_STR.search(tail)
-                end = _mt.start() if _mt else len(tail)
-                key = ('osc_clipboard_read' if tail[:end].rstrip().endswith('?')
+                # osc_clipboard (write) vs osc_clipboard_read share code 52; classify from
+                # the WHOLE payload up to the TRUE terminator, exactly as the enforcement path
+                # _handle_osc does, so the advisory can never diverge (a truncated or
+                # bare-ESC-stopped read misread as a write would be gated out by an enabled
+                # write).
+                key = ('osc_clipboard_read'
+                       if text[m.end():payload_end].rstrip().endswith('?')
                        else 'osc_clipboard')
-            if self.tui_active() and self.osc_enabled(key):
-                continue
-            if key not in emitted:
-                emitted.add(key)
-                self.osc_used.emit(key)
+            if not (self.tui_active() and self.osc_enabled(key)):
+                if key not in emitted:
+                    emitted.add(key)
+                    self.osc_used.emit(key)
+            pos = term.end() if term else len(text)
 
     # -- bell (BEL 0x07) -------------------------------------------------------
     # Notification channels are INDEPENDENT (not mutually exclusive): a bell may
