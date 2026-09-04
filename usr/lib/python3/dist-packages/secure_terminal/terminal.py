@@ -1885,11 +1885,13 @@ class SecureTerminal(QPlainTextEdit):
             if code == 52:
                 # osc_clipboard (write) and osc_clipboard_read share code 52;
                 # distinguish by the payload so the per-type notice is right.
-                # Cut at the TRUE terminator (BEL or ST), not the first bare ESC: an OSC 52
-                # payload can hold a literal ESC, and truncating there would misread the '?'
-                # that marks a READ -- flipping read<->write (a refused read misread as a
-                # write is then gated out by an enabled write).
-                tail = text[m.end():m.end() + 512]
+                # Classify from the WHOLE payload up to the TRUE terminator (BEL or ST),
+                # exactly as the enforcement path _handle_osc does -- so the advisory can
+                # never diverge from it. Truncating (an old 512-cap) or stopping at the first
+                # bare ESC would misread the '?' that marks a READ, flipping read<->write; a
+                # refused read misread as a write is then gated out by an enabled write. The
+                # text is already bounded by the reassembly cap, so the uncapped slice is safe.
+                tail = text[m.end():]
                 _mt = _OSC_TERMINATED_STR.search(tail)
                 end = _mt.start() if _mt else len(tail)
                 key = ('osc_clipboard_read' if tail[:end].rstrip().endswith('?')
