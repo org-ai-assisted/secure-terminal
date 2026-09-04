@@ -1852,22 +1852,28 @@ class SecureTerminal(QPlainTextEdit):
             # in text and still advises (never evades) via the scan below.
             text = self._notice_carry + text
             self._notice_carry = ''
-            carry_at = len(text) if text.endswith('\x1b') else -1
-            intro = text.rfind('\x1b]')
-            if intro != -1 and not _OSC_TERMINATED_STR.search(text[intro + 2:]):
-                carry_at = intro
-            if carry_at == len(text):
-                carry_at = len(text) - 1          # the trailing lone ESC
+            # The OPEN OSC starts at the first "\x1b]" AFTER the last terminator. An OSC
+            # payload may contain a literal "\x1b]", so the LAST raw occurrence (rfind) can
+            # be an inner, attacker-planted byte pair rather than the true introducer --
+            # carrying or truncating there would leave the real "\x1b]52;..." in text to be
+            # rescanned and MISCLASSIFIED (a refused read read as a write). Nothing after the
+            # last terminator is terminated, so the first "\x1b]" there is the genuinely-open
+            # one; a bare trailing "\x1b" (may begin an introducer next read) is held too.
+            _terms = list(_OSC_TERMINATED_STR.finditer(text))
+            _after = _terms[-1].end() if _terms else 0
+            intro = text.find('\x1b]', _after)
+            carry_at = intro if intro != -1 else (
+                len(text) - 1 if text.endswith('\x1b') else -1)
             if carry_at >= 0 and (len(text) - carry_at) <= self._OSC_CARRY_MAX:
                 self._notice_carry = text[carry_at:]
                 text = text[:carry_at]
             elif carry_at >= 0:
-                # over-cap unterminated OSC: not held (no unbounded buffer), and its type
-                # is unknowable -- a read's '?' may be past the cap, so classifying it from
-                # the truncated head would MISLABEL it (e.g. a refused clipboard read read
-                # as a write, then gated out by an enabled write). Surface it as a generic
-                # attempt (osc_other is never gated), matching CLI's over-cap discard emit,
-                # and drop the introducer so the scan below cannot re-type it.
+                # over-cap unterminated OSC: not held (no unbounded buffer), and its type is
+                # unknowable (a read's '?' may be past the cap), so classifying its truncated
+                # head would MISLABEL it (a refused read as a write, gated out by an enabled
+                # write). Surface the ungated osc_other (matching CLI's over-cap discard) and
+                # strip the whole open OSC (carry_at is its true start) so the scan cannot
+                # re-type it.
                 self.osc_used.emit('osc_other')
                 text = text[:carry_at]
         if '\x1b]' not in text:
