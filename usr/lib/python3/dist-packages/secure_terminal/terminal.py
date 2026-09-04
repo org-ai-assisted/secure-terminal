@@ -472,6 +472,8 @@ _OSC_CLIP_MAX = 64 * 1024        # cap a clipboard payload; no unbounded writes
 # back and prepended to the next read, so a sequence split across PTY reads (a
 # full-size OSC 52 clipboard payload always spans the 64 KiB read) is not missed.
 _OSC_TERMINATED = re.compile(rb'\x07|\x1b\\')
+# str sibling, for the CLI-symmetric OSC advisory carry in _notice_osc.
+_OSC_TERMINATED_STR = re.compile(r'\x07|\x1b\\')
 # OSC 8 hyperlink: ESC ] 8 ; <params> ; <URI> BEL <text> ESC ] 8 ; ; BEL. Captures
 # the real target URI and the visible text, so the true destination can be shown
 # (the display text can differ from the target -- the phishing risk).
@@ -1174,6 +1176,11 @@ class SecureTerminal(QPlainTextEdit):
         # reads is still acted on. Bounded a little above the clipboard cap.
         self._osc_carry = b''
         self._OSC_CARRY_MAX = _OSC_CLIP_MAX + 4096
+        # notice-path OSC reassembly: the TUI grid branch feeds _notice_osc the RAW
+        # chunk (no feed_chunk_carry), so hold an incomplete trailing OSC here or a split
+        # introducer / split OSC-52 '?' would evade or misclassify the advisory. Mirrors
+        # _osc_carry's reassembly, bounded by the same cap.
+        self._notice_carry = ''
         # emitted whenever a program uses an OSC escape while in pure CLI mode,
         # where it is stripped; the window de-duplicates to a once-per-tab notice
         # (it knows the setting, so the terminal must not consume the state itself).
@@ -1640,6 +1647,7 @@ class SecureTerminal(QPlainTextEdit):
         self._esc_dropped = 0
         self._esc_notified = False
         self._osc_carry = b''
+        self._notice_carry = ''
         # re-advertise the mode's terminfo to the running shell (no restart). ONLY
         # for the default login shell (self._command is None): a tab launched with
         # `-- PROGRAM` runs that program as _pid, which has_foreground_program cannot
@@ -1834,6 +1842,25 @@ class SecureTerminal(QPlainTextEdit):
         grid branch call this, so a refused OSC surfaces the same yellow banner either
         way. The over-cap discard emit stays at the CLI call site -- it reads
         feed_chunk_carry state this helper cannot see."""
+        if self._grid_mode():
+            # TUI feeds the RAW chunk (no feed_chunk_carry), so reassemble a split OSC
+            # here -- else a split introducer or a split OSC-52 '?' would EVADE or
+            # MISCLASSIFY the advisory (CLI arrives already reassembled, so it skips this
+            # and its _notice_carry stays empty). Mirror _handle_osc's core carry: hold an
+            # UNTERMINATED "\x1b]" introducer or a trailing lone "\x1b", bounded by the
+            # same cap; an over-cap unterminated flood is not held, so its introducer stays
+            # in text and still advises (never evades) via the scan below.
+            text = self._notice_carry + text
+            self._notice_carry = ''
+            carry_at = len(text) if text.endswith('\x1b') else -1
+            intro = text.rfind('\x1b]')
+            if intro != -1 and not _OSC_TERMINATED_STR.search(text[intro + 2:]):
+                carry_at = intro
+            if carry_at == len(text):
+                carry_at = len(text) - 1          # the trailing lone ESC
+            if carry_at >= 0 and (len(text) - carry_at) <= self._OSC_CARRY_MAX:
+                self._notice_carry = text[carry_at:]
+                text = text[:carry_at]
         if '\x1b]' not in text:
             return
         emitted = set()
@@ -3993,6 +4020,7 @@ class SecureTerminal(QPlainTextEdit):
         self._esc_dropped = 0
         self._esc_notified = False
         self._osc_carry = b''
+        self._notice_carry = ''
         self._alt_scan_carry = ''
         self._alt_feed_carry = b''
         self._sync_scan_carry = ''
