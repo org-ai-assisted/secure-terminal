@@ -1861,6 +1861,15 @@ class SecureTerminal(QPlainTextEdit):
             if carry_at >= 0 and (len(text) - carry_at) <= self._OSC_CARRY_MAX:
                 self._notice_carry = text[carry_at:]
                 text = text[:carry_at]
+            elif carry_at >= 0:
+                # over-cap unterminated OSC: not held (no unbounded buffer), and its type
+                # is unknowable -- a read's '?' may be past the cap, so classifying it from
+                # the truncated head would MISLABEL it (e.g. a refused clipboard read read
+                # as a write, then gated out by an enabled write). Surface it as a generic
+                # attempt (osc_other is never gated), matching CLI's over-cap discard emit,
+                # and drop the introducer so the scan below cannot re-type it.
+                self.osc_used.emit('osc_other')
+                text = text[:carry_at]
         if '\x1b]' not in text:
             return
         emitted = set()
