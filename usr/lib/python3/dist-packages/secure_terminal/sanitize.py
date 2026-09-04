@@ -323,7 +323,7 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
             # then its final byte -- or stop at an INTERRUPTING byte, which ends the
             # run and resumes as text (matching ANSI_RE's interrupted-CSI arm).
             m = _NONSTRING_BODY[drop].match(text)
-            end = m.end()
+            end = m.end() if m else 0       # the all-optional body pattern always matches
             if end >= len(text):
                 dropped += len(text)        # whole chunk still inside the body
                 return '', '', drop, dropped
