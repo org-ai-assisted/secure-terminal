@@ -650,7 +650,7 @@ def cli_terminfo_dir():
             try:
                 return (not os.path.islink(path) and os.path.isfile(path)
                         and os.stat(path).st_uid in (0, os.getuid()))
-            except OSError:
+            except OSError:  # pragma: no cover - race (stat after isfile) is defensive
                 return False
         compiled = [os.path.join(directory, 's', name)
                     for name in ('secure-terminal', 'secure-terminal-noedit')]
