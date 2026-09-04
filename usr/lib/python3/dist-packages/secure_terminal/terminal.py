@@ -313,7 +313,7 @@ from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData, QRect)
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
                          QTextFormat, QGuiApplication, QSyntaxHighlighter,
-                         QTextBlockUserData, QPainter)
+                         QTextBlockUserData, QPainter, QClipboard)
 from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QApplication)
 
@@ -384,6 +384,16 @@ def route_ctrl_wheel_zoom(widget, event):
 # _reset_leftover_sgr). '\x1b[0m' clears any stuck program colour before the prompt.
 _PROMPT_START_BYTES = PROMPT_START.encode('ascii')
 _SGR_RESET_BYTES = b'\x1b[0m'
+
+# Double-click "word" = a run of alphanumerics (Unicode-aware) plus this punctuation.
+# Chosen so a whole path/URL/key=value/user@host selects as one word (as konsole/kitty
+# do). Deliberately EXCLUDES ':' '\' ',' so host:port, HH:MM:SS, C:\ and comma/backslash
+# lists do not over-grab (kitty's reasoning). A neutralized/marker glyph is NOT alnum and
+# not here, so a word stops at it -- selection never runs across a boundary char.
+_WORD_PUNCT = '@-./_~?&=%+#'
+# Cells trimmed from a triple-click line tail (trailing blanks past the last glyph): plain
+# space, tab, no-break space, and Qt's block/line separators between joined wrap rows.
+_LINE_TRIM_CHARS = ' \t\u00a0\u2028\u2029'
 
 _CP_PROP = QTextFormat.Property.UserProperty + 1
 
@@ -1092,6 +1102,14 @@ class SecureTerminal(QPlainTextEdit):
         # "selects to the bottom" bug). While a selection is active the rebuild is frozen,
         # exactly as a traditional terminal holds the view still while you select.
         self._mouse_selecting = False
+        # Multi-click selection: our own click counter (Qt only exposes single/double),
+        # so a triple-click can select a whole line. _select_mode drives drag-extend --
+        # a drag after a double/triple click snaps to whole words/lines, not characters.
+        self._click_count = 0
+        self._last_click_ts = 0.0
+        self._last_click_pos = None
+        self._select_mode = 'char'    # 'char' | 'word' | 'line'
+        self._sel_anchor = None       # (start, end) doc positions the drag extends from
         self._grid_shown = False      # is the fixed pyte grid currently on screen
         # Local caret echoes (^C, ^\) awaiting possible de-duplication against the
         # shell's own echo: [(text, deadline_monotonic), ...]. See _echo_caret.
@@ -5021,11 +5039,28 @@ class SecureTerminal(QPlainTextEdit):
         # (unlike the passive hover tooltip): its text can be selected and copied,
         # and it stays open while you work. A double-click elsewhere selects a word
         # as usual.
-        cp = self._cp_at(event.position().toPoint())
+        point = event.position().toPoint()
+        cp = self._cp_at(point)
         if cp is not None:
             self._show_char_popup(cp, event.globalPosition().toPoint())
             return
-        super().mouseDoubleClickEvent(event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        # Select the WHOLE word (path/URL/key=value), not Qt's punctuation-split default;
+        # a 4th click (quad) selects the line, like triple. A point not on a word char
+        # falls back to Qt's own double-click behaviour.
+        if self._bump_click_count(point) >= 4:
+            a, b = self._line_range_at(point)
+            self._apply_unit_selection(a, b, 'line')
+            return
+        rng = self._word_range_at(point)
+        if rng is None:
+            self._select_mode = 'char'
+            self._sel_anchor = None
+            super().mouseDoubleClickEvent(event)
+            return
+        self._apply_unit_selection(rng[0], rng[1], 'word')
 
     def _show_char_popup(self, cp, global_point):
         """A small, dismissible, copyable popup describing a character. Copies the
@@ -5174,7 +5209,124 @@ class SecureTerminal(QPlainTextEdit):
         cur = self.textCursor()
         cur.clearSelection()
         self.setTextCursor(cur)
+        self._select_mode = 'char'
+        self._sel_anchor = None
         self._render_timer.start(16)
+
+    @staticmethod
+    def _is_word_char(ch):
+        return ch.isalnum() or ch in _WORD_PUNCT
+
+    def _word_range_at(self, point):
+        """(start, end) doc positions of the word-char run touching the point, or None
+        when the point is not on/adjacent to a word char (caller falls back to Qt's own
+        behaviour there). Stays within one document block -- a word does not cross a soft
+        wrap; line selection joins wrapped rows instead. Works in DOCUMENT positions
+        (UTF-16 units) with characterAt, never a Python str index -- the two desync on a
+        non-BMP glyph, so a mixed index picks the wrong cell / splits a surrogate. An
+        astral glyph reads as a boundary (a lone surrogate is not alnum)."""
+        doc = self.document()
+        cur = self.cursorForPosition(point)
+        block = cur.block()
+        lo = block.position()
+        hi = lo + block.length() - 1        # last content position (drop the separator)
+        i = min(max(cur.position(), lo), hi)
+        left = right = i
+        while right < hi and self._is_word_char(doc.characterAt(right)):
+            right += 1
+        while left > lo and self._is_word_char(doc.characterAt(left - 1)):
+            left -= 1
+        if left == right:
+            return None
+        return left, right
+
+    def _line_range_at(self, point):
+        """(start, end) doc positions of the LOGICAL line under the point -- the block
+        plus any following soft-wrap continuation rows (marked userState()==1) -- with
+        trailing blank cells trimmed to the last glyph (as VTE/kitty do, so a hidden
+        trailing tail cannot ride onto the clipboard)."""
+        block = self.cursorForPosition(point).block()
+        start = block
+        while start.userState() == 1 and start.previous().isValid():
+            start = start.previous()
+        end = block
+        while end.next().isValid() and end.next().userState() == 1:
+            end = end.next()
+        doc = self.document()
+        a = start.position()
+        # block.length()-1 is the block's content length in UTF-16 units (positions),
+        # matching doc offsets; len(text) counts code points and drops a UTF-16 unit per
+        # non-BMP glyph, which would leave the last cell out of the line.
+        b = end.position() + end.length() - 1
+        while b > a and doc.characterAt(b - 1) in _LINE_TRIM_CHARS:
+            b -= 1
+        return a, b
+
+    def _apply_unit_selection(self, a, b, mode):
+        """Select [a, b), record it as the drag anchor, and set the selection mode so a
+        following drag extends by whole words/lines."""
+        cur = self.textCursor()
+        cur.setPosition(a)
+        cur.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cur)
+        self._sel_anchor = (a, b)
+        self._select_mode = mode
+        # setTextCursor -> ensureCursorVisible jumps the hbar to the word's end; pin the
+        # left margin back (as the triple-click and drag paths do).
+        self._home_hscroll()
+
+    def _publish_primary(self):
+        """Publish the selection to the X11 PRIMARY buffer (sanitized, via
+        createMimeDataFromSelection), which a bare setTextCursor does NOT do -- so a
+        middle-click paste of a word/line select works, as it does after Qt's own
+        double-click. No-op where there is no PRIMARY selection (Wayland/macOS)."""
+        clip = QGuiApplication.clipboard()
+        if clip.supportsSelection():
+            clip.setMimeData(self.createMimeDataFromSelection(),
+                             QClipboard.Mode.Selection)
+
+    def _extend_unit_selection(self, point):
+        """Grow a word/line selection to cover every whole unit between the drag anchor
+        and the point (union of the anchor range and the unit under the pointer). The
+        ACTIVE end is put on the side the pointer moved toward, so ensureCursorVisible
+        scrolls to follow the drag upward as well as downward."""
+        if self._sel_anchor is None:
+            return
+        a, b = self._sel_anchor
+        if self._select_mode == 'line':
+            unit = self._line_range_at(point)
+        else:
+            unit = self._word_range_at(point)
+        if unit is None:
+            pos = self.cursorForPosition(point).position()
+            unit = (pos, pos)
+        lo, hi = min(a, unit[0]), max(b, unit[1])
+        cur = self.textCursor()
+        if unit[0] < a:                 # extending above the anchor -> active end is lo
+            cur.setPosition(hi)
+            cur.setPosition(lo, QTextCursor.MoveMode.KeepAnchor)
+        else:
+            cur.setPosition(lo)
+            cur.setPosition(hi, QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cur)
+        self._publish_primary()
+
+    def _bump_click_count(self, point):
+        """Our own consecutive-click counter (1=single, 2=double, 3+=triple): Qt signals
+        only single vs double, so a triple-click needs this. A click counts as consecutive
+        when it lands within the double-click interval AND near the previous click."""
+        now = time.monotonic()
+        interval = QApplication.styleHints().mouseDoubleClickInterval() / 1000.0
+        near = (self._last_click_pos is not None
+                and abs(point.x() - self._last_click_pos.x()) <= 4
+                and abs(point.y() - self._last_click_pos.y()) <= 4)
+        if now - self._last_click_ts <= interval and near:
+            self._click_count += 1
+        else:
+            self._click_count = 1
+        self._last_click_ts = now
+        self._last_click_pos = point
+        return self._click_count
 
     def _home_hscroll(self):
         """Pin the horizontal scrollbar to the left so the left document margin stays
@@ -5212,6 +5364,17 @@ class SecureTerminal(QPlainTextEdit):
                 # Collapse the cursor to the click first, so the shift-press starts a FRESH
                 # selection at the click instead of extending from the pinned cursor.
                 self.setTextCursor(self.cursorForPosition(event.position().toPoint()))
+            point = event.position().toPoint()
+            # A triple-click (3rd rapid press; Qt sends the 2nd as a dblclick) selects the
+            # whole logical line.
+            if self._bump_click_count(point) >= 3:
+                a, b = self._line_range_at(point)
+                self._apply_unit_selection(a, b, 'line')
+                self._home_hscroll()
+                event.accept()
+                return
+            self._select_mode = 'char'
+            self._sel_anchor = None
         super().mousePressEvent(event)
         self._home_hscroll()          # keep the left margin pinned during the press
 
@@ -5228,6 +5391,24 @@ class SecureTerminal(QPlainTextEdit):
             self._mouse_report_btns.discard(btn)
             if not self._mouse_report_btns:
                 self._mouse_report_cell = None
+            event.accept()
+            return
+        # The LEFT release that ends a word/line select is ours; do not let the base class
+        # re-finalize it from its own (stale) anchor. Only the left button -- a middle
+        # release must fall through to super so its PRIMARY paste runs (the mode stays
+        # 'word'/'line' until the next left press).
+        if btn == Qt.MouseButton.LeftButton and self._select_mode in ('word', 'line'):
+            self._mouse_selecting = False
+            if self._grid_mode():
+                self._render_timer.start(16)
+            # Qt publishes PRIMARY from its own double/press handlers, which we bypassed;
+            # publish it here so middle-click paste of the word/line works. A blank-line
+            # triple-click trims to an empty selection -> snap the caret back like the
+            # normal path, rather than leaving it stranded on the blank line.
+            if self.textCursor().hasSelection():
+                self._publish_primary()
+            else:
+                self.reset_caret()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -5271,6 +5452,15 @@ class SecureTerminal(QPlainTextEdit):
                     self._report_mouse(base, event, pressed=True, motion=True)
                 event.accept()
                 return
+        # After a double/triple click, a drag extends by whole words/lines (konsole/VTE
+        # idiom), so we manage the selection ourselves rather than letting Qt extend by
+        # character.
+        if (self._select_mode in ('word', 'line')
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            self._extend_unit_selection(event.position().toPoint())
+            self._home_hscroll()
+            event.accept()
+            return
         super().mouseMoveEvent(event)
         if self._mouse_selecting:     # keep the margin pinned through a local drag-select
             self._home_hscroll()
