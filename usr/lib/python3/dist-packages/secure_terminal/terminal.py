@@ -335,7 +335,7 @@ from secure_terminal.sanitize import (
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
     describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
-    PROMPT_START,
+    PROMPT_START, _printable_follows, _NO_NEWLINE_TEXT,
     feed_chunk_carry, has_bell, OSC_FEATURES,
     tail_from_escape_boundary, split_trailing_escape, scan_mouse_modes,
     sgr_mouse_report,
@@ -384,6 +384,22 @@ def route_ctrl_wheel_zoom(widget, event):
 # _reset_leftover_sgr). '\x1b[0m' clears any stuck program colour before the prompt.
 _PROMPT_START_BYTES = PROMPT_START.encode('ascii')
 _SGR_RESET_BYTES = b'\x1b[0m'
+# The no-final-newline marker for TUI: the same text the CLI cell path uses
+# (sanitize._NO_NEWLINE_TEXT), tinted the matching gray (#808080 == 128,128,128)
+# via an SGR pyte honours, then reset. Fed into pyte just before the break so it
+# sits at the end of the un-terminated line.
+_NO_NEWLINE_TUI_BYTES = (_SGR_RESET_BYTES + b'\x1b[38;2;128;128;128m'
+                         + _NO_NEWLINE_TEXT.encode('ascii') + _SGR_RESET_BYTES)
+
+# Double-click "word" = a run of alphanumerics (Unicode-aware) plus this punctuation.
+# Chosen so a whole path/URL/key=value/user@host selects as one word (as konsole/kitty
+# do). Deliberately EXCLUDES ':' '\' ',' so host:port, HH:MM:SS, C:\ and comma/backslash
+# lists do not over-grab (kitty's reasoning). A neutralized/marker glyph is NOT alnum and
+# not here, so a word stops at it -- selection never runs across a boundary char.
+_WORD_PUNCT = '@-./_~?&=%+#'
+# Cells trimmed from a triple-click line tail (trailing blanks past the last glyph): plain
+# space, tab, no-break space, and Qt's block/line separators between joined wrap rows.
+_LINE_TRIM_CHARS = ' \t\u00a0\u2028\u2029'
 
 _CP_PROP = QTextFormat.Property.UserProperty + 1
 
@@ -567,6 +583,17 @@ def _argv_for_command(command):
     return None if any('\x00' in w for w in parsed) else parsed
 
 
+def _command_display(command):
+    """A faithful one-line rendering of a launch command for the running-banner:
+    a `-e STRING` verbatim, a `-- argv` list joined with shell quoting. Display
+    only -- never fed to exec; the exec path is _argv_for_command."""
+    if isinstance(command, str):
+        return command
+    if isinstance(command, (list, tuple)):
+        return shlex.join(str(a) for a in command)
+    return ''
+
+
 # Directories a bell sound file may live in. Restricting to these keeps the
 # AppArmor profile enforceable (it grants read only here), so a user cannot point
 # the bell at an arbitrary path the sandbox would then have to be widened for.
@@ -708,13 +735,19 @@ def _build_tui_keys():
 def _build_line_edit_keys():
     """Qt.Key -> VT byte sequence for the keys line mode forwards to the shell's
     own line editor: history recall (Up/Down), intra-line movement (Left/Right/
-    Home/End) and forward delete. Built lazily (references Qt.Key)."""
+    Home/End), forward delete, and PageUp/PageDown. Built lazily (references Qt.Key).
+
+    Plain PageUp/PageDown go to the PROGRAM (konsole/gnome-terminal convention);
+    Shift+PageUp/Down scroll the local buffer (see _scroll_key). A shell that binds
+    \\e[5~/\\e[6~ (e.g. history-search-backward/forward) then reaches history from
+    PageUp; Up/Down stay the default history keys regardless."""
     k = Qt.Key
     return {
         k.Key_Up: b'\x1b[A', k.Key_Down: b'\x1b[B',
         k.Key_Right: b'\x1b[C', k.Key_Left: b'\x1b[D',
         k.Key_Home: b'\x1b[H', k.Key_End: b'\x1b[F',
         k.Key_Delete: b'\x1b[3~',
+        k.Key_PageUp: b'\x1b[5~', k.Key_PageDown: b'\x1b[6~',
     }
 
 
@@ -789,7 +822,8 @@ class SecureTerminal(QPlainTextEdit):
 
     def __init__(self, parent=None, command=None, tui=False, history='',
                  preview=False, cwd=None, mode='detail', colors=False,
-                 markings=True, line_edits=True, theme='light', cg_path=None):
+                 markings=True, line_edits=True, show_command=False,
+                 theme='light', cg_path=None):
         super().__init__(parent)
         # Deterministic screenshot mode (SECURE_TERMINAL_SHOT=1, a startup capture
         # MODE -- never a persisted per-tab setting): hide the caret and render the
@@ -1092,6 +1126,14 @@ class SecureTerminal(QPlainTextEdit):
         # "selects to the bottom" bug). While a selection is active the rebuild is frozen,
         # exactly as a traditional terminal holds the view still while you select.
         self._mouse_selecting = False
+        # Multi-click selection: our own click counter (Qt only exposes single/double),
+        # so a triple-click can select a whole line. _select_mode drives drag-extend --
+        # a drag after a double/triple click snaps to whole words/lines, not characters.
+        self._click_count = 0
+        self._last_click_ts = 0.0
+        self._last_click_pos = None
+        self._select_mode = 'char'    # 'char' | 'word' | 'line'
+        self._sel_anchor = None       # (start, end) doc positions the drag extends from
         self._grid_shown = False      # is the fixed pyte grid currently on screen
         # Local caret echoes (^C, ^\) awaiting possible de-duplication against the
         # shell's own echo: [(text, deadline_monotonic), ...]. See _echo_caret.
@@ -1210,6 +1252,19 @@ class SecureTerminal(QPlainTextEdit):
             # No child, no keyboard: a read-only rendering surface only.
             self.setReadOnly(True)
             return
+        # Launch banner: a tab LAUNCHED with an explicit command (-e / -- PROGRAM
+        # via the window's launch/new-command-tab paths, which pass show_command)
+        # records what it ran, so scrollback shows the original command a bare
+        # prompt would not echo. Seeded like restored history -- onto _raw (so a
+        # later CLI<->TUI switch replays it) and the live line document -- ABOVE the
+        # program's output. A bare-shell tab (command None) gets none, so ordinary
+        # interactive use is unchanged. (A full-screen program's alt screen hides it
+        # while running; it reappears on the primary screen when that program exits.)
+        if command is not None and show_command:
+            banner = '[secure-terminal] running: %s\r\n' % _command_display(command)
+            self._raw += banner
+            self._cap_raw()
+            self._append(banner)
         self._start(command)
         if self._tui:
             # A tab that STARTS in TUI must enter the grid view properly (seed the
@@ -3269,14 +3324,7 @@ class SecureTerminal(QPlainTextEdit):
             k = _alt_partial_tail(feed)         # hold back ONLY a split-marker tail
             self._alt_feed_carry = feed[len(feed) - k:] if k else b''
             stream = feed[:len(feed) - k] if k else feed
-            # Guard the shell prompt against a finished command's stuck colour in TUI
-            # too (the CLI path does this in _reset_leftover_sgr): inject an SGR reset
-            # ahead of the bracketed-paste prompt-start so pyte renders the prompt in
-            # the default palette rather than the program's leftover colour.
-            if _PROMPT_START_BYTES in stream:
-                stream = stream.replace(
-                    _PROMPT_START_BYTES, _SGR_RESET_BYTES + _PROMPT_START_BYTES)
-            self._feed_stream(stream)
+            self._feed_prompt_aware(stream)
         else:
             self._alt_feed_carry = b''          # CLI mode does not stream-feed; drop any tail
         if sync_end:
@@ -3407,6 +3455,35 @@ class SecureTerminal(QPlainTextEdit):
                          'keeps output append-only, so nothing can erase what you '
                          'have already seen. Turn on TUI mode if you need a program '
                          'to control the screen.')
+
+    def _feed_prompt_aware(self, stream):
+        """Feed TUI output, treating the shell's bracketed-paste prompt-start
+        specially. At every prompt-start we inject an SGR reset so a finished
+        command's leftover colour cannot tint the prompt (the CLI path does this in
+        _reset_leftover_sgr). When the PRIMARY-screen cursor sits mid-line with
+        prompt text still to follow (bash order: the marker precedes the prompt) we
+        ALSO inject a CR/LF, so the prompt starts on its own row instead of gluing
+        onto a command's un-terminated last line -- the TUI mirror of the CLI
+        feed_line_edits nicety (sanitize.py). Skipped on the alt screen (a
+        full-screen program owns the rows), at column 0 (nothing to break), when the
+        line already filled the width (pyte wraps the prompt itself), and in the zsh
+        order where the marker trails the prompt (nothing printable follows) -- the
+        same guard the CLI uses. Feeding per prompt segment keeps _alt_saved and the
+        cursor current at each boundary (unlike a blanket replace)."""
+        if _PROMPT_START_BYTES not in stream:
+            self._feed_stream(stream)
+            return
+        parts = stream.split(_PROMPT_START_BYTES)
+        self._feed_stream(parts[0])
+        for part in parts[1:]:
+            prefix = _SGR_RESET_BYTES
+            scr = self._screen
+            if (scr is not None and self._alt_saved is None
+                    and 0 < scr.cursor.x < scr.columns
+                    and _printable_follows(part.decode('latin-1'), 0)):
+                # note the missing final newline, then break (mirrors the CLI cell path)
+                prefix = _NO_NEWLINE_TUI_BYTES + b'\r\n' + prefix
+            self._feed_stream(prefix + _PROMPT_START_BYTES + part)
 
     def _feed_stream(self, data):
         """Feed bytes to pyte, handling alternate-screen enter/leave INLINE so the
@@ -4782,12 +4859,11 @@ class SecureTerminal(QPlainTextEdit):
                 self._write(seq)
                 return
 
-        # Scrollback navigation. In line mode there is no full-screen program to
-        # own these keys, so scroll the buffer: Shift+PageUp/Down a page and
-        # Shift+Home/End to the ends is the gnome-terminal/konsole convention,
-        # and plain PageUp/Down scroll too because "Page Up shows earlier output"
-        # is what a user reaches for. (TUI mode returned above; there the running
-        # program gets these as VT input.)
+        # Scrollback navigation reserved for Shift+navigation (the gnome-terminal/
+        # konsole convention): Shift+PageUp/Down scroll a page, Shift+Home/End jump
+        # to the ends. Plain PageUp/Down forwarded to the shell above via _LINE_KEYS
+        # (like a real terminal); only their Shift form scrolls. (TUI mode returned
+        # above; there the running program gets these as VT input.)
         if self._scroll_key(key, bool(shift)):
             return
 
@@ -4804,15 +4880,15 @@ class SecureTerminal(QPlainTextEdit):
         # non-printable input and arrow/navigation keys are intentionally ignored
 
     def _scroll_key(self, key, shift):
-        """Scroll the scrollback view for a navigation key in line mode. Returns
-        True when `key` was a scroll key and was handled. PageUp/PageDown scroll
-        a page unmodified (line mode has no program consuming them); Shift+Home/
-        End jump to the ends, matching the standard terminal bindings and leaving
-        plain Home/End free for line editing later."""
+        """Scroll the scrollback view for a Shift+navigation key in line mode.
+        Returns True when `key` was a scroll key and was handled. Shift+PageUp/
+        PageDown scroll a page and Shift+Home/End jump to the ends, matching the
+        standard terminal bindings; the unmodified keys are left for the shell
+        (PageUp/PageDown -> _LINE_KEYS, Home/End line editing)."""
         bar = self.verticalScrollBar()
-        if key == Qt.Key.Key_PageUp:
+        if shift and key == Qt.Key.Key_PageUp:
             bar.triggerAction(bar.SliderAction.SliderPageStepSub)
-        elif key == Qt.Key.Key_PageDown:
+        elif shift and key == Qt.Key.Key_PageDown:
             bar.triggerAction(bar.SliderAction.SliderPageStepAdd)
         elif shift and key == Qt.Key.Key_Home:
             bar.triggerAction(bar.SliderAction.SliderToMinimum)
@@ -5021,11 +5097,28 @@ class SecureTerminal(QPlainTextEdit):
         # (unlike the passive hover tooltip): its text can be selected and copied,
         # and it stays open while you work. A double-click elsewhere selects a word
         # as usual.
-        cp = self._cp_at(event.position().toPoint())
+        point = event.position().toPoint()
+        cp = self._cp_at(point)
         if cp is not None:
             self._show_char_popup(cp, event.globalPosition().toPoint())
             return
-        super().mouseDoubleClickEvent(event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        # Select the WHOLE word (path/URL/key=value), not Qt's punctuation-split default;
+        # a 4th click (quad) selects the line, like triple. A point not on a word char
+        # falls back to Qt's own double-click behaviour.
+        if self._bump_click_count(point) >= 4:
+            a, b = self._line_range_at(point)
+            self._apply_unit_selection(a, b, 'line')
+            return
+        rng = self._word_range_at(point)
+        if rng is None:
+            self._select_mode = 'char'
+            self._sel_anchor = None
+            super().mouseDoubleClickEvent(event)
+            return
+        self._apply_unit_selection(rng[0], rng[1], 'word')
 
     def _show_char_popup(self, cp, global_point):
         """A small, dismissible, copyable popup describing a character. Copies the
@@ -5174,7 +5267,98 @@ class SecureTerminal(QPlainTextEdit):
         cur = self.textCursor()
         cur.clearSelection()
         self.setTextCursor(cur)
+        self._select_mode = 'char'
+        self._sel_anchor = None
         self._render_timer.start(16)
+
+    @staticmethod
+    def _is_word_char(ch):
+        return ch.isalnum() or ch in _WORD_PUNCT
+
+    def _word_range_at(self, point):
+        """(start, end) doc positions of the word-char run touching the point, or None
+        when the point is not on/adjacent to a word char (caller falls back to Qt's own
+        behaviour there). Stays within one document block -- a word does not cross a soft
+        wrap; line selection joins wrapped rows instead."""
+        cur = self.cursorForPosition(point)
+        block = cur.block()
+        text = block.text()
+        n = len(text)
+        i = min(max(cur.position() - block.position(), 0), n)
+        left = right = i
+        while right < n and self._is_word_char(text[right]):
+            right += 1
+        while left > 0 and self._is_word_char(text[left - 1]):
+            left -= 1
+        if left == right:
+            return None
+        base = block.position()
+        return base + left, base + right
+
+    def _line_range_at(self, point):
+        """(start, end) doc positions of the LOGICAL line under the point -- the block
+        plus any following soft-wrap continuation rows (marked userState()==1) -- with
+        trailing blank cells trimmed to the last glyph (as VTE/kitty do, so a hidden
+        trailing tail cannot ride onto the clipboard)."""
+        block = self.cursorForPosition(point).block()
+        start = block
+        while start.userState() == 1 and start.previous().isValid():
+            start = start.previous()
+        end = block
+        while end.next().isValid() and end.next().userState() == 1:
+            end = end.next()
+        doc = self.document()
+        a = start.position()
+        b = end.position() + len(end.text())
+        while b > a and doc.characterAt(b - 1) in _LINE_TRIM_CHARS:
+            b -= 1
+        return a, b
+
+    def _apply_unit_selection(self, a, b, mode):
+        """Select [a, b), record it as the drag anchor, and set the selection mode so a
+        following drag extends by whole words/lines."""
+        cur = self.textCursor()
+        cur.setPosition(a)
+        cur.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cur)
+        self._sel_anchor = (a, b)
+        self._select_mode = mode
+
+    def _extend_unit_selection(self, point):
+        """Grow a word/line selection to cover every whole unit between the drag anchor
+        and the point (union of the anchor range and the unit under the pointer)."""
+        if self._sel_anchor is None:
+            return
+        a, b = self._sel_anchor
+        if self._select_mode == 'line':
+            unit = self._line_range_at(point)
+        else:
+            unit = self._word_range_at(point)
+        if unit is None:
+            pos = self.cursorForPosition(point).position()
+            unit = (pos, pos)
+        lo, hi = min(a, unit[0]), max(b, unit[1])
+        cur = self.textCursor()
+        cur.setPosition(lo)
+        cur.setPosition(hi, QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cur)
+
+    def _bump_click_count(self, point):
+        """Our own consecutive-click counter (1=single, 2=double, 3+=triple): Qt signals
+        only single vs double, so a triple-click needs this. A click counts as consecutive
+        when it lands within the double-click interval AND near the previous click."""
+        now = time.monotonic()
+        interval = QApplication.styleHints().mouseDoubleClickInterval() / 1000.0
+        near = (self._last_click_pos is not None
+                and abs(point.x() - self._last_click_pos.x()) <= 4
+                and abs(point.y() - self._last_click_pos.y()) <= 4)
+        if now - self._last_click_ts <= interval and near:
+            self._click_count += 1
+        else:
+            self._click_count = 1
+        self._last_click_ts = now
+        self._last_click_pos = point
+        return self._click_count
 
     def _home_hscroll(self):
         """Pin the horizontal scrollbar to the left so the left document margin stays
@@ -5212,6 +5396,17 @@ class SecureTerminal(QPlainTextEdit):
                 # Collapse the cursor to the click first, so the shift-press starts a FRESH
                 # selection at the click instead of extending from the pinned cursor.
                 self.setTextCursor(self.cursorForPosition(event.position().toPoint()))
+            point = event.position().toPoint()
+            # A triple-click (3rd rapid press; Qt sends the 2nd as a dblclick) selects the
+            # whole logical line.
+            if self._bump_click_count(point) >= 3:
+                a, b = self._line_range_at(point)
+                self._apply_unit_selection(a, b, 'line')
+                self._home_hscroll()
+                event.accept()
+                return
+            self._select_mode = 'char'
+            self._sel_anchor = None
         super().mousePressEvent(event)
         self._home_hscroll()          # keep the left margin pinned during the press
 
@@ -5228,6 +5423,14 @@ class SecureTerminal(QPlainTextEdit):
             self._mouse_report_btns.discard(btn)
             if not self._mouse_report_btns:
                 self._mouse_report_cell = None
+            event.accept()
+            return
+        # A word/line selection is ours; do not let the base class re-finalize it from its
+        # own (stale) anchor -- keep it and just re-arm the frozen grid render.
+        if self._select_mode in ('word', 'line'):
+            self._mouse_selecting = False
+            if self._grid_mode():
+                self._render_timer.start(16)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -5271,6 +5474,15 @@ class SecureTerminal(QPlainTextEdit):
                     self._report_mouse(base, event, pressed=True, motion=True)
                 event.accept()
                 return
+        # After a double/triple click, a drag extends by whole words/lines (konsole/VTE
+        # idiom), so we manage the selection ourselves rather than letting Qt extend by
+        # character.
+        if (self._select_mode in ('word', 'line')
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            self._extend_unit_selection(event.position().toPoint())
+            self._home_hscroll()
+            event.accept()
+            return
         super().mouseMoveEvent(event)
         if self._mouse_selecting:     # keep the margin pinned through a local drag-select
             self._home_hscroll()
