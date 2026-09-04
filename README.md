@@ -132,13 +132,14 @@ The safety model above does not cost you the usual conveniences:
   file cannot grow without bound.
 - **Persistent settings** in systemd-style drop-in directories. Settings are
   KEY=value `.conf` files read, lowest precedence first, from
-  `/etc/secure-terminal.d/`, `/usr/local/etc/secure-terminal.d/` and
-  `~/.config/secure-terminal.d/` -- so a distro or admin can seed defaults and
-  the user overrides them. Only `*.conf` files are read; within a directory they
-  apply in lexical order, later winning. The app writes its own settings to
-  `~/.config/secure-terminal.d/50_user.conf` (a higher-numbered `.conf` you drop
-  in wins over it). **Settings -> Folders & Files...**
-  shows every location with Copy and Open buttons.
+  `/usr/lib/secure-terminal.d/`, `/etc/secure-terminal.d/`,
+  `/usr/local/etc/secure-terminal.d/` and `~/.config/secure-terminal.d/` -- so a
+  distro or admin can seed defaults and the user overrides them. Only `*.conf`
+  files are read; within a directory they apply in lexical order, later winning.
+  The app writes its own settings to
+  `~/.config/secure-terminal.d/20_auto-generated.conf` (a higher-numbered `.conf`
+  you hand-maintain, e.g. `50_user.conf`, wins over it). **Settings -> Folders &
+  Files...** shows every location with Copy and Open buttons.
 - **Tabs you can name and colour.** Double-click a tab to rename it; right-click
   for rename, a colour, or close. Handy when several tabs each run a different
   TUI. A user name and a program-set title are kept separately (your name wins as
