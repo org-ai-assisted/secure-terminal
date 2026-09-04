@@ -466,6 +466,10 @@ def _cache_bounded(cache, key, fmt):
 # Any numeric-code OSC: ESC ] <code> ; <params> (BEL | ST). The dispatcher acts on
 # the codes for enabled OSC features and ignores the rest (still stripped).
 _OSC_ANY = re.compile(rb'\x1b\](\d{1,8});([^\x07\x1b]*)(?:\x07|\x1b\\)')
+# str sibling, so the OSC advisory (_notice_osc) parses EXACTLY as the enforcement path
+# (_handle_osc) does -- same code + params + terminator -- and can never diverge from it
+# (no missed real OSC, no spurious advisory, no read<->write misclassification).
+_OSC_ANY_STR = re.compile(r'\x1b\](\d{1,8});([^\x07\x1b]*)(?:\x07|\x1b\\)')
 _OSC_CLIP_MAX = 64 * 1024        # cap a clipboard payload; no unbounded writes
 # Whether an OSC body (the bytes after its "\x1b]") contains a terminator (BEL or
 # ST). Used to decide if a trailing OSC introducer is incomplete and must be held
@@ -1843,22 +1847,17 @@ class SecureTerminal(QPlainTextEdit):
         way. The over-cap discard emit stays at the CLI call site -- it reads
         feed_chunk_carry state this helper cannot see."""
         if self._grid_mode():
-            # TUI feeds the RAW chunk (no feed_chunk_carry), so reassemble a split OSC
-            # here -- else a split introducer or a split OSC-52 '?' would EVADE or
-            # MISCLASSIFY the advisory (CLI arrives already reassembled, so it skips this
-            # and its _notice_carry stays empty). Mirror _handle_osc's core carry: hold an
-            # UNTERMINATED "\x1b]" introducer or a trailing lone "\x1b", bounded by the
-            # same cap; an over-cap unterminated flood is not held, so its introducer stays
-            # in text and still advises (never evades) via the scan below.
+            # TUI feeds the RAW chunk (no feed_chunk_carry), so reassemble a split OSC here
+            # -- else a split introducer or a split OSC-52 '?' would evade or misclassify the
+            # advisory (CLI arrives already reassembled and skips this; its _notice_carry
+            # stays empty). Hold the genuinely-open OSC: the first "\x1b]" AFTER the last
+            # terminator (an OSC payload may hold a literal "\x1b]", so the LAST raw one can be
+            # an inner byte pair, not the real introducer), or a bare trailing "\x1b". An
+            # over-cap unterminated flood is NOT held: it stays in text and the scan below --
+            # which requires a terminator -- simply skips it, exactly as _handle_osc drops an
+            # over-cap OSC (no dispatch, no advisory).
             text = self._notice_carry + text
             self._notice_carry = ''
-            # The OPEN OSC starts at the first "\x1b]" AFTER the last terminator. An OSC
-            # payload may contain a literal "\x1b]", so the LAST raw occurrence (rfind) can
-            # be an inner, attacker-planted byte pair rather than the true introducer --
-            # carrying or truncating there would leave the real "\x1b]52;..." in text to be
-            # rescanned and MISCLASSIFIED (a refused read read as a write). Nothing after the
-            # last terminator is terminated, so the first "\x1b]" there is the genuinely-open
-            # one; a bare trailing "\x1b" (may begin an introducer next read) is held too.
             _terms = list(_OSC_TERMINATED_STR.finditer(text))
             _after = _terms[-1].end() if _terms else 0
             intro = text.find('\x1b]', _after)
@@ -1867,47 +1866,26 @@ class SecureTerminal(QPlainTextEdit):
             if carry_at >= 0 and (len(text) - carry_at) <= self._OSC_CARRY_MAX:
                 self._notice_carry = text[carry_at:]
                 text = text[:carry_at]
-            elif carry_at >= 0:
-                # over-cap unterminated OSC: not held (no unbounded buffer), and its type is
-                # unknowable (a read's '?' may be past the cap), so classifying its truncated
-                # head would MISLABEL it (a refused read as a write, gated out by an enabled
-                # write). Surface the ungated osc_other (matching CLI's over-cap discard) and
-                # strip the whole open OSC (carry_at is its true start) so the scan cannot
-                # re-type it.
-                self.osc_used.emit('osc_other')
-                text = text[:carry_at]
         if '\x1b]' not in text:
             return
-        # Parse OSCs left-to-right, ADVANCING past each terminator. finditer would re-match
-        # a literal "\x1b]" inside a payload as a separate OSC (a spurious duplicate advisory)
-        # AND, once code-52 classification scans to the true terminator, re-scan the whole
-        # remainder for every introducer -- O(n^2) on the GUI thread (a chunk of many
-        # "\x1b]52;" fragments freezes it for seconds). Advancing past the terminator makes
-        # each byte scanned once (O(n)) and treats a payload's bytes as payload, not OSCs.
+        # Parse with the SAME matcher the enforcement path uses (_OSC_ANY in _handle_osc): a
+        # full "<code>;<params><BEL|ST>" match. finditer retries at every start position, so
+        # the advisory NEVER misses a real OSC embedded after a malformed one and NEVER fires
+        # for a payload _handle_osc ignores -- it cannot diverge from what is actually honored
+        # or refused. Anchored on "\x1b]" and terminator-bounded params, so it is O(n).
         emitted = set()
-        pos = 0
-        while True:
-            m = _OSC_CODE_RE.search(text, pos)
-            if m is None:
-                break
+        for m in _OSC_ANY_STR.finditer(text):
             code = int(m.group(1))
             key = _OSC_CODE_KEY.get(code, 'osc_other')
-            term = _OSC_TERMINATED_STR.search(text, m.end())
-            payload_end = term.start() if term else len(text)
             if code == 52:
-                # osc_clipboard (write) vs osc_clipboard_read share code 52; classify from
-                # the WHOLE payload up to the TRUE terminator, exactly as the enforcement path
-                # _handle_osc does, so the advisory can never diverge (a truncated or
-                # bare-ESC-stopped read misread as a write would be gated out by an enabled
-                # write).
-                key = ('osc_clipboard_read'
-                       if text[m.end():payload_end].rstrip().endswith('?')
+                # write vs read share code 52; a trailing '?' in the params is a READ query,
+                # decided exactly as _handle_osc does.
+                key = ('osc_clipboard_read' if m.group(2).rstrip().endswith('?')
                        else 'osc_clipboard')
             if not (self.tui_active() and self.osc_enabled(key)):
                 if key not in emitted:
                     emitted.add(key)
                     self.osc_used.emit(key)
-            pos = term.end() if term else len(text)
 
     # -- bell (BEL 0x07) -------------------------------------------------------
     # Notification channels are INDEPENDENT (not mutually exclusive): a bell may
