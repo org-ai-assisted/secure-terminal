@@ -202,7 +202,12 @@ def save(values, locked=()):
         for key in sorted(values):
             if key in locked:
                 continue
-            lines.append('%s=%s' % (key, values[key]))
+            value = values[key]
+            # A newline/CR in a key or value would split into extra lines and
+            # smuggle unrelated KEY=value settings back on the next load; drop it.
+            if any(c in key or c in value for c in ('\n', '\r')):
+                continue
+            lines.append('%s=%s' % (key, value))
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as handle:
             handle.write('\n'.join(lines) + '\n')
