@@ -5656,7 +5656,7 @@ class SecureTerminal(QPlainTextEdit):
         """True while a pasted text is held awaiting the user's review choice."""
         return self._review_active
 
-    def ctl_send_text(self, text):
+    def ctl_send_text(self, text, submit=False):
         """Deliver text from the ctl socket as if typed, preserving the terminal's
         never-auto-run guarantee. A MULTILINE payload (an embedded newline before the
         final byte) would auto-execute every line but the last the instant it lands --
@@ -5665,8 +5665,16 @@ class SecureTerminal(QPlainTextEdit):
         The lone exemption mirrors the paste gate: a TUI child with bracketed paste
         active buffers the payload as inert data, so an embedded newline cannot run.
         A single-line payload is made safe by _dispatch_paste (its trailing submit is
-        stripped, so it waits at the prompt for the user's own Enter). Returns None on
-        success, or an error string to relay to the caller."""
+        stripped, so it waits at the prompt for the user's own Enter).
+
+        submit=True runs the delivered single line: remote_control is an admin-gated,
+        owner-only surface whose whole purpose is to DRIVE a terminal (drive-and-assert
+        E2E, automation), so an EXPLICIT submit is the controller's own intent, not
+        untrusted content auto-running -- the never-auto-run guarantee protects the GUI
+        paste/clipboard paths (which never reach here) and the DEFAULT ctl path. The
+        multiline refusal above still holds under submit, so a hidden second command
+        can never ride an explicit Enter. Returns None on success, or an error string
+        to relay to the caller."""
         if self._review_active:
             # A paste/copy review is up: input to the child is SUSPENDED (the security
             # promise the review bar makes -- no byte reaches the shell until the user
@@ -5682,6 +5690,12 @@ class SecureTerminal(QPlainTextEdit):
                     '(an embedded newline is held for GUI review, which ctl cannot '
                     'prompt)')
         self._dispatch_paste(text, 'stripped')
+        if submit:
+            # Deliver the Enter the strip withheld, mirroring the Key_Return keypress
+            # (settle the line mirror, then send CR) so the single staged command runs.
+            self._line_buffer = ''
+            self._line_dirty = False
+            self._write(b'\r')
         return None
 
     def _dispatch_paste(self, raw, action):
