@@ -18,8 +18,9 @@ found at runtime. The code is the source of truth for behaviour.
 
 - `debian/rules` runs `tic -x` twice and installs the result into two places:
   - `/usr/share/terminfo/s/secure-terminal{,-noedit}` -- the SYSTEM db, so bare
-    `TERM=secure-terminal` resolves everywhere (nested shell, ssh, tmux, mode-switch
-    re-export) with no `TERMINFO_DIRS`.
+    `TERM=secure-terminal` resolves in every LOCAL process (a nested shell, a
+    local tmux, the mode-switch re-export) with no `TERMINFO_DIRS`. Over ssh the
+    entry is not on the remote host, so that resolution does not extend there.
   - `/usr/share/secure-terminal/terminfo/s/secure-terminal{,-noedit}` -- an
     app-local copy the app points `TERMINFO_DIRS` at.
 - An installed system therefore has both compiled entries; the runtime path below
