@@ -1885,9 +1885,13 @@ class SecureTerminal(QPlainTextEdit):
             if code == 52:
                 # osc_clipboard (write) and osc_clipboard_read share code 52;
                 # distinguish by the payload so the per-type notice is right.
+                # Cut at the TRUE terminator (BEL or ST), not the first bare ESC: an OSC 52
+                # payload can hold a literal ESC, and truncating there would misread the '?'
+                # that marks a READ -- flipping read<->write (a refused read misread as a
+                # write is then gated out by an enabled write).
                 tail = text[m.end():m.end() + 512]
-                end = min((p for p in (tail.find('\x07'), tail.find('\x1b'))
-                           if p >= 0), default=len(tail))
+                _mt = _OSC_TERMINATED_STR.search(tail)
+                end = _mt.start() if _mt else len(tail)
                 key = ('osc_clipboard_read' if tail[:end].rstrip().endswith('?')
                        else 'osc_clipboard')
             if self.tui_active() and self.osc_enabled(key):
