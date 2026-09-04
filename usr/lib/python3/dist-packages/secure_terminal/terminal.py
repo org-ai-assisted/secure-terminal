@@ -335,7 +335,7 @@ from secure_terminal.sanitize import (
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
     describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
-    PROMPT_START,
+    PROMPT_START, _printable_follows, _NO_NEWLINE_TEXT,
     feed_chunk_carry, has_bell, OSC_FEATURES,
     tail_from_escape_boundary, split_trailing_escape, scan_mouse_modes,
     sgr_mouse_report,
@@ -384,6 +384,12 @@ def route_ctrl_wheel_zoom(widget, event):
 # _reset_leftover_sgr). '\x1b[0m' clears any stuck program colour before the prompt.
 _PROMPT_START_BYTES = PROMPT_START.encode('ascii')
 _SGR_RESET_BYTES = b'\x1b[0m'
+# The no-final-newline marker for TUI: the same text the CLI cell path uses
+# (sanitize._NO_NEWLINE_TEXT), tinted the matching gray (#808080 == 128,128,128)
+# via an SGR pyte honours, then reset. Fed into pyte just before the break so it
+# sits at the end of the un-terminated line.
+_NO_NEWLINE_TUI_BYTES = (_SGR_RESET_BYTES + b'\x1b[38;2;128;128;128m'
+                         + _NO_NEWLINE_TEXT.encode('ascii') + _SGR_RESET_BYTES)
 
 # Double-click "word" = a run of alphanumerics (Unicode-aware) plus this punctuation.
 # Chosen so a whole path/URL/key=value/user@host selects as one word (as konsole/kitty
@@ -577,6 +583,17 @@ def _argv_for_command(command):
     return None if any('\x00' in w for w in parsed) else parsed
 
 
+def _command_display(command):
+    """A faithful one-line rendering of a launch command for the running-banner:
+    a `-e STRING` verbatim, a `-- argv` list joined with shell quoting. Display
+    only -- never fed to exec; the exec path is _argv_for_command."""
+    if isinstance(command, str):
+        return command
+    if isinstance(command, (list, tuple)):
+        return shlex.join(str(a) for a in command)
+    return ''
+
+
 # Directories a bell sound file may live in. Restricting to these keeps the
 # AppArmor profile enforceable (it grants read only here), so a user cannot point
 # the bell at an arbitrary path the sandbox would then have to be widened for.
@@ -718,13 +735,19 @@ def _build_tui_keys():
 def _build_line_edit_keys():
     """Qt.Key -> VT byte sequence for the keys line mode forwards to the shell's
     own line editor: history recall (Up/Down), intra-line movement (Left/Right/
-    Home/End) and forward delete. Built lazily (references Qt.Key)."""
+    Home/End), forward delete, and PageUp/PageDown. Built lazily (references Qt.Key).
+
+    Plain PageUp/PageDown go to the PROGRAM (konsole/gnome-terminal convention);
+    Shift+PageUp/Down scroll the local buffer (see _scroll_key). A shell that binds
+    \\e[5~/\\e[6~ (e.g. history-search-backward/forward) then reaches history from
+    PageUp; Up/Down stay the default history keys regardless."""
     k = Qt.Key
     return {
         k.Key_Up: b'\x1b[A', k.Key_Down: b'\x1b[B',
         k.Key_Right: b'\x1b[C', k.Key_Left: b'\x1b[D',
         k.Key_Home: b'\x1b[H', k.Key_End: b'\x1b[F',
         k.Key_Delete: b'\x1b[3~',
+        k.Key_PageUp: b'\x1b[5~', k.Key_PageDown: b'\x1b[6~',
     }
 
 
@@ -799,7 +822,8 @@ class SecureTerminal(QPlainTextEdit):
 
     def __init__(self, parent=None, command=None, tui=False, history='',
                  preview=False, cwd=None, mode='detail', colors=False,
-                 markings=True, line_edits=True, theme='light', cg_path=None):
+                 markings=True, line_edits=True, show_command=False,
+                 theme='light', cg_path=None):
         super().__init__(parent)
         # Deterministic screenshot mode (SECURE_TERMINAL_SHOT=1, a startup capture
         # MODE -- never a persisted per-tab setting): hide the caret and render the
@@ -1228,6 +1252,19 @@ class SecureTerminal(QPlainTextEdit):
             # No child, no keyboard: a read-only rendering surface only.
             self.setReadOnly(True)
             return
+        # Launch banner: a tab LAUNCHED with an explicit command (-e / -- PROGRAM
+        # via the window's launch/new-command-tab paths, which pass show_command)
+        # records what it ran, so scrollback shows the original command a bare
+        # prompt would not echo. Seeded like restored history -- onto _raw (so a
+        # later CLI<->TUI switch replays it) and the live line document -- ABOVE the
+        # program's output. A bare-shell tab (command None) gets none, so ordinary
+        # interactive use is unchanged. (A full-screen program's alt screen hides it
+        # while running; it reappears on the primary screen when that program exits.)
+        if command is not None and show_command:
+            banner = '[secure-terminal] running: %s\r\n' % _command_display(command)
+            self._raw += banner
+            self._cap_raw()
+            self._append(banner)
         self._start(command)
         if self._tui:
             # A tab that STARTS in TUI must enter the grid view properly (seed the
@@ -3287,14 +3324,7 @@ class SecureTerminal(QPlainTextEdit):
             k = _alt_partial_tail(feed)         # hold back ONLY a split-marker tail
             self._alt_feed_carry = feed[len(feed) - k:] if k else b''
             stream = feed[:len(feed) - k] if k else feed
-            # Guard the shell prompt against a finished command's stuck colour in TUI
-            # too (the CLI path does this in _reset_leftover_sgr): inject an SGR reset
-            # ahead of the bracketed-paste prompt-start so pyte renders the prompt in
-            # the default palette rather than the program's leftover colour.
-            if _PROMPT_START_BYTES in stream:
-                stream = stream.replace(
-                    _PROMPT_START_BYTES, _SGR_RESET_BYTES + _PROMPT_START_BYTES)
-            self._feed_stream(stream)
+            self._feed_prompt_aware(stream)
         else:
             self._alt_feed_carry = b''          # CLI mode does not stream-feed; drop any tail
         if sync_end:
@@ -3425,6 +3455,35 @@ class SecureTerminal(QPlainTextEdit):
                          'keeps output append-only, so nothing can erase what you '
                          'have already seen. Turn on TUI mode if you need a program '
                          'to control the screen.')
+
+    def _feed_prompt_aware(self, stream):
+        """Feed TUI output, treating the shell's bracketed-paste prompt-start
+        specially. At every prompt-start we inject an SGR reset so a finished
+        command's leftover colour cannot tint the prompt (the CLI path does this in
+        _reset_leftover_sgr). When the PRIMARY-screen cursor sits mid-line with
+        prompt text still to follow (bash order: the marker precedes the prompt) we
+        ALSO inject a CR/LF, so the prompt starts on its own row instead of gluing
+        onto a command's un-terminated last line -- the TUI mirror of the CLI
+        feed_line_edits nicety (sanitize.py). Skipped on the alt screen (a
+        full-screen program owns the rows), at column 0 (nothing to break), when the
+        line already filled the width (pyte wraps the prompt itself), and in the zsh
+        order where the marker trails the prompt (nothing printable follows) -- the
+        same guard the CLI uses. Feeding per prompt segment keeps _alt_saved and the
+        cursor current at each boundary (unlike a blanket replace)."""
+        if _PROMPT_START_BYTES not in stream:
+            self._feed_stream(stream)
+            return
+        parts = stream.split(_PROMPT_START_BYTES)
+        self._feed_stream(parts[0])
+        for part in parts[1:]:
+            prefix = _SGR_RESET_BYTES
+            scr = self._screen
+            if (scr is not None and self._alt_saved is None
+                    and 0 < scr.cursor.x < scr.columns
+                    and _printable_follows(part.decode('latin-1'), 0)):
+                # note the missing final newline, then break (mirrors the CLI cell path)
+                prefix = _NO_NEWLINE_TUI_BYTES + b'\r\n' + prefix
+            self._feed_stream(prefix + _PROMPT_START_BYTES + part)
 
     def _feed_stream(self, data):
         """Feed bytes to pyte, handling alternate-screen enter/leave INLINE so the
@@ -4800,12 +4859,11 @@ class SecureTerminal(QPlainTextEdit):
                 self._write(seq)
                 return
 
-        # Scrollback navigation. In line mode there is no full-screen program to
-        # own these keys, so scroll the buffer: Shift+PageUp/Down a page and
-        # Shift+Home/End to the ends is the gnome-terminal/konsole convention,
-        # and plain PageUp/Down scroll too because "Page Up shows earlier output"
-        # is what a user reaches for. (TUI mode returned above; there the running
-        # program gets these as VT input.)
+        # Scrollback navigation reserved for Shift+navigation (the gnome-terminal/
+        # konsole convention): Shift+PageUp/Down scroll a page, Shift+Home/End jump
+        # to the ends. Plain PageUp/Down forwarded to the shell above via _LINE_KEYS
+        # (like a real terminal); only their Shift form scrolls. (TUI mode returned
+        # above; there the running program gets these as VT input.)
         if self._scroll_key(key, bool(shift)):
             return
 
@@ -4822,15 +4880,15 @@ class SecureTerminal(QPlainTextEdit):
         # non-printable input and arrow/navigation keys are intentionally ignored
 
     def _scroll_key(self, key, shift):
-        """Scroll the scrollback view for a navigation key in line mode. Returns
-        True when `key` was a scroll key and was handled. PageUp/PageDown scroll
-        a page unmodified (line mode has no program consuming them); Shift+Home/
-        End jump to the ends, matching the standard terminal bindings and leaving
-        plain Home/End free for line editing later."""
+        """Scroll the scrollback view for a Shift+navigation key in line mode.
+        Returns True when `key` was a scroll key and was handled. Shift+PageUp/
+        PageDown scroll a page and Shift+Home/End jump to the ends, matching the
+        standard terminal bindings; the unmodified keys are left for the shell
+        (PageUp/PageDown -> _LINE_KEYS, Home/End line editing)."""
         bar = self.verticalScrollBar()
-        if key == Qt.Key.Key_PageUp:
+        if shift and key == Qt.Key.Key_PageUp:
             bar.triggerAction(bar.SliderAction.SliderPageStepSub)
-        elif key == Qt.Key.Key_PageDown:
+        elif shift and key == Qt.Key.Key_PageDown:
             bar.triggerAction(bar.SliderAction.SliderPageStepAdd)
         elif shift and key == Qt.Key.Key_Home:
             bar.triggerAction(bar.SliderAction.SliderToMinimum)

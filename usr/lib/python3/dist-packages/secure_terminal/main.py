@@ -1152,6 +1152,7 @@ class MainWindow(QMainWindow):
         term = SecureTerminal(tui=tui, command=command or None,
                               line_edits=self._default_line_edits,
                               cwd=inherit_cwd or None,
+                              show_command=True,
                               cg_path=self._alloc_cgroup())
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)
@@ -1206,6 +1207,7 @@ class MainWindow(QMainWindow):
         term = SecureTerminal(tui=tui, command=_cmd or None,
                               line_edits=bool(_tab('line_edits',
                                                    self._default_line_edits)),
+                              show_command=True,
                               cg_path=self._alloc_cgroup())
         term.apply_theme(self._default_theme)
         term.apply_zoom(self._default_zoom)

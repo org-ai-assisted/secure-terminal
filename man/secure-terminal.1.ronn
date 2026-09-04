@@ -210,9 +210,11 @@ these directories, lowest precedence first:
     ~/.config/secure-terminal.d/*.conf      user (highest precedence)
 
 The user's own choices are written to
-`~/.config/secure-terminal.d/50_user.conf`. A privileged directory may `lock` a
-key so the user cannot override it. The built-in defaults file documents every
-key. See also the app's View menu and the global Settings dialog.
+`~/.config/secure-terminal.d/20_auto-generated.conf` (do not hand-edit it; drop a
+higher-numbered `.conf` such as `50_user.conf` to override). A privileged
+directory may `lock` a key so the user cannot override it. The built-in defaults
+file documents every key. See also the app's View menu and the global Settings
+dialog.
 
 ## INSTANCES
 

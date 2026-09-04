@@ -1,5 +1,7 @@
 # secure-terminal CLI-mode terminfo.
 #
+# terminfo source of truth; build-time tic + runtime cache: see docs/terminfo.md.
+#
 # In CLI mode the renderer STRIPS every escape sequence and honours only
 # line-local horizontal moves (CSI C/D/G, EL) + SGR colour, and answers NO
 # capability query. This entry advertises exactly that: it inherits the correct

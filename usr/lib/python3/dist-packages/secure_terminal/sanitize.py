@@ -665,6 +665,14 @@ _UNBOUNDED_MAX_COL = 8192
 # starts fresh (below), and, in terminal.py, to reset a leftover colour.
 PROMPT_START = '\x1b[?2004h'
 
+# Shown at the end of a command's output that ended WITHOUT a final newline, right
+# before the shell's next prompt (bash order), so the missing terminator is explicit
+# rather than silently swallowed. Pure ASCII (stays inert under the T1/T9 proofs); a
+# fixed gray SGR state so it reads as the terminal's own note, distinct from program
+# output (the tint only shows when colours are on -- otherwise it renders plainly).
+_NO_NEWLINE_TEXT = ' [no newline]'
+_NO_NEWLINE_STATE = (('bg', None), ('bold', False), ('fg', '#808080'))
+
 
 def _printable_follows(raw, i):
     """True if raw[i:] still holds printable text (past any escape sequences and
@@ -943,6 +951,11 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                 # follows stock-bash behaviour, gluing to any leftover output.)
                 j = i + len(PROMPT_START)
                 if col != 0 and _printable_follows(raw, j):
+                    # Note the missing final newline before ending the line: a faint,
+                    # ST-styled marker (safe ASCII cells) so the swallowed terminator
+                    # is visible. Appended to the line being flushed, not the fresh
+                    # one, so it sits at the end of the command's output.
+                    cells += [(_mc, _NO_NEWLINE_STATE) for _mc in _NO_NEWLINE_TEXT]
                     completed.append(cells)
                     # A line filled to the width is in the pending-wrap state, so
                     # ending it here is a SOFT autowrap (the prompt continues on

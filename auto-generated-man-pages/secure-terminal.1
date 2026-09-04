@@ -115,7 +115,7 @@ Settings are \fBKEY=value\fR lines spread over \fB*\.conf\fR drop\-in files, rea
 .fi
 .IP "" 0
 .P
-The user's own choices are written to \fB~/\.config/secure\-terminal\.d/50_user\.conf\fR\. A privileged directory may \fBlock\fR a key so the user cannot override it\. The built\-in defaults file documents every key\. See also the app's View menu and the global Settings dialog\.
+The user's own choices are written to \fB~/\.config/secure\-terminal\.d/20_auto\-generated\.conf\fR (do not hand\-edit it; drop a higher\-numbered \fB\.conf\fR such as \fB50_user\.conf\fR to override)\. A privileged directory may \fBlock\fR a key so the user cannot override it\. The built\-in defaults file documents every key\. See also the app's View menu and the global Settings dialog\.
 .SH "INSTANCES"
 Every launch opens a new independent window in its own process, like konsole or qterminal \-\- a second \fBsecure\-terminal\fR gives you a second window, not a raised first one\. Independent processes keep sessions isolated and re\-read the administrator locks per process\.
 .P

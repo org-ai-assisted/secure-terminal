@@ -23,6 +23,7 @@ execute_after_dh_install:
 	## mode-switch re-export -- the way alacritty and kitty ship their entries (a
 	## unique s/secure-terminal file, no dpkg conflict). The copy next to the source
 	## stays for a not-installed source checkout (the app points TERMINFO_DIRS there).
+	## See docs/terminfo.md.
 	tic -x -o debian/secure-terminal/usr/share/secure-terminal/terminfo \
 		debian/secure-terminal/usr/share/secure-terminal/terminfo/secure-terminal.ti
 	install -d debian/secure-terminal/usr/share/terminfo
