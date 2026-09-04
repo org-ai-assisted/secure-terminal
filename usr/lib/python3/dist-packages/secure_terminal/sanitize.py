@@ -237,11 +237,16 @@ def display_len(text):
 
 
 def split_trailing_escape(text, cap=4096):
-    """Split off an INCOMPLETE escape sequence at the end of `text`, if any, so a
-    caller feeding one read()-chunk at a time can carry it to the next chunk rather
-    than leak its tail. Returns (complete_text, carry). A carry longer than `cap`
-    is NOT held (a genuine split sequence is short; an unterminated flood -- or a
-    program that simply never terminates its OSC -- is let through, bounded)."""
+    """Split off an INCOMPLETE escape sequence at the end of `text`, if any.
+    Returns (complete_text, carry) -- `carry` is the split-off tail (<= `cap`) or
+    ''. For ONE-SHOT callers (a static preview, a mode scan) that render or discard
+    `complete_text` and never feed a following chunk.
+
+    NOT safe for incremental DISPLAY carry: an over-cap incomplete escape is NOT
+    held (it stays inside `complete_text`, carry ''), so a caller that carried it
+    across read() chunks would leak the sequence's continuation as literal text on
+    the next chunk -- the over-cap bypass class. Use feed_chunk_carry for
+    chunk-by-chunk display; it has the O(1) discard state this deliberately lacks."""
     m = _TRAILING_ESCAPE.search(text)
     if m and m.group() and len(m.group()) <= cap:
         return text[:m.start()], m.group()
@@ -269,16 +274,30 @@ _STRING_TERMINATOR = {
     '_': re.compile(r'\x1b\\'),         # APC
 }
 
+# An over-cap INCOMPLETE non-string escape -- a CSI (ESC [ ...) or a generic ESC
+# (ESC + intermediates) -- also switches to the discard state, or its continuation
+# leaks as literal text on the next chunk (a real program never emits a 4 KiB CSI,
+# but untrusted output can -- exactly the threat this sanitizer holds). The body is
+# consumed to the sequence's final byte, matching ANSI_RE: a byte outside the
+# body-and-final grammar INTERRUPTS the sequence (the run ends and that byte resumes
+# as text, as ANSI_RE's interrupted-CSI arm does).
+_NONSTRING_BODY = {
+    '[': re.compile(r'[0-?]*[ -/]*'),   # CSI: parameter bytes 0x30-0x3F then intermediates
+    '\x1b': re.compile(r'[ -/]*'),      # generic ESC: intermediate bytes 0x20-0x2F
+}
+_NONSTRING_FINAL = {'[': 0x40, '\x1b': 0x30}   # CSI final 0x40-0x7E; generic 0x30-0x7E
+
 
 def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
     """CLI-mode incremental escape handling across read() chunks. Given the new
     `text`, the short `carry` held from the previous chunk (str), `drop` (the
-    introducer byte of an over-long string sequence being discarded, or ''), and
-    `dropped` (characters swallowed so far in the current discard run), return
-    (renderable_text, new_carry, new_drop, new_dropped). Guarantees every escape --
-    including an arbitrarily long, chunk-split string sequence -- is fully removed
-    with O(1) memory: an incomplete string sequence past `cap` switches to a
-    discard state that swallows bytes until its terminator (handling a terminator
+    marker of an over-long sequence being discarded -- a string introducer, or '['
+    / ESC for a CSI / generic escape -- or ''), and `dropped` (characters swallowed
+    so far in the current discard run), return (renderable_text, new_carry,
+    new_drop, new_dropped). Guarantees every escape -- including an arbitrarily
+    long, chunk-split sequence -- is fully removed with O(1) memory: an incomplete
+    sequence past `cap` -- string OR CSI / generic-ESC -- switches to a discard
+    state that swallows bytes until its terminator (handling a string terminator
     itself split across the boundary via a one-byte ESC carry).
 
     `dropped` accumulates the characters suppressed while hunting a terminator that
@@ -290,14 +309,30 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
     text = carry + text
     carry = ''
     if drop:
-        m = _STRING_TERMINATOR[drop].search(text)
-        if not m:
-            dropped += len(text)
-            # still inside the sequence; a lone trailing ESC may be a split ST
-            return '', ('\x1b' if text.endswith('\x1b') else ''), drop, dropped
-        text = text[m.end():]
-        drop = ''
-        dropped = 0
+        if drop in _STRING_TERMINATOR:
+            m = _STRING_TERMINATOR[drop].search(text)
+            if not m:
+                dropped += len(text)
+                # still inside the sequence; a lone trailing ESC may be a split ST
+                return '', ('\x1b' if text.endswith('\x1b') else ''), drop, dropped
+            text = text[m.end():]
+            drop = ''
+            dropped = 0
+        else:
+            # CSI ('[') / generic-ESC ('\x1b') discard: consume the body prefix,
+            # then its final byte -- or stop at an INTERRUPTING byte, which ends the
+            # run and resumes as text (matching ANSI_RE's interrupted-CSI arm).
+            m = _NONSTRING_BODY[drop].match(text)
+            end = m.end() if m else 0       # the all-optional body pattern always matches
+            if end >= len(text):
+                dropped += len(text)        # whole chunk still inside the body
+                return '', '', drop, dropped
+            if _NONSTRING_FINAL[drop] <= ord(text[end]) <= 0x7E:
+                text = text[end + 1:]       # final byte -> sequence complete
+            else:
+                text = text[end:]           # interrupt -> that byte resumes as text
+            drop = ''
+            dropped = 0
     m = _TRAILING_ESCAPE.search(text)
     if m and m.group():
         g = m.group()
@@ -308,8 +343,13 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
         elif len(g) <= cap:
             carry = g                   # short incomplete escape -> hold for next chunk
             text = text[:m.start()]
-        # else: an over-cap NON-string tail (a pathological unterminated CSI, which
-        # a real program never emits) is let through, bounded -- as before.
+        else:
+            # over-cap incomplete NON-string escape (CSI or generic ESC): enter the
+            # same O(1) discard state as an over-cap string sequence, so the
+            # continuation cannot leak as literal text on the next chunk.
+            drop = '[' if g[1] == '[' else '\x1b'
+            dropped = len(g)
+            text = text[:m.start()]
     return text, carry, drop, dropped
 
 

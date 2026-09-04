@@ -641,9 +641,20 @@ def cli_terminfo_dir():
         upgrade that cancelled a capability left existing users on the stale
         compilation, so the terminal kept advertising what the renderer no longer
         matched -- the source-vs-artifact drift these entries exist to prevent."""
+        def _owned_regular(path):
+            # Trust a compiled entry only if it is a REGULAR file (not a symlink to
+            # an attacker-chosen target) owned by root (the packaged /usr copy) or
+            # us (our own cache) -- never a foreign-owned or symlinked entry planted
+            # in a shared or poisoned cache dir, which the child would then load via
+            # TERMINFO_DIRS.
+            try:
+                return (not os.path.islink(path) and os.path.isfile(path)
+                        and os.stat(path).st_uid in (0, os.getuid()))
+            except OSError:
+                return False
         compiled = [os.path.join(directory, 's', name)
                     for name in ('secure-terminal', 'secure-terminal-noedit')]
-        if not all(os.path.isfile(path) for path in compiled):
+        if not all(_owned_regular(path) for path in compiled):
             return False
         if not src:
             return True
@@ -662,7 +673,9 @@ def cli_terminfo_dir():
         return cache
     if src:
         try:
-            os.makedirs(cache, exist_ok=True)
+            # 0700 so another user cannot plant a poisoned compiled entry we would
+            # then hand the child via TERMINFO_DIRS (also guarded by _owned_regular).
+            os.makedirs(cache, mode=0o700, exist_ok=True)
             subprocess.run(['tic', '-x', '-o', cache, src],
                            check=True, capture_output=True, timeout=15)
             # the same both-entries test: a tic that produced only one of them is
