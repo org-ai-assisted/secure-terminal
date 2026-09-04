@@ -242,6 +242,12 @@ standalone process that never becomes a primary and answers no `ctl` or
 (`send-text`, as if typed) over an owner-only socket. It is an injection/read surface and is OFF by default; it can
 only be enabled from a privileged configuration directory (`remote_control`).
 
+`send-text` sanitizes what it delivers and by default leaves it waiting at the
+prompt for your own Enter (its trailing submit is stripped); `--submit` presses
+Enter so the delivered single line runs, for driving a terminal (automation,
+drive-and-assert tests). A multiline payload is refused either way, so a hidden
+second command can never ride an explicit submit.
+
 ## FILES
 
   * `~/.config/secure-terminal.d/*.conf`:

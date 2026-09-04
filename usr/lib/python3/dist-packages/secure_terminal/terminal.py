@@ -5656,7 +5656,7 @@ class SecureTerminal(QPlainTextEdit):
         """True while a pasted text is held awaiting the user's review choice."""
         return self._review_active
 
-    def ctl_send_text(self, text):
+    def ctl_send_text(self, text, submit=False):
         """Deliver text from the ctl socket as if typed, preserving the terminal's
         never-auto-run guarantee. A MULTILINE payload (an embedded newline before the
         final byte) would auto-execute every line but the last the instant it lands --
@@ -5665,8 +5665,18 @@ class SecureTerminal(QPlainTextEdit):
         The lone exemption mirrors the paste gate: a TUI child with bracketed paste
         active buffers the payload as inert data, so an embedded newline cannot run.
         A single-line payload is made safe by _dispatch_paste (its trailing submit is
-        stripped, so it waits at the prompt for the user's own Enter). Returns None on
-        success, or an error string to relay to the caller."""
+        stripped, so it waits at the prompt for the user's own Enter).
+
+        submit=True runs the delivered single line: remote_control is an admin-gated,
+        owner-only surface whose whole purpose is to DRIVE a terminal (drive-and-assert
+        E2E, automation), so an EXPLICIT submit is the controller's own intent, not
+        untrusted content auto-running -- the never-auto-run guarantee protects the GUI
+        paste/clipboard paths (which never reach here) and the DEFAULT ctl path. The
+        multiline refusal above still holds under submit, so a hidden second command
+        can never ride an explicit Enter, and a payload that sanitizes to nothing
+        delivers nothing and does NOT submit (a bare Enter would else run whatever
+        already sits at the prompt). Returns None on success, or an error string
+        to relay to the caller."""
         if self._review_active:
             # A paste/copy review is up: input to the child is SUSPENDED (the security
             # promise the review bar makes -- no byte reaches the shell until the user
@@ -5677,11 +5687,24 @@ class SecureTerminal(QPlainTextEdit):
             # the review resolves.
             return ('a paste/copy review is in progress; input to the child is '
                     'suspended -- retry after it resolves')
-        if paste_is_multiline(text) and not self._bracketed_paste_active():
+        # submit forces the multiline refusal even when bracketed paste is active: that
+        # exemption exists only so a TUI child can BUFFER a multiline paste inert, but an
+        # explicit submit appends a real CR after the 200~/201~ framing, which submits the
+        # whole buffer -- so a hidden second command would ride the Enter. Refuse it.
+        if paste_is_multiline(text) and (submit or not self._bracketed_paste_active()):
             return ('multiline text would auto-execute; send one line at a time '
                     '(an embedded newline is held for GUI review, which ctl cannot '
                     'prompt)')
-        self._dispatch_paste(text, 'stripped')
+        delivered = self._dispatch_paste(text, 'stripped')
+        if submit and delivered:
+            # Deliver the Enter the strip withheld, mirroring the Key_Return keypress
+            # (settle the line mirror, then send CR) so the single staged command runs.
+            # ONLY when _dispatch_paste actually wrote: a payload that sanitizes to empty
+            # delivers nothing, so a bare CR would submit whatever ALREADY sits at the
+            # prompt (a prior staged line, or the user's own input) -- never do that.
+            self._line_buffer = ''
+            self._line_dirty = False
+            self._write(b'\r')
         return None
 
     def _dispatch_paste(self, raw, action):
@@ -5700,7 +5723,7 @@ class SecureTerminal(QPlainTextEdit):
         safe = (sanitize_paste_unicode(raw) if action == 'unicode'
                 else sanitize_paste(raw))
         if not safe:
-            return
+            return False
         # Bracketed paste when a TUI program asked for it (DEC mode 2004): the child
         # BUFFERS the payload as data rather than interpreting it as keystrokes, so
         # it cannot auto-execute -- deliver it verbatim between the markers.
@@ -5715,7 +5738,7 @@ class SecureTerminal(QPlainTextEdit):
             # dropped); a single-line paste then reaches the shell with no submit.
             safe = paste_no_autosubmit(safe)
             if not safe:
-                return
+                return False
             # A non-bracketed MULTI-line paste still carries embedded submit CRs
             # (paste_no_autosubmit only drops the TRAILING one), and with no bracketed
             # framing to make the child buffer them inert, each would AUTO-RUN a line
@@ -5752,6 +5775,9 @@ class SecureTerminal(QPlainTextEdit):
         if bracketed:
             data = b'\x1b[200~' + data + b'\x1b[201~'
         self._write(data)
+        # Report delivery: ctl_send_text(submit=True) fires its CR only when THIS line
+        # reached the pty; every early return above wrote nothing and returns False.
+        return True
 
     def _insert_next_staged(self):
         """Insert the next HELD line of a reviewed multi-line paste at the prompt, on

@@ -1405,12 +1405,17 @@ class MainWindow(QMainWindow):
                 text = request.get('text')
                 if not isinstance(text, str):
                     return {'ok': False, 'error': 'text must be a string'}
+                submit = request.get('submit', False)
+                if not isinstance(submit, bool):
+                    return {'ok': False, 'error': 'submit must be a boolean'}
                 # Route through the terminal's ctl guard: a single-line payload is
                 # sanitized and left waiting at the prompt (trailing submit stripped);
                 # a MULTILINE payload whose embedded newline would auto-run a hidden
                 # command is REFUSED, mirroring the GUI's forced multiline-paste review
                 # (a bracketed-paste TUI child, which buffers it inert, is exempt).
-                err = term.ctl_send_text(text)
+                # submit=true runs the single delivered line -- an explicit choice on
+                # this admin-gated, owner-only surface, whose purpose is to drive.
+                err = term.ctl_send_text(text, submit=submit)
                 if err:
                     return {'ok': False, 'error': err}
                 return {'ok': True}
@@ -5483,7 +5488,11 @@ def _ctl_main(argv):
                                             'sanitized)')
     send.add_argument('--tab', required=True, metavar='MATCH',
                       help='target tab: id:N or title:NAME')
-    send.add_argument('text', help='text to send (include a newline to submit)')
+    send.add_argument('text', help='text to send (sanitized; waits at the prompt '
+                                   'unless --submit)')
+    send.add_argument('--submit', action='store_true',
+                      help='press Enter after the text so the single-line command '
+                           'runs (multiline is still refused)')
     title = sub.add_parser('set-tab-title', help='rename a tab')
     title.add_argument('--tab', required=True, metavar='MATCH')
     title.add_argument('title')
@@ -5506,6 +5515,8 @@ def _ctl_main(argv):
         request['level'] = args.level
     if args.cmd == 'send-text':
         request['text'] = args.text
+        if args.submit:
+            request['submit'] = True
     if args.cmd == 'set-tab-title':
         request['title'] = args.title
     if args.cmd == 'dump-tab' and args.lines is not None:
