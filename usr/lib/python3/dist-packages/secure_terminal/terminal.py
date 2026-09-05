@@ -468,8 +468,10 @@ def _cache_bounded(cache, key, fmt):
 _OSC_ANY = re.compile(rb'\x1b\](\d{1,8});([^\x07\x1b]*)(?:\x07|\x1b\\)')
 # str sibling, so the OSC advisory (_notice_osc) parses EXACTLY as the enforcement path
 # (_handle_osc) does -- same code + params + terminator -- and can never diverge from it
-# (no missed real OSC, no spurious advisory, no read<->write misclassification).
-_OSC_ANY_STR = re.compile(r'\x1b\](\d{1,8});([^\x07\x1b]*)(?:\x07|\x1b\\)')
+# (no missed real OSC, no spurious advisory, no read<->write misclassification). re.ASCII:
+# on a str subject \d would else match Unicode digits (Arabic-Indic etc.) the byte matcher
+# cannot, a spurious advisory for input the enforcement path never recognizes.
+_OSC_ANY_STR = re.compile(r'\x1b\](\d{1,8});([^\x07\x1b]*)(?:\x07|\x1b\\)', re.ASCII)
 _OSC_CLIP_MAX = 64 * 1024        # cap a clipboard payload; no unbounded writes
 # Whether an OSC body (the bytes after its "\x1b]") contains a terminator (BEL or
 # ST). Used to decide if a trailing OSC introducer is incomplete and must be held
@@ -1849,20 +1851,20 @@ class SecureTerminal(QPlainTextEdit):
         if self._grid_mode():
             # TUI feeds the RAW chunk (no feed_chunk_carry), so reassemble a split OSC here
             # -- else a split introducer or a split OSC-52 '?' would evade or misclassify the
-            # advisory (CLI arrives already reassembled and skips this; its _notice_carry
-            # stays empty). Hold the genuinely-open OSC: the first "\x1b]" AFTER the last
-            # terminator (an OSC payload may hold a literal "\x1b]", so the LAST raw one can be
-            # an inner byte pair, not the real introducer), or a bare trailing "\x1b". An
-            # over-cap unterminated flood is NOT held: it stays in text and the scan below --
-            # which requires a terminator -- simply skips it, exactly as _handle_osc drops an
-            # over-cap OSC (no dispatch, no advisory).
+            # advisory (CLI arrives already reassembled and skips this; its _notice_carry stays
+            # empty). Hold the incomplete trailing OSC EXACTLY as _handle_osc's carry does: the
+            # LAST unterminated "\x1b]" introducer, or a bare trailing "\x1b" -- same rfind +
+            # terminator check + cap. An earlier, never-completed introducer is abandoned (a raw
+            # ESC in an OSC's params ends it under _OSC_ANY, so the trailing well-formed OSC is
+            # what completes). Matching the enforcement's reassembly keeps them from diverging.
             text = self._notice_carry + text
             self._notice_carry = ''
-            _terms = list(_OSC_TERMINATED_STR.finditer(text))
-            _after = _terms[-1].end() if _terms else 0
-            intro = text.find('\x1b]', _after)
-            carry_at = intro if intro != -1 else (
-                len(text) - 1 if text.endswith('\x1b') else -1)
+            carry_at = len(text) if text.endswith('\x1b') else -1
+            intro = text.rfind('\x1b]')
+            if intro != -1 and not _OSC_TERMINATED_STR.search(text[intro + 2:]):
+                carry_at = intro
+            if carry_at == len(text):
+                carry_at = len(text) - 1          # the trailing lone ESC
             if carry_at >= 0 and (len(text) - carry_at) <= self._OSC_CARRY_MAX:
                 self._notice_carry = text[carry_at:]
                 text = text[:carry_at]
@@ -1878,9 +1880,11 @@ class SecureTerminal(QPlainTextEdit):
             code = int(m.group(1))
             key = _OSC_CODE_KEY.get(code, 'osc_other')
             if code == 52:
-                # write vs read share code 52; a trailing '?' in the params is a READ query,
-                # decided exactly as _handle_osc does.
-                key = ('osc_clipboard_read' if m.group(2).rstrip().endswith('?')
+                # write vs read share code 52; a trailing '?' in the params is a READ query.
+                # str.rstrip() would strip Unicode whitespace, but _handle_osc uses
+                # bytes.rstrip() (ASCII only) -- strip the SAME ASCII set so read/write matches.
+                key = ('osc_clipboard_read'
+                       if m.group(2).rstrip(' \t\n\r\x0b\x0c').endswith('?')
                        else 'osc_clipboard')
             if not (self.tui_active() and self.osc_enabled(key)):
                 if key not in emitted:
