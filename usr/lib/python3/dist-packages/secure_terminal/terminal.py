@@ -2351,13 +2351,15 @@ class SecureTerminal(QPlainTextEdit):
         # (a display-integrity/spoofing bug). Clamp it into the new grid, as the render
         # paths (_grid_signatures, _place_grid_cursor) already do for their reads.
         self._screen.cursor.y = min(self._screen.cursor.y, rows - 1)
-        # Clamp cursor.x ONLY when the width actually SHRANK, and allow x == cols: pyte
-        # encodes the pending-autowrap state (a line filled exactly to the last column) as
-        # cursor.x == columns and pyte.Screen.resize never touches cursor.x. A blanket
-        # min(x, cols-1) on a HEIGHT-only resize demoted that pending-wrap x from cols to
-        # cols-1, so the next printable byte overwrote the last cell instead of wrapping.
+        # Clamp cursor.x ONLY on a WIDTH shrink, to the last real column (cols - 1). A
+        # HEIGHT-only resize leaves cursor.x untouched so pyte's pending-autowrap state
+        # survives -- a line filled exactly to the last column encodes cursor.x == columns,
+        # which pyte.Screen.resize never changes. The old blanket min(x, cols-1) ran on EVERY
+        # resize and demoted that pending-wrap, so the next byte overwrote instead of
+        # wrapping. (On a shrink, cols-1 is correct: a cursor past the new edge is a real
+        # position clipped in, not pending-wrap, so it must land on the last column.)
         if cols < old_cols:
-            self._screen.cursor.x = min(self._screen.cursor.x, cols)
+            self._screen.cursor.x = min(self._screen.cursor.x, cols - 1)
         self._set_winsize(cols, rows)
 
     def _pyte_qcolor(self, color, default, bright=False):
@@ -4218,7 +4220,10 @@ class SecureTerminal(QPlainTextEdit):
                 pass        # already closed -> nothing to do
             self._fd = None
         if self._pid:
-            if hangup:
+            if hangup and self._pid_is_current_child():
+                # Only SIGHUP a pid that is still OUR child: reap_pty_children may have freed
+                # it for OS reuse (see #30), and hanging up a reused pid would signal an
+                # unrelated process. A gone / reused pid has nothing of ours to hang up.
                 try:
                     os.kill(self._pid, signal.SIGHUP)
                 except OSError:
@@ -4237,6 +4242,10 @@ class SecureTerminal(QPlainTextEdit):
         pty machinery is torn down inside the event loop, not during teardown."""
         self._render_timer.stop()          # no pending paint fires into teardown
         self._blink_timer.stop()           # nor a cursor-blink paint into teardown
+        if self._transcript_file:
+            self._transcript_timer.stop()  # a closing tab must not write its transcript
+            #                                AFTER it leaves the tab bar -- that late write
+            #                                would clobber the primary tab's base path (#25).
         self._flush_paint()                # paint the last CLI line before we go
         self._release_pty(hangup=True)
         # Remove this tab's cgroup once its child is hung up. Best-effort: a child
@@ -4586,17 +4595,24 @@ class SecureTerminal(QPlainTextEdit):
         base. Computed at write time, not __init__: only here is the tab parented, so the
         live count reflects a tab opened LATER."""
         base = self._transcript_file
+        if base is None:
+            return None                     # no path configured -> nothing to write
         win = self.window()
         tabs = getattr(win, 'tabs', None)
         serials = getattr(win, '_tab_ids', None)
         if tabs is None or not serials:
             return base                     # standalone / preview term: no MainWindow tab bar
-        sibs = [w for i in range(tabs.count())
-                if isinstance((w := tabs.widget(i)), SecureTerminal)
-                and w._transcript_file is not None]
-        if len(sibs) <= 1:
+        # Only tabs sharing THIS exact base compete for it (all tabs read one process-wide
+        # env, so in practice they share it; grouping by base is defensive against any tab
+        # carrying a different / None base). The lowest-id tab keeps the exact base path; the
+        # rest get 'base.<id>'. A closing tab stops its timer in shutdown(), so a tab removed
+        # from the bar never reaches here to elect itself primary and clobber the base.
+        group = [w for i in range(tabs.count())
+                 if isinstance((w := tabs.widget(i)), SecureTerminal)
+                 and w._transcript_file == base]
+        if len(group) <= 1:
             return base                     # sole transcript tab (and every shot-harness capture)
-        primary = min(sibs, key=lambda t: serials.get(t, 0))
+        primary = min(group, key=lambda t: serials.get(t, 0))
         return base if self is primary else '%s.%d' % (base, serials.get(self, 0))
 
     def _write_transcript_file(self):
@@ -4944,7 +4960,7 @@ class SecureTerminal(QPlainTextEdit):
         """The SHELL's full working directory (where the prompt sits), for saving a
         session tab so it restores in the same place. Always the shell pid (not the
         foreground pgrp): that is the canonical prompt location. '' if unreadable."""
-        if not self._pid_is_current_child():
+        if self._pid is None or not self._pid_is_current_child():
             return ''       # no child, or self._pid was freed and reused by a stranger
         try:
             return os.readlink('/proc/%d/cwd' % self._pid)
@@ -6127,6 +6143,12 @@ class SecureTerminal(QPlainTextEdit):
                     '(an embedded newline is held for GUI review, which ctl cannot '
                     'prompt)')
         delivered = self._dispatch_paste(text, 'stripped')
+        if delivered is False:
+            # A PARTIAL / timed-out write to a wedged or slow child: report it rather than a
+            # false ok, and never submit a half-delivered line. (None means the payload
+            # sanitized to empty -- nothing to send, a benign no-op, not a failure.)
+            return ('the child did not accept the full line (a partial or timed-out '
+                    'write); nothing was submitted')
         if submit and delivered:
             # Deliver the Enter the strip withheld, mirroring the Key_Return keypress
             # (settle the line mirror, then send CR) so the single staged command runs.
@@ -6135,7 +6157,9 @@ class SecureTerminal(QPlainTextEdit):
             # prompt (a prior staged line, or the user's own input) -- never do that.
             self._line_buffer = ''
             self._line_dirty = False
-            self._write(b'\r')
+            if not self._write(b'\r'):
+                return ('the line was delivered but its submit newline was not (a '
+                        'partial or timed-out write)')
         return None
 
     def _dispatch_paste(self, raw, action):
@@ -6154,7 +6178,7 @@ class SecureTerminal(QPlainTextEdit):
         safe = (sanitize_paste_unicode(raw) if action == 'unicode'
                 else sanitize_paste(raw))
         if not safe:
-            return False
+            return None     # nothing to send (sanitized to empty) -- not a write failure
         # Bracketed paste when a TUI program asked for it (DEC mode 2004): the child
         # BUFFERS the payload as data rather than interpreting it as keystrokes, so
         # it cannot auto-execute -- deliver it verbatim between the markers.
@@ -6169,7 +6193,7 @@ class SecureTerminal(QPlainTextEdit):
             # dropped); a single-line paste then reaches the shell with no submit.
             safe = paste_no_autosubmit(safe)
             if not safe:
-                return False
+                return None     # sanitized to empty after dropping the trailing submit
             # A non-bracketed MULTI-line paste still carries embedded submit CRs
             # (paste_no_autosubmit only drops the TRAILING one), and with no bracketed
             # framing to make the child buffer them inert, each would AUTO-RUN a line
@@ -6205,11 +6229,11 @@ class SecureTerminal(QPlainTextEdit):
         data = safe.encode('utf-8')
         if bracketed:
             data = b'\x1b[200~' + data + b'\x1b[201~'
-        # Report delivery from the ACTUAL write: ctl_send_text(submit=True) fires its CR
-        # only when THIS line fully reached the pty. _write returns False on a partial /
-        # timed-out write to a wedged or slow child (e.g. SIGSTOP-ed), so a bare submit CR
-        # can never run a partially-delivered line. Every early return above wrote nothing
-        # and returns False.
+        # Report delivery from the ACTUAL write: True = every byte reached the pty, False =
+        # a partial / timed-out write to a wedged or slow child (e.g. SIGSTOP-ed). The early
+        # returns above yield None: the payload sanitized to empty (nothing to send).
+        # ctl_send_text distinguishes all three -- submit the withheld CR only on True,
+        # report False as a partial-write error, treat None as a benign no-op.
         return self._write(data)
 
     def _insert_next_staged(self):
