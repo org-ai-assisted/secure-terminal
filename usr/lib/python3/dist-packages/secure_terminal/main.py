@@ -3093,7 +3093,9 @@ class MainWindow(QMainWindow):
         run_act = menu.addAction('Run in the background')
         run_act.setCheckable(True)
         run_act.setChecked(clipboard_watch.is_running())
-        run_act.setEnabled(enabled)
+        # gated HERE as well as in the setter (like warn_act below): an admin-locked
+        # control must be un-clickable from this ephemeral tray menu, not only refused.
+        run_act.setEnabled(enabled and 'clip_run' not in self._locked)
         run_act.setToolTip(
             'Start / stop the background clipboard watcher: it pops a review only '
             'when copied text hides deceptive Unicode.' if enabled else
@@ -3114,12 +3116,14 @@ class MainWindow(QMainWindow):
         auto_act = menu.addAction('Start on login')
         auto_act.setCheckable(True)
         auto_act.setChecked(clipboard_watch.autostart_enabled())
-        auto_act.setEnabled(enabled)
+        auto_act.setEnabled(enabled and 'clip_autostart' not in self._locked)
         auto_act.toggled.connect(self.set_clip_autostart)
 
     def set_clip_run(self, on):
         """Start or stop the background clipboard-sanitizer daemon (a singleton, so a
         second start is idempotent)."""
+        if 'clip_run' in self._locked:
+            return                        # admin-locked; not user-changeable
         from secure_terminal import clipboard_watch   # noqa: PLC0415
         if on:
             if not clipboard_watch.is_running():
@@ -3157,6 +3161,8 @@ class MainWindow(QMainWindow):
         self._clip_reviewer.review_now()
 
     def set_clip_autostart(self, on):
+        if 'clip_autostart' in self._locked:
+            return                      # admin-locked; not user-changeable
         from secure_terminal import clipboard_watch   # noqa: PLC0415
         if on and not self._clip_controls_enabled():
             return                      # cannot autostart a tray watcher without a tray
