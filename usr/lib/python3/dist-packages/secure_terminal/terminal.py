@@ -2341,6 +2341,7 @@ class SecureTerminal(QPlainTextEdit):
         # on the SIGWINCH from the new winsize, so do not force a render here (that
         # would flash a blank frame). The document keeps the last frame until the
         # program's redraw arrives.
+        old_cols = self._screen.columns
         self._screen.resize(rows, cols)
         # pyte.Screen.resize() does NOT clamp the cursor on a shrink, so a subsequent
         # \r-only redraw (an ordinary status/spinner) would write to a now-out-of-range
@@ -2348,7 +2349,13 @@ class SecureTerminal(QPlainTextEdit):
         # (a display-integrity/spoofing bug). Clamp it into the new grid, as the render
         # paths (_grid_signatures, _place_grid_cursor) already do for their reads.
         self._screen.cursor.y = min(self._screen.cursor.y, rows - 1)
-        self._screen.cursor.x = min(self._screen.cursor.x, cols - 1)
+        # Clamp cursor.x ONLY when the width actually SHRANK, and allow x == cols: pyte
+        # encodes the pending-autowrap state (a line filled exactly to the last column) as
+        # cursor.x == columns and pyte.Screen.resize never touches cursor.x. A blanket
+        # min(x, cols-1) on a HEIGHT-only resize demoted that pending-wrap x from cols to
+        # cols-1, so the next printable byte overwrote the last cell instead of wrapping.
+        if cols < old_cols:
+            self._screen.cursor.x = min(self._screen.cursor.x, cols)
         self._set_winsize(cols, rows)
 
     def _pyte_qcolor(self, color, default, bright=False):
@@ -6122,10 +6129,12 @@ class SecureTerminal(QPlainTextEdit):
         data = safe.encode('utf-8')
         if bracketed:
             data = b'\x1b[200~' + data + b'\x1b[201~'
-        self._write(data)
-        # Report delivery: ctl_send_text(submit=True) fires its CR only when THIS line
-        # reached the pty; every early return above wrote nothing and returns False.
-        return True
+        # Report delivery from the ACTUAL write: ctl_send_text(submit=True) fires its CR
+        # only when THIS line fully reached the pty. _write returns False on a partial /
+        # timed-out write to a wedged or slow child (e.g. SIGSTOP-ed), so a bare submit CR
+        # can never run a partially-delivered line. Every early return above wrote nothing
+        # and returns False.
+        return self._write(data)
 
     def _insert_next_staged(self):
         """Insert the next HELD line of a reviewed multi-line paste at the prompt, on
