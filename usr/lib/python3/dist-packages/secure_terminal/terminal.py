@@ -466,12 +466,20 @@ def _cache_bounded(cache, key, fmt):
 # Any numeric-code OSC: ESC ] <code> ; <params> (BEL | ST). The dispatcher acts on
 # the codes for enabled OSC features and ignores the rest (still stripped).
 _OSC_ANY = re.compile(rb'\x1b\](\d{1,8});([^\x07\x1b]*)(?:\x07|\x1b\\)')
+# str sibling, so the OSC advisory (_notice_osc) parses EXACTLY as the enforcement path
+# (_handle_osc) does -- same code + params + terminator -- and can never diverge from it
+# (no missed real OSC, no spurious advisory, no read<->write misclassification). re.ASCII:
+# on a str subject \d would else match Unicode digits (Arabic-Indic etc.) the byte matcher
+# cannot, a spurious advisory for input the enforcement path never recognizes.
+_OSC_ANY_STR = re.compile(r'\x1b\](\d{1,8});([^\x07\x1b]*)(?:\x07|\x1b\\)', re.ASCII)
 _OSC_CLIP_MAX = 64 * 1024        # cap a clipboard payload; no unbounded writes
 # Whether an OSC body (the bytes after its "\x1b]") contains a terminator (BEL or
 # ST). Used to decide if a trailing OSC introducer is incomplete and must be held
 # back and prepended to the next read, so a sequence split across PTY reads (a
 # full-size OSC 52 clipboard payload always spans the 64 KiB read) is not missed.
 _OSC_TERMINATED = re.compile(rb'\x07|\x1b\\')
+# str sibling, for the CLI-symmetric OSC advisory carry in _notice_osc.
+_OSC_TERMINATED_STR = re.compile(r'\x07|\x1b\\')
 # OSC 8 hyperlink: ESC ] 8 ; <params> ; <URI> BEL <text> ESC ] 8 ; ; BEL. Captures
 # the real target URI and the visible text, so the true destination can be shown
 # (the display text can differ from the target -- the phishing risk).
@@ -1174,6 +1182,11 @@ class SecureTerminal(QPlainTextEdit):
         # reads is still acted on. Bounded a little above the clipboard cap.
         self._osc_carry = b''
         self._OSC_CARRY_MAX = _OSC_CLIP_MAX + 4096
+        # notice-path OSC reassembly: the TUI grid branch feeds _notice_osc the RAW
+        # chunk (no feed_chunk_carry), so hold an incomplete trailing OSC here or a split
+        # introducer / split OSC-52 '?' would evade or misclassify the advisory. Mirrors
+        # _osc_carry's reassembly, bounded by the same cap.
+        self._notice_carry = ''
         # emitted whenever a program uses an OSC escape while in pure CLI mode,
         # where it is stripped; the window de-duplicates to a once-per-tab notice
         # (it knows the setting, so the terminal must not consume the state itself).
@@ -1640,6 +1653,7 @@ class SecureTerminal(QPlainTextEdit):
         self._esc_dropped = 0
         self._esc_notified = False
         self._osc_carry = b''
+        self._notice_carry = ''
         # re-advertise the mode's terminfo to the running shell (no restart). ONLY
         # for the default login shell (self._command is None): a tab launched with
         # `-- PROGRAM` runs that program as _pid, which has_foreground_program cannot
@@ -1825,6 +1839,60 @@ class SecureTerminal(QPlainTextEdit):
 
     def any_osc_enabled(self):
         return any(self._osc.values())
+
+    def _notice_osc(self, text):
+        """Advise on each distinct OSC TYPE in text, at most once per call (the window
+        de-dups per tab). Symmetric across modes: in TUI a type the user ENABLED
+        (osc_enabled) is honored, not refused, so it does NOT advise; CLI honors nothing
+        (tui_active False), so every type advises. Both the CLI line path and the TUI
+        grid branch call this, so a refused OSC surfaces the same yellow banner either
+        way. The over-cap discard emit stays at the CLI call site -- it reads
+        feed_chunk_carry state this helper cannot see."""
+        if self._grid_mode():
+            # TUI feeds the RAW chunk (no feed_chunk_carry), so reassemble a split OSC here
+            # -- else a split introducer or a split OSC-52 '?' would evade or misclassify the
+            # advisory (CLI arrives already reassembled and skips this; its _notice_carry stays
+            # empty). Hold the incomplete trailing OSC with _handle_osc's core carry: the LAST
+            # unterminated "\x1b]" introducer, or a bare trailing "\x1b" (rfind + terminator
+            # check + cap). An earlier, never-completed introducer is abandoned (a raw ESC in an
+            # OSC's params ends it under _OSC_ANY, so the trailing well-formed OSC is what
+            # completes). This is a str view of the byte enforcement (the cap counts chars, and
+            # the OSC-8 opener-pairing holdback is not mirrored), so on an adversarial multi-byte
+            # or bundled-OSC-8 edge it can only ERR toward over-advising -- never toward missing a
+            # refused OSC. Byte-exact parity would need a bytes rewrite of this path (follow-up).
+            text = self._notice_carry + text
+            self._notice_carry = ''
+            carry_at = len(text) if text.endswith('\x1b') else -1
+            intro = text.rfind('\x1b]')
+            if intro != -1 and not _OSC_TERMINATED_STR.search(text[intro + 2:]):
+                carry_at = intro
+            if carry_at == len(text):
+                carry_at = len(text) - 1          # the trailing lone ESC
+            if carry_at >= 0 and (len(text) - carry_at) <= self._OSC_CARRY_MAX:
+                self._notice_carry = text[carry_at:]
+                text = text[:carry_at]
+        if '\x1b]' not in text:
+            return
+        # Parse with the SAME matcher the enforcement path uses (_OSC_ANY in _handle_osc): a
+        # full "<code>;<params><BEL|ST>" match. finditer retries at every start position, so
+        # the advisory NEVER misses a real OSC embedded after a malformed one and NEVER fires
+        # for a payload _handle_osc ignores -- it cannot diverge from what is actually honored
+        # or refused. Anchored on "\x1b]" and terminator-bounded params, so it is O(n).
+        emitted = set()
+        for m in _OSC_ANY_STR.finditer(text):
+            code = int(m.group(1))
+            key = _OSC_CODE_KEY.get(code, 'osc_other')
+            if code == 52:
+                # write vs read share code 52; a trailing '?' in the params is a READ query.
+                # str.rstrip() would strip Unicode whitespace, but _handle_osc uses
+                # bytes.rstrip() (ASCII only) -- strip the SAME ASCII set so read/write matches.
+                key = ('osc_clipboard_read'
+                       if m.group(2).rstrip(' \t\n\r\x0b\x0c').endswith('?')
+                       else 'osc_clipboard')
+            if not (self.tui_active() and self.osc_enabled(key)):
+                if key not in emitted:
+                    emitted.add(key)
+                    self.osc_used.emit(key)
 
     # -- bell (BEL 0x07) -------------------------------------------------------
     # Notification channels are INDEPENDENT (not mutually exclusive): a bell may
@@ -3354,6 +3422,11 @@ class SecureTerminal(QPlainTextEdit):
         text = self._absorb_caret(text)         # drop a shell's duplicate ^C echo
 
         if self._grid_mode():
+            # Advise on a refused OSC in TUI too, so the yellow banner is symmetric with
+            # CLI (an enabled type is honored by _handle_osc above and gated out of the
+            # advisory inside _notice_osc). `text` still carries the ESC] introducers
+            # here (pre escape-stripping), so the scan sees every OSC.
+            self._notice_osc(text)
             # Keep the retained raw prompt-clean, like the CLI branch below, so a TUI
             # re-render (replayed through _feed_stream from _raw) does not re-stick a
             # finished command's leftover colour onto the prompt.
@@ -3394,24 +3467,10 @@ class SecureTerminal(QPlainTextEdit):
         # false-fires on a shell's BEL-terminated title, split across reads or not.
         if self._bell_channels and has_bell(text):
             self._ring()
-        # An OSC (ESC ]) is stripped in CLI mode; flag each distinct TYPE seen so
-        # the window can notice it at most once per tab (not once per any OSC).
-        if '\x1b]' in text:
-            emitted = set()
-            for m in _OSC_CODE_RE.finditer(text):
-                code = int(m.group(1))
-                key = _OSC_CODE_KEY.get(code, 'osc_other')
-                if code == 52:
-                    # osc_clipboard (write) and osc_clipboard_read share code 52;
-                    # distinguish by the payload so the per-type notice is right.
-                    tail = text[m.end():m.end() + 512]
-                    end = min((p for p in (tail.find('\x07'), tail.find('\x1b'))
-                               if p >= 0), default=len(tail))
-                    key = ('osc_clipboard_read' if tail[:end].rstrip().endswith('?')
-                           else 'osc_clipboard')
-                if key not in emitted:
-                    emitted.add(key)
-                    self.osc_used.emit(key)
+        # An OSC (ESC ]) is refused in CLI mode; advise each distinct TYPE seen. The
+        # TUI grid branch calls the SAME helper, so the advisory is symmetric across
+        # modes (an OSC refused in CLI is equally refused in the fixed TUI grid).
+        self._notice_osc(text)
         # An over-cap OSC that just switched to the discard state had its introducer
         # truncated away before the scan above, so still surface the attempt (as a
         # generic OSC) -- else padding an OSC past the cap would evade the notice.
@@ -3974,6 +4033,7 @@ class SecureTerminal(QPlainTextEdit):
         self._esc_dropped = 0
         self._esc_notified = False
         self._osc_carry = b''
+        self._notice_carry = ''
         self._alt_scan_carry = ''
         self._alt_feed_carry = b''
         self._sync_scan_carry = ''
