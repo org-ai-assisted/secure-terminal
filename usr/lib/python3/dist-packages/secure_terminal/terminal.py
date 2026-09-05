@@ -4576,12 +4576,35 @@ class SecureTerminal(QPlainTextEdit):
         self._force_current_frame()  # never read a stale (debounced/gated) document
         return self._export_ascii(super().toPlainText())
 
+    def _transcript_path(self):
+        """Resolve THIS tab's transcript path from the configured base. Every tab writes
+        its OWN content, so a shared base path would let multiple tabs clobber each other.
+        The SINGLE / primary tab (the lowest live per-tab id) keeps the exact base path --
+        so a single-tab window (every shot-harness capture) reads the unchanged env path,
+        and the base is always populated as tabs open and close -- while each ADDITIONAL
+        tab writes 'base.<id>'. A standalone widget (no MainWindow tab bar) also keeps the
+        base. Computed at write time, not __init__: only here is the tab parented, so the
+        live count reflects a tab opened LATER."""
+        base = self._transcript_file
+        win = self.window()
+        tabs = getattr(win, 'tabs', None)
+        serials = getattr(win, '_tab_ids', None)
+        if tabs is None or not serials:
+            return base                     # standalone / preview term: no MainWindow tab bar
+        sibs = [w for i in range(tabs.count())
+                if isinstance((w := tabs.widget(i)), SecureTerminal)
+                and w._transcript_file is not None]
+        if len(sibs) <= 1:
+            return base                     # sole transcript tab (and every shot-harness capture)
+        primary = min(sibs, key=lambda t: serials.get(t, 0))
+        return base if self is primary else '%s.%d' % (base, serials.get(self, 0))
+
     def _write_transcript_file(self):
         """Write this tab's transcript to the configured SECURE_TERMINAL_TRANSCRIPT_FILE,
         atomically. transcript_text() is the lossless plain-ASCII record and walks the
         RENDERED document, so it reflects CLI and TUI (incl. the alternate screen) alike.
         Best-effort: a write failure must never disturb the terminal."""
-        path = self._transcript_file
+        path = self._transcript_path()
         if path is None:  # pragma: no cover - the debounce timer only fires when a path is set
             return
         # Force any pending debounced GRID render first, so the transcript reflects the
