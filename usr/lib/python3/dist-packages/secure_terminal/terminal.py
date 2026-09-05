@@ -183,6 +183,13 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         super().linefeed()
 
     def draw(self, data):
+        # New glyphs make any no-trailing-newline flag on the cursor row STALE (a
+        # cursor-addressed rewrite of a flagged row must not keep the old row's gutter
+        # marker -- the "no output lies" guarantee). Drop it before the write; the flag
+        # is re-set from a fresh structural detection when the case recurs.
+        _row = self.buffer.get(self.cursor.y)
+        if _row is not None and getattr(_row, 'no_newline', False):
+            _row.no_newline = False
         # Bound a Zalgo flood. pyte merges each zero-width combining mark into
         # the cell before the cursor via unicodedata.normalize("NFC",
         # cell.data + mark) -- O(len) per mark -- so a base plus thousands of
@@ -268,6 +275,30 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             row, col = self.cursor.y - 1, self.columns - 1
         self.buffer[row][col] = target._replace(data=target.data + ch)
         self.dirty.add(row)
+
+    def erase_in_line(self, how=0, *args, **kwargs):
+        # Erasing the cursor row's content clears its no-trailing-newline flag (the
+        # gutter must not mark a row whose old content is gone).
+        row = self.buffer.get(self.cursor.y)
+        if row is not None and getattr(row, 'no_newline', False):
+            row.no_newline = False
+        super().erase_in_line(how, *args, **kwargs)
+
+    def erase_in_display(self, how=0, *args, **kwargs):
+        # Clear the flag on exactly the rows this erase blanks (whole screen for how
+        # 2/3, cursor->end for 0, start->cursor for 1) so no stale gutter marker rides
+        # a cleared region -- e.g. `clear` (ESC[H ESC[2J) after un-terminated output.
+        if how in (2, 3):
+            ys = range(self.lines)
+        elif how == 1:
+            ys = range(self.cursor.y + 1)
+        else:
+            ys = range(self.cursor.y, self.lines)
+        for y in ys:
+            row = self.buffer.get(y)
+            if row is not None and getattr(row, 'no_newline', False):
+                row.no_newline = False
+        super().erase_in_display(how, *args, **kwargs)
 
 
 class _Utf8CharsetByteStream(pyte.ByteStream):
@@ -404,11 +435,12 @@ _CP_PROP = QTextFormat.Property.UserProperty + 1
 _BLK_WRAP_CONT = 1     # soft-autowrap continuation: copy joins it onto the previous row
 _BLK_NO_NEWLINE = 2    # the command output on this line ended without a trailing newline
 
-# Sentinel "format" appended by _grid_row_runs to a TUI row whose pyte row carries the
+# Sentinel format appended by _grid_row_runs to a TUI row whose pyte row carries the
 # no_newline flag. It rides the row SIGNATURE (so a pure-flag change re-renders the row)
 # and is stripped by _gridrow_blockdata into _GridRow.no_newline -- it never becomes cell
-# text (unforgeable + copy-safe). A plain object() so it can never equal a QTextCharFormat.
-_NO_NL_SENTINEL = object()
+# text. A distinct QTextCharFormat INSTANCE, matched by identity (`is`), so it keeps the
+# runs list's (str, QTextCharFormat) element type while never colliding with a real format.
+_NO_NL_SENTINEL = QTextCharFormat()
 
 
 def _blk_flags(block):
@@ -1183,12 +1215,12 @@ class SecureTerminal(QPlainTextEdit):
         self._tui_follow = True
         self._programmatic_scroll = False
         self.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
-        # Left gutter: per-line annotation strip (no-trailing-newline marker). The
-        # standard line-number-area wiring -- reserve its margin on a block-count
-        # change, scroll/repaint it on updateRequest. Position + width are set here and
-        # kept in step by _apply_font / resizeEvent.
+        # Left gutter: per-line annotation strip (no-trailing-newline marker). Repaint
+        # it on updateRequest (content/scroll). Its width is a FIXED font-based strip
+        # (unlike a line-number area it does not grow with line count), so it is set here
+        # and only re-reserved on a font/zoom change (_apply_font) -- NOT per block, which
+        # would call setViewportMargins on every output line for no width change.
         self._gutter = _GutterArea(self)
-        self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_gutter_area)
         self._update_gutter_width()
         self._position_gutter()
@@ -2150,42 +2182,46 @@ class SecureTerminal(QPlainTextEdit):
                 yield block, top, bottom
             block = block.next()
 
+    def _block_last_line_center(self, block, block_top):
+        """Viewport y of the centre of the block's LAST visual line. A wrapped block
+        (Detail/Reveal wrap to the width) spans several visual lines; the no-newline
+        belongs to its FINAL row, so the glyph rides there -- not the block centre,
+        which a tall wrapped block pushes far off-screen. The block is always laid out
+        here (the caller reached it through blockBoundingGeometry), so lineCount >= 1."""
+        line = block.layout().lineAt(block.layout().lineCount() - 1)
+        return int(block_top + line.y() + line.height() / 2)
+
     def _paint_gutter(self, event):
         """Draw the per-line markers. Same-coloured background as the terminal keeps the
         strip unobtrusive; a muted return-arrow glyph marks each no-trailing-newline
-        line. Font-independent (drawn with QPainter, no glyph font dependency) and
-        ASCII-only in source. Called only from the gutter widget's own paintEvent, so
-        self._gutter is always live here."""
+        line, on that line's LAST visual row. Font-independent (drawn with QPainter, no
+        glyph font dependency) and ASCII-only in source. QPainter clips to the widget,
+        so a glyph whose row is scrolled out is harmlessly clipped. Called only from the
+        gutter widget's own paintEvent, so self._gutter is always live here."""
         painter = QPainter(self._gutter)
-        base = self.palette().color(QPalette.ColorRole.Base)
-        painter.fillRect(event.rect(), base)
+        painter.fillRect(event.rect(), self.palette().color(QPalette.ColorRole.Base))
         fg = self.palette().color(QPalette.ColorRole.Text)
         fg.setAlpha(150)                          # muted: a note, not program output
-        for block, top, bottom in self._gutter_blocks():
-            if bottom < event.rect().top() or top > event.rect().bottom():
-                continue
+        for block, top, _bottom in self._gutter_blocks():
             if self._block_no_newline(block):
-                self._draw_no_newline_glyph(painter, top, bottom - top, fg)
+                self._draw_no_newline_glyph(
+                    painter, self._block_last_line_center(block, top), fg)
         painter.end()
 
-    def _draw_no_newline_glyph(self, painter, top, height, color):
-        """A small return-arrow (down then left, with a head) centred in the row: the
-        universal 'a newline belongs here' mark, flagging that this line lacked one."""
-        w = self._gutter_width_px()
-        cx = w // 2
-        h = min(height, self.fontMetrics().height())
-        mid = top + height // 2
+    def _draw_no_newline_glyph(self, painter, mid, color):
+        """A small return-arrow (down then left, with a head) centred vertically on the
+        marked line at `mid`: the universal 'a newline belongs here' mark."""
+        cx = self._gutter_width_px() // 2
+        h = self.fontMetrics().height()
         a = max(2, h // 4)                         # arm half-length
         pen = QPen(color)
-        pen.setWidth(max(1, self.fontMetrics().height() // 12))
+        pen.setWidth(max(1, h // 12))
         painter.setPen(pen)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        # vertical stroke down, then left along the baseline (the return hook)
-        painter.drawLine(cx + a, mid - a, cx + a, mid + a)
-        painter.drawLine(cx + a, mid + a, cx - a, mid + a)
-        # arrowhead at the left end
-        painter.drawLine(cx - a, mid + a, cx - a + a, mid + a - a)
-        painter.drawLine(cx - a, mid + a, cx - a + a, mid + a + a)
+        painter.drawLine(cx + a, mid - a, cx + a, mid + a)     # vertical stroke down
+        painter.drawLine(cx + a, mid + a, cx - a, mid + a)     # left along the base
+        painter.drawLine(cx - a, mid + a, cx, mid)             # arrowhead
+        painter.drawLine(cx - a, mid + a, cx, mid + 2 * a)
 
     def _block_at_gutter_y(self, y):
         """The visible block whose row contains gutter-local y, or None."""
