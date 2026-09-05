@@ -1844,9 +1844,18 @@ class SecureTerminal(QPlainTextEdit):
         advise; CLI honors nothing (tui_active False), so every type advises. Both the CLI
         line path and the TUI grid branch feed this the raw read, each with its own carry.
         The advisory keeps its OWN carry (_notice_carry), independent of _handle_osc's
-        _osc_carry -- both consume the stream (in TUI both run)."""
+        _osc_carry -- both consume the stream (in TUI both run).
+
+        osc8=False here (NOT mirrored from _handle_osc): the OSC-8 opener holdback exists
+        only to reassemble a split opener+closer PAIR for _handle_osc's phishing notice, and
+        it holds back EVERYTHING from the opener to end-of-buffer. The advisory needs no
+        pair (it classifies a code-8 opener directly via _OSC_ANY), so mirroring the
+        holdback would let an unclosed opener SUPPRESS the advisory for every OSC after it
+        (a program opening one never-closed hyperlink hides its own clipboard/title/etc.
+        attempts). Omitting it only OVER-advises OSC-8 (fires on the opener before any
+        closer) -- never suppresses a refused OSC."""
         data, self._notice_carry, dropped = self._osc_split(
-            data, self._notice_carry, self._osc['osc_hyperlink'])
+            data, self._notice_carry, False)
         if dropped:
             # An over-cap open OSC was let go by _osc_split (no unbounded buffer); its type
             # is unknowable from the truncated head, so surface a generic attempt
