@@ -3337,8 +3337,10 @@ class SecureTerminal(QPlainTextEdit):
             # Drop any stale wheel-scroll remainder at an alt-screen transition:
             # a leftover sub-line delta must not carry into the next full-screen
             # session, where the first small wheel event could cross the per-line
-            # threshold and emit a spurious arrow key.
+            # threshold and emit a spurious arrow key. BOTH axes feed the SGR wheel
+            # report, so clear the horizontal remainder too (else a spurious ESC[<66/67).
             self._wheel_accum = 0
+            self._wheel_accum_x = 0
             if not self._alt_screen:
                 self._tui_hint_shown = False   # a later full-screen app re-advises
 
@@ -3646,8 +3648,12 @@ class SecureTerminal(QPlainTextEdit):
             never-completed introducer is abandoned (a raw ESC in an OSC's params ends it
             under _OSC_ANY, so the trailing well-formed OSC is what completes);
           - `dropped` is True when that open OSC ran PAST the cap: it is NOT buffered (no
-            unbounded carry) and is stripped from `data` so a truncated head cannot be
-            re-typed -- the advisory surfaces it generically, enforcement drops it.
+            unbounded carry). `data` is left INTACT (not truncated) -- the over-cap tail is
+            an UNTERMINATED sequence that _OSC_ANY cannot match anyway, so leaving it in
+            place lets any COMPLETE OSC before/after it still parse (enforcement dispatches
+            it, the advisory names it); truncating at carry_at would wrongly drop a complete
+            OSC sitting after an unclosed OSC-8 opener. `dropped` drives only the advisory's
+            generic osc_other, so padding past the cap cannot silently evade the notice.
         NB: a held carry feeds ONLY reassembly (never the render pipeline), so retaining it
         across a cosmetic _rerender is correct; apply_tui, the real CLI<->TUI boundary,
         clears both carries."""
@@ -3676,7 +3682,10 @@ class SecureTerminal(QPlainTextEdit):
                 new_carry = data[carry_at:]
                 data = data[:carry_at]
             else:
-                data = data[:carry_at]
+                # Over cap: do NOT buffer and do NOT truncate. The open tail is
+                # unterminated (or an unclosed OSC-8 opener), so _OSC_ANY / _OSC8 cannot
+                # match it; leaving `data` whole keeps any COMPLETE OSC after an unclosed
+                # opener parseable, while `dropped` still surfaces the attempt generically.
                 dropped = True
         return data, new_carry, dropped
 
