@@ -4941,11 +4941,12 @@ class SecureTerminal(QPlainTextEdit):
         informative default than a static "shell": it tracks where you are as you
         cd around."""
         pgrp = self._foreground_pgrp()
-        if pgrp is None and not self._pid_is_current_child():
-            return None     # only the shell pid to read, and it is gone / freed + reused
-        pid = pgrp if pgrp is not None else self._pid
-        if pid is None:
-            return None
+        if pgrp is not None:
+            pid = pgrp
+        elif self._pid is not None and self._pid_is_current_child():
+            pid = self._pid
+        else:
+            return None     # no foreground pgrp, and the shell pid is gone / freed + reused
         try:
             path = os.readlink('/proc/%d/cwd' % pid)
         except OSError:
@@ -4997,12 +4998,12 @@ class SecureTerminal(QPlainTextEdit):
         except OSError:
             return None
         rparen = data.rfind(b')')
-        if rparen < 0:
+        if rparen < 0:  # pragma: no cover - /proc/<pid>/stat always contains the comm ')'
             return None
         fields = data[rparen + 2:].split()
         try:
             return int(fields[19])
-        except (IndexError, ValueError):
+        except (IndexError, ValueError):  # pragma: no cover - a real /proc stat line is well-formed
             return None
 
     def _pid_is_current_child(self):
