@@ -202,8 +202,9 @@ class ReviewBar(QWidget):
         # buttons + open/restore; a manual box edit leaves it (the chosen tier stands).
         self._active_mode = 'keep'
         self._kind = _KINDS['paste']
-        # The anti-fat-finger countdown gating Deliver for a PASTE (seconds). Re-armed
-        # on every edit and transform; a copy passes delay 0 (no countdown).
+        # The anti-fat-finger countdown gating Deliver for a PASTE (seconds). Armed on a
+        # BULK change -- open, a transform, Restore, or a paste INTO the box -- not on an
+        # ordinary keystroke; a copy passes delay 0 (no countdown).
         self._remaining = 0
         self._delay = 0
         self._countdown = QTimer(self)
@@ -216,11 +217,16 @@ class ReviewBar(QWidget):
         # The widget groups are (re)assigned at the end of __init__; init them empty first
         # so an early resizeEvent during construction is a safe no-op.
         self._zoom = 100
-        self._zoom_widgets = ()
-        self._zoom_caps = ()
+        self._zoom_widgets: tuple[QWidget, ...] = ()
+        self._zoom_caps: tuple[QLabel, ...] = ()
         # Narrow (mobile-width) mode: the transform captions hide and the buttons take
         # their SHORT labels, so the row fits instead of clipping. Set in resizeEvent.
         self._narrow = False
+        # The beyond-cap tail neutralized to each tier, precomputed once per review (the
+        # tail is fixed; not per-keystroke). Lets the transform-state + verdict logic
+        # judge the WHOLE delivered content, not just the shown box.
+        self._tail_tiers: dict[str, str] = {}
+        self._tail_tier_conf: dict[str, int] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 6)
@@ -260,6 +266,10 @@ class ReviewBar(QWidget):
         self._editor.setSizePolicy(QSizePolicy.Policy.Expanding,
                                    QSizePolicy.Policy.Expanding)
         self._editor.changed.connect(self._on_edit)
+        # A paste INTO the box is a bulk change of un-reviewed content -> re-arm the
+        # countdown, so a freshly-pasted payload gets the full anti-fat-finger delay even
+        # after an earlier countdown already elapsed (an ordinary keystroke does not).
+        self._editor.pasted.connect(self._arm_countdown)
         outer.addWidget(self._editor, 1)
 
         # The in-place transforms GLUED beneath the box (they act ON it -- proximity makes
@@ -401,6 +411,14 @@ class ReviewBar(QWidget):
         self._term = term
         self._raw = raw
         self._tail = raw[_BOX_MAX:]
+        # Precompute the tail neutralized to each tier (+ its residual look-alike count),
+        # once -- the tail is fixed and not editable, so the transform-state / verdict
+        # logic can judge the FULL delivered content (box + tail) without re-neutralizing
+        # a possibly-huge tail on every keystroke.
+        self._tail_tiers = {m: fn(self._tail) for m, fn in self._TIER.items()} if self._tail else {}
+        self._tail_tier_conf = {
+            m: classify_paste_detail(v)['counts'].get('confusable', 0)
+            for m, v in self._tail_tiers.items()}
         self._active_mode = 'reveal'        # opens fully revealed; the tail follows
         self._kind = _KINDS.get(kind, _KINDS['paste'])
         self._reject.setText(self._kind['reject'])
@@ -466,6 +484,10 @@ class ReviewBar(QWidget):
             f = w.font()
             f.setPointSize(small)
             w.setFont(f)
+        # Zoom changes the effective fit (the narrow threshold scales with zoom AND the
+        # bigger fonts need more room), so re-evaluate narrow-mode here too, not only on a
+        # resize -- otherwise zooming past the breakpoint would not switch to short labels.
+        self._apply_responsive()
 
     def wheelEvent(self, event):
         """Ctrl+wheel anywhere over the bar (the table/buttons, not only the box) zooms
@@ -482,6 +504,14 @@ class ReviewBar(QWidget):
         fonts do. _zoom_caps is () until the end of __init__, so an early construction
         resize is a safe no-op."""
         super().resizeEvent(event)
+        self._apply_responsive()
+
+    def _apply_responsive(self):
+        """Recompute narrow-mode (captions hidden + short button labels) from the CURRENT
+        width and zoom, and relabel. Called on BOTH resize and zoom -- each changes the
+        effective fit -- so zooming past the breakpoint switches to short labels even with
+        no resize. _zoom_caps is () until the end of __init__, so an early construction
+        pass is a safe no-op."""
         self._narrow = self.width() < max(1, round(560 * self._zoom / 100.0))
         for cap in self._zoom_caps:
             cap.setVisible(not self._narrow)
@@ -534,19 +564,31 @@ class ReviewBar(QWidget):
         self._set_detail(detail, term, truncated, states, text)
 
     def _transform_states(self, text):
-        """Per-transform outcome for the CURRENT box -- the ONE source of truth for both
-        the state-aware buttons and the verdict rows. Each entry is (result, is_noop),
-        is_noop iff the transform would leave the box unchanged (result == text, functions
-        pure). `equiv` is True when Strip and Fold produce the same bytes (no look-alikes,
-        so folding maps nothing)."""
-        keep = sanitize_clipboard_unicode(text)
-        strip = sanitize_clipboard(text)
-        fold = ascii_fold_display(text)
+        """Per-transform outcome for the current review -- the ONE source of truth for both
+        the state-aware buttons and the verdict rows. Each entry is (box_result, is_noop).
+        is_noop is judged against the WHOLE DELIVERED content (box + the un-shown tail at
+        the tier the click would set), NOT the shown box alone: a transform that would only
+        change the beyond-cap tail (e.g. a look-alike past the box cap) must still count as
+        active, or it would wrongly disable + claim the paste already clean. `equiv` is True
+        when Strip and Fold deliver the same bytes (no look-alikes anywhere)."""
+        keep_res = sanitize_clipboard_unicode(text)
+        strip_res = sanitize_clipboard(text)
+        fold_res = ascii_fold_display(text)
+
+        def _deliv(mode, box_res):
+            # what a Deliver would send if this tier were active: neutralized box + the
+            # tail already neutralized to the same tier.
+            return box_res + (self._tail_tiers.get(mode, '') if self._tail else '')
+
+        current = text + (self._tail_tiers.get(self._active_mode, '') if self._tail else '')
+        d_keep = _deliv('keep', keep_res)
+        d_strip = _deliv('strip', strip_res)
+        d_fold = _deliv('fold', fold_res)
         return {
-            'keep': (keep, keep == text),
-            'strip': (strip, strip == text),
-            'fold': (fold, fold == text),
-            'equiv': strip == fold,
+            'keep': (keep_res, d_keep == current),
+            'strip': (strip_res, d_strip == current),
+            'fold': (fold_res, d_fold == current),
+            'equiv': d_strip == d_fold,
         }
 
     def _refresh_transform_controls(self, text, states):
@@ -678,19 +720,29 @@ class ReviewBar(QWidget):
             chars_html = ('<table cellspacing="0" cellpadding="1">%s</table>'
                           % ''.join(crows))
 
-        # "Outcome if delivered now" -- the per-criterion verdict, straight from the same
-        # `states` the buttons use, so a checked (disabled) button matches a satisfied row.
-        # Invisible/reordering removed is the Deliver GATE (red cross while unmet); Plain
-        # ASCII and Look-alikes-folded are choices, not danger (amber cross when unmet).
+        # "Outcome if delivered now" -- the per-criterion verdict on the WHOLE delivered
+        # content (box + the un-shown tail at the active tier), so it never certifies clean
+        # when a look-alike sits past the box cap:
+        #  - Invisible/reordering removed = the Deliver GATE (box has no hidden char; any
+        #    tier drops the tail's, so this is box-only, red cross while unmet);
+        #  - Plain ASCII = the delivered bytes are pure ASCII (strip would change nothing);
+        #  - Look-alikes folded/none = no confusable remains in box OR in the tail at the
+        #    active tier (NOT "fold is a no-op" -- folding also drops honest non-ASCII, so a
+        #    CJK paste with zero look-alikes must still read as folded/none).
+        # The last two are choices, not danger (amber cross when unmet).
+        folded_ok = (counts.get('confusable', 0) == 0
+                     and (not self._tail
+                          or self._tail_tier_conf.get(self._active_mode, 0) == 0))
+
         def _verdict(met, name, unmet_note, gate=False):
             glyph = _SAFE_GLYPH if met else _CROSS_GLYPH
             color = SAFE_FG if met else (RISK_FG if gate else CAUTION_FG)
             return _row(glyph, color, name, '' if met else unmet_note)
         vrows = [
-            _verdict(states['keep'][1], 'Invisible / reordering removed',
+            _verdict(self._blocked_count(text) == 0, 'Invisible / reordering removed',
                      'blocks sending', gate=True),
             _verdict(states['strip'][1], 'Plain ASCII', 'unicode kept'),
-            _verdict(states['fold'][1], 'Look-alikes folded / none', 'look-alikes remain'),
+            _verdict(folded_ok, 'Look-alikes folded / none', 'look-alikes remain'),
         ]
         verdict_html = ('<table cellspacing="0" cellpadding="1">%s</table>'
                         % ''.join(vrows))
