@@ -110,6 +110,15 @@ def _parse_into(path, out):
             _parse_lines(handle, parsed)
     except (OSError, ValueError):
         return                  # missing / unreadable / non-UTF-8 drop-in -> ignored
+    # `lock` ACCUMULATES across files in a directory (union), unlike every other key
+    # (last-write-wins): an admin may split locks over several .conf files (10-*.conf,
+    # 20-*.conf), and last-write-wins would silently drop every lock but the last file's --
+    # a lock-bypass. Merge whenever a later file MENTIONS lock, dropping empty values, so a
+    # bare `lock=` (empty) cannot CLEAR accumulated locks either (the same bypass). The
+    # final `locked` set de-dups, so a repeated key is harmless.
+    if 'lock' in parsed:
+        parsed['lock'] = ','.join(
+            value for value in (out.get('lock', ''), parsed['lock']) if value)
     out.update(parsed)
 
 
