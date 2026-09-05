@@ -55,7 +55,6 @@ from typing import NotRequired, TypedDict, cast
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton, QFrame, QSizePolicy,
 )
