@@ -789,22 +789,27 @@ class MainWindow(QMainWindow):
         # (double-click to rename the title, right-click for rename/colour/close).
         bar.setCursor(Qt.CursorShape.PointingHandCursor)
         bar.setToolTip('Double-click to rename this tab; right-click for more.')
-        # a dismissible advisory banner BELOW the tab bar and terminal (not
-        # injected into any terminal, so an advisory can never be copied as
-        # program output). Placing it under the tabs, rather than above, keeps
-        # the tab bar at a fixed position: showing or hiding the banner no longer
-        # shifts the tab strip, so switching tabs does not make them jump.
         central = QWidget(self)
+        self._central = central
         col = QVBoxLayout(central)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(0)
-        self._banner = self._make_banner()
+        # A dismissible advisory banner, floated as a top OVERLAY over the terminal
+        # area (a free child of `central`, positioned in _position_banner -- NOT a
+        # layout item). An auto notice must not resize the terminal: as a layout
+        # sibling it shrank the grid, which SIGWINCHed the child (re-prompt, and a
+        # full-screen reflow). As an overlay the child's winsize is untouched; the
+        # terminal reserves a matching top INSET (set_chrome_top_inset) so content
+        # renders below the banner rather than behind it. Its text is selectable but
+        # lives outside any terminal document, so it is never copied as program output.
+        # (This mirrors iTerm2's announcement banner and Konsole's KMessageWidget:
+        # a top-anchored overlay that leaves the PTY grid intact.)
+        self._banner = self._make_banner(central)
         self._find_bar = FindBar(self)
         self._review_bar = ReviewBar(self)
         col.addWidget(self.tabs)
         col.addWidget(self._review_bar)
         col.addWidget(self._find_bar)
-        col.addWidget(self._banner)
         self.setCentralWidget(central)
         # Theme the container up front so the very first tab's opaque-viewport
         # paint has a dark backdrop, not white (see _apply_container_theme).
@@ -963,11 +968,12 @@ class MainWindow(QMainWindow):
         term.setFocus()
         return index
 
-    def _make_banner(self):
-        """A dismissible, yellowish advisory banner shown above the tabs. Its text
-        is selectable/copyable but lives OUTSIDE any terminal document, so it is
-        never mistaken for -- or copied as -- program output."""
-        frame = _AdvisoryFrame(self)
+    def _make_banner(self, parent):
+        """A dismissible, yellowish advisory banner floated as a top overlay over the
+        terminal (see the central-widget setup for why it is an overlay, not a layout
+        item). Its text is selectable/copyable but lives OUTSIDE any terminal document,
+        so it is never mistaken for -- or copied as -- program output."""
+        frame = _AdvisoryFrame(parent)
         frame.setObjectName('advisory')
         frame.setVisible(False)
         frame.setStyleSheet(_banner_css(getattr(self, '_default_zoom', 100)))
@@ -1085,8 +1091,37 @@ class MainWindow(QMainWindow):
             self._style_banner(self.current_zoom_percent())
             self._banner_label.setText(entry[1])
             self._banner.setVisible(True)
+            self._position_banner()
         else:
             self._banner.setVisible(False)
+            # Drop the current tab's top inset so its content reclaims the band. A
+            # backgrounded tab that still holds an advisory keeps its inset until it
+            # is shown again -- harmless, since the inset is winsize-neutral and the
+            # tab is not visible.
+            term = self.current()
+            if term is not None:
+                term.set_chrome_top_inset(0)
+
+    def _position_banner(self):
+        """Lay the advisory overlay across the top of the terminal content area
+        (below the tab strip) and reserve a matching inset on the current terminal so
+        its output renders below the banner, not behind it. Idempotent; re-run on
+        show, window resize and zoom (the wrapped height tracks width and font)."""
+        banner = getattr(self, '_banner', None)
+        if banner is None or not banner.isVisible():
+            return
+        tabs = self.tabs
+        geo = tabs.geometry()                       # in `central` coordinates
+        top = geo.top() + tabs.tabBar().height()    # below the tab strip
+        width = geo.width()
+        # the wrapped label carries heightForWidth; floor at 1 so a degenerate width
+        # still yields a positive inset (never a negative one that hides content).
+        height = max(1, banner.heightForWidth(width))
+        banner.setGeometry(geo.left(), top, width, height)
+        banner.raise_()
+        # the banner is only visible while the current tab holds an advisory, so
+        # current() is a live terminal here.
+        self.current().set_chrome_top_inset(height)
 
     def _on_tab_step(self, step):
         """Ctrl+PageUp/Down: move to the previous/next tab, wrapping around."""
@@ -2304,6 +2339,7 @@ class MainWindow(QMainWindow):
         self._default_zoom = percent
         self._review_bar.rerender_mirror()   # an open review mirrors the tab's font
         self._style_banner(percent)          # the advisory banner scales with zoom too
+        self._position_banner()              # a taller/shorter banner re-insets the grid
         self._persist()
 
     def _on_zoom_step(self, direction):
@@ -4983,6 +5019,9 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._relayout_toolbar()
+        # the overlay is not in the layout, so it must be re-placed by hand: its width
+        # follows the terminal and its wrapped height follows that width.
+        self._position_banner()
 
     def _relayout_toolbar(self):
         """Keep every toolbar control reachable at narrow widths by picking the
