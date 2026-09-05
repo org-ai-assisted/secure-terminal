@@ -1119,9 +1119,12 @@ class MainWindow(QMainWindow):
         height = max(1, banner.heightForWidth(width))
         banner.setGeometry(geo.left(), top, width, height)
         banner.raise_()
-        # the banner is only visible while the current tab holds an advisory, so
-        # current() is a live terminal here.
-        self.current().set_chrome_top_inset(height)
+        # current() is normally live (the banner shows only for a tab that holds an
+        # advisory), but closing the LAST tab can fire a resize while the banner is
+        # still visible and current() is already None -- guard that window.
+        term = self.current()
+        if term is not None:
+            term.set_chrome_top_inset(height)
 
     def _on_tab_step(self, step):
         """Ctrl+PageUp/Down: move to the previous/next tab, wrapping around."""
