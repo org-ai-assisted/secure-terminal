@@ -310,12 +310,13 @@ class _Utf8CharsetByteStream(pyte.ByteStream):
 
 
 from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
-                          QMimeData, QRect)
+                          QMimeData, QRect, QSize)
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
                          QTextFormat, QGuiApplication, QSyntaxHighlighter,
-                         QTextBlockUserData, QPainter, QClipboard)
+                         QTextBlockUserData, QPainter, QPen, QClipboard)
 from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
-                             QHBoxLayout, QLabel, QPushButton, QApplication)
+                             QHBoxLayout, QLabel, QPushButton, QApplication,
+                             QWidget)
 
 # The pure, Qt-free sanitization core (also tested directly by dist-ai). Names
 # are re-exported here so terminal.py stays the single import point for the rest
@@ -329,13 +330,13 @@ from secure_terminal.sanitize import (
     ensure_utf8_ctype,
     sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, display_len,
-    MARK_KEY, WRAP_NL, BOX,
+    MARK_KEY, WRAP_NL, _NO_NEWLINE_KEY, BOX,
     SPACE_MARK,
     render_output, render_cap_prefix,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
     describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
-    PROMPT_START, _printable_follows, _NO_NEWLINE_TEXT,
+    PROMPT_START, _printable_follows,
     feed_chunk_carry, has_bell, OSC_FEATURES,
     tail_from_escape_boundary, split_trailing_escape, scan_mouse_modes,
     sgr_mouse_report,
@@ -384,12 +385,6 @@ def route_ctrl_wheel_zoom(widget, event):
 # _reset_leftover_sgr). '\x1b[0m' clears any stuck program colour before the prompt.
 _PROMPT_START_BYTES = PROMPT_START.encode('ascii')
 _SGR_RESET_BYTES = b'\x1b[0m'
-# The no-final-newline marker for TUI: the same text the CLI cell path uses
-# (sanitize._NO_NEWLINE_TEXT), tinted the matching gray (#808080 == 128,128,128)
-# via an SGR pyte honours, then reset. Fed into pyte just before the break so it
-# sits at the end of the un-terminated line.
-_NO_NEWLINE_TUI_BYTES = (_SGR_RESET_BYTES + b'\x1b[38;2;128;128;128m'
-                         + _NO_NEWLINE_TEXT.encode('ascii') + _SGR_RESET_BYTES)
 
 # Double-click "word" = a run of alphanumerics (Unicode-aware) plus this punctuation.
 # Chosen so a whole path/URL/key=value/user@host selects as one word (as konsole/kitty
@@ -402,6 +397,26 @@ _WORD_PUNCT = '@-./_~?&=%+#'
 _LINE_TRIM_CHARS = ' \t\u00a0\u2028\u2029'
 
 _CP_PROP = QTextFormat.Property.UserProperty + 1
+
+# Per-block annotation bits kept in QTextBlock.userState() -- a small bitfield, and a
+# general per-line channel (future: neutralized-escape, OSC-activity). Qt's unset default
+# is -1, so read through _blk_flags (which floors it to 0) before masking.
+_BLK_WRAP_CONT = 1     # soft-autowrap continuation: copy joins it onto the previous row
+_BLK_NO_NEWLINE = 2    # the command output on this line ended without a trailing newline
+
+# Sentinel "format" appended by _grid_row_runs to a TUI row whose pyte row carries the
+# no_newline flag. It rides the row SIGNATURE (so a pure-flag change re-renders the row)
+# and is stripped by _gridrow_blockdata into _GridRow.no_newline -- it never becomes cell
+# text (unforgeable + copy-safe). A plain object() so it can never equal a QTextCharFormat.
+_NO_NL_SENTINEL = object()
+
+
+def _blk_flags(block):
+    """QTextBlock.userState() as a non-negative bitfield. Qt returns -1 when the state was
+    never set; -1 & bit is truthy in Python (arbitrary-precision two's complement), so an
+    unset block would spuriously match every bit -- floor to 0 first."""
+    st = block.userState()
+    return st if st > 0 else 0
 
 
 class _GridRow(QTextBlockUserData):
@@ -416,9 +431,10 @@ class _GridRow(QTextBlockUserData):
     formats are not readable via charFormat(), so the code point that hover / copy
     / transcript need is kept here too (see _run_cp_at / _block_runs)."""
 
-    def __init__(self, runs):
+    def __init__(self, runs, no_newline=False):
         super().__init__()
         self.runs = runs
+        self.no_newline = no_newline
 
 
 class _GridHighlighter(QSyntaxHighlighter):
@@ -434,6 +450,33 @@ class _GridHighlighter(QSyntaxHighlighter):
         if isinstance(data, _GridRow):
             for offset, length, fmt, _cp in data.runs:
                 self.setFormat(offset, length, fmt)
+
+
+# Padding (px) on each side of the gutter glyph, so the strip stays narrow.
+_GUTTER_PAD = 3
+
+
+class _GutterArea(QWidget):
+    """Left-margin per-line annotation strip (the standard QPlainTextEdit
+    line-number-area pattern). It is CHROME, not document text: its glyphs are painted
+    here and never enter the selectable/copyable document. Painting and hover
+    hit-testing live on the editor; this widget only sizes itself and forwards events.
+    Today it marks lines whose command output had no trailing newline; it is a general
+    channel for future per-line markers (neutralized-escape, OSC-activity)."""
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self._editor = editor
+        self.setMouseTracking(True)   # hover -> tooltip with no button pressed
+
+    def sizeHint(self):
+        return QSize(self._editor._gutter_width_px(), 0)
+
+    def paintEvent(self, event):
+        self._editor._paint_gutter(event)
+
+    def mouseMoveEvent(self, event):
+        self._editor._gutter_hover(event)
 
 
 # Human-readable gloss for each risk class (marking_class), for the click popup.
@@ -1140,6 +1183,15 @@ class SecureTerminal(QPlainTextEdit):
         self._tui_follow = True
         self._programmatic_scroll = False
         self.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
+        # Left gutter: per-line annotation strip (no-trailing-newline marker). The
+        # standard line-number-area wiring -- reserve its margin on a block-count
+        # change, scroll/repaint it on updateRequest. Position + width are set here and
+        # kept in step by _apply_font / resizeEvent.
+        self._gutter = _GutterArea(self)
+        self.blockCountChanged.connect(self._update_gutter_width)
+        self.updateRequest.connect(self._update_gutter_area)
+        self._update_gutter_width()
+        self._position_gutter()
         # True while the user is dragging a text selection. The TUI grid is rebuilt
         # (_delete_grid + _append_grid) every ~16ms frame; doing that under an active
         # selection re-anchors it and drags it to the document bottom (the reported
@@ -1393,6 +1445,10 @@ class SecureTerminal(QPlainTextEdit):
                 pass                 # per-feature control needs Qt >= 6.7; skip
         font.setPointSize(size)
         self.setFont(font)
+        # The glyph size drives the gutter width; re-reserve + reposition it (both
+        # self-guard before the gutter exists, for the ctor's first _apply_font).
+        self._update_gutter_width()
+        self._position_gutter()
         if sync:
             # Push the new glyph size through to the pty winsize, exactly as
             # resizeEvent does for a viewport resize: a zoom changes how many
@@ -2023,7 +2079,131 @@ class SecureTerminal(QPlainTextEdit):
         if px == self._chrome_top_inset:
             return
         self._chrome_top_inset = px
-        self.setViewportMargins(0, px, 0, 0)
+        self._apply_viewport_margins()
+        self._position_gutter()
+
+    # -- left gutter (per-line no-trailing-newline marker) --------------------
+
+    def _gutter_width_px(self):
+        """Width of the left annotation strip: one glyph cell plus padding. Scales with
+        the font so a zoom keeps it proportionate; a constant strip means enabling it
+        SIGWINCHes the child once at startup, never per notice (no flicker loop)."""
+        return self.fontMetrics().horizontalAdvance('M') + 2 * _GUTTER_PAD
+
+    def _apply_viewport_margins(self):
+        """Set both reserved insets at once (Qt has a single setViewportMargins): the
+        LEFT gutter strip and the TOP banner band. Called from either owner so neither
+        clobbers the other's margin."""
+        # Both insets are read defensively: __init__ calls _apply_font (hence this) before
+        # either _gutter or _chrome_top_inset exists.
+        left = self._gutter_width_px() if getattr(self, '_gutter', None) else 0
+        self.setViewportMargins(left, getattr(self, '_chrome_top_inset', 0), 0, 0)
+
+    def _update_gutter_width(self, _count=0):
+        """Re-reserve the gutter margin (font/zoom change, block-count change)."""
+        self._apply_viewport_margins()
+
+    def _update_gutter_area(self, rect, dy):
+        """Scroll/repaint the gutter in step with the viewport (updateRequest). Wired only
+        after _gutter exists, so no None-guard is needed."""
+        g = self._gutter
+        if dy:
+            g.scroll(0, dy)
+        else:
+            g.update(0, rect.y(), g.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_gutter_width()
+
+    def _position_gutter(self):
+        """Align the gutter strip with the viewport: same top/height, its own width,
+        pinned to the content's left edge. Block y-coordinates are viewport-relative, so
+        an aligned top lets the paint map them straight to gutter coordinates."""
+        g = getattr(self, '_gutter', None)
+        if g is None:
+            return
+        vp = self.viewport().geometry()
+        g.setGeometry(QRect(self.contentsRect().left(), vp.top(),
+                            self._gutter_width_px(), vp.height()))
+
+    def _block_no_newline(self, block):
+        """True if `block`'s line carries the no-trailing-newline annotation, in BOTH
+        render paths: a TUI grid block records it on its _GridRow; a CLI line block
+        records it as a userState bit. Neither is document content, so it is unforgeable
+        (a program cannot print its way into either channel) and copy-safe."""
+        data = block.userData()
+        if isinstance(data, _GridRow):
+            return data.no_newline
+        return bool(_blk_flags(block) & _BLK_NO_NEWLINE)
+
+    def _gutter_blocks(self):
+        """Yield (block, top_y, bottom_y) for each visible block, in gutter/viewport
+        coordinates."""
+        block = self.firstVisibleBlock()
+        offset = self.contentOffset()
+        while block.isValid():
+            geo = self.blockBoundingGeometry(block).translated(offset)
+            top = int(geo.top())
+            bottom = int(geo.bottom())
+            if top > self.viewport().height():
+                break
+            if block.isVisible():
+                yield block, top, bottom
+            block = block.next()
+
+    def _paint_gutter(self, event):
+        """Draw the per-line markers. Same-coloured background as the terminal keeps the
+        strip unobtrusive; a muted return-arrow glyph marks each no-trailing-newline
+        line. Font-independent (drawn with QPainter, no glyph font dependency) and
+        ASCII-only in source. Called only from the gutter widget's own paintEvent, so
+        self._gutter is always live here."""
+        painter = QPainter(self._gutter)
+        base = self.palette().color(QPalette.ColorRole.Base)
+        painter.fillRect(event.rect(), base)
+        fg = self.palette().color(QPalette.ColorRole.Text)
+        fg.setAlpha(150)                          # muted: a note, not program output
+        for block, top, bottom in self._gutter_blocks():
+            if bottom < event.rect().top() or top > event.rect().bottom():
+                continue
+            if self._block_no_newline(block):
+                self._draw_no_newline_glyph(painter, top, bottom - top, fg)
+        painter.end()
+
+    def _draw_no_newline_glyph(self, painter, top, height, color):
+        """A small return-arrow (down then left, with a head) centred in the row: the
+        universal 'a newline belongs here' mark, flagging that this line lacked one."""
+        w = self._gutter_width_px()
+        cx = w // 2
+        h = min(height, self.fontMetrics().height())
+        mid = top + height // 2
+        a = max(2, h // 4)                         # arm half-length
+        pen = QPen(color)
+        pen.setWidth(max(1, self.fontMetrics().height() // 12))
+        painter.setPen(pen)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # vertical stroke down, then left along the baseline (the return hook)
+        painter.drawLine(cx + a, mid - a, cx + a, mid + a)
+        painter.drawLine(cx + a, mid + a, cx - a, mid + a)
+        # arrowhead at the left end
+        painter.drawLine(cx - a, mid + a, cx - a + a, mid + a - a)
+        painter.drawLine(cx - a, mid + a, cx - a + a, mid + a + a)
+
+    def _block_at_gutter_y(self, y):
+        """The visible block whose row contains gutter-local y, or None."""
+        for block, top, bottom in self._gutter_blocks():
+            if top <= y <= bottom:
+                return block
+        return None
+
+    def _gutter_hover(self, event):
+        """Show the tooltip when the pointer is over a marked line's glyph."""
+        y = event.position().toPoint().y()
+        block = self._block_at_gutter_y(y)
+        if block is not None and self._block_no_newline(block):
+            QToolTip.showText(event.globalPosition().toPoint(),
+                              'This line has no trailing newline',
+                              getattr(self, '_gutter', self))
+        else:
+            QToolTip.hideText()
 
     def _grid_size(self):
         """Columns and rows that fit the viewport at the current font. Used for
@@ -2409,6 +2589,11 @@ class SecureTerminal(QPlainTextEdit):
                 run_text, run_fmt = ch, fmt
         if run_text:
             runs.append((run_text, run_fmt))
+        if getattr(row, 'no_newline', False):
+            # Fold the no-trailing-newline flag into the row's runs (its reconcile
+            # signature) so a pure-flag change re-renders the row; _gridrow_blockdata
+            # strips this sentinel into _GridRow.no_newline rather than emitting text.
+            runs.append(('', _NO_NL_SENTINEL))
         return runs
 
     def _grid_signatures(self, screen):
@@ -2465,14 +2650,21 @@ class SecureTerminal(QPlainTextEdit):
         runs = []
         parts = []
         offset = 0
+        no_newline = False
         for text, fmt in cell_runs:
+            if fmt is _NO_NL_SENTINEL:
+                # Synthetic no-trailing-newline marker (see _grid_row_runs): record it as
+                # a block annotation and drop it -- it contributes no text, so the marker
+                # never enters the document (unforgeable + copy-safe).
+                no_newline = True
+                continue
             length = len(text) + sum(ord(ch) > 0xFFFF for ch in text)   # UTF-16 units
             # _grid_row_runs always yields a real QTextCharFormat (pyrefly types it Optional).
             cp = fmt.property(_CP_PROP)  # pyrefly: ignore[missing-attribute]
             runs.append((offset, length, fmt, None if cp is None else int(cp)))
             parts.append(text)
             offset += length
-        return ''.join(parts), runs
+        return ''.join(parts), runs, no_newline
 
     def _insert_grid_row(self, cursor, row, columns, cell_runs=None):
         """Insert one pyte row at the cursor as PLAIN text, recording its format
@@ -2484,10 +2676,10 @@ class SecureTerminal(QPlainTextEdit):
         if cell_runs is None:
             cell_runs = self._grid_row_runs(row, columns)
         block_pos = cursor.position()
-        text, runs = self._gridrow_blockdata(cell_runs)
+        text, runs, no_newline = self._gridrow_blockdata(cell_runs)
         cursor.insertText(text)
         block = self.document().findBlock(block_pos)
-        block.setUserData(_GridRow(runs))
+        block.setUserData(_GridRow(runs, no_newline))
         self._grid_hl.rehighlightBlock(block)
 
     def _replace_grid_rows(self, start, cell_runs_list):
@@ -2502,14 +2694,14 @@ class SecureTerminal(QPlainTextEdit):
         grid_top = doc.blockCount() - self._grid_rows
         for i, cell_runs in enumerate(cell_runs_list):
             num = grid_top + start + i
-            text, runs = self._gridrow_blockdata(cell_runs)
+            text, runs, no_newline = self._gridrow_blockdata(cell_runs)
             cur = QTextCursor(doc.findBlockByNumber(num))
             cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
             cur.movePosition(QTextCursor.MoveOperation.EndOfBlock,
                              QTextCursor.MoveMode.KeepAnchor)
             cur.insertText(text)                 # replaces the selected old row text
             block = doc.findBlockByNumber(num)   # same block (no newline added)
-            block.setUserData(_GridRow(runs))
+            block.setUserData(_GridRow(runs, no_newline))
             self._grid_hl.rehighlightBlock(block)
 
     def _delete_grid(self, keep=0):
@@ -3567,8 +3759,15 @@ class SecureTerminal(QPlainTextEdit):
             if (scr is not None and self._alt_saved is None
                     and 0 < scr.cursor.x < scr.columns
                     and _printable_follows(part.decode('latin-1'), 0)):
-                # note the missing final newline, then break (mirrors the CLI cell path)
-                prefix = _NO_NEWLINE_TUI_BYTES + b'\r\n' + prefix
+                # Flag the un-terminated row for the left gutter, then break (mirrors the
+                # CLI cell path). The flag rides the pyte ROW OBJECT, so it scrolls into
+                # history with the row (identity preserved) rather than living as cell
+                # content -- unforgeable and copy-safe. Mark the row dirty so the next
+                # frame re-renders it and stamps the gutter annotation onto its block.
+                y = min(scr.cursor.y, scr.lines - 1)
+                scr.buffer[y].no_newline = True
+                scr.dirty.add(y)
+                prefix = b'\r\n' + prefix
             self._feed_stream(prefix + _PROMPT_START_BYTES + part)
 
     def _feed_stream(self, data):
@@ -4256,7 +4455,14 @@ class SecureTerminal(QPlainTextEdit):
                 # a soft-autowrap break: a real newline for display, but the new
                 # block is marked a continuation so copy joins the wrapped rows.
                 edit.insertText('\n')
-                edit.block().setUserState(1)
+                blk = edit.block()
+                blk.setUserState(_blk_flags(blk) | _BLK_WRAP_CONT)
+            elif key == _NO_NEWLINE_KEY:
+                # the no-trailing-newline marker: inserts NO text (unforgeable and
+                # copy-safe), only annotates this line's block so the left gutter
+                # paints its glyph. OR-in, so a wrapped last row keeps its cont bit.
+                blk = edit.block()
+                blk.setUserState(_blk_flags(blk) | _BLK_NO_NEWLINE)
             else:
                 edit.insertText(text, self._fmt_from_key(key))
         disp = cells_display_col(self._line_cells, self._line_col, self._mode)
@@ -4463,7 +4669,7 @@ class SecureTerminal(QPlainTextEdit):
 
     def _selection_text(self):
         """The current selection as it would leave the widget: soft-autowrapped
-        rows (blocks _paint_line marked with userState 1) are joined so a line that
+        rows (blocks _paint_line marks with the _BLK_WRAP_CONT bit) are joined so a line that
         wrapped at the terminal width copies as one line, like a real terminal --
         not with a spurious newline at each wrap -- and each neutralized placeholder
         is mapped back to ASCII per _export_selection_fragment. '' if nothing
@@ -4478,7 +4684,7 @@ class SecureTerminal(QPlainTextEdit):
         parts: list = []
         block = doc.findBlock(start)
         while block.isValid() and block.position() <= end:
-            if parts and block.userState() != 1:      # 1 == wrap continuation
+            if parts and not (_blk_flags(block) & _BLK_WRAP_CONT):
                 parts.append('\n')
             # Walk per-run (grid _GridRow or line fragments) so each carries its own
             # source code point -- the only way to keep a real Show-mode U+2423/U+25A1
@@ -5112,6 +5318,7 @@ class SecureTerminal(QPlainTextEdit):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._position_gutter()
         if self.tui_active() or (self._alt_screen and self._screen is not None):
             # TUI mode, or a full-screen program held in the background while in
             # line mode: keep the pyte screen and the pty at the (scrollbar-
@@ -5419,15 +5626,15 @@ class SecureTerminal(QPlainTextEdit):
 
     def _line_range_at(self, point):
         """(start, end) doc positions of the LOGICAL line under the point -- the block
-        plus any following soft-wrap continuation rows (marked userState()==1) -- with
+        plus any following soft-wrap continuation rows (the _BLK_WRAP_CONT bit) -- with
         trailing blank cells trimmed to the last glyph (as VTE/kitty do, so a hidden
         trailing tail cannot ride onto the clipboard)."""
         block = self.cursorForPosition(point).block()
         start = block
-        while start.userState() == 1 and start.previous().isValid():
+        while (_blk_flags(start) & _BLK_WRAP_CONT) and start.previous().isValid():
             start = start.previous()
         end = block
-        while end.next().isValid() and end.next().userState() == 1:
+        while end.next().isValid() and (_blk_flags(end.next()) & _BLK_WRAP_CONT):
             end = end.next()
         doc = self.document()
         a = start.position()

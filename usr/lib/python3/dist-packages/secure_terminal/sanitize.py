@@ -709,13 +709,16 @@ _UNBOUNDED_MAX_COL = 8192
 # starts fresh (below), and, in terminal.py, to reset a leftover colour.
 PROMPT_START = '\x1b[?2004h'
 
-# Shown at the end of a command's output that ended WITHOUT a final newline, right
-# before the shell's next prompt (bash order), so the missing terminator is explicit
-# rather than silently swallowed. Pure ASCII (stays inert under the T1/T9 proofs); a
-# fixed gray SGR state so it reads as the terminal's own note, distinct from program
-# output (the tint only shows when colours are on -- otherwise it renders plainly).
-_NO_NEWLINE_TEXT = ' [no newline]'
-_NO_NEWLINE_STATE = (('bg', None), ('bold', False), ('fg', '#808080'))
+# A command's output that ended WITHOUT a final newline (right before the shell's next
+# prompt, bash order) is flagged by ONE marker cell appended to the flushed line, NOT by
+# inline text. Its state carries an internal, non-SGR key ('_no_newline'); parse_sgr only
+# ever produces the standard SGR keys (fg/bg/bold/...), so a program printing "[no newline]"
+# or grey text can never forge it. cells_to_runs suppresses the cell's display (it emits the
+# _NO_NEWLINE_KEY run with NO text), so the marker is neither rendered into the document nor
+# copyable; the widget keys on that run to paint the left-gutter "no trailing newline" glyph.
+# The ' ' char is a never-displayed placeholder (the render intercepts on the state key).
+_NO_NEWLINE_STATE = (('_no_newline', True),)
+_NO_NEWLINE_MARK = (' ', _NO_NEWLINE_STATE)
 
 
 def _printable_follows(raw, i):
@@ -995,11 +998,12 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                 # follows stock-bash behaviour, gluing to any leftover output.)
                 j = i + len(PROMPT_START)
                 if col != 0 and _printable_follows(raw, j):
-                    # Note the missing final newline before ending the line: a faint,
-                    # ST-styled marker (safe ASCII cells) so the swallowed terminator
-                    # is visible. Appended to the line being flushed, not the fresh
-                    # one, so it sits at the end of the command's output.
-                    cells += [(_mc, _NO_NEWLINE_STATE) for _mc in _NO_NEWLINE_TEXT]
+                    # Flag the missing final newline with ONE internal marker cell on
+                    # the line being flushed (not the fresh one), so it sits at the end
+                    # of the command's output. The cell is suppressed on render (see
+                    # cells_to_runs) -- unforgeable and copy-safe -- and drives the
+                    # left-gutter glyph instead of inline text.
+                    cells.append(_NO_NEWLINE_MARK)
                     completed.append(cells)
                     # A line filled to the width is in the pending-wrap state, so
                     # ending it here is a SOFT autowrap (the prompt continues on
@@ -1348,6 +1352,12 @@ MARK_KEY = '\x00mark'
 # reaching `wrap` cells wraps before any later \n.
 WRAP_NL = '\x00wrap'
 
+# sentinel key for the no-trailing-newline marker cell (_NO_NEWLINE_MARK). cells_to_runs
+# emits it as a run carrying NO display text, so the marker never enters the document
+# (unforgeable + copy-safe); the widget keys on it to paint the left-gutter glyph on that
+# line. A general per-line annotation channel (future: neutralized-escape, OSC-activity).
+_NO_NEWLINE_KEY = '\x00nonl'
+
 # Beyond this many runs, stop per-character marking colour so a flood of
 # alternating safe/marking characters re-coalesces into a few plain runs instead
 # of one Qt insert per character -- preserving the flood-coalescing guard. A
@@ -1428,7 +1438,13 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
 
     for idx, cellline in enumerate(lines):
         for ch, key in (_collapse_zalgo_runs(cellline) if mode == 'show' else cellline):
-            emit(ch, key)
+            if key == _NO_NEWLINE_STATE:
+                # Internal no-trailing-newline marker: emit a run with NO display text
+                # (so it is neither shown nor copyable) whose key the widget recognizes
+                # to paint the left-gutter glyph. Program SGR can never produce this key.
+                add('', _NO_NEWLINE_KEY)
+            else:
+                emit(ch, key)
         # a newline that ended a soft autowrap is tagged so the widget can join
         # the wrapped rows on copy (see WRAP_NL); a real line break stays None.
         soft = wraps is not None and idx < len(wraps) and wraps[idx]
