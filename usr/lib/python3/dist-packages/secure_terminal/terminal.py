@@ -3884,6 +3884,10 @@ class SecureTerminal(QPlainTextEdit):
         if board is None:  # pragma: no cover - clipboard() is non-None under a running QApplication
             return
         raw = (board.text() or '').encode('utf-8', 'replace')[:_OSC_CLIP_MAX]
+        # the byte cap can slice a multi-byte character mid-sequence; drop the
+        # trailing partial so the child always receives valid UTF-8 (the source was
+        # encoded with 'replace', so decode-ignore removes ONLY that cut fragment).
+        raw = raw.decode('utf-8', 'ignore').encode('utf-8')
         reply = b'\x1b]52;c;' + base64.b64encode(raw) + b'\x07'
         if self._write(reply) is False:
             # A slow/gone child left the ~87 KiB reply truncated -- its buffered prefix
