@@ -1096,6 +1096,8 @@ class SecureTerminal(QPlainTextEdit):
         self._command_exec_failed = False  # set by _start: the -e program could not exec
         self._spawn_exe = None             # set by _start: /proc exe of the spawned child (an
         #                                    unforgeable baseline: detect an `exec`-replaced shell)
+        self._spawn_starttime = None       # set by _start: /proc/<pid>/stat starttime baseline
+        #                                    (identify THIS child across a freed+reused pid)
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -3463,6 +3465,12 @@ class SecureTerminal(QPlainTextEdit):
         # a login shell REPLACED via the `exec` builtin (same pid + pgrp). exe is used, not
         # comm, because comm is child-writable (spoofable) and exe is not.
         self._spawn_exe = None if self._command_exec_failed else self._read_exe(pid)
+        # Baseline the child's /proc start-time too: reap_pty_children (SIGCHLD) frees the
+        # pid for OS reuse the instant the child exits, but self._pid is not cleared until
+        # the EOF-driven _release_pty -- so in that window a pid-trusting reader must confirm
+        # the pid still names THIS child. starttime (field 22) is unique per pid incarnation.
+        self._spawn_starttime = (None if self._command_exec_failed
+                                 else self._pid_start_time(pid))
         SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
         self._fd = fd
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -4895,6 +4903,8 @@ class SecureTerminal(QPlainTextEdit):
         informative default than a static "shell": it tracks where you are as you
         cd around."""
         pgrp = self._foreground_pgrp()
+        if pgrp is None and not self._pid_is_current_child():
+            return None     # only the shell pid to read, and it is gone / freed + reused
         pid = pgrp if pgrp is not None else self._pid
         if pid is None:
             return None
@@ -4911,8 +4921,8 @@ class SecureTerminal(QPlainTextEdit):
         """The SHELL's full working directory (where the prompt sits), for saving a
         session tab so it restores in the same place. Always the shell pid (not the
         foreground pgrp): that is the canonical prompt location. '' if unreadable."""
-        if self._pid is None:
-            return ''
+        if not self._pid_is_current_child():
+            return ''       # no child, or self._pid was freed and reused by a stranger
         try:
             return os.readlink('/proc/%d/cwd' % self._pid)
         except OSError:
@@ -4935,6 +4945,40 @@ class SecureTerminal(QPlainTextEdit):
         # which the panic Terminate would then kill. Strip it so both reads normalize.
         deleted = ' (deleted)'
         return target[:-len(deleted)] if target.endswith(deleted) else target
+
+    @staticmethod
+    def _pid_start_time(pid):
+        """Field 22 (starttime, clock ticks since boot) of /proc/<pid>/stat, or None. It is
+        FIXED for a pid's lifetime and differs for the next process that reuses the pid, so
+        (pid, starttime) identifies THIS child even after the pid is freed. field 2 (comm) may
+        contain spaces and parentheses, so parse everything AFTER the last ')': field 3
+        (state) is then index 0, and starttime (field 22) is index 19."""
+        try:
+            with open('/proc/%d/stat' % pid, 'rb') as handle:
+                data = handle.read()
+        except OSError:
+            return None
+        rparen = data.rfind(b')')
+        if rparen < 0:
+            return None
+        fields = data[rparen + 2:].split()
+        try:
+            return int(fields[19])
+        except (IndexError, ValueError):
+            return None
+
+    def _pid_is_current_child(self):
+        """True only while self._pid still names OUR spawned child, not a reused pid. Guards
+        the pid-reuse TOCTOU: after the child exits, reap_pty_children frees the pid before
+        _release_pty clears self._pid, so getpgid(self._pid) / /proc/<self._pid> would trust
+        whatever process reused the slot. Compare the live /proc start-time to the spawn
+        baseline. Falls back to True when no baseline was captured (unreadable at spawn), to
+        preserve the prior behaviour rather than over-refuse."""
+        if self._pid is None:
+            return False
+        if self._spawn_starttime is None:
+            return True
+        return self._pid_start_time(self._pid) == self._spawn_starttime
 
     def _child_execd(self):
         """True when a LOGIN-shell tab's direct child has been REPLACED via the shell
@@ -4966,6 +5010,11 @@ class SecureTerminal(QPlainTextEdit):
         pgrp = self._foreground_pgrp()
         if pgrp is None:
             return False
+        if self._pid is not None and not self._pid_is_current_child():
+            # our child exited: the pid is gone, or was freed and reused by a stranger.
+            # Nothing of ours holds the foreground (same outcome as the getpgid
+            # ProcessLookupError path below, but also closed against a REUSED pid).
+            return False
         try:
             child_pgrp = os.getpgid(self._pid) if self._pid is not None else None
         except ProcessLookupError:
@@ -4996,6 +5045,10 @@ class SecureTerminal(QPlainTextEdit):
         # secure-terminal itself. A child always runs in its own pty session, so a
         # match here means the foreground pgrp was misresolved -- refuse it.
         if pgrp == os.getpgrp():
+            return False
+        if self._pid is not None and not self._pid_is_current_child():
+            # our child exited (pid gone / freed + reused): nothing of ours to signal, and
+            # we must not trust a reused self._pid below (nor killpg a coincidental match).
             return False
         # The direct child is in the foreground: a bare LOGIN-shell prompt (nothing
         # to terminate), but for a `-- PROGRAM` tab that child IS the program to kill.
