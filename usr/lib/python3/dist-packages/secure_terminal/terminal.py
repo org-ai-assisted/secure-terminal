@@ -1852,11 +1852,14 @@ class SecureTerminal(QPlainTextEdit):
             # TUI feeds the RAW chunk (no feed_chunk_carry), so reassemble a split OSC here
             # -- else a split introducer or a split OSC-52 '?' would evade or misclassify the
             # advisory (CLI arrives already reassembled and skips this; its _notice_carry stays
-            # empty). Hold the incomplete trailing OSC EXACTLY as _handle_osc's carry does: the
-            # LAST unterminated "\x1b]" introducer, or a bare trailing "\x1b" -- same rfind +
-            # terminator check + cap. An earlier, never-completed introducer is abandoned (a raw
-            # ESC in an OSC's params ends it under _OSC_ANY, so the trailing well-formed OSC is
-            # what completes). Matching the enforcement's reassembly keeps them from diverging.
+            # empty). Hold the incomplete trailing OSC with _handle_osc's core carry: the LAST
+            # unterminated "\x1b]" introducer, or a bare trailing "\x1b" (rfind + terminator
+            # check + cap). An earlier, never-completed introducer is abandoned (a raw ESC in an
+            # OSC's params ends it under _OSC_ANY, so the trailing well-formed OSC is what
+            # completes). This is a str view of the byte enforcement (the cap counts chars, and
+            # the OSC-8 opener-pairing holdback is not mirrored), so on an adversarial multi-byte
+            # or bundled-OSC-8 edge it can only ERR toward over-advising -- never toward missing a
+            # refused OSC. Byte-exact parity would need a bytes rewrite of this path (follow-up).
             text = self._notice_carry + text
             self._notice_carry = ''
             carry_at = len(text) if text.endswith('\x1b') else -1
