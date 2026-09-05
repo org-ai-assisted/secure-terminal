@@ -2343,7 +2343,6 @@ class SecureTerminal(QPlainTextEdit):
         # on the SIGWINCH from the new winsize, so do not force a render here (that
         # would flash a blank frame). The document keeps the last frame until the
         # program's redraw arrives.
-        old_cols = self._screen.columns
         self._screen.resize(rows, cols)
         # pyte.Screen.resize() does NOT clamp the cursor on a shrink, so a subsequent
         # \r-only redraw (an ordinary status/spinner) would write to a now-out-of-range
@@ -2351,15 +2350,15 @@ class SecureTerminal(QPlainTextEdit):
         # (a display-integrity/spoofing bug). Clamp it into the new grid, as the render
         # paths (_grid_signatures, _place_grid_cursor) already do for their reads.
         self._screen.cursor.y = min(self._screen.cursor.y, rows - 1)
-        # Clamp cursor.x ONLY on a WIDTH shrink, to the last real column (cols - 1). A
-        # HEIGHT-only resize leaves cursor.x untouched so pyte's pending-autowrap state
-        # survives -- a line filled exactly to the last column encodes cursor.x == columns,
-        # which pyte.Screen.resize never changes. The old blanket min(x, cols-1) ran on EVERY
-        # resize and demoted that pending-wrap, so the next byte overwrote instead of
-        # wrapping. (On a shrink, cols-1 is correct: a cursor past the new edge is a real
-        # position clipped in, not pending-wrap, so it must land on the last column.)
-        if cols < old_cols:
-            self._screen.cursor.x = min(self._screen.cursor.x, cols - 1)
+        # Clamp cursor.x ONLY when it lands BEYOND the new width (x > cols): a cursor left past
+        # the new grid by a wider->narrower resize drops to the last real column (cols - 1). A
+        # cursor AT the boundary (x == cols) is pyte's pending-autowrap state -- a line filled
+        # exactly to the last column, which pyte.Screen.resize never changes -- and is LEFT
+        # as-is so the next byte WRAPS instead of overwriting. This covers both a height-only
+        # resize (cols unchanged, x possibly == cols) and a width shrink to exactly the filled
+        # width; the old blanket clamp demoted that pending-wrap on every resize.
+        if self._screen.cursor.x > cols:
+            self._screen.cursor.x = cols - 1
         self._set_winsize(cols, rows)
 
     def _pyte_qcolor(self, color, default, bright=False):
