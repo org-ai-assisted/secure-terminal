@@ -90,7 +90,10 @@ def cap_text(text, scrollback):
 
 
 def _write_atomic(path, text):
-    tmp = path + '.tmp'
+    # Per-process temp name: two instances saving the same file concurrently must not
+    # share one '.tmp' inode, or their writes interleave into a corrupt file before the
+    # os.replace. os.replace is atomic, so the last writer wins cleanly.
+    tmp = '%s.tmp.%d' % (path, os.getpid())
     # 0o600: session logs and state are sensitive terminal history; never create them
     # world-readable (a bare open() would land at 0644 under a typical umask).
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
