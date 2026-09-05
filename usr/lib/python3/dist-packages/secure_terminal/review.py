@@ -22,9 +22,10 @@ readout). There is NO separate hidden edit box and NO separate read-only mirror:
 box the user edits and the preview of what crosses are the same surface, so a
 "works live, wrong in the review box" divergence cannot recur.
 
-The box OPENS in the default "Keep printable unicode" state -- every invisible /
-bidi / control character dropped, visible glyphs (INCLUDING look-alikes) kept,
-revealed and editable. The four actions each carry a house-style hover tooltip:
+The box OPENS FULLY REVEALED -- every invisible / bidi / control character shown as
+a named badge in place, look-alikes tinted, NOTHING pre-dropped, so the trap is
+EVIDENCE seen before choosing; it is revealed and editable. The actions each carry a
+house-style hover tooltip:
 
   [Strip unicode]  delete ALL non-ASCII, NO mapping (Cyrillic a is REMOVED, never
                    mapped to Latin a), so a homoglyph-spoofed domain reads visibly
@@ -38,27 +39,32 @@ revealed and editable. The four actions each carry a house-style hover tooltip:
                    defense-in-depth, so a re-paste into the box cannot smuggle an
                    invisible past review).
 
-Only Reject is coloured safe-green: the one unconditionally-safe choice (nothing
-crosses), never gated -- Esc rejects from anywhere. The Deliver button stays gated
-by the anti-fat-finger countdown for a PASTE (re-armed on every edit and transform,
-so the currently-shown buffer always gets the full delay); a copy has no countdown.
-Delivery is dispatched back to the tab that held the text, the only path that lets
-it cross.
+The two terminal choices anchor a bottom action row at OPPOSITE ends (Reject left,
+Deliver right -- Qt/Linux platform order), so the safe/dangerous pair can't be
+fat-fingered for each other; Restore original moves out of the decisions into the
+transform toolbar (it resets the box, it is not an outcome). Only Reject is coloured
+safe-green: the one unconditionally-safe choice (nothing crosses), never gated -- Esc
+rejects from anywhere. The Deliver button stays gated by the anti-fat-finger countdown
+for a PASTE, armed on a BULK change (open, a transform, Restore) so the freshly-shown
+buffer gets the full delay; ordinary trimming keeps the running countdown rather than
+restarting it per keystroke. A copy has no countdown. Delivery is dispatched back to the
+tab that held the text, the only path that lets it cross.
 """
 
 from typing import NotRequired, TypedDict, cast
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton,
+    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton, QFrame, QSizePolicy,
 )
 
 from secure_terminal.sanitize import (
-    classify_paste, classify_paste_detail,
+    BASE_POINT_SIZE, classify_paste, classify_paste_detail,
     sanitize_clipboard, sanitize_clipboard_unicode, ascii_fold_display,
 )
-from secure_terminal.terminal import SecureTerminal
+from secure_terminal.terminal import SecureTerminal, route_ctrl_wheel_zoom
 from secure_terminal.revealed_editor import RevealedEditor
 
 # Semantic colours -- the app's green=safe traffic light, matching the main window
@@ -100,7 +106,8 @@ _CLASS_ROWS = tuple(
 # Absent classes, the box-drawing row, and the informational Length row: no risk, muted.
 _MUTED_FG = '#888888'
 _LINES_GLYPH = chr(0x00B6)   # pilcrow, for the Lines row
-_SAFE_GLYPH = chr(0x2713)    # check: the never-auto-run guarantee is met
+_SAFE_GLYPH = chr(0x2713)    # check: a criterion is met (never-auto-run, or a verdict row)
+_CROSS_GLYPH = chr(0x2717)   # ballot X: a verdict criterion not yet met
 _CAUTION_GLYPH = chr(0x25B2)  # up-triangle: accepted, but delivery is not a waiting command line
 # Shown (safe-green) when a reviewed paste hides nothing -- a positive all-clear so an
 # ASCII-only paste held for another reason (a multi-line paste) reads as safe.
@@ -205,13 +212,25 @@ class ReviewBar(QWidget):
         self.setObjectName('reviewbar')
         self.setVisible(False)
 
+        # Zoom follows the reviewed tab (set in _sync_appearance) and scales EVERY text
+        # widget in the bar, not just the editor, so the whole review reads at one size.
+        # The widget groups are (re)assigned at the end of __init__; init them empty first
+        # so an early resizeEvent during construction is a safe no-op.
+        self._zoom = 100
+        self._zoom_widgets = ()
+        self._zoom_caps = ()
+        # Narrow (mobile-width) mode: the transform captions hide and the buttons take
+        # their SHORT labels, so the row fits instead of clipping. Set in resizeEvent.
+        self._narrow = False
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 6)
         outer.setSpacing(6)
 
-        # summary row: risk dot, the "what is hidden" headline, then the three DECISIONS
-        # -- Show original (reset to the revealed trap), Reject (safe backout), Deliver
-        # (content-driven). The transforms live in their own group below.
+        # CONTEXT row (top): risk dot + the "what is hidden" headline ONLY. The decisions
+        # live in a fixed action row at the BOTTOM (below the evidence), so a commit never
+        # precedes the content in reading order (context -> box -> transforms -> evidence
+        # -> decide).
         row = QHBoxLayout()
         row.setSpacing(8)
         # The risk dot recolours per review: RISK_FG when something is hidden, SAFE_FG
@@ -228,40 +247,72 @@ class ReviewBar(QWidget):
         self._summary.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self._summary, 1)
-        # Restore original: revert the box to the original paste, fully revealed
-        # (discards edits + transforms, re-blocks Deliver) -- the evidence escape hatch,
-        # one click, no confirm, so re-inspecting the trap is never gated. Named for what
-        # it does (reverts the content); "show" would wrongly read as a display toggle.
-        self._restore = QPushButton('Restore original', self)
-        self._restore.setToolTip('Revert the box to the original paste with every hidden '
-                                 'character revealed again (discards your edits and any '
-                                 'transformation). Re-blocks sending until you remove them.')
-        self._restore.clicked.connect(self._do_restore)
-        row.addWidget(self._restore)
-        # Only Reject is fixed green: the one unconditionally-safe choice (nothing
-        # crosses), never gated -- Enter/Esc always back out.
-        self._reject = QPushButton('Reject', self)
-        self._reject.setStyleSheet('color:%s; font-weight:600;' % SAFE_FG)
-        self._reject.clicked.connect(lambda: self._choose('reject'))
-        row.addWidget(self._reject)
-        # Deliver is CONTENT-DRIVEN (see _update_deliver): red + disabled while any hidden
-        # (invisible/bidi/control) character remains -- a trap literally cannot be sent
-        # while it is visible -- amber when only printable unicode (look-alikes) remains,
-        # no colour when pure ASCII. The paste countdown gates it on top.
-        self._deliver = QPushButton('Paste', self)
-        self._deliver.clicked.connect(self._deliver_clicked)
-        row.addWidget(self._deliver)
         outer.addLayout(row)
 
         # THE box: editable, revealed, multi-line -- opens showing the WHOLE paste
         # (invisibles/bidi as named badges, look-alikes tinted), nothing pre-dropped, so
         # the trap is EVIDENCE you see before choosing. What is shown is what a Deliver
         # sends (re-sanitized); an edit can never bypass the neutralization, and a typed
-        # or re-pasted character is cleaned so it cannot ADD a hidden one.
+        # or re-pasted character is cleaned so it cannot ADD a hidden one. A MINIMUM height
+        # (not a fixed cap) plus expanding policy lets the resizable-bar splitter grow the
+        # box for a long paste; it only scrolls past the chosen size.
         self._editor = RevealedEditor(self)
-        self._editor.setMaximumHeight(140)
+        self._editor.setMinimumHeight(140)
+        self._editor.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                   QSizePolicy.Policy.Expanding)
         self._editor.changed.connect(self._on_edit)
-        outer.addWidget(self._editor)
+        outer.addWidget(self._editor, 1)
+
+        # The in-place transforms GLUED beneath the box (they act ON it -- proximity makes
+        # that legible), under a NEUTRAL header (they change the text; they promise
+        # nothing). Each: a technical label + a plain gloss beneath, and a green/amber tint
+        # in the app's green=safe language -- Strip + ASCII-fold give a safe ASCII result
+        # (green), Keep printable leaves the look-alikes (amber). So the button colour
+        # predicts what Deliver becomes if you click it. State-aware: a no-op transform
+        # checks + disables (see _refresh_transform_controls).
+        self._transform_header_base = 'Text transformations:'
+        header = QLabel(self._transform_header_base, self)
+        header.setStyleSheet('color:%s; font-weight:600;' % _MUTED_FG)
+        self._transform_header = header
+        outer.addWidget(header)
+        trow = QHBoxLayout()
+        trow.setSpacing(14)
+        self._trow = trow
+        self._strip, self._strip_cap = self._transform_button(
+            trow, 'Strip unicode', 'Strip', SAFE_FG, 'remove every non-ASCII character',
+            'Delete every non-ASCII character, with NO mapping -- a look-alike is removed, '
+            'not turned into the letter it imitates, so a spoofed word reads visibly '
+            'broken. Result is plain ASCII (safe to send).', self._do_strip)
+        self._fold, self._fold_cap = self._transform_button(
+            trow, 'ASCII-fold', 'Fold', SAFE_FG,
+            'replace look-alikes with the plain letter they imitate',
+            'Replace each look-alike with the ASCII character it imitates (Cyrillic a '
+            'becomes Latin a), then clean -- reveals the plain ASCII the disguise was '
+            'pretending to be. Result is plain ASCII (safe to send).', self._do_fold)
+        self._keep, self._keep_cap = self._transform_button(
+            trow, 'Keep printable unicode', 'Keep unicode', CAUTION_FG,
+            'remove invisible/reordering characters, keep the rest',
+            'Remove the invisible / reordering / control characters, but KEEP every visible '
+            'letter including any look-alikes. The visible deception survives, so this '
+            'result is caution (amber), not fully safe.', self._do_keep)
+        # Restore original: a RESET of the box (revert to the original revealed paste,
+        # discarding edits + transforms, re-blocking Deliver). It is a CONTENT op, not an
+        # outcome, so it bookends the transform toolbar (set apart by a separator), NOT
+        # the decision row. One click, no confirm, so re-inspecting the trap is never gated.
+        sep = QFrame(self)
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet('color:%s;' % _MUTED_FG)
+        trow.addWidget(sep)
+        self._restore = QPushButton('Restore original', self)
+        self._restore._base_label = 'Restore original'
+        self._restore._short_label = 'Restore'
+        self._restore.setToolTip('Revert the box to the original paste with every hidden '
+                                 'character revealed again (discards your edits and any '
+                                 'transformation). Re-blocks sending until you remove them.')
+        self._restore.clicked.connect(self._do_restore)
+        trow.addWidget(self._restore)
+        trow.addStretch(1)
+        outer.addLayout(trow)
 
         # Status line: names the CURRENT box state and which classes a transform removed
         # (never a bare ambiguous count). The badges in the box name each exact character.
@@ -270,40 +321,12 @@ class ReviewBar(QWidget):
         self._status.setWordWrap(True)
         outer.addWidget(self._status)
 
-        # The in-place transforms, under a NEUTRAL header (they change the text; they
-        # promise nothing). Each: a technical label + a plain gloss beneath, and a
-        # green/amber tint in the app's green=safe language -- Strip + ASCII-fold give a
-        # safe ASCII result (green), Keep printable leaves the look-alikes (amber). So the
-        # button colour predicts what Deliver becomes if you click it.
-        header = QLabel('Text transformations:', self)
-        header.setStyleSheet('color:%s; font-weight:600;' % _MUTED_FG)
-        outer.addWidget(header)
-        trow = QHBoxLayout()
-        trow.setSpacing(14)
-        self._strip = self._transform_button(
-            trow, 'Strip unicode', SAFE_FG, 'remove every non-ASCII character',
-            'Delete every non-ASCII character, with NO mapping -- a look-alike is removed, '
-            'not turned into the letter it imitates, so a spoofed word reads visibly '
-            'broken. Result is plain ASCII (safe to send).', self._do_strip)
-        self._fold = self._transform_button(
-            trow, 'ASCII-fold', SAFE_FG,
-            'replace look-alikes with the plain letter they imitate',
-            'Replace each look-alike with the ASCII character it imitates (Cyrillic a '
-            'becomes Latin a), then clean -- reveals the plain ASCII the disguise was '
-            'pretending to be. Result is plain ASCII (safe to send).', self._do_fold)
-        self._keep = self._transform_button(
-            trow, 'Keep printable unicode', CAUTION_FG,
-            'remove invisible/reordering characters, keep the rest',
-            'Remove the invisible / reordering / control characters, but KEEP every visible '
-            'letter including any look-alikes. The visible deception survives, so this '
-            'result is caution (amber), not fully safe.', self._do_keep)
-        trow.addStretch(1)
-        outer.addLayout(trow)
-
         # The breakdown beneath the box: a Structure section (lines, the never-auto-run
-        # guarantee, length) and a per-class hidden-character table, recomputed from the
-        # box on every change. Rich text so a glyph can carry its risk colour; selectable
-        # so the user can copy it.
+        # guarantee, length), a per-class hidden-character table, and an "Outcome if
+        # delivered now" verdict (the per-criterion "is it clean yet" readout), recomputed
+        # from the box on every change. Sits directly above the decision row, so the gate's
+        # justification is adjacent to the gated Deliver button. Rich text so a glyph can
+        # carry its risk colour; selectable so the user can copy it.
         self._detail = QLabel('', self)
         self._detail.setTextFormat(Qt.TextFormat.RichText)
         self._detail.setWordWrap(True)
@@ -311,23 +334,63 @@ class ReviewBar(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         outer.addWidget(self._detail)
 
-    def _transform_button(self, row, label, colour, gloss, tip, slot):
+        # DECISION row (bottom, AFTER the evidence): the two terminal choices at OPPOSITE
+        # ends -- Reject (safe backout, left, quiet green, Esc) and Deliver (committing,
+        # right, content-driven colour + countdown). The stretch between them separates the
+        # safe/dangerous pair so one can't be fat-fingered for the other; platform order
+        # (Qt/Linux, matching GNOME/Apple/Material) is cancel-left / affirmative-right.
+        # Reject is never gated -- Enter/Esc always back out. Deliver is CONTENT-DRIVEN
+        # (see _update_deliver): red + disabled while any hidden character remains, amber
+        # when only printable unicode remains, no colour when pure ASCII; the paste
+        # countdown gates it on top. Deliver is NEVER the Enter default (destructive).
+        drow = QHBoxLayout()
+        drow.setSpacing(8)
+        self._reject = QPushButton('Reject', self)
+        self._reject.setStyleSheet('color:%s; font-weight:600;' % SAFE_FG)
+        self._reject.clicked.connect(lambda: self._choose('reject'))
+        drow.addWidget(self._reject)
+        drow.addStretch(1)
+        self._deliver = QPushButton('Paste', self)
+        self._deliver.clicked.connect(self._deliver_clicked)
+        drow.addWidget(self._deliver)
+        outer.addLayout(drow)
+
+        # The bar's text widgets that follow tab zoom (the editor scales itself). The
+        # detail table inherits the _detail widget font. Captions scale a touch smaller
+        # (they are secondary), so they are a separate group in apply_zoom.
+        self._zoom_widgets = (
+            self._summary, self._status, self._transform_header, self._detail,
+            self._strip, self._fold, self._keep, self._restore,
+            self._reject, self._deliver,
+        )
+        self._zoom_caps = (self._strip_cap, self._fold_cap, self._keep_cap)
+
+    def _transform_button(self, row, label, short_label, colour, gloss, tip, slot):
         """One transform: a tinted technical button (colour = its result's safety, in the
         app's green=safe language) with a plain-language gloss beneath it, and the house
-        tooltip on hover. Added as its own column to `row`; returns the button."""
+        tooltip on hover. Added as its own column to `row`; returns (button, caption). The
+        base/short label, colour and gloss are stashed on the button so
+        _refresh_transform_controls can re-render its active/no-op state and pick the short
+        label on a narrow bar. No font-size in the stylesheet -- apply_zoom owns the point
+        size (captions scale a touch smaller)."""
         col = QVBoxLayout()
         col.setSpacing(1)
         btn = QPushButton(label, self)
         btn.setStyleSheet('color:%s; font-weight:600;' % colour)
         btn.setToolTip(tip)
         btn.clicked.connect(slot)
+        btn._base_label = label
+        btn._short_label = short_label
+        btn._base_colour = colour
+        btn._base_tip = tip
         col.addWidget(btn)
         cap = QLabel(gloss, self)
-        cap.setStyleSheet('color:%s; font-size:11px;' % _MUTED_FG)
+        cap.setStyleSheet('color:%s;' % _MUTED_FG)
         cap.setWordWrap(True)
+        cap._base_gloss = gloss
         col.addWidget(cap)
         row.addLayout(col)
-        return btn
+        return btn, cap
 
     # -- lifecycle ------------------------------------------------------------
     def show_review(self, term, raw, delay, kind='paste'):
@@ -353,10 +416,13 @@ class ReviewBar(QWidget):
         self._sync_appearance()
         # Open FULLY REVEALED -- the whole trap is shown (invisibles/bidi as badges),
         # nothing pre-dropped. set_source_revealed emits `changed`, which runs _on_edit
-        # -> refresh + arm-countdown, so the table + the content-driven Deliver state
-        # populate without a separate call.
+        # -> refresh (summary + breakdown + transform-control state + Deliver), so the bar
+        # populates without a separate call. _on_edit no longer arms the countdown, so arm
+        # it here explicitly -- opening a fresh paste is a bulk change that must get the
+        # full anti-fat-finger delay.
         self._editor.set_source_revealed(raw[:_BOX_MAX])
         self._set_status_reveal()
+        self._arm_countdown()
         self.setVisible(True)
         self._editor.setFocus()
 
@@ -370,15 +436,69 @@ class ReviewBar(QWidget):
         if hasattr(term, 'current_font_family'):
             self._editor.set_font_family(term.current_font_family())
         if hasattr(term, 'current_zoom'):
-            self._editor.apply_zoom(term.current_zoom())
+            zoom = term.current_zoom()
+            self._editor.apply_zoom(zoom)
+            self.apply_zoom(zoom)
 
     def _on_edit(self):
-        """The box changed (a manual edit or a transform button): refresh the summary
-        + breakdown from it, and RE-ARM the countdown so the currently-shown buffer
-        gets the full delay -- editing to new content must never inherit the original
-        text's already-elapsed countdown."""
+        """The box changed: refresh the summary, breakdown, transform-control state and
+        the Deliver button from the CURRENT box. Does NOT re-arm the anti-fat-finger
+        countdown -- a BULK change (open, a transform button, Restore) arms it explicitly,
+        so ordinary trimming keeps the already-running countdown rather than restarting the
+        full delay on every keystroke (which would never let Deliver settle while editing).
+        The hard gate (no hidden char, _blocked_count==0) is unaffected -- the countdown is
+        only anti-fat-finger, not a security control."""
         self._refresh_review()
-        self._arm_countdown()
+        self._update_deliver()
+
+    def apply_zoom(self, percent):
+        """Scale EVERY text widget in the bar to follow the tab's zoom (the editor scales
+        itself). Buttons, labels and the detail table take the base point size; the
+        transform captions are secondary, so they scale a touch smaller. Called from
+        _sync_appearance, which the window drives on open and on any live zoom change."""
+        self._zoom = max(10, min(1000, int(percent)))
+        base = max(1, round(BASE_POINT_SIZE * self._zoom / 100.0))
+        small = max(1, round(base * 0.85))
+        for w in self._zoom_widgets:
+            f = w.font()
+            f.setPointSize(base)
+            w.setFont(f)
+        for w in self._zoom_caps:
+            f = w.font()
+            f.setPointSize(small)
+            w.setFont(f)
+
+    def wheelEvent(self, event):
+        """Ctrl+wheel anywhere over the bar (the table/buttons, not only the box) zooms
+        the tab, like the terminal and the box; a plain wheel scrolls normally."""
+        if route_ctrl_wheel_zoom(self, event):
+            return
+        super().wheelEvent(event)
+
+    def resizeEvent(self, event):
+        """Responsive transform row: below a narrow threshold the plain-language captions
+        crowd AND the full button labels overflow (clipping), so hide the captions and
+        switch every toolbar button to its SHORT label (the tooltip still carries the full
+        gloss); restore both when there is room. The threshold scales with zoom because the
+        fonts do. _zoom_caps is () until the end of __init__, so an early construction
+        resize is a safe no-op."""
+        super().resizeEvent(event)
+        self._narrow = self.width() < max(1, round(560 * self._zoom / 100.0))
+        for cap in self._zoom_caps:
+            cap.setVisible(not self._narrow)
+        if self._zoom_caps:                          # widgets exist (post-construction)
+            self._restore.setText(self._btn_label(self._restore))
+            # The three transforms carry a no-op check glyph, so relabel them via the state
+            # refresh -- only when a review is open (states come from the live box).
+            if self._term is not None:
+                text = self._editor.source()
+                self._refresh_transform_controls(text, self._transform_states(text))
+
+    def _btn_label(self, btn):
+        """A toolbar button's base label for the current width -- its SHORT form on a
+        narrow bar, the full form otherwise. The no-op check glyph (transforms) is appended
+        by the caller."""
+        return btn._short_label if self._narrow else btn._base_label
 
     def _refresh_review(self):
         """Recompute the summary, risk dot and breakdown from the CURRENT box content,
@@ -390,6 +510,7 @@ class ReviewBar(QWidget):
         if term is None:
             return
         text = self._editor.source()
+        states = self._transform_states(text)
         detail = classify_paste_detail(text)
         parts = ['%d %s%s' % (n, label, '' if n == 1 else 's')
                  for label, n in classify_paste(text)]
@@ -410,14 +531,69 @@ class ReviewBar(QWidget):
                         'Reject if you cannot verify the rest]'
                         .format(_BOX_MAX, self._kind['full_note']))
         self._summary.setText(summary)
-        self._set_detail(detail, term, truncated)
+        self._refresh_transform_controls(text, states)
+        self._set_detail(detail, term, truncated, states, text)
 
-    def _set_detail(self, detail, term, truncated):
+    def _transform_states(self, text):
+        """Per-transform outcome for the CURRENT box -- the ONE source of truth for both
+        the state-aware buttons and the verdict rows. Each entry is (result, is_noop),
+        is_noop iff the transform would leave the box unchanged (result == text, functions
+        pure). `equiv` is True when Strip and Fold produce the same bytes (no look-alikes,
+        so folding maps nothing)."""
+        keep = sanitize_clipboard_unicode(text)
+        strip = sanitize_clipboard(text)
+        fold = ascii_fold_display(text)
+        return {
+            'keep': (keep, keep == text),
+            'strip': (strip, strip == text),
+            'fold': (fold, fold == text),
+            'equiv': strip == fold,
+        }
+
+    def _refresh_transform_controls(self, text, states):
+        """State-aware transforms: a no-op transform (its result already == the box) is
+        CHECKED + disabled with a 'no change' caption; an active one keeps its result-safety
+        tint and its base gloss. When ALL THREE are no-ops the box is already plain ASCII
+        with nothing hidden, so the header says so (every button checked+disabled -- the
+        pure-ASCII case). Fold, when it equals Strip (no look-alikes), says so."""
+        keep_noop = states['keep'][1]
+        strip_noop = states['strip'][1]
+        fold_noop = states['fold'][1]
+        equiv = states['equiv']
+        all_noop = keep_noop and strip_noop and fold_noop
+
+        def _apply(btn, cap, noop, active_cap):
+            label = self._btn_label(btn)
+            if noop:
+                btn.setText('%s %s' % (label, _SAFE_GLYPH))
+                btn.setEnabled(False)
+                btn.setStyleSheet('color:%s; font-weight:600;' % _MUTED_FG)
+                btn.setToolTip('Already applied -- this transform would not change the box.')
+                cap.setText('no change')
+            else:
+                btn.setText(label)
+                btn.setEnabled(True)
+                btn.setStyleSheet('color:%s; font-weight:600;' % btn._base_colour)
+                btn.setToolTip(btn._base_tip)
+                cap.setText(active_cap)
+
+        _apply(self._strip, self._strip_cap, strip_noop, self._strip_cap._base_gloss)
+        _apply(self._fold, self._fold_cap, fold_noop,
+               'same as Strip (no look-alikes)' if equiv else self._fold_cap._base_gloss)
+        _apply(self._keep, self._keep_cap, keep_noop, self._keep_cap._base_gloss)
+        self._transform_header.setText(
+            '%s  (already plain ASCII -- nothing to transform)' % self._transform_header_base
+            if all_noop else self._transform_header_base)
+
+    def _set_detail(self, detail, term, truncated, states, text):
         """Populate the breakdown label from a classify_paste_detail result: a Structure
-        section (lines, the never-auto-run guarantee for a paste, length) and a per-class
-        hidden-character table. Each present class's glyph carries its ON-SCREEN marking
-        colour (SecureTerminal.MARKING_COLORS) so the table and the terminal never
-        disagree; absent classes stay muted, so what is NOT present is explicit."""
+        section (lines, the never-auto-run guarantee for a paste, length), a per-class
+        hidden-character table, and an "Outcome if delivered now" verdict (the
+        per-criterion "is it clean yet" readout, from the same transform `states` that
+        drive the buttons -- a checked button == a satisfied row). Each present class's
+        glyph carries its ON-SCREEN marking colour (SecureTerminal.MARKING_COLORS) so the
+        table and the terminal never disagree; absent classes stay muted, so what is NOT
+        present is explicit."""
         theme = getattr(term, '_theme', 'dark')
         # MARKING_COLORS is an untyped nested class attribute -> its values read as object;
         # name the concrete shape here so palette[class]['fg'] indexes cleanly (mypy).
@@ -488,7 +664,9 @@ class ReviewBar(QWidget):
 
         counts = detail['counts']
         if sum(counts.values()) == 0 and not truncated:
-            chars_html = '<font color="%s">(none)</font>' % _MUTED_FG
+            # a block (<div>) so the next section header starts on its own line, not
+            # abutting an inline "(none)".
+            chars_html = '<div><font color="%s">(none)</font></div>' % _MUTED_FG
         else:
             crows = []
             for key, glyph, label in _CLASS_ROWS:
@@ -500,10 +678,30 @@ class ReviewBar(QWidget):
                 crows.append(_row(glyph, color, label, count_txt))
             chars_html = ('<table cellspacing="0" cellpadding="1">%s</table>'
                           % ''.join(crows))
+
+        # "Outcome if delivered now" -- the per-criterion verdict, straight from the same
+        # `states` the buttons use, so a checked (disabled) button matches a satisfied row.
+        # Invisible/reordering removed is the Deliver GATE (red cross while unmet); Plain
+        # ASCII and Look-alikes-folded are choices, not danger (amber cross when unmet).
+        def _verdict(met, name, unmet_note, gate=False):
+            glyph = _SAFE_GLYPH if met else _CROSS_GLYPH
+            color = SAFE_FG if met else (RISK_FG if gate else CAUTION_FG)
+            return _row(glyph, color, name, '' if met else unmet_note)
+        vrows = [
+            _verdict(states['keep'][1], 'Invisible / reordering removed',
+                     'blocks sending', gate=True),
+            _verdict(states['strip'][1], 'Plain ASCII', 'unicode kept'),
+            _verdict(states['fold'][1], 'Look-alikes folded / none', 'look-alikes remain'),
+        ]
+        verdict_html = ('<table cellspacing="0" cellpadding="1">%s</table>'
+                        % ''.join(vrows))
+
         self._detail.setText(
             '<b>Structure</b>'
             '<table cellspacing="0" cellpadding="1">%s</table>'
-            '<b>Hidden characters</b>%s' % (''.join(struct), chars_html))
+            '<b>Hidden characters</b>%s'
+            '<b>Outcome if delivered now</b>%s'
+            % (''.join(struct), chars_html, verdict_html))
 
     # -- the transforms -------------------------------------------------------
     # The display sanitizer (newline-preserving) for each tier -- ONE source of truth,
@@ -532,6 +730,7 @@ class ReviewBar(QWidget):
                              'control)%s; kept the visible letters, including any '
                              'look-alikes.'
                              % (removed, '' if removed == 1 else 's', self._tail_note()))
+        self._arm_countdown()   # a transform is a bulk change -> re-review before sending
 
     def _do_strip(self):
         """[Strip unicode]: delete every non-ASCII character, NO mapping. Applies to the
@@ -543,6 +742,7 @@ class ReviewBar(QWidget):
         self._editor.set_source(after)        # emits changed -> _on_edit refresh
         self._status.setText('Removed all %d non-ASCII character%s%s -- plain ASCII only.'
                              % (removed, '' if removed == 1 else 's', self._tail_note()))
+        self._arm_countdown()   # a transform is a bulk change -> re-review before sending
 
     def _do_fold(self):
         """[ASCII-fold]: replace each look-alike with the ASCII it imitates, then clean to
@@ -553,6 +753,7 @@ class ReviewBar(QWidget):
         self._editor.set_source(after)
         self._status.setText('Replaced look-alikes with the plain ASCII they imitate, then '
                              'removed any remaining non-ASCII%s.' % self._tail_note())
+        self._arm_countdown()   # a transform is a bulk change -> re-review before sending
 
     def _do_restore(self):
         """[Restore original]: revert the box to the FULLY REVEALED original paste,
@@ -564,6 +765,7 @@ class ReviewBar(QWidget):
         self._active_mode = 'reveal'
         self._editor.set_source_revealed(self._raw[:_BOX_MAX])
         self._set_status_reveal()
+        self._arm_countdown()   # a bulk reset -> re-review before sending
 
     def _blocked_count(self, text):
         """How many characters in `text` are the truly-hidden kind Keep-printable drops

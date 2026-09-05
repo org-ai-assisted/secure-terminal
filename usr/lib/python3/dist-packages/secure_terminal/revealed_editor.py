@@ -135,6 +135,23 @@ class RevealedEditor(QPlainTextEdit):
             return
         super().wheelEvent(event)
 
+    def _window_zoom(self, direction):
+        """Drive the top-level window's zoom for a Ctrl +/-/0 keystroke. The box's Ctrl
+        whitelist swallows chords, so keyboard zoom cannot rely on the menu shortcut
+        firing while the box has focus (it opens focused) -- call the window's own zoom
+        entry points directly, the keyboard twin of route_ctrl_wheel_zoom. direction 1/-1
+        = step in/out via _on_zoom_step; 0 = zoom_reset. Guarded so a stray parent chain
+        is a no-op."""
+        win = self.window()
+        if direction:
+            step = getattr(win, '_on_zoom_step', None)
+            if callable(step):
+                step(direction)
+        else:
+            reset = getattr(win, 'zoom_reset', None)
+            if callable(reset):
+                reset()
+
     # -- content --------------------------------------------------------------
     def set_source(self, text):
         """Load `text` as the box content, caret at the end. `text` is expected to be
@@ -389,6 +406,12 @@ class RevealedEditor(QPlainTextEdit):
                 self._cut()
             elif key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
                 self._delete_word(forward=(key == Qt.Key.Key_Delete))
+            elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+                self._window_zoom(1)              # keyboard zoom, like the terminal
+            elif key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+                self._window_zoom(-1)
+            elif key == Qt.Key.Key_0:
+                self._window_zoom(0)              # reset
             return
         if key in (Qt.Key.Key_Backspace,):
             start, end = self._edit_range()

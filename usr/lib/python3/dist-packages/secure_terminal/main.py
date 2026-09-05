@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame, QScrollArea,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QKeySequenceEdit,
-    QTextEdit, QFontDialog, QFontComboBox, QGroupBox, QToolButton,
+    QTextEdit, QFontDialog, QFontComboBox, QGroupBox, QToolButton, QSplitter,
 )
 
 from secure_terminal import settings, session, ipc, resource_isolation
@@ -807,8 +807,19 @@ class MainWindow(QMainWindow):
         self._banner = self._make_banner(central)
         self._find_bar = FindBar(self)
         self._review_bar = ReviewBar(self)
-        col.addWidget(self.tabs)
-        col.addWidget(self._review_bar)
+        # Tabs + review bar share a vertical splitter, so the user can DRAG the handle
+        # between them to enlarge the review area for a long paste (the bar is otherwise a
+        # fixed strip). The bar is hidden until a review opens, so the handle collapses to
+        # nothing until then. Tabs take the stretch and keep the full height when the bar
+        # is hidden; neither pane collapses to zero (the terminal must stay usable, the bar
+        # must stay above its content floor). The find bar stays a plain row below.
+        self._vsplit = QSplitter(Qt.Orientation.Vertical, central)
+        self._vsplit.setChildrenCollapsible(False)
+        self._vsplit.addWidget(self.tabs)
+        self._vsplit.addWidget(self._review_bar)
+        self._vsplit.setStretchFactor(0, 1)
+        self._vsplit.setStretchFactor(1, 0)
+        col.addWidget(self._vsplit)
         col.addWidget(self._find_bar)
         self.setCentralWidget(central)
         # Theme the container up front so the very first tab's opaque-viewport
