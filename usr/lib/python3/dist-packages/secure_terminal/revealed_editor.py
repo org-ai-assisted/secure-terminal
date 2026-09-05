@@ -56,6 +56,11 @@ class RevealedEditor(QPlainTextEdit):
     edit so the review bar can recompute the hidden-character table live."""
 
     changed = pyqtSignal()
+    # A bulk paste INTO the box (Ctrl+V / middle-click / drag / context-menu), distinct
+    # from `changed` (which also fires per keystroke): the review bar re-arms its
+    # anti-fat-finger countdown on a paste, so a freshly-pasted payload cannot be
+    # delivered without the full delay, while ordinary trimming does not restart it.
+    pasted = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -339,6 +344,7 @@ class RevealedEditor(QPlainTextEdit):
         paste can neither smuggle a hidden character nor edit the doc behind _text."""
         board = QGuiApplication.clipboard()
         self._insert(self._display_clean(board.text() if board is not None else ''))
+        self.pasted.emit()
 
     def _cut(self):
         """Ctrl+X: DELETE the selection through _text -- a trim, not a clipboard cut.
@@ -483,6 +489,7 @@ class RevealedEditor(QPlainTextEdit):
         invisibles, keep printable, preserve newlines) before inserting, so the box
         can never adopt a hidden character a re-paste tried to smuggle in."""
         self._insert(self._display_clean(source.text() if source is not None else ''))
+        self.pasted.emit()
 
     def mousePressEvent(self, event):
         """Place the caret at the SOURCE character nearest the click. Qt lands the

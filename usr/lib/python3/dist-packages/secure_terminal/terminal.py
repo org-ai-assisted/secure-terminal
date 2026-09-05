@@ -183,6 +183,13 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         super().linefeed()
 
     def draw(self, data):
+        # New glyphs make any no-trailing-newline flag on the cursor row STALE (a
+        # cursor-addressed rewrite of a flagged row must not keep the old row's gutter
+        # marker -- the "no output lies" guarantee). Drop it before the write; the flag
+        # is re-set from a fresh structural detection when the case recurs.
+        _row = self.buffer.get(self.cursor.y)
+        if _row is not None and getattr(_row, 'no_newline', False):
+            _row.no_newline = False
         # Bound a Zalgo flood. pyte merges each zero-width combining mark into
         # the cell before the cursor via unicodedata.normalize("NFC",
         # cell.data + mark) -- O(len) per mark -- so a base plus thousands of
@@ -268,6 +275,30 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             row, col = self.cursor.y - 1, self.columns - 1
         self.buffer[row][col] = target._replace(data=target.data + ch)
         self.dirty.add(row)
+
+    def erase_in_line(self, how=0, *args, **kwargs):
+        # Erasing the cursor row's content clears its no-trailing-newline flag (the
+        # gutter must not mark a row whose old content is gone).
+        row = self.buffer.get(self.cursor.y)
+        if row is not None and getattr(row, 'no_newline', False):
+            row.no_newline = False
+        super().erase_in_line(how, *args, **kwargs)
+
+    def erase_in_display(self, how=0, *args, **kwargs):
+        # Clear the flag on exactly the rows this erase blanks (whole screen for how
+        # 2/3, cursor->end for 0, start->cursor for 1) so no stale gutter marker rides
+        # a cleared region -- e.g. `clear` (ESC[H ESC[2J) after un-terminated output.
+        if how in (2, 3):
+            ys = range(self.lines)
+        elif how == 1:
+            ys = range(self.cursor.y + 1)
+        else:
+            ys = range(self.cursor.y, self.lines)
+        for y in ys:
+            row = self.buffer.get(y)
+            if row is not None and getattr(row, 'no_newline', False):
+                row.no_newline = False
+        super().erase_in_display(how, *args, **kwargs)
 
 
 class _Utf8CharsetByteStream(pyte.ByteStream):
@@ -404,11 +435,12 @@ _CP_PROP = QTextFormat.Property.UserProperty + 1
 _BLK_WRAP_CONT = 1     # soft-autowrap continuation: copy joins it onto the previous row
 _BLK_NO_NEWLINE = 2    # the command output on this line ended without a trailing newline
 
-# Sentinel "format" appended by _grid_row_runs to a TUI row whose pyte row carries the
+# Sentinel format appended by _grid_row_runs to a TUI row whose pyte row carries the
 # no_newline flag. It rides the row SIGNATURE (so a pure-flag change re-renders the row)
 # and is stripped by _gridrow_blockdata into _GridRow.no_newline -- it never becomes cell
-# text (unforgeable + copy-safe). A plain object() so it can never equal a QTextCharFormat.
-_NO_NL_SENTINEL = object()
+# text. A distinct QTextCharFormat INSTANCE, matched by identity (`is`), so it keeps the
+# runs list's (str, QTextCharFormat) element type while never colliding with a real format.
+_NO_NL_SENTINEL = QTextCharFormat()
 
 
 def _blk_flags(block):
@@ -1064,6 +1096,8 @@ class SecureTerminal(QPlainTextEdit):
         self._command_exec_failed = False  # set by _start: the -e program could not exec
         self._spawn_exe = None             # set by _start: /proc exe of the spawned child (an
         #                                    unforgeable baseline: detect an `exec`-replaced shell)
+        self._spawn_starttime = None       # set by _start: /proc/<pid>/stat starttime baseline
+        #                                    (identify THIS child across a freed+reused pid)
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
@@ -1183,12 +1217,12 @@ class SecureTerminal(QPlainTextEdit):
         self._tui_follow = True
         self._programmatic_scroll = False
         self.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
-        # Left gutter: per-line annotation strip (no-trailing-newline marker). The
-        # standard line-number-area wiring -- reserve its margin on a block-count
-        # change, scroll/repaint it on updateRequest. Position + width are set here and
-        # kept in step by _apply_font / resizeEvent.
+        # Left gutter: per-line annotation strip (no-trailing-newline marker). Repaint
+        # it on updateRequest (content/scroll). Its width is a FIXED font-based strip
+        # (unlike a line-number area it does not grow with line count), so it is set here
+        # and only re-reserved on a font/zoom change (_apply_font) -- NOT per block, which
+        # would call setViewportMargins on every output line for no width change.
         self._gutter = _GutterArea(self)
-        self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_gutter_area)
         self._update_gutter_width()
         self._position_gutter()
@@ -2150,42 +2184,46 @@ class SecureTerminal(QPlainTextEdit):
                 yield block, top, bottom
             block = block.next()
 
+    def _block_last_line_center(self, block, block_top):
+        """Viewport y of the centre of the block's LAST visual line. A wrapped block
+        (Detail/Reveal wrap to the width) spans several visual lines; the no-newline
+        belongs to its FINAL row, so the glyph rides there -- not the block centre,
+        which a tall wrapped block pushes far off-screen. The block is always laid out
+        here (the caller reached it through blockBoundingGeometry), so lineCount >= 1."""
+        line = block.layout().lineAt(block.layout().lineCount() - 1)
+        return int(block_top + line.y() + line.height() / 2)
+
     def _paint_gutter(self, event):
         """Draw the per-line markers. Same-coloured background as the terminal keeps the
         strip unobtrusive; a muted return-arrow glyph marks each no-trailing-newline
-        line. Font-independent (drawn with QPainter, no glyph font dependency) and
-        ASCII-only in source. Called only from the gutter widget's own paintEvent, so
-        self._gutter is always live here."""
+        line, on that line's LAST visual row. Font-independent (drawn with QPainter, no
+        glyph font dependency) and ASCII-only in source. QPainter clips to the widget,
+        so a glyph whose row is scrolled out is harmlessly clipped. Called only from the
+        gutter widget's own paintEvent, so self._gutter is always live here."""
         painter = QPainter(self._gutter)
-        base = self.palette().color(QPalette.ColorRole.Base)
-        painter.fillRect(event.rect(), base)
+        painter.fillRect(event.rect(), self.palette().color(QPalette.ColorRole.Base))
         fg = self.palette().color(QPalette.ColorRole.Text)
         fg.setAlpha(150)                          # muted: a note, not program output
-        for block, top, bottom in self._gutter_blocks():
-            if bottom < event.rect().top() or top > event.rect().bottom():
-                continue
+        for block, top, _bottom in self._gutter_blocks():
             if self._block_no_newline(block):
-                self._draw_no_newline_glyph(painter, top, bottom - top, fg)
+                self._draw_no_newline_glyph(
+                    painter, self._block_last_line_center(block, top), fg)
         painter.end()
 
-    def _draw_no_newline_glyph(self, painter, top, height, color):
-        """A small return-arrow (down then left, with a head) centred in the row: the
-        universal 'a newline belongs here' mark, flagging that this line lacked one."""
-        w = self._gutter_width_px()
-        cx = w // 2
-        h = min(height, self.fontMetrics().height())
-        mid = top + height // 2
+    def _draw_no_newline_glyph(self, painter, mid, color):
+        """A small return-arrow (down then left, with a head) centred vertically on the
+        marked line at `mid`: the universal 'a newline belongs here' mark."""
+        cx = self._gutter_width_px() // 2
+        h = self.fontMetrics().height()
         a = max(2, h // 4)                         # arm half-length
         pen = QPen(color)
-        pen.setWidth(max(1, self.fontMetrics().height() // 12))
+        pen.setWidth(max(1, h // 12))
         painter.setPen(pen)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        # vertical stroke down, then left along the baseline (the return hook)
-        painter.drawLine(cx + a, mid - a, cx + a, mid + a)
-        painter.drawLine(cx + a, mid + a, cx - a, mid + a)
-        # arrowhead at the left end
-        painter.drawLine(cx - a, mid + a, cx - a + a, mid + a - a)
-        painter.drawLine(cx - a, mid + a, cx - a + a, mid + a + a)
+        painter.drawLine(cx + a, mid - a, cx + a, mid + a)     # vertical stroke down
+        painter.drawLine(cx + a, mid + a, cx - a, mid + a)     # left along the base
+        painter.drawLine(cx - a, mid + a, cx, mid)             # arrowhead
+        painter.drawLine(cx - a, mid + a, cx, mid + 2 * a)
 
     def _block_at_gutter_y(self, y):
         """The visible block whose row contains gutter-local y, or None."""
@@ -2312,7 +2350,15 @@ class SecureTerminal(QPlainTextEdit):
         # (a display-integrity/spoofing bug). Clamp it into the new grid, as the render
         # paths (_grid_signatures, _place_grid_cursor) already do for their reads.
         self._screen.cursor.y = min(self._screen.cursor.y, rows - 1)
-        self._screen.cursor.x = min(self._screen.cursor.x, cols - 1)
+        # Clamp cursor.x ONLY when it lands BEYOND the new width (x > cols): a cursor left past
+        # the new grid by a wider->narrower resize drops to the last real column (cols - 1). A
+        # cursor AT the boundary (x == cols) is pyte's pending-autowrap state -- a line filled
+        # exactly to the last column, which pyte.Screen.resize never changes -- and is LEFT
+        # as-is so the next byte WRAPS instead of overwriting. This covers both a height-only
+        # resize (cols unchanged, x possibly == cols) and a width shrink to exactly the filled
+        # width; the old blanket clamp demoted that pending-wrap on every resize.
+        if self._screen.cursor.x > cols:
+            self._screen.cursor.x = cols - 1
         self._set_winsize(cols, rows)
 
     def _pyte_qcolor(self, color, default, bright=False):
@@ -3420,6 +3466,12 @@ class SecureTerminal(QPlainTextEdit):
         # a login shell REPLACED via the `exec` builtin (same pid + pgrp). exe is used, not
         # comm, because comm is child-writable (spoofable) and exe is not.
         self._spawn_exe = None if self._command_exec_failed else self._read_exe(pid)
+        # Baseline the child's /proc start-time too: reap_pty_children (SIGCHLD) frees the
+        # pid for OS reuse the instant the child exits, but self._pid is not cleared until
+        # the EOF-driven _release_pty -- so in that window a pid-trusting reader must confirm
+        # the pid still names THIS child. starttime (field 22) is unique per pid incarnation.
+        self._spawn_starttime = (None if self._command_exec_failed
+                                 else self._pid_start_time(pid))
         SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
         self._fd = fd
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -4167,7 +4219,10 @@ class SecureTerminal(QPlainTextEdit):
                 pass        # already closed -> nothing to do
             self._fd = None
         if self._pid:
-            if hangup:
+            if hangup and self._pid_is_current_child():
+                # Only SIGHUP a pid that is still OUR child: reap_pty_children may have freed
+                # it for OS reuse (see #30), and hanging up a reused pid would signal an
+                # unrelated process. A gone / reused pid has nothing of ours to hang up.
                 try:
                     os.kill(self._pid, signal.SIGHUP)
                 except OSError:
@@ -4186,6 +4241,10 @@ class SecureTerminal(QPlainTextEdit):
         pty machinery is torn down inside the event loop, not during teardown."""
         self._render_timer.stop()          # no pending paint fires into teardown
         self._blink_timer.stop()           # nor a cursor-blink paint into teardown
+        if self._transcript_file:
+            self._transcript_timer.stop()  # a closing tab must not write its transcript
+            #                                AFTER it leaves the tab bar -- that late write
+            #                                would clobber the primary tab's base path (#25).
         self._flush_paint()                # paint the last CLI line before we go
         self._release_pty(hangup=True)
         # Remove this tab's cgroup once its child is hung up. Best-effort: a child
@@ -4525,12 +4584,42 @@ class SecureTerminal(QPlainTextEdit):
         self._force_current_frame()  # never read a stale (debounced/gated) document
         return self._export_ascii(super().toPlainText())
 
+    def _transcript_path(self):
+        """Resolve THIS tab's transcript path from the configured base. Every tab writes
+        its OWN content, so a shared base path would let multiple tabs clobber each other.
+        The SINGLE / primary tab (the lowest live per-tab id) keeps the exact base path --
+        so a single-tab window (every shot-harness capture) reads the unchanged env path,
+        and the base is always populated as tabs open and close -- while each ADDITIONAL
+        tab writes 'base.<id>'. A standalone widget (no MainWindow tab bar) also keeps the
+        base. Computed at write time, not __init__: only here is the tab parented, so the
+        live count reflects a tab opened LATER."""
+        base = self._transcript_file
+        if base is None:
+            return None                     # no path configured -> nothing to write
+        win = self.window()
+        tabs = getattr(win, 'tabs', None)
+        serials = getattr(win, '_tab_ids', None)
+        if tabs is None or not serials:
+            return base                     # standalone / preview term: no MainWindow tab bar
+        # Only tabs sharing THIS exact base compete for it (all tabs read one process-wide
+        # env, so in practice they share it; grouping by base is defensive against any tab
+        # carrying a different / None base). The lowest-id tab keeps the exact base path; the
+        # rest get 'base.<id>'. A closing tab stops its timer in shutdown(), so a tab removed
+        # from the bar never reaches here to elect itself primary and clobber the base.
+        group = [w for i in range(tabs.count())
+                 if isinstance((w := tabs.widget(i)), SecureTerminal)
+                 and w._transcript_file == base]
+        if len(group) <= 1:
+            return base                     # sole transcript tab (and every shot-harness capture)
+        primary = min(group, key=lambda t: serials.get(t, 0))
+        return base if self is primary else '%s.%d' % (base, serials.get(self, 0))
+
     def _write_transcript_file(self):
         """Write this tab's transcript to the configured SECURE_TERMINAL_TRANSCRIPT_FILE,
         atomically. transcript_text() is the lossless plain-ASCII record and walks the
         RENDERED document, so it reflects CLI and TUI (incl. the alternate screen) alike.
         Best-effort: a write failure must never disturb the terminal."""
-        path = self._transcript_file
+        path = self._transcript_path()
         if path is None:  # pragma: no cover - the debounce timer only fires when a path is set
             return
         # Force any pending debounced GRID render first, so the transcript reflects the
@@ -4852,9 +4941,12 @@ class SecureTerminal(QPlainTextEdit):
         informative default than a static "shell": it tracks where you are as you
         cd around."""
         pgrp = self._foreground_pgrp()
-        pid = pgrp if pgrp is not None else self._pid
-        if pid is None:
-            return None
+        if pgrp is not None:
+            pid = pgrp
+        elif self._pid is not None and self._pid_is_current_child():
+            pid = self._pid
+        else:
+            return None     # no foreground pgrp, and the shell pid is gone / freed + reused
         try:
             path = os.readlink('/proc/%d/cwd' % pid)
         except OSError:
@@ -4868,8 +4960,8 @@ class SecureTerminal(QPlainTextEdit):
         """The SHELL's full working directory (where the prompt sits), for saving a
         session tab so it restores in the same place. Always the shell pid (not the
         foreground pgrp): that is the canonical prompt location. '' if unreadable."""
-        if self._pid is None:
-            return ''
+        if self._pid is None or not self._pid_is_current_child():
+            return ''       # no child, or self._pid was freed and reused by a stranger
         try:
             return os.readlink('/proc/%d/cwd' % self._pid)
         except OSError:
@@ -4892,6 +4984,40 @@ class SecureTerminal(QPlainTextEdit):
         # which the panic Terminate would then kill. Strip it so both reads normalize.
         deleted = ' (deleted)'
         return target[:-len(deleted)] if target.endswith(deleted) else target
+
+    @staticmethod
+    def _pid_start_time(pid):
+        """Field 22 (starttime, clock ticks since boot) of /proc/<pid>/stat, or None. It is
+        FIXED for a pid's lifetime and differs for the next process that reuses the pid, so
+        (pid, starttime) identifies THIS child even after the pid is freed. field 2 (comm) may
+        contain spaces and parentheses, so parse everything AFTER the last ')': field 3
+        (state) is then index 0, and starttime (field 22) is index 19."""
+        try:
+            with open('/proc/%d/stat' % pid, 'rb') as handle:
+                data = handle.read()
+        except OSError:
+            return None
+        rparen = data.rfind(b')')
+        if rparen < 0:  # pragma: no cover - /proc/<pid>/stat always contains the comm ')'
+            return None
+        fields = data[rparen + 2:].split()
+        try:
+            return int(fields[19])
+        except (IndexError, ValueError):  # pragma: no cover - a real /proc stat line is well-formed
+            return None
+
+    def _pid_is_current_child(self):
+        """True only while self._pid still names OUR spawned child, not a reused pid. Guards
+        the pid-reuse TOCTOU: after the child exits, reap_pty_children frees the pid before
+        _release_pty clears self._pid, so getpgid(self._pid) / /proc/<self._pid> would trust
+        whatever process reused the slot. Compare the live /proc start-time to the spawn
+        baseline. Falls back to True when no baseline was captured (unreadable at spawn), to
+        preserve the prior behaviour rather than over-refuse."""
+        if self._pid is None:
+            return False
+        if self._spawn_starttime is None:
+            return True
+        return self._pid_start_time(self._pid) == self._spawn_starttime
 
     def _child_execd(self):
         """True when a LOGIN-shell tab's direct child has been REPLACED via the shell
@@ -4923,6 +5049,11 @@ class SecureTerminal(QPlainTextEdit):
         pgrp = self._foreground_pgrp()
         if pgrp is None:
             return False
+        if self._pid is not None and not self._pid_is_current_child():
+            # our child exited: the pid is gone, or was freed and reused by a stranger.
+            # Nothing of ours holds the foreground (same outcome as the getpgid
+            # ProcessLookupError path below, but also closed against a REUSED pid).
+            return False
         try:
             child_pgrp = os.getpgid(self._pid) if self._pid is not None else None
         except ProcessLookupError:
@@ -4953,6 +5084,10 @@ class SecureTerminal(QPlainTextEdit):
         # secure-terminal itself. A child always runs in its own pty session, so a
         # match here means the foreground pgrp was misresolved -- refuse it.
         if pgrp == os.getpgrp():
+            return False
+        if self._pid is not None and not self._pid_is_current_child():
+            # our child exited (pid gone / freed + reused): nothing of ours to signal, and
+            # we must not trust a reused self._pid below (nor killpg a coincidental match).
             return False
         # The direct child is in the foreground: a bare LOGIN-shell prompt (nothing
         # to terminate), but for a `-- PROGRAM` tab that child IS the program to kill.
@@ -6008,6 +6143,12 @@ class SecureTerminal(QPlainTextEdit):
                     '(an embedded newline is held for GUI review, which ctl cannot '
                     'prompt)')
         delivered = self._dispatch_paste(text, 'stripped')
+        if delivered is False:
+            # A PARTIAL / timed-out write to a wedged or slow child: report it rather than a
+            # false ok, and never submit a half-delivered line. (None means the payload
+            # sanitized to empty -- nothing to send, a benign no-op, not a failure.)
+            return ('the child did not accept the full line (a partial or timed-out '
+                    'write); nothing was submitted')
         if submit and delivered:
             # Deliver the Enter the strip withheld, mirroring the Key_Return keypress
             # (settle the line mirror, then send CR) so the single staged command runs.
@@ -6016,7 +6157,9 @@ class SecureTerminal(QPlainTextEdit):
             # prompt (a prior staged line, or the user's own input) -- never do that.
             self._line_buffer = ''
             self._line_dirty = False
-            self._write(b'\r')
+            if not self._write(b'\r'):
+                return ('the line was delivered but its submit newline was not (a '
+                        'partial or timed-out write)')
         return None
 
     def _dispatch_paste(self, raw, action):
@@ -6035,7 +6178,7 @@ class SecureTerminal(QPlainTextEdit):
         safe = (sanitize_paste_unicode(raw) if action == 'unicode'
                 else sanitize_paste(raw))
         if not safe:
-            return False
+            return None     # nothing to send (sanitized to empty) -- not a write failure
         # Bracketed paste when a TUI program asked for it (DEC mode 2004): the child
         # BUFFERS the payload as data rather than interpreting it as keystrokes, so
         # it cannot auto-execute -- deliver it verbatim between the markers.
@@ -6050,7 +6193,7 @@ class SecureTerminal(QPlainTextEdit):
             # dropped); a single-line paste then reaches the shell with no submit.
             safe = paste_no_autosubmit(safe)
             if not safe:
-                return False
+                return None     # sanitized to empty after dropping the trailing submit
             # A non-bracketed MULTI-line paste still carries embedded submit CRs
             # (paste_no_autosubmit only drops the TRAILING one), and with no bracketed
             # framing to make the child buffer them inert, each would AUTO-RUN a line
@@ -6086,10 +6229,12 @@ class SecureTerminal(QPlainTextEdit):
         data = safe.encode('utf-8')
         if bracketed:
             data = b'\x1b[200~' + data + b'\x1b[201~'
-        self._write(data)
-        # Report delivery: ctl_send_text(submit=True) fires its CR only when THIS line
-        # reached the pty; every early return above wrote nothing and returns False.
-        return True
+        # Report delivery from the ACTUAL write: True = every byte reached the pty, False =
+        # a partial / timed-out write to a wedged or slow child (e.g. SIGSTOP-ed). The early
+        # returns above yield None: the payload sanitized to empty (nothing to send).
+        # ctl_send_text distinguishes all three -- submit the withheld CR only on True,
+        # report False as a partial-write error, treat None as a benign no-op.
+        return self._write(data)
 
     def _insert_next_staged(self):
         """Insert the next HELD line of a reviewed multi-line paste at the prompt, on

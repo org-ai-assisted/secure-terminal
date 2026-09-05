@@ -4714,7 +4714,15 @@ class MainWindow(QMainWindow):
         dialog.on_zoom = _live_zoom
 
         _select_labels(dialog, self._ui_scale)
+        prev_ui_scale = self._ui_scale
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            # Ctrl+wheel (_live_zoom) mutated self._ui_scale and _persist()ed it LIVE
+            # during the dialog; Cancel must discard it like every other field. Revert
+            # the in-memory scale and re-persist so neither the session nor the on-disk
+            # config keeps a cancelled zoom.
+            if self._ui_scale != prev_ui_scale:
+                self._ui_scale = prev_ui_scale
+                self._persist()
             return
         self._apply_global({
             'theme': theme.currentData(), 'zoom': zoom.value(),
