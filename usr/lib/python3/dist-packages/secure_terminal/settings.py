@@ -113,9 +113,12 @@ def _parse_into(path, out):
     # `lock` ACCUMULATES across files in a directory (union), unlike every other key
     # (last-write-wins): an admin may split locks over several .conf files (10-*.conf,
     # 20-*.conf), and last-write-wins would silently drop every lock but the last file's --
-    # a lock-bypass. The final `locked` set de-dups, so a repeated key is harmless.
-    if parsed.get('lock') and out.get('lock'):
-        parsed['lock'] = out['lock'] + ',' + parsed['lock']
+    # a lock-bypass. Merge whenever a later file MENTIONS lock, dropping empty values, so a
+    # bare `lock=` (empty) cannot CLEAR accumulated locks either (the same bypass). The
+    # final `locked` set de-dups, so a repeated key is harmless.
+    if 'lock' in parsed:
+        parsed['lock'] = ','.join(
+            value for value in (out.get('lock', ''), parsed['lock']) if value)
     out.update(parsed)
 
 
