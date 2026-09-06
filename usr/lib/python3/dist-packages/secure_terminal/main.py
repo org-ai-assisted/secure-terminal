@@ -2641,13 +2641,26 @@ class MainWindow(QMainWindow):
         self._update_security_indicator()
 
     def _osc_level(self):
-        """The OSC risk axis as (colour, short, detail): green when every OSC
-        feature is neutralized (the default); yellow when a low/medium one is
-        enabled; red when a high-risk one (clipboard) is enabled."""
+        """The OSC risk axis as (colour, short, detail). OSC side-effects are
+        honored ONLY in TUI mode (terminal gates _handle_osc on tui_active), so
+        an enabled feature in CLI mode is ARMED BUT INERT -- the current risk is
+        green. Green when nothing is enabled, or when enabled features are not
+        active in this (CLI) mode; yellow when a live low/medium feature is on;
+        red when a live high-risk one (clipboard) is."""
         term = self.current()
         enabled = [k for k in self._osc_defaults if self._osc_defaults[k]]
         if term is not None:
             enabled = [k for k in self._osc_actions if term.osc_enabled(k)]
+        in_tui = term is not None and term.tui_active()
+        if enabled and not in_tui:
+            labels = ', '.join(OSC_FEATURE_BY_KEY[k][0] for k in enabled)
+            return ('#1f8a54', 'OSC idle',
+                    'OSC: enabled but inactive in CLI mode (green).\n\n'
+                    'You have enabled: ' + labels + '. OSC side-effects take '
+                    'effect only in the opt-in TUI mode, so in the current CLI '
+                    'mode no output can trigger them -- there is no live risk. '
+                    'Switch to TUI mode to activate them (at your own risk), or '
+                    'turn them off under View > OSC features.\n\n' + _OSC_THREAT_MODEL)
         if not enabled:
             return ('#1f8a54', 'OSC off',
                     'OSC: all neutralized (green).\n\n'
