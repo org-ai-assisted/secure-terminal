@@ -3895,9 +3895,13 @@ class SecureTerminal(QPlainTextEdit):
         screen so it can be restored intact on exit (pyte has no alt buffer)."""
         if self._alt_saved is not None or self._screen is None:
             return                        # already in the alt screen; do not nest
-        # Freeze the primary scrollback text NOW (a read-only document walk, no render),
-        # so 'Save Transcript' keeps returning it while the program runs instead of the
-        # ephemeral alt grid. The document still shows the primary at this boundary.
+        # Freeze the primary scrollback text NOW, so 'Save Transcript' keeps returning it
+        # while the program runs instead of the ephemeral alt grid. Render the pyte model
+        # to the document FIRST: _feed_stream fed the pre-marker primary bytes (this read's
+        # output right up to the switch) to pyte before calling us, but rendering is
+        # debounced, so a bare document walk would drop that final unpainted primary output.
+        if self._grid_mode():
+            self._render_tui()
         self._alt_primary_text = self._walk_document_text()
         s = self._screen
         self._alt_saved = (
@@ -3912,9 +3916,14 @@ class SecureTerminal(QPlainTextEdit):
         scrollback is clean."""
         if self._alt_saved is None or self._screen is None:
             return
-        # Append ONE final-frame snapshot of the full-screen session as a bounded record
-        # (read-only walk; the document still holds the last alt frame here), so 'Save
-        # Transcript' keeps a trace of what was displayed without logging every frame.
+        # Append ONE final-frame snapshot of the full-screen session as a bounded record,
+        # so 'Save Transcript' keeps a trace of what was displayed without logging every
+        # frame. Render the alt screen to the document FIRST (same debounce reason as
+        # _alt_enter): the whole enter/draw/leave can arrive in one read before the render
+        # timer fires, so a bare walk would snapshot a stale (or empty) frame, not the
+        # program's actual last screen.
+        if self._grid_mode():
+            self._render_tui()
         self._append_exit_snapshot(self._walk_document_text())
         self._screen.buffer, self._screen.history, self._screen.cursor = \
             self._alt_saved
@@ -4735,7 +4744,16 @@ class SecureTerminal(QPlainTextEdit):
             base = self._alt_primary_text
         else:
             base = self.transcript_text()
-        return base + ''.join(self._alt_exit_snapshots)
+        if not self._alt_exit_snapshots:
+            return base
+        # A full-screen (alternate-screen) session has no position in the LINEAR
+        # scrollback, so its recorded frames are a trailing section, oldest first --
+        # deliberately NOT interleaved with the primary scrollback above (there is no
+        # scrollback line to interleave them at). Headed so a reader is not misled into
+        # reading the order as chronological relative to the primary output.
+        return (base + '\n===== full-screen application sessions '
+                '(recorded separately, not in scroll order) ====='
+                + ''.join(self._alt_exit_snapshots))
 
     def _walk_document_text(self):
         """Render the CURRENT document to lossless text WITHOUT forcing a frame (a

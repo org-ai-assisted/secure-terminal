@@ -3470,7 +3470,11 @@ class MainWindow(QMainWindow):
         path = os.path.join(session._state_dir(), filename)
         try:
             session.ensure_state_dir()
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # O_NOFOLLOW: refuse to follow a symlink at the target (defence in depth; the
+            # shipped AppArmor profile already confines writes to the state dir). A planted
+            # symlink then fails the open, caught below -- never an arbitrary-file overwrite.
+            fd = os.open(path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 handle.write(getter(term))
         except OSError:
