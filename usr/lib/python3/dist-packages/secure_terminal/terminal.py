@@ -1141,6 +1141,13 @@ class SecureTerminal(QPlainTextEdit):
         # pyte has no separate alt buffer, so without this the program's clear/draw
         # would destroy the primary screen and pollute the scrollback.
         self._alt_saved = None
+        # 'Save Transcript' scrollback (Option B): the alt screen is NOT scrollback, so
+        # the primary transcript text is frozen at alt entry (returned while the program
+        # runs, instead of the ephemeral grid), and each finished full-screen session
+        # leaves ONE final-frame snapshot appended as a bounded record. Both are captured
+        # by a READ-ONLY document walk (no render), so they are safe in the feed path.
+        self._alt_primary_text = ''
+        self._alt_exit_snapshots = []
 
         # OSC features a program may reach OUT of the grid with (title, notify,
         # clipboard, hyperlink, palette, cwd, iTerm2). Each is honored ONLY when
@@ -3888,6 +3895,10 @@ class SecureTerminal(QPlainTextEdit):
         screen so it can be restored intact on exit (pyte has no alt buffer)."""
         if self._alt_saved is not None or self._screen is None:
             return                        # already in the alt screen; do not nest
+        # Freeze the primary scrollback text NOW (a read-only document walk, no render),
+        # so 'Save Transcript' keeps returning it while the program runs instead of the
+        # ephemeral alt grid. The document still shows the primary at this boundary.
+        self._alt_primary_text = self._walk_document_text()
         s = self._screen
         self._alt_saved = (
             copy.deepcopy(s.buffer),
@@ -3901,10 +3912,30 @@ class SecureTerminal(QPlainTextEdit):
         scrollback is clean."""
         if self._alt_saved is None or self._screen is None:
             return
+        # Append ONE final-frame snapshot of the full-screen session as a bounded record
+        # (read-only walk; the document still holds the last alt frame here), so 'Save
+        # Transcript' keeps a trace of what was displayed without logging every frame.
+        self._append_exit_snapshot(self._walk_document_text())
         self._screen.buffer, self._screen.history, self._screen.cursor = \
             self._alt_saved
         self._alt_saved = None
+        self._alt_primary_text = ''       # the frozen primary is now restored, live again
         self._reset_grid_view()           # rebuild scrollback from restored history
+
+    # Cap the accumulated exit snapshots so a long-lived tab that runs many full-screen
+    # programs cannot grow the transcript without bound.
+    _EXIT_SNAPSHOTS_MAX = 256 * 1024
+
+    def _append_exit_snapshot(self, frame):
+        """Record one full-screen session's final frame, headed so it reads as a distinct
+        block. Empty frames are skipped; the oldest are dropped past the size cap."""
+        if not frame.strip():
+            return
+        self._alt_exit_snapshots.append(
+            '\n----- full-screen application (final screen) -----\n' + frame + '\n')
+        total = sum(len(s) for s in self._alt_exit_snapshots)
+        while total > self._EXIT_SNAPSHOTS_MAX and len(self._alt_exit_snapshots) > 1:
+            total -= len(self._alt_exit_snapshots.pop(0))
 
     def _osc_split(self, data, carry, osc8):
         """Rejoin an OSC split across PTY reads and hold back a new incomplete tail, so a
@@ -4687,17 +4718,35 @@ class SecureTerminal(QPlainTextEdit):
         return None
 
     def transcript_text(self):
-        """The scrollback for SAVING: lossless, and pure ASCII except the real
-        glyphs Show mode keeps. In Box mode the display collapses every neutralized
-        byte to an inert box, which toPlainText saves as a bare '_' -- losing which
-        codepoint it was. A saved transcript is a record, so walk the RENDERED
-        document (line edits, wraps and scrollback already applied -- unlike the
-        capped raw stream) and expand each box to its source codepoint named inline
-        (<U+XXXX NAME>, the Detail rendering). Non-box display passes through
-        unchanged: Reveal/Detail already carry <U+XXXX> badges, and Show keeps the
-        glyph you opted into. Works the same in CLI and TUI (both render a
-        document)."""
+        """The CURRENT frame/screen as lossless, pure-ASCII (except the real glyphs Show
+        mode keeps) text. In TUI this is the live grid -- what 'Save Current Screen'
+        captures and what the session-restore file records. See scrollback_text() for the
+        'Save Transcript' append-only history (which excludes the ephemeral alt grid)."""
         self._force_current_frame()  # a save must include the last unpainted/ungated frame
+        return self._walk_document_text()
+
+    def scrollback_text(self):
+        """The append-only SCROLLBACK for 'Save Transcript'. The alternate screen is NOT
+        scrollback (konsole/xterm exclude it): while a full-screen program holds it, the
+        primary transcript frozen at entry is returned instead of the live grid, and each
+        finished full-screen session leaves ONE final-frame snapshot appended as a bounded
+        record. Outside the alt screen this is just the current document."""
+        if self._alt_saved is not None:
+            base = self._alt_primary_text
+        else:
+            base = self.transcript_text()
+        return base + ''.join(self._alt_exit_snapshots)
+
+    def _walk_document_text(self):
+        """Render the CURRENT document to lossless text WITHOUT forcing a frame (a
+        read-only walk, safe to call from the feed path). In Box mode the display
+        collapses every neutralized byte to an inert box, which toPlainText saves as a
+        bare '_' -- losing which codepoint it was. A saved record must not, so walk the
+        RENDERED document (line edits, wraps and scrollback already applied -- unlike the
+        capped raw stream) and expand each box to its source codepoint named inline
+        (<U+XXXX NAME>, the Detail rendering). Non-box display passes through unchanged:
+        Reveal/Detail already carry <U+XXXX> badges, and Show keeps the glyph you opted
+        into. Works the same in CLI and TUI (both render a document)."""
         doc = self.document()
         out = []
         cur = QTextCursor(doc)
