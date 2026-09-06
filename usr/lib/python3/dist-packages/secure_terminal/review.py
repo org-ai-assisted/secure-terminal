@@ -51,14 +51,12 @@ restarting it per keystroke. A copy has no countdown. Delivery is dispatched bac
 tab that held the text, the only path that lets it cross.
 """
 
-from math import ceil
 from typing import NotRequired, TypedDict, cast
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtCore import QTimer, QSize
+from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton, QFrame, QSizePolicy,
-    QTextEdit,
 )
 
 from secure_terminal.sanitize import (
@@ -113,78 +111,6 @@ _CAUTION_GLYPH = chr(0x25B2)  # up-triangle: accepted, but delivery is not a wai
 # Shown (safe-green) when a reviewed paste hides nothing -- a positive all-clear so an
 # ASCII-only paste held for another reason (a multi-line paste) reads as safe.
 _CLEAN_MSG = 'ASCII-only -- nothing hidden.'
-
-
-class _RichView(QTextEdit):
-    """A read-only rich-text view that sizes to exactly its document height.
-
-    The breakdown (Structure / Hidden characters / Outcome) is stacked HTML tables. A
-    word-wrapped QLabel mis-sizes those (heightForWidth under-counts them and its sizeHint
-    reports a wrongly-wrapped narrow-width height), so a QVBoxLayout -- and the shot host
-    sized by adjustSize() -- reserves the wrong height and the decision row below lands on
-    top of the last ("Plain ASCII") verdict row: the paste-warning-shot overlap. QTextEdit
-    lays HTML tables out correctly and exposes the real height via its document, so pin the
-    widget to `document().size().height()` at the current viewport width -- recomputed on
-    resize (wrap changes) and on a font change (zoom). Frameless, transparent and
-    scrollbar-free so it reads exactly like the old inline label, and read-only + mouse-
-    selectable so the user can still copy the breakdown.
-
-    Drop-in for the old QLabel: `setText`/`text` keep the QLabel signatures (text() returns
-    the HTML that was set), so ReviewBar and the tests need no other change."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._html = ''
-        self.setReadOnly(True)
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.viewport().setAutoFillBackground(False)
-        self.setStyleSheet('QTextEdit { background: transparent; border: none; }')
-        self.document().setDocumentMargin(0)
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        # The layout drives the height from heightForWidth (width-parameterised, so it is
-        # stable no matter what transient width a resize passes), not the viewport's live
-        # width -- which avoids pinning a height measured mid-layout at the wrong width.
-        policy = self.sizePolicy()
-        policy.setVerticalPolicy(QSizePolicy.Policy.Fixed)
-        policy.setHeightForWidth(True)
-        self.setSizePolicy(policy)
-
-    def _content_height(self, width):
-        # Measure on a clone so the live viewport document (its own textWidth) is never
-        # disturbed by a layout's height query.
-        doc = self.document().clone()
-        doc.setTextWidth(float(width))
-        return ceil(doc.size().height())
-
-    def hasHeightForWidth(self):
-        return True
-
-    def heightForWidth(self, width):
-        if width <= 0:
-            return super().heightForWidth(width)
-        return self._content_height(width)
-
-    def sizeHint(self):
-        width = self.width()
-        return QSize(0, self._content_height(width) if width > 0 else 0)
-
-    def minimumSizeHint(self):
-        return QSize(0, 0)
-
-    def setText(self, html):
-        self._html = html
-        self.setHtml(html)
-        self.updateGeometry()
-
-    def text(self):
-        return self._html
-
-    def setFont(self, font):
-        super().setFont(font)
-        self.document().setDefaultFont(font)
-        self.updateGeometry()
 
 
 # Everything that differs between the two directions. `dispatch` is the tab method the
@@ -410,9 +336,11 @@ class ReviewBar(QWidget):
         # from the box on every change. Sits directly above the decision row, so the gate's
         # justification is adjacent to the gated Deliver button. Rich text so a glyph can
         # carry its risk colour; selectable so the user can copy it.
-        # _RichView (a QTextEdit) sizes to the true height of its stacked HTML tables; a
-        # word-wrapped QLabel mis-sizes them and lets the decision row overlap the table.
-        self._detail = _RichView(self)
+        self._detail = QLabel('', self)
+        self._detail.setTextFormat(Qt.TextFormat.RichText)
+        self._detail.setWordWrap(True)
+        self._detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
         outer.addWidget(self._detail)
 
         # DECISION row (bottom, AFTER the evidence): the two terminal choices at OPPOSITE
