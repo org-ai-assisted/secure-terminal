@@ -2641,48 +2641,53 @@ class MainWindow(QMainWindow):
         self._update_security_indicator()
 
     def _osc_level(self):
-        """The OSC risk axis as (colour, short, detail). OSC side-effects are
-        honored ONLY in TUI mode (terminal gates _handle_osc on tui_active), so
-        an enabled feature in CLI mode is ARMED BUT INERT -- the current risk is
-        green. Green when nothing is enabled, or when enabled features are not
-        active in this (CLI) mode; yellow when a live low/medium feature is on;
-        red when a live high-risk one (clipboard) is."""
-        term = self.current()
-        enabled = [k for k in self._osc_defaults if self._osc_defaults[k]]
-        if term is not None:
-            enabled = [k for k in self._osc_actions if term.osc_enabled(k)]
-        in_tui = term is not None and term.tui_active()
-        if enabled and not in_tui:
-            labels = ', '.join(OSC_FEATURE_BY_KEY[k][0] for k in enabled)
+        """The OSC risk axis as (colour, short, detail). OSC side-effects (clipboard,
+        title, notify) escape the tab -- they reach the SYSTEM clipboard / window /
+        status bar -- and a BACKGROUND tab keeps honoring them, so risk is computed
+        across ALL tabs, not just the current one. A feature is honored only where its
+        tab is in TUI (terminal gates _handle_osc on tui_active); enabled with no tab
+        in TUI is armed-but-inert. Green when nothing is enabled anywhere, or nothing
+        is live; yellow when a live low/medium feature is on; red when a live high-risk
+        one (clipboard) is."""
+        order = list(self._osc_actions)
+        armed, live = set(), set()
+        for t in self._real_terms():
+            on = {k for k in order if t.osc_enabled(k)}
+            armed |= on
+            if t.tui_active():
+                live |= on
+        live_l = [k for k in order if k in live]
+        armed_l = [k for k in order if k in armed]
+        if live_l:
+            risks = [OSC_FEATURE_BY_KEY[k][3] for k in live_l]
+            labels = ', '.join(OSC_FEATURE_BY_KEY[k][0] for k in live_l)
+            colour, word = (('#e5484d', 'OSC red') if 'high' in risks
+                            else ('#e5a50a', 'OSC on'))
+            return (colour, word,
+                    'OSC: live features (%s).\n\n'
+                    % ('high risk' if 'high' in risks else 'elevated') +
+                    'Live now (a tab in TUI): ' + labels + '.\n\n'
+                    'Untrusted output can now trigger these side-effects (not only a '
+                    'program you chose to run -- any output, including a file you view '
+                    'or a server banner), and a BACKGROUND TUI tab counts. Turn them '
+                    'off under View > OSC features to return to green.\n\n'
+                    + _OSC_THREAT_MODEL)
+        if armed_l:
+            labels = ', '.join(OSC_FEATURE_BY_KEY[k][0] for k in armed_l)
             return ('#1f8a54', 'OSC idle',
-                    'OSC: enabled but inactive in CLI mode (green).\n\n'
-                    'You have enabled: ' + labels + '. OSC side-effects take '
-                    'effect only in the opt-in TUI mode, so in the current CLI '
-                    'mode no output can trigger them -- there is no live risk. '
-                    'Switch to TUI mode to activate them (at your own risk), or '
-                    'turn them off under View > OSC features.\n\n' + _OSC_THREAT_MODEL)
-        if not enabled:
-            return ('#1f8a54', 'OSC off',
-                    'OSC: all neutralized (green).\n\n'
-                    'Every way OUTPUT can reach out of the terminal (set the window '
-                    'title, write your clipboard, make hyperlinks, change colours, '
-                    '...) is turned off, so viewing untrusted output cannot trigger '
-                    'those side-effects. Enable individual ones in TUI mode under '
-                    'View > OSC features, at your own risk.\n\n' + _OSC_THREAT_MODEL)
-        risks = [OSC_FEATURE_BY_KEY[k][3] for k in enabled]
-        labels = ', '.join(OSC_FEATURE_BY_KEY[k][0] for k in enabled)
-        if 'high' in risks:
-            colour, word = '#e5484d', 'OSC red'
-        else:
-            colour, word = '#e5a50a', 'OSC on'
-        return (colour, word,
-                'OSC: enabled features (%s).\n\n' % ('high risk' if 'high' in risks
-                                                     else 'elevated') +
-                'You have enabled: ' + labels + '.\n\n'
-                'Untrusted output can now trigger these side-effects (not only a '
-                'program you chose to run -- any output, including a file you view '
-                'or a server banner). Turn them off under View > OSC features to '
-                'return to green.\n\n' + _OSC_THREAT_MODEL)
+                    'OSC: enabled but inactive (green).\n\n'
+                    'Enabled: ' + labels + '. OSC side-effects take effect only in '
+                    'the opt-in TUI mode, and no tab is in TUI now, so no output can '
+                    'trigger them -- there is no live risk. A tab switching to TUI '
+                    'activates them (at your own risk); turn them off under '
+                    'View > OSC features.\n\n' + _OSC_THREAT_MODEL)
+        return ('#1f8a54', 'OSC off',
+                'OSC: all neutralized (green).\n\n'
+                'Every way OUTPUT can reach out of the terminal (set the window '
+                'title, write your clipboard, make hyperlinks, change colours, '
+                '...) is turned off, so viewing untrusted output cannot trigger '
+                'those side-effects. Enable individual ones in TUI mode under '
+                'View > OSC features, at your own risk.\n\n' + _OSC_THREAT_MODEL)
 
     def _display_level(self):
         """The display (unicode) risk axis as (colour, short, detail). Show
@@ -4663,7 +4668,11 @@ class MainWindow(QMainWindow):
                  'default. Also on the View > Clipboard sanitizer menu.')
         clip_autostart = QCheckBox()
         clip_autostart.setChecked(clipboard_watch.autostart_enabled())
-        clip_autostart.setEnabled(self._clip_controls_enabled())
+        # Both gates: tray availability AND the admin lock (set_clip_autostart
+        # refuses a locked change, so an editable-but-ignored control would mislead
+        # -- matches the tray-menu control's gating).
+        clip_autostart.setEnabled(self._clip_controls_enabled()
+                                  and 'clip_autostart' not in self._locked)
         _tip_row(clip_box, 'Start sanitizer on login', clip_autostart,
                  'Start the tray clipboard sanitizer automatically at login. Needs the '
                  'system tray on -- it is a tray app, so turning the tray off turns '
