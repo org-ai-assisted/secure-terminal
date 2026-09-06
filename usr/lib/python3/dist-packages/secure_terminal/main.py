@@ -327,6 +327,12 @@ class _ZoomDialog(QDialog):
 
 _QWIDGETSIZE_MAX = (1 << 24) - 1   # Qt's QWIDGETSIZE_MAX (no-maximum sentinel; PyQt does not export it)
 
+# Tooltip card colours (background, foreground, border) by theme. Single source shared by
+# the custom InfoTip widget AND the app-level QToolTip stylesheet, so the native menu
+# tooltip (which cannot use InfoTip) reads the same and never renders dark-on-dark.
+_TIP_COLORS = {'dark':  ('#252a31', '#e7ebf1', '#3b434f'),
+               'light': ('#fbfbfd', '#23262b', '#d3d9e2')}
+
 
 class InfoTip(QLabel):
     """A persistent, selectable, zoom- and theme-aware replacement for the plain
@@ -367,10 +373,7 @@ class InfoTip(QLabel):
     def _apply_palette(self, theme):
         """Colours from the active tab's theme -- an elevated surface over the
         terminal background, not a fixed light card that jars on a dark terminal."""
-        if theme == 'dark':
-            bg, fg, border = '#252a31', '#e7ebf1', '#3b434f'
-        else:
-            bg, fg, border = '#fbfbfd', '#23262b', '#d3d9e2'
+        bg, fg, border = _TIP_COLORS['dark' if theme == 'dark' else 'light']
         self.setStyleSheet('QLabel{background:%s;color:%s;'
                            'border:1px solid %s;border-radius:8px;'
                            'padding:8px 11px}' % (bg, fg, border))
@@ -467,22 +470,32 @@ class InfoTip(QLabel):
 
 class _InfoLabel(QLabel):
     """A settings-row label whose trailing "(i)" marker is a real CLICK target:
-    a click shows the persistent, copyable InfoTip at once -- reliable and
-    re-openable, unlike a hover tooltip that only fires on a fresh mouse-rest (so
+    clicking the marker shows the persistent, copyable InfoTip at once -- reliable
+    and re-openable, unlike a hover tooltip that only fires on a fresh mouse-rest (so
     re-hovering the same spot does nothing). Hover still works (the tooltip is set
-    too); the pointing-hand cursor advertises that the marker is clickable."""
+    too). The marker is an ANCHOR, not the whole label: clicking the label TEXT selects
+    it for copy instead of popping the tip over the very words you are marking (the
+    reported 'tooltip overlaps the text I am selecting'). Only the (i) link opens it."""
+
+    _MARK = '<span style="color:#5b9bd5">(i)</span>'
+    _LINK = ('<a href="tip" style="color:#5b9bd5;text-decoration:none">(i)</a>')
 
     def __init__(self, html, tip, window):
-        super().__init__(html)
+        # Turn the "(i)" marker into a link so it, and only it, opens the tip on click;
+        # the surrounding text stays plain and selectable.
+        super().__init__(html.replace(self._MARK, self._LINK))
         self._tip_text = tip
         self._window = window
         self.setTextFormat(Qt.TextFormat.RichText)
         self.setToolTip(tip)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def mousePressEvent(self, event):
-        self._window.show_info_tip(self, self._tip_text)
-        super().mousePressEvent(event)
+        # Text selectable for copy AND the marker clickable as a link; _select_labels
+        # later ORs in the selection flags too (it preserves these).
+        self.setTextInteractionFlags(
+            self.textInteractionFlags()
+            | Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.linkActivated.connect(
+            lambda _href: self._window.show_info_tip(self, self._tip_text))
 
 
 class _ToolTipFilter(QObject):
@@ -514,6 +527,13 @@ class _ToolTipFilter(QObject):
 
 _BANNER_LABEL_PX = 13
 _BANNER_BTN_PX = 15
+
+# Suffix appended to an OSC-feature tooltip naming its risk class. Every risk value in
+# OSC_FEATURES MUST have a non-empty entry -- a missing/blank one silently drops the risk
+# label from that feature's tooltip (the low-risk osc_cwd bug). Kept module-level so a
+# test can assert completeness against OSC_FEATURES.
+_RISK_TAG = {'low': '   [risk: low]', 'medium': '   [risk: medium]',
+             'high': '   [RISK: HIGH]'}
 
 
 def _banner_css(zoom):
@@ -830,6 +850,9 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self._tip_filter)
+        # Style Qt's native QToolTip: MENU action hints use it (not InfoTip), and the
+        # platform default can paint dark-on-dark. Follows the window default theme.
+        self._apply_tooltip_style(self._default_theme)
 
         self._theme_actions = {}
         self._osc_actions = {}       # osc feature key -> its checkable menu action
@@ -2248,6 +2271,19 @@ class MainWindow(QMainWindow):
             return term.current_theme()
         return getattr(self, '_default_theme', 'light')
 
+    def _apply_tooltip_style(self, theme):
+        """Style Qt's native QToolTip app-wide so it is readable in either theme. Menu
+        action hints (View > OSC features risk hints, ...) go to the native tooltip, not
+        the custom InfoTip (_ToolTipFilter leaves QMenu to Qt), and the platform default
+        can paint dark text on a dark ground. Matches the InfoTip card via _TIP_COLORS. A
+        QToolTip-only rule at the app level does not disturb the per-widget stylesheets
+        used elsewhere (nothing else sets an app-level stylesheet)."""
+        app = QApplication.instance()
+        if app is not None:
+            bg, fg, border = _TIP_COLORS['dark' if theme == 'dark' else 'light']
+            app.setStyleSheet('QToolTip{background:%s;color:%s;border:1px solid %s;'
+                              'border-radius:6px;padding:5px 8px}' % (bg, fg, border))
+
     # -- copy / paste route through the current tab (paste stays sanitized) ----
     def copy_selection(self):
         term = self.current()
@@ -2339,6 +2375,14 @@ class MainWindow(QMainWindow):
         self._update_tui_indicator()
         self._update_security_indicator()
         self._update_terminate_enabled()
+        # Give the newly-current terminal the keyboard focus. A QTabWidget hands focus
+        # to the tab BAR on a switch, not the page content, so without this the tab is
+        # visible but the caret is elsewhere -- the user must click once more before
+        # typing (konsole focuses the terminal directly). Skip while the find bar is
+        # open so switching tabs mid-search does not yank the caret out of the field.
+        _fb = getattr(self, '_find_bar', None)
+        if not (_fb is not None and _fb.isVisible()):
+            term.setFocus()
 
     # -- zoom: per current tab ------------------------------------------------
     def set_zoom(self, percent):
@@ -2384,6 +2428,7 @@ class MainWindow(QMainWindow):
             term.apply_theme(theme)
             self._apply_container_theme(theme)   # container follows the current tab
         self._default_theme = theme
+        self._apply_tooltip_style(theme)     # native menu tooltip follows the theme
         self._review_bar.rerender_mirror()   # an open review follows the theme
         self._persist()
 
@@ -3374,52 +3419,60 @@ class MainWindow(QMainWindow):
         self._update_security_indicator()          # review lamp reflects the level
         self._persist()
 
+    # The two captures share one writer each, differing only in the text getter:
+    #   Transcript      -> scrollback_text(): append-only history, alt grid EXCLUDED
+    #   Current Screen  -> transcript_text():  the live current frame (incl. a TUI app)
+    # Both getters are lossless plain ASCII (Box names each neutralized character inline
+    # <U+XXXX NAME> rather than collapsing to '_'), so a saved file is safe to open
+    # anywhere, unlike a normal terminal's raw log.
     def save_transcript(self):
+        self._save_capture('Save Transcript', 'secure-terminal-transcript.txt',
+                           SecureTerminal.scrollback_text)
+
+    def save_current_screen(self):
+        self._save_capture('Save Current Screen', 'secure-terminal-screen.txt',
+                           SecureTerminal.transcript_text)
+
+    def open_transcript(self):
+        self._open_capture('transcript.txt', SecureTerminal.scrollback_text)
+
+    def open_current_screen(self):
+        self._open_capture('screen.txt', SecureTerminal.transcript_text)
+
+    def _save_capture(self, title, default_name, getter):
         term = self.current()
         if term is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, 'Save Transcript', 'secure-terminal-transcript.txt',
-            'Text files (*.txt);;All files (*)')
+            self, title, default_name, 'Text files (*.txt);;All files (*)')
         if not path:
             return
         # The tab's shell may have exited during the save dialog, deleting term;
-        # term.transcript_text() on the freed C++ object would then crash.
+        # a getter on the freed C++ object would then crash.
         if not self._tab_is_live(term):
             return
-        # transcript_text() is lossless -- Box mode names each neutralized
-        # character inline (<U+XXXX NAME>) rather than collapsing it to '_' -- and
-        # pure ASCII except the real glyphs Show mode keeps. So the saved file is
-        # safe to open anywhere (unlike a normal terminal's raw log) and still
-        # records exactly which characters were there.
         try:
             with open(path, 'w', encoding='utf-8') as handle:
-                handle.write(term.transcript_text())
+                handle.write(getter(term))
         except OSError:
             pass            # a failed save (bad path, no space) is not fatal
 
-    def open_transcript(self):
+    def _open_capture(self, filename, getter):
         term = self.current()
         if term is None or not self._tab_is_live(term):
             return
-        # Hand this tab's transcript to the system default text viewer/editor (xdg-open via
-        # Qt), no save dialog. transcript_text() is lossless plain ASCII -- Box names each
-        # neutralized character inline -- so the opened file is safe anywhere, unlike a raw
-        # terminal log. Written to a FIXED file under the app's XDG state dir: the shipped
-        # AppArmor profile allows ~/.local/state/secure-terminal/** but NOT /tmp, and reusing
-        # one file (rather than a fresh temp each time) keeps sensitive history from
-        # accumulating on disk.
-        state_dir = session._state_dir()
-        path = os.path.join(state_dir, 'transcript.txt')
-        # Guard the write like save_transcript does: an OSError (ENOSPC/EACCES on the
-        # makedirs or the write) must NOT propagate out of this Qt slot and take the
-        # whole window (all tabs) down with it. ensure_state_dir + 0o600 keep this
-        # sensitive history owner-only (a bare makedirs/open would be world-readable).
+        # Hand the text to the system default viewer/editor (xdg-open via Qt), no dialog.
+        # Written to a FIXED file under the app's XDG state dir: the shipped AppArmor
+        # profile allows ~/.local/state/secure-terminal/** but NOT /tmp, and reusing one
+        # file (rather than a fresh temp each time) keeps sensitive history from
+        # accumulating. ensure_state_dir + 0o600 keep it owner-only; an OSError must NOT
+        # propagate out of this Qt slot and take the whole window (all tabs) down with it.
+        path = os.path.join(session._state_dir(), filename)
         try:
             session.ensure_state_dir()
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                handle.write(term.transcript_text())
+                handle.write(getter(term))
         except OSError:
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
@@ -3618,8 +3671,9 @@ class MainWindow(QMainWindow):
                                 '&Save Transcript...', self)
         self._bind(self.act_save, 'save_transcript', 'Ctrl+Shift+S')
         self.act_save.setToolTip(
-            'Save this tab\'s scrollback to a file. It is already sanitized '
-            'plain ASCII, so the saved file is safe to open anywhere.')
+            "Save this tab's scrollback (its command history) to a file. A running "
+            'full-screen program (vim, htop) is not part of the scrollback -- use Save '
+            'Current Screen for that. Sanitized plain ASCII, safe to open anywhere.')
         self.act_save.triggered.connect(self.save_transcript)
         file_menu.addAction(self.act_save)
 
@@ -3627,10 +3681,31 @@ class MainWindow(QMainWindow):
                                 'Op&en Transcript...', self)
         self._bind(self.act_open, 'open_transcript', '')
         self.act_open.setToolTip(
-            'Open this tab\'s transcript in your system default text editor. It is '
-            'already sanitized plain ASCII, so it is safe to open anywhere.')
+            "Open this tab's scrollback in your system default text editor. "
+            'Sanitized plain ASCII, so it is safe to open anywhere.')
         self.act_open.triggered.connect(self.open_transcript)
         file_menu.addAction(self.act_open)
+
+        # No mnemonic: the File menu's letters are already saturated (a duplicate
+        # would fail the no-dup-mnemonic gate); these two niche actions go without.
+        self.act_save_screen = QAction(QIcon.fromTheme('document-save'),
+                                       'Save Current Screen...', self)
+        self._bind(self.act_save_screen, 'save_current_screen', '')
+        self.act_save_screen.setToolTip(
+            'Save what is on screen right NOW -- including a full-screen program (vim, '
+            'htop) the scrollback does not capture. Sanitized plain ASCII, safe '
+            'anywhere.')
+        self.act_save_screen.triggered.connect(self.save_current_screen)
+        file_menu.addAction(self.act_save_screen)
+
+        self.act_open_screen = QAction(QIcon.fromTheme('document-open'),
+                                       'Open Current Screen...', self)
+        self._bind(self.act_open_screen, 'open_current_screen', '')
+        self.act_open_screen.setToolTip(
+            'Open what is on screen right NOW -- including a full-screen program -- in '
+            'your system default text editor. Sanitized plain ASCII, safe anywhere.')
+        self.act_open_screen.triggered.connect(self.open_current_screen)
+        file_menu.addAction(self.act_open_screen)
 
         file_menu.addSeparator()
         self.act_terminate = QAction(
@@ -3886,12 +3961,10 @@ class MainWindow(QMainWindow):
                             'file-transfer escapes (OSC 1337) are always '
                             'neutralized and have no toggle -- they can never be '
                             'safely enabled.')
-        _risk_tag = {'low': '', 'medium': '   [risk: medium]',
-                     'high': '   [RISK: HIGH]'}
         for key, label, codes, _dflt, risk, hint in OSC_FEATURES:
             act = QAction(label + '  (OSC ' + codes + ')', self, checkable=True)
             act.setChecked(self._osc_defaults.get(key, False))
-            act.setToolTip(hint + _risk_tag[risk])
+            act.setToolTip(hint + _RISK_TAG[risk])
             act.toggled.connect(lambda on, k=key: self.set_osc(k, on))
             osc_menu.addAction(act)
             self._osc_actions[key] = act
@@ -4309,7 +4382,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def show_about(self):
-        dialog = QDialog(self)
+        dialog = _ZoomDialog(self)      # Ctrl+wheel live-zooms the dialog (below)
         dialog.setWindowTitle('About secure-terminal')
         layout = QVBoxLayout(dialog)
         icon = _app_icon()
@@ -4319,7 +4392,11 @@ class MainWindow(QMainWindow):
             logo.setAlignment(Qt.AlignmentFlag.AlignHCenter)
             layout.addWidget(logo)
         title = QLabel('secure-terminal ' + APP_VERSION)
-        title.setStyleSheet('font-weight:bold; font-size:16px;')
+        # Heading emphasis via a scaled QFont, NOT a fixed px: a stylesheet font-size
+        # would override the dialog font and refuse to zoom. Base captured once so
+        # re-scaling never compounds; a pixel-size font reports pointSizeF() <= 0.
+        _tpt = title.font().pointSizeF()
+        _title_base = _tpt if _tpt > 0 else 10.0
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(title)
         body = QLabel(
@@ -4347,7 +4424,27 @@ class MainWindow(QMainWindow):
         close.clicked.connect(dialog.accept)
         buttons.addWidget(close)
         layout.addLayout(buttons)
-        _select_labels(dialog, self._ui_scale)
+
+        def _apply_about_scale(scale, _dlg=dialog, _title=title, _base=_title_base):
+            _select_labels(_dlg, scale)             # body + selectable labels
+            tf = _title.font()
+            tf.setBold(True)
+            tf.setPointSizeF(_base * 1.45 * scale / 100.0)   # heading tracks the zoom
+            _title.setFont(tf)
+
+        # Ctrl+wheel zoom is LOCAL to this dialog (does not change the global menu size
+        # or persist), so reading the About box never mutates a setting.
+        _about_scale = [self._ui_scale]
+
+        def _about_zoom(direction):
+            new = max(UI_SCALE_MIN,
+                      min(UI_SCALE_MAX, _about_scale[0] + direction * UI_SCALE_STEP))
+            if new != _about_scale[0]:
+                _about_scale[0] = new
+                _apply_about_scale(new)
+        dialog.on_zoom = _about_zoom
+
+        _apply_about_scale(self._ui_scale)
         dialog.exec()
 
     _COMMAND_HELP = (
@@ -4712,7 +4809,48 @@ class MainWindow(QMainWindow):
 
         scroll.setWidget(content)           # all sections scroll; buttons pinned below
         outer.addWidget(scroll)
+
+        def _reset_defaults():
+            # Repopulate each control with its shipped default (in-dialog only; nothing
+            # persists until Apply). Skip a DISABLED control so a reset never flips a
+            # setting the user is not allowed to change: an admin-locked key, or a
+            # tray-gated clip_autostart, is already setEnabled(False) above -- one guard
+            # covers both. Defaults mirror the constructor's fallbacks; the drift guard
+            # is a test comparing this against a freshly-defaulted window.
+            def _set(widget, apply_default):
+                if widget.isEnabled():
+                    apply_default()
+            _set(theme, lambda: theme.setCurrentIndex(theme.findData('light')))
+            _set(font_family,
+                 lambda: font_family.setCurrentFont(QFont(DEFAULT_FONT_FAMILY)))
+            _set(font_size, lambda: font_size.setValue(BASE_POINT_SIZE))
+            _set(ui_scale, lambda: ui_scale.setValue(100))
+            _set(zoom, lambda: zoom.setValue(100))
+            _set(scrollback, lambda: scrollback.setCurrentIndex(scrollback.findData(0)))
+            _set(mode, lambda: mode.setCurrentIndex(mode.findData('detail')))
+            _set(colors, lambda: colors.setChecked(True))
+            _set(line_edits, lambda: line_edits.setChecked(True))
+            _set(tui, lambda: tui.setChecked(False))
+            _set(tui_autobox_notice, lambda: tui_autobox_notice.setChecked(True))
+            _set(osc, lambda: osc.setChecked(True))
+            for _rk, _rcb in osc_checks.items():
+                _set(_rcb, lambda _rcb=_rcb: _rcb.setChecked(False))
+            _set(pdelay, lambda: pdelay.setCurrentIndex(pdelay.findData(3)))
+            _set(esc_limit, lambda: esc_limit.setCurrentIndex(esc_limit.findData(4096)))
+            _set(paste_warn,
+                 lambda: paste_warn.setCurrentIndex(paste_warn.findData('unicode')))
+            _set(copy_warn,
+                 lambda: copy_warn.setCurrentIndex(copy_warn.findData('unicode')))
+            _set(persist, lambda: persist.setChecked(True))
+            _set(systray, lambda: systray.setChecked(False))
+            _set(auto_tab_colors, lambda: auto_tab_colors.setChecked(True))
+            _set(clip_warn_any, lambda: clip_warn_any.setChecked(False))
+            _set(clip_autostart, lambda: clip_autostart.setChecked(False))
+
         buttons = QHBoxLayout()
+        reset = QPushButton('Reset to defaults')
+        reset.clicked.connect(_reset_defaults)
+        buttons.addWidget(reset)
         buttons.addStretch(1)
         cancel = QPushButton('Cancel')
         cancel.clicked.connect(dialog.reject)
@@ -4737,6 +4875,19 @@ class MainWindow(QMainWindow):
         dialog.on_zoom = _live_zoom
 
         _select_labels(dialog, self._ui_scale)
+        # Open tall enough to show every section without a scrollbar by default; cap to
+        # the screen so a large Menu-size scale (or a small display) still fits, and only
+        # then does the scroll area engage. Width follows the content so nothing clips.
+        _screen = QApplication.primaryScreen()
+        if _screen is not None:
+            _avail = _screen.availableGeometry()
+            _chint = content.sizeHint()
+            _m = outer.contentsMargins()
+            _need_h = (_chint.height() + reset.sizeHint().height()
+                       + _m.top() + _m.bottom() + outer.spacing() + 8)
+            _need_w = _chint.width() + 2 * scroll.frameWidth() + 24  # scrollbar allowance
+            dialog.resize(min(_avail.width(), max(dialog.width(), _need_w)),
+                          min(int(_avail.height() * 0.9), _need_h))
         prev_ui_scale = self._ui_scale
         if dialog.exec() != QDialog.DialogCode.Accepted:
             # Ctrl+wheel (_live_zoom) mutated self._ui_scale and _persist()ed it LIVE
@@ -5191,6 +5342,8 @@ class MainWindow(QMainWindow):
         for label, directory in zip(labels, settings.config_dirs()):
             rows.append((label, directory))
         rows.append(('Saved session', session.session_path()))
+        # Where a saved / opened transcript is written (open_transcript, save on restore).
+        rows.append(('Transcripts', session._state_dir()))
 
         dialog = QDialog(self)
         dialog.setWindowTitle('Folders & Files')
