@@ -1045,9 +1045,10 @@ class MainWindow(QMainWindow):
         entry = OSC_FEATURE_BY_KEY.get(key)
         label = entry[0].lower() if entry else 'an escape'
         self._on_advise(term, 'An application used an OSC escape (' + label + '), '
-                        'which the safe CLI mode neutralized. Enable it under '
-                        'View > OSC features if you trust the source; turn this '
-                        'notice off (all or per type) in View > Notify on OSC use.',
+                        'which secure-terminal neutralized. Enable it in TUI mode '
+                        'under View > OSC features if you trust the source; turn '
+                        'this notice off (all or per type) in View > Notify on '
+                        'OSC use.',
                         'osc')
 
     def _on_escape_suppressed(self, term):
@@ -2653,8 +2654,8 @@ class MainWindow(QMainWindow):
                     'Every way OUTPUT can reach out of the terminal (set the window '
                     'title, write your clipboard, make hyperlinks, change colours, '
                     '...) is turned off, so viewing untrusted output cannot trigger '
-                    'those side-effects. Enable individual ones under View > OSC '
-                    'features, at your own risk.\n\n' + _OSC_THREAT_MODEL)
+                    'those side-effects. Enable individual ones in TUI mode under '
+                    'View > OSC features, at your own risk.\n\n' + _OSC_THREAT_MODEL)
         risks = [OSC_FEATURE_BY_KEY[k][3] for k in enabled]
         labels = ', '.join(OSC_FEATURE_BY_KEY[k][0] for k in enabled)
         if 'high' in risks:
@@ -3842,7 +3843,7 @@ class MainWindow(QMainWindow):
         self.act_osc_notice.setChecked(self._osc_notice)
         self.act_osc_notice.setToolTip(
             'Show a dismissible banner (at most once per TYPE per tab) when a '
-            'program uses an OSC escape the safe CLI mode neutralized. On by '
+            'program uses an OSC escape secure-terminal neutralized. On by '
             'default. Untick a specific type below to mute just that one.')
         self.act_osc_notice.toggled.connect(self.set_osc_notice)
         osc_notice_menu.addAction(self.act_osc_notice)
