@@ -1141,6 +1141,13 @@ class SecureTerminal(QPlainTextEdit):
         # pyte has no separate alt buffer, so without this the program's clear/draw
         # would destroy the primary screen and pollute the scrollback.
         self._alt_saved = None
+        # 'Save Transcript' scrollback (Option B): the alt screen is NOT scrollback, so
+        # the primary transcript text is frozen at alt entry (returned while the program
+        # runs, instead of the ephemeral grid), and each finished full-screen session
+        # leaves ONE final-frame snapshot appended as a bounded record. Both are captured
+        # by a READ-ONLY document walk (no render), so they are safe in the feed path.
+        self._alt_primary_text = ''
+        self._alt_exit_snapshots = []
 
         # OSC features a program may reach OUT of the grid with (title, notify,
         # clipboard, hyperlink, palette, cwd, iTerm2). Each is honored ONLY when
@@ -3888,6 +3895,14 @@ class SecureTerminal(QPlainTextEdit):
         screen so it can be restored intact on exit (pyte has no alt buffer)."""
         if self._alt_saved is not None or self._screen is None:
             return                        # already in the alt screen; do not nest
+        # Freeze the primary scrollback text NOW, so 'Save Transcript' keeps returning it
+        # while the program runs instead of the ephemeral alt grid. Render the pyte model
+        # to the document FIRST: _feed_stream fed the pre-marker primary bytes (this read's
+        # output right up to the switch) to pyte before calling us, but rendering is
+        # debounced, so a bare document walk would drop that final unpainted primary output.
+        if self._grid_mode():
+            self._render_tui()
+        self._alt_primary_text = self._walk_document_text()
         s = self._screen
         self._alt_saved = (
             copy.deepcopy(s.buffer),
@@ -3901,10 +3916,35 @@ class SecureTerminal(QPlainTextEdit):
         scrollback is clean."""
         if self._alt_saved is None or self._screen is None:
             return
+        # Append ONE final-frame snapshot of the full-screen session as a bounded record,
+        # so 'Save Transcript' keeps a trace of what was displayed without logging every
+        # frame. Render the alt screen to the document FIRST (same debounce reason as
+        # _alt_enter): the whole enter/draw/leave can arrive in one read before the render
+        # timer fires, so a bare walk would snapshot a stale (or empty) frame, not the
+        # program's actual last screen.
+        if self._grid_mode():
+            self._render_tui()
+        self._append_exit_snapshot(self._walk_document_text())
         self._screen.buffer, self._screen.history, self._screen.cursor = \
             self._alt_saved
         self._alt_saved = None
+        self._alt_primary_text = ''       # the frozen primary is now restored, live again
         self._reset_grid_view()           # rebuild scrollback from restored history
+
+    # Cap the accumulated exit snapshots so a long-lived tab that runs many full-screen
+    # programs cannot grow the transcript without bound.
+    _EXIT_SNAPSHOTS_MAX = 256 * 1024
+
+    def _append_exit_snapshot(self, frame):
+        """Record one full-screen session's final frame, headed so it reads as a distinct
+        block. Empty frames are skipped; the oldest are dropped past the size cap."""
+        if not frame.strip():
+            return
+        self._alt_exit_snapshots.append(
+            '\n----- full-screen application (final screen) -----\n' + frame + '\n')
+        total = sum(len(s) for s in self._alt_exit_snapshots)
+        while total > self._EXIT_SNAPSHOTS_MAX and len(self._alt_exit_snapshots) > 1:
+            total -= len(self._alt_exit_snapshots.pop(0))
 
     def _osc_split(self, data, carry, osc8):
         """Rejoin an OSC split across PTY reads and hold back a new incomplete tail, so a
@@ -4687,17 +4727,44 @@ class SecureTerminal(QPlainTextEdit):
         return None
 
     def transcript_text(self):
-        """The scrollback for SAVING: lossless, and pure ASCII except the real
-        glyphs Show mode keeps. In Box mode the display collapses every neutralized
-        byte to an inert box, which toPlainText saves as a bare '_' -- losing which
-        codepoint it was. A saved transcript is a record, so walk the RENDERED
-        document (line edits, wraps and scrollback already applied -- unlike the
-        capped raw stream) and expand each box to its source codepoint named inline
-        (<U+XXXX NAME>, the Detail rendering). Non-box display passes through
-        unchanged: Reveal/Detail already carry <U+XXXX> badges, and Show keeps the
-        glyph you opted into. Works the same in CLI and TUI (both render a
-        document)."""
+        """The CURRENT frame/screen as lossless, pure-ASCII (except the real glyphs Show
+        mode keeps) text. In TUI this is the live grid -- what 'Save Current Screen'
+        captures and what the session-restore file records. See scrollback_text() for the
+        'Save Transcript' append-only history (which excludes the ephemeral alt grid)."""
         self._force_current_frame()  # a save must include the last unpainted/ungated frame
+        return self._walk_document_text()
+
+    def scrollback_text(self):
+        """The append-only SCROLLBACK for 'Save Transcript'. The alternate screen is NOT
+        scrollback (konsole/xterm exclude it): while a full-screen program holds it, the
+        primary transcript frozen at entry is returned instead of the live grid, and each
+        finished full-screen session leaves ONE final-frame snapshot appended as a bounded
+        record. Outside the alt screen this is just the current document."""
+        if self._alt_saved is not None:
+            base = self._alt_primary_text
+        else:
+            base = self.transcript_text()
+        if not self._alt_exit_snapshots:
+            return base
+        # A full-screen (alternate-screen) session has no position in the LINEAR
+        # scrollback, so its recorded frames are a trailing section, oldest first --
+        # deliberately NOT interleaved with the primary scrollback above (there is no
+        # scrollback line to interleave them at). Headed so a reader is not misled into
+        # reading the order as chronological relative to the primary output.
+        return (base + '\n===== full-screen application sessions '
+                '(recorded separately, not in scroll order) ====='
+                + ''.join(self._alt_exit_snapshots))
+
+    def _walk_document_text(self):
+        """Render the CURRENT document to lossless text WITHOUT forcing a frame (a
+        read-only walk, safe to call from the feed path). In Box mode the display
+        collapses every neutralized byte to an inert box, which toPlainText saves as a
+        bare '_' -- losing which codepoint it was. A saved record must not, so walk the
+        RENDERED document (line edits, wraps and scrollback already applied -- unlike the
+        capped raw stream) and expand each box to its source codepoint named inline
+        (<U+XXXX NAME>, the Detail rendering). Non-box display passes through unchanged:
+        Reveal/Detail already carry <U+XXXX> badges, and Show keeps the glyph you opted
+        into. Works the same in CLI and TUI (both render a document)."""
         doc = self.document()
         out = []
         cur = QTextCursor(doc)
