@@ -3428,11 +3428,17 @@ class SecureTerminal(QPlainTextEdit):
             if not argv:
                 argv = [os.environ.get('SHELL') or '/bin/bash']
             if self._cwd:
-                # restore a session tab's working directory; a vanished dir falls
-                # back to the inherited cwd rather than failing the spawn.
+                # restore a session tab's working directory; a vanished dir OR a
+                # malformed one falls back to the inherited cwd rather than failing the
+                # spawn. ValueError/UnicodeEncodeError: _cwd comes from session-restore
+                # JSON validated only as a non-empty str, so an embedded NUL or a lone
+                # surrogate reaches here -- os.chdir raises ValueError (a ValueError
+                # subclass for the surrogate), which uncaught would crash this forked
+                # child and spoof the exec-detection handshake below (parent reads EOF
+                # and wrongly concludes exec succeeded).
                 try:
                     os.chdir(self._cwd)
-                except OSError:
+                except (OSError, ValueError):
                     pass
             try:
                 os.execvp(argv[0], argv)
@@ -5354,7 +5360,10 @@ class SecureTerminal(QPlainTextEdit):
                 self._write(meta + ctl.encode('latin-1'))
                 return
 
-        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+        # Ctrl+Shift is reserved for the WINDOW (like the TUI dispatch at the top and every
+        # Ctrl+Shift menu chord): Ctrl+Shift+Return/Backspace/Tab must NOT send a raw byte
+        # to the program -- they fall through so a window shortcut (or nothing) handles them.
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (ctrl and shift):
             # Enter submits the line: reset the mirror state, then send CR. Enter NEVER
             # advances a held multi-line paste -- the next line is inserted only by an
             # explicit paste gesture at an idle prompt (see _insert_next_staged), so a
@@ -5363,11 +5372,11 @@ class SecureTerminal(QPlainTextEdit):
             self._line_dirty = False
             self._write(b'\r')
             return
-        if key == Qt.Key.Key_Backspace:
+        if key == Qt.Key.Key_Backspace and not (ctrl and shift):
             self._line_buffer = self._line_buffer[:-1]
             self._write(b'\x7f')
             return
-        if key == Qt.Key.Key_Tab:
+        if key == Qt.Key.Key_Tab and not (ctrl and shift):
             # Tab completion rewrites the shell's line (path/command completion)
             # without updating _line_buffer, so mark the mirror unreliable for
             # _line_pending().
