@@ -71,4 +71,7 @@ dist-ai-tests:
   ## (labwc, via the runners' wl-headless-run wrap); qt6-wayland ships PyQt6's wayland platform
   ## plugin. Absent, the runners FATAL ("wl-headless-run: labwc not installed"); there is no
   ## offscreen fallback, so both are hard test deps.
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia qt6-wayland labwc python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git procps"
+  ## qt6-svg-plugins: the app icon is an SVG; QIcon renders it via this plugin. It is only a
+  ## Recommends of libqt6gui6, so a --no-install-recommends CI install drops it and the window
+  ## icon (and the _app_icon availableSizes regression test) would silently break. Pin it.
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia qt6-wayland qt6-svg-plugins labwc python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git procps"
