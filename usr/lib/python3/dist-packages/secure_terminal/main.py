@@ -204,6 +204,26 @@ def _app_icon():
 # cap on a `ctl dump-tab` reply so it stays under the IPC frame limit.
 _DUMP_MAX = 512 * 1024
 
+# The shipped default (persisted-string form) of every key _persist writes. save()
+# omits a key equal to its default, so the generated config holds ONLY real
+# overrides -- a later change to a shipped default then reaches everyone who has not
+# customised that key, with no migration and no stale default pinned on disk. The
+# drift guard (a test: a fresh-config window persists NOTHING) fails if any value
+# here diverges from the constructor's actual default, so this stays honest.
+_PERSIST_DEFAULTS = {
+    'allow_title': 'false', 'auto_tab_colors': 'true', 'bell': '', 'bell_sound': '',
+    'colored_markings': 'true', 'colors': 'true', 'confirm_close': 'true',
+    'copy_warn': 'unicode', 'escape_limit': '4096', 'font_family': DEFAULT_FONT_FAMILY,
+    'font_size': '11', 'keybindings': '', 'line_edits': 'true', 'osc_clipboard': 'false',
+    'osc_clipboard_read': 'false', 'osc_clipboard_read_always': 'false',
+    'osc_colors': 'false', 'osc_cwd': 'false', 'osc_hyperlink': 'false',
+    'osc_notice': 'true', 'osc_notice_off': ','.join(sorted(OSC_NOTICE_DEFAULT_OFF)),
+    'osc_notify': 'false', 'osc_title': 'false', 'paste_delay': '3',
+    'paste_warn': 'unicode', 'persist_session': 'true', 'scrollback': '0',
+    'systray': 'false', 'theme': 'light', 'tui': 'false', 'tui_autobox_notice': 'true',
+    'ui_scale': '100', 'unicode_mode': 'detail', 'zoom': '100',
+}
+
 # cap on tabs opened by a single --reuse/open IPC frame. A handoff opens a handful
 # (claude-rc-session open-all); ~58k tiny specs fit in the 1 MiB frame and would
 # exhaust fds/memory, so a frame past this is a runaway, refused whole.
@@ -3754,7 +3774,7 @@ class MainWindow(QMainWindow):
             'persist_session': 'true' if self._persist_session else 'false',
             'confirm_close': 'true' if self._confirm_close else 'false',
             **{k: 'true' if v else 'false' for k, v in self._osc_defaults.items()},
-        }, locked=self._locked)
+        }, defaults=_PERSIST_DEFAULTS, locked=self._locked)
 
     # -- chrome ---------------------------------------------------------------
     def _build_menu(self):
