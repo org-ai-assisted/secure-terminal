@@ -18,7 +18,7 @@ import argparse
 import json
 
 from PyQt6.QtCore import (
-    QTimer, Qt, QUrl, QRect, QPoint, QByteArray, QObject, QEvent,
+    QTimer, Qt, QUrl, QRect, QPoint, QSize, QByteArray, QObject, QEvent,
     qInstallMessageHandler)
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QIcon, QColor, QPalette, QPixmap,
@@ -197,7 +197,17 @@ def _app_icon():
     for path in ('/usr/share/icons/hicolor/scalable/apps/secure-terminal.svg',
                  os.path.join(base, rel)):
         if os.path.exists(path):
-            return QIcon(path)
+            # A QIcon built straight from an SVG path reports NO availableSizes(), so Qt's
+            # X11 _NET_WM_ICON export emits nothing and the window/taskbar icon silently
+            # falls back to the WM's default placeholder (the installed hicolor-theme path
+            # above does carry sizes, so this only bites a source checkout / uncached /
+            # bare-desktop run). Render the SVG to concrete pixmaps so the icon carries
+            # real sizes and the window icon actually shows.
+            src = QIcon(path)
+            icon = QIcon()
+            for size in (16, 22, 24, 32, 48, 64, 128, 256):
+                icon.addPixmap(src.pixmap(QSize(size, size)))
+            return icon
     return QIcon()
 
 
