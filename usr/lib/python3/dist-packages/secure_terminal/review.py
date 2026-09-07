@@ -909,7 +909,13 @@ class ReviewBar(QWidget):
                                      % (blocked, '' if blocked == 1 else 's'))
             return
         # not blocked: the OUTCOME is safe (ASCII) or caution (printable unicode kept).
-        if any(ord(c) > 0x7F for c in box):
+        # Judge the FULL delivered content -- the box PLUS the un-shown tail neutralized
+        # to the active tier -- not the box alone: a long paste whose box is ASCII but
+        # whose tail (past _BOX_MAX) carries a printable look-alike would else read
+        # "ASCII" while a homoglyph crosses (the tail is delivered kept at the reveal/
+        # keep tier, which sanitize_paste_unicode preserves on the way out).
+        delivered = box + self._tail_delivered()
+        if any(ord(c) > 0x7F for c in delivered):
             base, colour = '%s unicode' % verb, CAUTION_FG
         else:
             base, colour = '%s ASCII' % verb, None
