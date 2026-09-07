@@ -412,28 +412,36 @@ class InfoTip(QLabel):
         self.raise_()
         self._poll.start()
 
-    def _place(self, widget):
-        """Anchor the tip to the SOURCE widget's rectangle, never over it, so the
-        widget stays clickable the instant it is hovered: below it by preference,
-        flipped above when there is no room (e.g. a bottom status-bar lamp), and
-        clamped to the screen so a wide tip never runs off-edge. The old placement
-        (cursor + (12,18)) landed the opaque tip on the hovered chip and swallowed
-        the next click."""
-        rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
-        size = self.size()
-        screen = widget.screen() or QApplication.primaryScreen()
-        avail = screen.availableGeometry()
-        below = rect.bottom() + 1 + self._GAP
-        above = rect.top() - self._GAP - size.height()
-        # Below the widget by preference; flip above only when below would run off the
-        # screen bottom AND there is room above (e.g. a status-bar lamp).
+    @staticmethod
+    def _placement(rect, size, avail, gap):
+        """Pure geometry -- given the SOURCE global rect, the tip size, the screen's
+        available rect and the gap, return the tip's top-left QPoint: below the source by
+        preference, flipped above only when below would run off the screen bottom AND there
+        is room above (e.g. a bottom status-bar lamp), and clamped so a wide/tall tip never
+        runs off-edge. Split out from _place so the flip/clamp DECISION is testable with
+        synthetic rects -- a headless Wayland compositor cannot position or query the absolute
+        geometry of a standalone top-level, so the old real-window placement test is not
+        portable; the pure math is."""
+        below = rect.bottom() + 1 + gap
+        above = rect.top() - gap - size.height()
         if below + size.height() > avail.bottom() and above >= avail.top():
             y = above
         else:
             y = below
         x = min(max(rect.left(), avail.left()), avail.right() - size.width() + 1)
         y = min(max(y, avail.top()), avail.bottom() - size.height() + 1)
-        self.move(x, y)
+        return QPoint(x, y)
+
+    def _place(self, widget):
+        """Anchor the tip to the SOURCE widget's rectangle, never over it, so the
+        widget stays clickable the instant it is hovered: below it by preference,
+        flipped above when there is no room (e.g. a bottom status-bar lamp), and
+        clamped to the screen so a wide tip never runs off-edge. The old placement
+        (cursor + (12,18)) landed the opaque tip on the hovered chip and swallowed
+        the next click. The flip/clamp math is _placement (testable in isolation)."""
+        rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+        screen = widget.screen() or QApplication.primaryScreen()
+        self.move(self._placement(rect, self.size(), screen.availableGeometry(), self._GAP))
 
     def _check_pointer(self):
         pos = QCursor.pos()
@@ -1357,31 +1365,25 @@ class MainWindow(QMainWindow):
         if conn is None:
             return
         framer = ipc.Framer()
-        # Service a connection exactly once, and never touch the socket after teardown.
-        # Qt can deliver a trailing readyRead (the peer's EOF once it has read our reply
-        # and closed) or a synchronous `disconnected` while we tear the socket down; a
-        # re-entered handler then dereferences a QLocalSocket whose C++ object is already
-        # being freed -- a use-after-free that SIGSEGVs inside this slot, independent of
-        # the QPA platform. The `finished` latch plus detaching readyRead before teardown
-        # make the handler run at most once and only on a live socket. `deleteLater` is
-        # driven from here (not a raw `disconnected -> deleteLater`) so it happens exactly
-        # once, after readyRead is detached.
+        # Service the connection, then detach and tear it down exactly once. A QLocalSocket
+        # whose readyRead notifier fires while the socket is being torn down segfaults in
+        # Qt's dispatch (QAbstractSocketPrivate::canReadNotification) -- a use-after-free
+        # BEFORE any Python slot code runs. So _finish disconnects readyRead FIRST (with no
+        # slot left, Qt disables the read notifier), then disconnectFromServer + deleteLater.
+        # The `finished` latch makes _finish idempotent because BOTH on_ready (after it has
+        # replied or rejected the frame) and `disconnected` (a bare liveness-probe connect
+        # that sent no request) call it; whichever fires first tears down, the rest no-op.
         finished = {'done': False}
 
         def _finish():
             if finished['done']:
                 return
             finished['done'] = True
-            try:
-                conn.readyRead.disconnect(on_ready)
-            except (TypeError, RuntimeError):
-                pass                        # already detached, or C++ side gone
+            conn.readyRead.disconnect(on_ready)
             conn.disconnectFromServer()
             conn.deleteLater()
 
         def on_ready():
-            if finished['done']:
-                return                      # a trailing readyRead after we replied
             try:
                 payload = framer.feed(bytes(conn.readAll()))
             except ValueError:
@@ -1389,7 +1391,7 @@ class MainWindow(QMainWindow):
                 _finish()
                 return
             if payload is None:
-                return                      # frame not complete yet
+                return                      # frame not complete yet; more may follow
             reply = self._dispatch_request(payload)
             conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
             conn.flush()
@@ -1397,8 +1399,8 @@ class MainWindow(QMainWindow):
 
         conn.readyRead.connect(on_ready)
         # A bare connect (the socket_is_live liveness probe connects then closes with no
-        # framed request) reaches us only via `disconnected`; reap it there. The `finished`
-        # latch makes this idempotent with on_ready's own teardown.
+        # framed request) never delivers a full frame; reap it via `disconnected`. The
+        # `finished` latch keeps this idempotent with on_ready's own teardown.
         conn.disconnected.connect(_finish)
 
     def _dispatch_request(self, payload):
