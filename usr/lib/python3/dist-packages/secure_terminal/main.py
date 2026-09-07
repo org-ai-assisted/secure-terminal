@@ -37,7 +37,8 @@ from PyQt6.QtWidgets import (
 
 from secure_terminal import settings, session, ipc, resource_isolation
 from secure_terminal.sanitize import (
-    OSC_FEATURES, OSC_FEATURE_BY_KEY, luminance, sanitize_title)
+    OSC_FEATURES, OSC_FEATURE_BY_KEY, OSC_NOTICE_DEFAULT_OFF, luminance,
+    sanitize_title)
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
@@ -202,6 +203,26 @@ def _app_icon():
 
 # cap on a `ctl dump-tab` reply so it stays under the IPC frame limit.
 _DUMP_MAX = 512 * 1024
+
+# The shipped default (persisted-string form) of every key _persist writes. save()
+# omits a key equal to its default, so the generated config holds ONLY real
+# overrides -- a later change to a shipped default then reaches everyone who has not
+# customised that key, with no migration and no stale default pinned on disk. The
+# drift guard (a test: a fresh-config window persists NOTHING) fails if any value
+# here diverges from the constructor's actual default, so this stays honest.
+_PERSIST_DEFAULTS = {
+    'allow_title': 'false', 'auto_tab_colors': 'true', 'bell': '', 'bell_sound': '',
+    'colored_markings': 'true', 'colors': 'true', 'confirm_close': 'true',
+    'copy_warn': 'unicode', 'escape_limit': '4096', 'font_family': DEFAULT_FONT_FAMILY,
+    'font_size': '11', 'keybindings': '', 'line_edits': 'true', 'osc_clipboard': 'false',
+    'osc_clipboard_read': 'false', 'osc_clipboard_read_always': 'false',
+    'osc_colors': 'false', 'osc_cwd': 'false', 'osc_hyperlink': 'false',
+    'osc_notice': 'true', 'osc_notice_off': ','.join(sorted(OSC_NOTICE_DEFAULT_OFF)),
+    'osc_notify': 'false', 'osc_title': 'false', 'paste_delay': '3',
+    'paste_warn': 'unicode', 'persist_session': 'true', 'scrollback': '0',
+    'systray': 'false', 'theme': 'light', 'tui': 'false', 'tui_autobox_notice': 'true',
+    'ui_scale': '100', 'unicode_mode': 'detail', 'zoom': '100',
+}
 
 # cap on tabs opened by a single --reuse/open IPC frame. A handoff opens a handful
 # (claude-rc-session open-all); ~58k tiny specs fit in the 1 MiB frame and would
@@ -412,28 +433,36 @@ class InfoTip(QLabel):
         self.raise_()
         self._poll.start()
 
-    def _place(self, widget):
-        """Anchor the tip to the SOURCE widget's rectangle, never over it, so the
-        widget stays clickable the instant it is hovered: below it by preference,
-        flipped above when there is no room (e.g. a bottom status-bar lamp), and
-        clamped to the screen so a wide tip never runs off-edge. The old placement
-        (cursor + (12,18)) landed the opaque tip on the hovered chip and swallowed
-        the next click."""
-        rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
-        size = self.size()
-        screen = widget.screen() or QApplication.primaryScreen()
-        avail = screen.availableGeometry()
-        below = rect.bottom() + 1 + self._GAP
-        above = rect.top() - self._GAP - size.height()
-        # Below the widget by preference; flip above only when below would run off the
-        # screen bottom AND there is room above (e.g. a status-bar lamp).
+    @staticmethod
+    def _placement(rect, size, avail, gap):
+        """Pure geometry -- given the SOURCE global rect, the tip size, the screen's
+        available rect and the gap, return the tip's top-left QPoint: below the source by
+        preference, flipped above only when below would run off the screen bottom AND there
+        is room above (e.g. a bottom status-bar lamp), and clamped so a wide/tall tip never
+        runs off-edge. Split out from _place so the flip/clamp DECISION is testable with
+        synthetic rects -- a headless Wayland compositor cannot position or query the absolute
+        geometry of a standalone top-level, so the old real-window placement test is not
+        portable; the pure math is."""
+        below = rect.bottom() + 1 + gap
+        above = rect.top() - gap - size.height()
         if below + size.height() > avail.bottom() and above >= avail.top():
             y = above
         else:
             y = below
         x = min(max(rect.left(), avail.left()), avail.right() - size.width() + 1)
         y = min(max(y, avail.top()), avail.bottom() - size.height() + 1)
-        self.move(x, y)
+        return QPoint(x, y)
+
+    def _place(self, widget):
+        """Anchor the tip to the SOURCE widget's rectangle, never over it, so the
+        widget stays clickable the instant it is hovered: below it by preference,
+        flipped above when there is no room (e.g. a bottom status-bar lamp), and
+        clamped to the screen so a wide tip never runs off-edge. The old placement
+        (cursor + (12,18)) landed the opaque tip on the hovered chip and swallowed
+        the next click. The flip/clamp math is _placement (testable in isolation)."""
+        rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+        screen = widget.screen() or QApplication.primaryScreen()
+        self.move(self._placement(rect, self.size(), screen.availableGeometry(), self._GAP))
 
     def _check_pointer(self):
         pos = QCursor.pos()
@@ -743,9 +772,18 @@ class MainWindow(QMainWindow):
         # toggle turns it off. A notice only -- the auto-switch itself is unconditional.
         self._tui_autobox_notice = cfg.get('tui_autobox_notice') != 'false'
         # OSC types the user has muted individually (still neutralized, just no
-        # notice): a set of feature keys, comma-separated in config.
-        self._osc_notice_off = set(
-            k.strip() for k in cfg.get('osc_notice_off', '').split(',') if k.strip())
+        # notice): a set of feature keys, comma-separated in config. Some types
+        # (OSC_NOTICE_DEFAULT_OFF: title, palette) are muted by DEFAULT -- they
+        # fire on routine output and the notice is noise. An ABSENT key takes the
+        # default; a present value (even empty) is the user's own choice, honoured
+        # verbatim -- an explicit empty means notify about every type. The lock is
+        # enforced downstream (set_osc_notice_type, the settings dialog).
+        _raw_notice_off = cfg.get('osc_notice_off')
+        if _raw_notice_off is None:
+            self._osc_notice_off = set(OSC_NOTICE_DEFAULT_OFF)
+        else:
+            self._osc_notice_off = set(
+                k.strip() for k in _raw_notice_off.split(',') if k.strip())
         # global "always allow clipboard read": auto-answers OSC 52 read in any tab
         # that has made no explicit decision, WITHOUT prompting. Off by default and
         # security-relevant (any untrusted output could then exfiltrate the
@@ -802,6 +840,12 @@ class MainWindow(QMainWindow):
         # double-click a tab to rename it; right-click for rename/colour/close.
         self.tabs.tabBarDoubleClicked.connect(self.rename_tab)
         bar = self.tabs.tabBar()
+        # Elide in the MIDDLE, not the (default) right: many same-prefixed tabs
+        # (claude-rc-session opens dev46x/dev47x/... as one tab each) collapse to
+        # window_width/tab_count, and ElideRight drops the trailing session NUMBER
+        # -- every tab reads "dev47" and is indistinguishable. ElideMiddle keeps the
+        # number ("dev...471"), which is the part that tells the tabs apart.
+        bar.setElideMode(Qt.TextElideMode.ElideMiddle)
         # keep the 1..N tab numbers correct after a drag-reorder
         bar.tabMoved.connect(lambda *_: self._renumber_tabs())
         bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1357,31 +1401,25 @@ class MainWindow(QMainWindow):
         if conn is None:
             return
         framer = ipc.Framer()
-        # Service a connection exactly once, and never touch the socket after teardown.
-        # Qt can deliver a trailing readyRead (the peer's EOF once it has read our reply
-        # and closed) or a synchronous `disconnected` while we tear the socket down; a
-        # re-entered handler then dereferences a QLocalSocket whose C++ object is already
-        # being freed -- a use-after-free that SIGSEGVs inside this slot, independent of
-        # the QPA platform. The `finished` latch plus detaching readyRead before teardown
-        # make the handler run at most once and only on a live socket. `deleteLater` is
-        # driven from here (not a raw `disconnected -> deleteLater`) so it happens exactly
-        # once, after readyRead is detached.
+        # Service the connection, then detach and tear it down exactly once. A QLocalSocket
+        # whose readyRead notifier fires while the socket is being torn down segfaults in
+        # Qt's dispatch (QAbstractSocketPrivate::canReadNotification) -- a use-after-free
+        # BEFORE any Python slot code runs. So _finish disconnects readyRead FIRST (with no
+        # slot left, Qt disables the read notifier), then disconnectFromServer + deleteLater.
+        # The `finished` latch makes _finish idempotent because BOTH on_ready (after it has
+        # replied or rejected the frame) and `disconnected` (a bare liveness-probe connect
+        # that sent no request) call it; whichever fires first tears down, the rest no-op.
         finished = {'done': False}
 
         def _finish():
             if finished['done']:
                 return
             finished['done'] = True
-            try:
-                conn.readyRead.disconnect(on_ready)
-            except (TypeError, RuntimeError):
-                pass                        # already detached, or C++ side gone
+            conn.readyRead.disconnect(on_ready)
             conn.disconnectFromServer()
             conn.deleteLater()
 
         def on_ready():
-            if finished['done']:
-                return                      # a trailing readyRead after we replied
             try:
                 payload = framer.feed(bytes(conn.readAll()))
             except ValueError:
@@ -1389,7 +1427,7 @@ class MainWindow(QMainWindow):
                 _finish()
                 return
             if payload is None:
-                return                      # frame not complete yet
+                return                      # frame not complete yet; more may follow
             reply = self._dispatch_request(payload)
             conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
             conn.flush()
@@ -1397,8 +1435,8 @@ class MainWindow(QMainWindow):
 
         conn.readyRead.connect(on_ready)
         # A bare connect (the socket_is_live liveness probe connects then closes with no
-        # framed request) reaches us only via `disconnected`; reap it there. The `finished`
-        # latch makes this idempotent with on_ready's own teardown.
+        # framed request) never delivers a full frame; reap it via `disconnected`. The
+        # `finished` latch keeps this idempotent with on_ready's own teardown.
         conn.disconnected.connect(_finish)
 
     def _dispatch_request(self, payload):
@@ -3488,12 +3526,68 @@ class MainWindow(QMainWindow):
     def open_current_screen(self):
         self._open_capture('screen.txt', SecureTerminal.transcript_text)
 
+    def copy_transcript_path(self):
+        """Write this tab's scrollback to the app's default transcript file and show
+        its path with a one-click copy, so it can be found or shared without hunting.
+        Independent of any env var: it uses the SAME default state-dir file Open
+        Transcript writes (the one place AppArmor permits writes), refreshed NOW so
+        the shown path always names a real, current file."""
+        term = self.current()
+        if term is None or not self._tab_is_live(term):
+            return
+        path = os.path.join(session._state_dir(), 'transcript.txt')
+        try:
+            session.ensure_state_dir()
+            # 0600 + O_NOFOLLOW, exactly as Open Transcript writes it: owner-only, and
+            # a planted symlink at the target fails the open rather than redirecting.
+            fd = os.open(path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.write(term.scrollback_text())
+        except OSError as exc:
+            QMessageBox.warning(
+                self, 'Transcript file path',
+                'Could not write the transcript file:\n%s\n\n%s'
+                % (path, exc.strerror or exc))
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Transcript file path')
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("This tab's transcript file:", dlg))
+        field = QLineEdit(path, dlg)     # read-only + selectable: copy by hand too
+        field.setReadOnly(True)
+        field.setCursorPosition(0)
+        lay.addWidget(field)
+        row = QHBoxLayout()
+        copied = QLabel('', dlg)
+        copy_btn = QPushButton('&Copy path', dlg)
+        # Copy does NOT close the dialog, so the confirmation is visible; the path is
+        # a plain ASCII filesystem path (no untrusted bytes), safe to place verbatim.
+        copy_btn.clicked.connect(
+            lambda: (QApplication.clipboard().setText(path), copied.setText('Copied.')))
+        close_btn = QPushButton('Close', dlg)
+        close_btn.clicked.connect(dlg.accept)
+        row.addWidget(copy_btn)
+        row.addWidget(copied)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+        lay.addLayout(row)
+        dlg.exec()
+
     def _save_capture(self, title, default_name, getter):
         term = self.current()
         if term is None:
             return
+        # Open the dialog IN a folder the AppArmor profile permits writes to (the
+        # app's state dir): the home directory is confined read-only, so defaulting
+        # there (Qt's default) offers only locations the save would then be denied.
+        try:
+            session.ensure_state_dir()
+            start_path = os.path.join(session._state_dir(), default_name)
+        except OSError:
+            start_path = default_name
         path, _ = QFileDialog.getSaveFileName(
-            self, title, default_name, 'Text files (*.txt);;All files (*)')
+            self, title, start_path, 'Text files (*.txt);;All files (*)')
         if not path:
             return
         # The tab's shell may have exited during the save dialog, deleting term;
@@ -3503,8 +3597,15 @@ class MainWindow(QMainWindow):
         try:
             with open(path, 'w', encoding='utf-8') as handle:
                 handle.write(getter(term))
-        except OSError:
-            pass            # a failed save (bad path, no space) is not fatal
+        except OSError as exc:
+            # A denied/failed save must TELL the user, never vanish -- a silently
+            # swallowed AppArmor denial (writing outside the state dir) looks
+            # exactly like a successful save. Name the reason and the writeable dir.
+            QMessageBox.warning(
+                self, title,
+                'Could not save to:\n%s\n\n%s\n\nWrites are confined to %s -- '
+                'choose a location there.'
+                % (path, exc.strerror or exc, session._state_dir()))
 
     def _open_capture(self, filename, getter):
         term = self.current()
@@ -3673,7 +3774,7 @@ class MainWindow(QMainWindow):
             'persist_session': 'true' if self._persist_session else 'false',
             'confirm_close': 'true' if self._confirm_close else 'false',
             **{k: 'true' if v else 'false' for k, v in self._osc_defaults.items()},
-        }, locked=self._locked)
+        }, defaults=_PERSIST_DEFAULTS, locked=self._locked)
 
     # -- chrome ---------------------------------------------------------------
     def _build_menu(self):
@@ -3759,6 +3860,15 @@ class MainWindow(QMainWindow):
             'your system default text editor. Sanitized plain ASCII, safe anywhere.')
         self.act_open_screen.triggered.connect(self.open_current_screen)
         file_menu.addAction(self.act_open_screen)
+
+        self.act_transcript_path = QAction('Copy Transcript File Pat&h...', self)
+        self._bind(self.act_transcript_path, 'copy_transcript_path', '')
+        self.act_transcript_path.setToolTip(
+            "Show the path of this tab's live transcript file (written continuously "
+            'when started with SECURE_TERMINAL_TRANSCRIPT_FILE) and copy it in one '
+            'click.')
+        self.act_transcript_path.triggered.connect(self.copy_transcript_path)
+        file_menu.addAction(self.act_transcript_path)
 
         file_menu.addSeparator()
         self.act_terminate = QAction(
@@ -4720,11 +4830,25 @@ class MainWindow(QMainWindow):
             osc_section.addRow(_lbl, _cb)
             osc_checks[_key] = _cb
 
+        # Notice controls: the master "All OSC notices" plus one toggle per type,
+        # mirroring the View > Notify on OSC use submenu and the OSC-features rows
+        # above. A type notifies when the master is on AND its own box is ticked;
+        # the title/palette types are unticked by default (OSC_NOTICE_DEFAULT_OFF).
+        notice_section = _section('Notify on OSC use')
         osc = QCheckBox()
         osc.setChecked(self._osc_notice)
-        _tip_row(osc_section, 'Notify on OSC use', osc,
+        _tip_row(notice_section, 'All OSC notices', osc,
                  'Show a one-time notice when a program uses an OSC escape you '
-                 'have not enabled, so a silent attempt does not go unseen.')
+                 'have not enabled, so a silent attempt does not go unseen. Untick '
+                 'a single type below to mute just that one.')
+        osc_notice_checks = {}
+        for _key, _label, _codes, _dflt, _risk, _hint in OSC_FEATURES:
+            _ncb = QCheckBox()
+            _ncb.setChecked(_key not in self._osc_notice_off)   # ticked == notify
+            _tip_row(notice_section, _label + '  (OSC ' + _codes + ')', _ncb,
+                     'Notify when untrusted output uses this OSC escape (it stays '
+                     'neutralized either way).')
+            osc_notice_checks[_key] = _ncb
 
         session_box = _section('Paste and session')
         pdelay = QComboBox()
@@ -4859,6 +4983,12 @@ class MainWindow(QMainWindow):
         # greys osc_title/osc_notify (same reason _apply_global uses it).
         for _key, _cb in osc_checks.items():
             _cb.setEnabled(not self._osc_locked(_key))
+        # Per-type notice checkboxes are all governed by the single osc_notice_off
+        # key, so an admin lock on it greys every one (a per-type edit the apply
+        # would discard would mislead worse than a greyed control).
+        if 'osc_notice_off' in self._locked:
+            for _ncb in osc_notice_checks.values():
+                _ncb.setEnabled(False)
 
         scroll.setWidget(content)           # all sections scroll; buttons pinned below
         outer.addWidget(scroll)
@@ -4888,6 +5018,13 @@ class MainWindow(QMainWindow):
             _set(osc, lambda: osc.setChecked(True))
             for _rk, _rcb in osc_checks.items():
                 _set(_rcb, lambda _rcb=_rcb: _rcb.setChecked(False))
+            # Per-type notice toggles: ticked == notify, so reset to the shipped
+            # default mute set (title/palette OFF, the rest ON). Missing here, Reset
+            # left them as the user set them and a following Apply persisted a mute
+            # set that was not the default.
+            for _rk, _ncb in osc_notice_checks.items():
+                _set(_ncb, lambda _ncb=_ncb, _rk=_rk:
+                     _ncb.setChecked(_rk not in OSC_NOTICE_DEFAULT_OFF))
             _set(pdelay, lambda: pdelay.setCurrentIndex(pdelay.findData(3)))
             _set(esc_limit, lambda: esc_limit.setCurrentIndex(esc_limit.findData(4096)))
             _set(paste_warn,
@@ -4961,6 +5098,8 @@ class MainWindow(QMainWindow):
             'tui': tui.isChecked(),
             'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
             'osc_notice': osc.isChecked(),
+            'osc_notice_types': {k: cb.isChecked()      # True == notify
+                                 for k, cb in osc_notice_checks.items()},
             'tui_autobox_notice': tui_autobox_notice.isChecked(),
             'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
             'escape_limit': esc_limit.currentData(),
@@ -5001,6 +5140,16 @@ class MainWindow(QMainWindow):
                 osc[key] = self._osc_defaults.get(key, False)
         if 'osc_notice' in opts:
             self.act_osc_notice.setChecked(self._osc_notice)
+        # Per-type notice mutes (ticked == notify). A lock on osc_notice_off keeps
+        # the current set (the dialog greyed the controls, so opts carries the old
+        # values, but guard anyway to match every other locked-key path).
+        if 'osc_notice_types' in opts and 'osc_notice_off' not in self._locked:
+            off = {k for k, notify in opts['osc_notice_types'].items() if not notify}
+            self._osc_notice_off = off
+            for k, act in self._osc_notice_actions.items():   # keep View menu in sync
+                act.setChecked(k not in off)
+            if off:
+                self._clear_advisories('osc')   # drop a showing notice for a muted type
         if 'tui_autobox_notice' in opts:
             self.act_tui_autobox_notice.setChecked(self._tui_autobox_notice)
         for key, value in osc.items():

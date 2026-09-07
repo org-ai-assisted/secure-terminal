@@ -410,6 +410,13 @@ OSC_FEATURES = (
 # key -> (label, codes, default, risk, hint), for quick lookup.
 OSC_FEATURE_BY_KEY = {f[0]: f[1:] for f in OSC_FEATURES}
 
+# OSC notice types muted by DEFAULT: their neutralized use raises no banner
+# (still neutralized). Title repaints and palette sets happen on routine output,
+# so a notice each time is noise. Any type NOT listed here notifies by default;
+# the user re-enables or mutes any type individually. Single source of truth for
+# the default mute set (config key osc_notice_off).
+OSC_NOTICE_DEFAULT_OFF = frozenset({'osc_title', 'osc_colors'})
+
 
 def colors_allowed():
     """False only when NO_COLOR is set (per no-color.org: presence, any value),

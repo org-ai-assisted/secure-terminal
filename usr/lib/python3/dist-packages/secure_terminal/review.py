@@ -608,7 +608,10 @@ class ReviewBar(QWidget):
             if noop:
                 btn.setText('%s %s' % (label, _SAFE_GLYPH))
                 btn.setEnabled(False)
-                btn.setStyleSheet('color:%s; font-weight:600;' % _MUTED_FG)
+                # A done (no-op) transform reads as a SAFE outcome, so its check is
+                # green like an active transform -- but NOT bold, so "already done"
+                # stays visually lighter than the bold, clickable active buttons.
+                btn.setStyleSheet('color:%s; font-weight:400;' % SAFE_FG)
                 btn.setToolTip('Already applied -- this transform would not change the box.')
                 cap.setText('no change')
             else:
@@ -906,7 +909,13 @@ class ReviewBar(QWidget):
                                      % (blocked, '' if blocked == 1 else 's'))
             return
         # not blocked: the OUTCOME is safe (ASCII) or caution (printable unicode kept).
-        if any(ord(c) > 0x7F for c in box):
+        # Judge the FULL delivered content -- the box PLUS the un-shown tail neutralized
+        # to the active tier -- not the box alone: a long paste whose box is ASCII but
+        # whose tail (past _BOX_MAX) carries a printable look-alike would else read
+        # "ASCII" while a homoglyph crosses (the tail is delivered kept at the reveal/
+        # keep tier, which sanitize_paste_unicode preserves on the way out).
+        delivered = box + self._tail_delivered()
+        if any(ord(c) > 0x7F for c in delivered):
             base, colour = '%s unicode' % verb, CAUTION_FG
         else:
             base, colour = '%s ASCII' % verb, None

@@ -67,4 +67,8 @@ dist-ai-tests:
   ## procps (pgrep/pkill) backs safe-pgrep/safe-pkill, which the shots reaper HARD-REQUIRES
   ## (R-220, refuses to fall back to a self-matching bare pgrep -f); not guaranteed in the
   ## CI base image, so pin it.
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git procps"
+  ## labwc + qt6-wayland: the Qt test suites run ONLY on a real headless Wayland compositor
+  ## (labwc, via the runners' wl-headless-run wrap); qt6-wayland ships PyQt6's wayland platform
+  ## plugin. Absent, the runners FATAL ("wl-headless-run: labwc not installed"); there is no
+  ## offscreen fallback, so both are hard test deps.
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia qt6-wayland labwc python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git procps"
