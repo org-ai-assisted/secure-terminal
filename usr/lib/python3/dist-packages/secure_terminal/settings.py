@@ -192,17 +192,38 @@ def load():
     return Config(merged, locked, sorted(set(violations)))
 
 
-def save(values, defaults=None, locked=()):
+def load_system():
+    """The merged SYSTEM layer only (privileged + system drop-ins), WITHOUT the user
+    file. This is the effective lower-precedence value each user override is compared
+    against in save(): a key omitted from the user file falls through to exactly this
+    value on the next load(). Never raises."""
+    system = {}
+    for directory in _system_dirs():
+        layer = _load_dir(directory)
+        layer.pop('lock', None)            # locking is not a value; ignore here
+        system.update(layer)
+    return system
+
+
+def save(values, locked=(), defaults=None):
     """Write the application's settings to the user drop-in file. Locked keys are
     NOT written -- the user cannot control them, so persisting them would be dead,
-    ignored config. A key whose value EQUALS its default (`defaults[key]`) is also
-    not written: the generated file holds only real OVERRIDES, so a later change to
-    a shipped default reaches everyone who has not customised that key -- no
-    migration, and no stale default pinned on disk. Keys absent from `defaults` are
-    always written (a caller that owns one key, e.g. the clipboard tray, passes no
-    defaults). Never raises."""
+    ignored config. A key whose value equals its EFFECTIVE lower-precedence value is
+    also not written: the generated file holds only real OVERRIDES, so a later change
+    to a shipped default reaches everyone who has not customised that key -- no
+    migration, and no stale default pinned on disk. The effective value is the SYSTEM
+    layer (load_system) when it sets the key, else the built-in `defaults[key]`:
+    comparing against the built-in default ALONE would drop a user's SAFER choice
+    (e.g. paste_warn=unicode) when an unlocked system config sets a LESS safe value
+    (paste_warn=never) that happens to differ from it -- with no override written the
+    system value would silently re-apply on restart, a security downgrade. Keys absent
+    from BOTH layers are always written (a caller that owns one key, e.g. the clipboard
+    tray, passes no defaults). Never raises."""
     locked = frozenset(locked)
     defaults = defaults or {}
+    # Only consult the system layer when omit-defaults is in play (a defaults map was
+    # passed); a single-key owner write (set_user_key, no defaults) writes as before.
+    system = load_system() if defaults else {}
     path = user_config_file()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -218,15 +239,25 @@ def save(values, defaults=None, locked=()):
             if key in locked:
                 continue
             value = values[key]
-            if defaults.get(key) == value:
-                continue        # equals the default -> omit (and prune it from the file)
+            # Omit only when the value matches what the LOWER layers would apply anyway
+            # (system layer if it sets the key, else the built-in default). A user value
+            # that differs from an unlocked system value is a REAL override -> written.
+            if key in defaults or key in system:
+                if system.get(key, defaults.get(key)) == value:
+                    continue    # equals the effective value -> omit (and prune it)
             # A newline/CR in a key or value would split into extra lines and
             # smuggle unrelated KEY=value settings back on the next load; drop it.
             if any(c in key or c in value for c in ('\n', '\r')):
                 continue
             lines.append('%s=%s' % (key, value))
         tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as handle:
+        # 0600: this file persists security-relevant toggles (osc_clipboard_read_always,
+        # paste_warn/copy_warn levels, osc_notice_off). A permissive umask must NOT leave
+        # it group/world-readable -- another local user could fingerprint which safety
+        # prompts the victim disabled. O_NOFOLLOW: a planted symlink at tmp fails the open.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            os.fchmod(handle.fileno(), 0o600)   # force 0600 even if tmp pre-existed
             handle.write('\n'.join(lines) + '\n')
         os.replace(tmp, path)
     except OSError:
@@ -274,7 +305,7 @@ def set_user_key(key, value):
             os.close(handle)
 
 
-def update_user(values, defaults=None, locked=()):
+def update_user(values, locked=(), defaults=None):
     """Merge-preserving multi-key update of the app's OWN user file: set each key in
     `values`, keeping the other keys the file already holds -- e.g. a key ANOTHER
     process persisted via set_user_key (clip_warn_any, from the clipboard-watch
