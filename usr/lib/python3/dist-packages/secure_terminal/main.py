@@ -3864,9 +3864,9 @@ class MainWindow(QMainWindow):
         self.act_transcript_path = QAction('Copy Transcript File Pat&h...', self)
         self._bind(self.act_transcript_path, 'copy_transcript_path', '')
         self.act_transcript_path.setToolTip(
-            "Show the path of this tab's live transcript file (written continuously "
-            'when started with SECURE_TERMINAL_TRANSCRIPT_FILE) and copy it in one '
-            'click.')
+            "Write this tab's transcript to the app's default file (the same file Open "
+            'Transcript uses, in the state directory), then show and copy its path in '
+            'one click.')
         self.act_transcript_path.triggered.connect(self.copy_transcript_path)
         file_menu.addAction(self.act_transcript_path)
 
