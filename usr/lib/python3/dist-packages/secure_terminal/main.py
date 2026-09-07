@@ -21,17 +21,18 @@ from PyQt6.QtCore import (
     QTimer, Qt, QUrl, QRect, QPoint, QByteArray, QObject, QEvent,
     qInstallMessageHandler)
 from PyQt6.QtGui import (
-    QAction, QActionGroup, QKeySequence, QIcon, QColor, QPixmap,
+    QAction, QActionGroup, QKeySequence, QIcon, QColor, QPalette, QPixmap,
     QPainter, QBrush, QFont, QFontDatabase, QDesktopServices, QCursor,
     QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget, QToolBar, QSpinBox, QLabel,
+    QApplication, QMainWindow, QTabWidget, QTabBar, QToolBar, QSpinBox, QLabel,
     QWidget, QSizePolicy, QFileDialog, QInputDialog, QColorDialog,
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame, QScrollArea,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QKeySequenceEdit,
     QTextEdit, QFontDialog, QFontComboBox, QGroupBox, QToolButton, QSplitter,
+    QToolTip,
 )
 
 from secure_terminal import settings, session, ipc, resource_isolation
@@ -1355,27 +1356,50 @@ class MainWindow(QMainWindow):
         conn = self._server.nextPendingConnection()
         if conn is None:
             return
-        # Reap the accepted socket when the peer disconnects, so a bare connect (the
-        # socket_is_live liveness probe, which connects then closes with no data) and
-        # every completed request free their QLocalSocket instead of leaking one per
-        # launch onto the long-lived primary.
-        conn.disconnected.connect(conn.deleteLater)
         framer = ipc.Framer()
+        # Service a connection exactly once, and never touch the socket after teardown.
+        # Qt can deliver a trailing readyRead (the peer's EOF once it has read our reply
+        # and closed) or a synchronous `disconnected` while we tear the socket down; a
+        # re-entered handler then dereferences a QLocalSocket whose C++ object is already
+        # being freed -- a use-after-free that SIGSEGVs inside this slot, independent of
+        # the QPA platform. The `finished` latch plus detaching readyRead before teardown
+        # make the handler run at most once and only on a live socket. `deleteLater` is
+        # driven from here (not a raw `disconnected -> deleteLater`) so it happens exactly
+        # once, after readyRead is detached.
+        finished = {'done': False}
+
+        def _finish():
+            if finished['done']:
+                return
+            finished['done'] = True
+            try:
+                conn.readyRead.disconnect(on_ready)
+            except (TypeError, RuntimeError):
+                pass                        # already detached, or C++ side gone
+            conn.disconnectFromServer()
+            conn.deleteLater()
 
         def on_ready():
+            if finished['done']:
+                return                      # a trailing readyRead after we replied
             try:
                 payload = framer.feed(bytes(conn.readAll()))
             except ValueError:
                 conn.abort()
+                _finish()
                 return
             if payload is None:
                 return                      # frame not complete yet
             reply = self._dispatch_request(payload)
             conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
             conn.flush()
-            conn.disconnectFromServer()
+            _finish()
 
         conn.readyRead.connect(on_ready)
+        # A bare connect (the socket_is_live liveness probe connects then closes with no
+        # framed request) reaches us only via `disconnected`; reap it there. The `finished`
+        # latch makes this idempotent with on_ready's own teardown.
+        conn.disconnected.connect(_finish)
 
     def _dispatch_request(self, payload):
         """Handle one IPC request; return a reply dict. Every request is same-UID
@@ -2279,10 +2303,27 @@ class MainWindow(QMainWindow):
         QToolTip-only rule at the app level does not disturb the per-widget stylesheets
         used elsewhere (nothing else sets an app-level stylesheet)."""
         app = QApplication.instance()
-        if app is not None:
-            bg, fg, border = _TIP_COLORS['dark' if theme == 'dark' else 'light']
-            app.setStyleSheet('QToolTip{background:%s;color:%s;border:1px solid %s;'
-                              'border-radius:6px;padding:5px 8px}' % (bg, fg, border))
+        if app is None:
+            return
+        # Idempotent + cheap on the hot path: this runs on every tab switch, but app-level
+        # setStyleSheet re-polishes EVERY widget of EVERY window, so re-applying an unchanged
+        # theme would make a switch O(all widgets). Skip when the resolved theme is unchanged.
+        resolved = 'dark' if theme == 'dark' else 'light'
+        if getattr(self, '_tooltip_theme', None) == resolved:
+            return
+        self._tooltip_theme = resolved
+        bg, fg, border = _TIP_COLORS[resolved]
+        # Two independent paint paths, BOTH must be pinned:
+        #  - the app stylesheet styles the frame (border, radius, padding);
+        #  - QToolTip's PALETTE (ToolTipBase/ToolTipText) is what the Fusion style paints
+        #    the background and text with under a platform theme (qt5ct). A stylesheet
+        #    alone does NOT override that palette, so the text stayed dark-on-dark.
+        pal = QToolTip.palette()
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(bg))
+        pal.setColor(QPalette.ColorRole.ToolTipText, QColor(fg))
+        QToolTip.setPalette(pal)
+        app.setStyleSheet('QToolTip{background:%s;color:%s;border:1px solid %s;'
+                          'border-radius:6px;padding:5px 8px}' % (bg, fg, border))
 
     # -- copy / paste route through the current tab (paste stays sanitized) ----
     def copy_selection(self):
@@ -2340,6 +2381,7 @@ class MainWindow(QMainWindow):
         if not isinstance(term, SecureTerminal):
             return                          # a restore placeholder is transiently current
         self._apply_container_theme(term.current_theme())   # kill the switch white-flash
+        self._apply_tooltip_style(term.current_theme())   # native menu tooltip follows the tab
         self._refresh_banner()          # the banner follows the current tab
         self.zoom_box.blockSignals(True)
         self.zoom_box.setValue(term.current_zoom())
@@ -2375,11 +2417,18 @@ class MainWindow(QMainWindow):
         self._update_tui_indicator()
         self._update_security_indicator()
         self._update_terminate_enabled()
-        # Give the newly-current terminal the keyboard focus. A QTabWidget hands focus
-        # to the tab BAR on a switch, not the page content, so without this the tab is
-        # visible but the caret is elsewhere -- the user must click once more before
-        # typing (konsole focuses the terminal directly). Skip while the find bar is
-        # open so switching tabs mid-search does not yank the caret out of the field.
+        self._focus_current_terminal()
+
+    def _focus_current_terminal(self):
+        """Give the current tab's terminal the keyboard focus. A QTabWidget hands focus
+        to the tab BAR on a switch, and window activation lands focus on no child at all,
+        so without this the tab is visible but the caret is elsewhere -- the user must
+        click once more before typing (konsole focuses the terminal directly). Skip while
+        the find bar is open so a tab switch / re-activation mid-search does not yank the
+        caret out of the field."""
+        term = self.current()
+        if not isinstance(term, SecureTerminal):
+            return
         _fb = getattr(self, '_find_bar', None)
         if not (_fb is not None and _fb.isVisible()):
             term.setFocus()
@@ -5375,6 +5424,25 @@ class MainWindow(QMainWindow):
         grid.addWidget(close, len(rows) + 1, 3)
         _select_labels(dialog, self._ui_scale)
         dialog.exec()
+
+    @staticmethod
+    def _activation_should_claim_focus(fw):
+        # Focus is "loose" -- claim it for the terminal -- only when NO input child holds it:
+        # None (nothing focused) or the tab bar (arrow keys would step tabs, not type). Any
+        # real input child keeps its focus -- the terminal, the find bar, the paste/copy
+        # review editor, the zoom box, a dialog -- so reactivation cannot drop a pending
+        # review on the next Enter/Esc or misroute a half-typed value.
+        return fw is None or isinstance(fw, QTabBar)
+
+    def changeEvent(self, event):
+        # On window activation (alt-tab back, a fresh open-all launch, a raise) Qt may leave
+        # focus loose -- the tab looks active but typing needs an extra click. Claim focus
+        # for the current terminal only then (the tab-switch path, which always focuses the
+        # new terminal, is separate).
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow() \
+                and self._activation_should_claim_focus(QApplication.focusWidget()):
+            self._focus_current_terminal()
+        super().changeEvent(event)
 
     # -- lifecycle ------------------------------------------------------------
     def closeEvent(self, event):
