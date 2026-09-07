@@ -608,7 +608,10 @@ class ReviewBar(QWidget):
             if noop:
                 btn.setText('%s %s' % (label, _SAFE_GLYPH))
                 btn.setEnabled(False)
-                btn.setStyleSheet('color:%s; font-weight:600;' % _MUTED_FG)
+                # A done (no-op) transform reads as a SAFE outcome, so its check is
+                # green like an active transform -- but NOT bold, so "already done"
+                # stays visually lighter than the bold, clickable active buttons.
+                btn.setStyleSheet('color:%s; font-weight:400;' % SAFE_FG)
                 btn.setToolTip('Already applied -- this transform would not change the box.')
                 cap.setText('no change')
             else:
