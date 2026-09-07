@@ -75,6 +75,14 @@ jobs:
           path: _dist-ai
           persist-credentials: false
 
+      - name: Checkout helper-scripts (wl-headless-run sources its has.sh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: org-ai-assisted/helper-scripts
+          ref: master
+          path: helper-scripts
+          persist-credentials: false
+
       - name: Resolve the declared dependency set
         id: deps
         ## Read the package list from .github/dm-consumer.yml rather than copying
@@ -100,6 +108,12 @@ jobs:
           # word splitting is intended: PACKAGES is a space-separated apt list
           # shellcheck disable=SC2086
           sudo apt-get install --yes --no-install-recommends ${PACKAGES}
+
+      - name: Provide helper-scripts runtime at the system path
+        ## wl-headless-run sources /usr/libexec/helper-scripts/has.sh (an absolute path),
+        ## so symlink the checkout there -- same setup the reusable dist-ai workflow does.
+        ## sudo: /usr/libexec is root-owned on the ubuntu-latest runner (no container).
+        run: sudo _dist-ai/ci/dist-ai-tests-ci-hs-runtime.sh "${GITHUB_WORKSPACE}/helper-scripts"
 
       - name: Validate the corpus (schema + sanitization lint)
         working-directory: _corpus
