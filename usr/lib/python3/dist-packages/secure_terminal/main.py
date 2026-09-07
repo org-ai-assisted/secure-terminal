@@ -37,7 +37,8 @@ from PyQt6.QtWidgets import (
 
 from secure_terminal import settings, session, ipc, resource_isolation
 from secure_terminal.sanitize import (
-    OSC_FEATURES, OSC_FEATURE_BY_KEY, luminance, sanitize_title)
+    OSC_FEATURES, OSC_FEATURE_BY_KEY, OSC_NOTICE_DEFAULT_OFF, luminance,
+    sanitize_title)
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
@@ -751,9 +752,18 @@ class MainWindow(QMainWindow):
         # toggle turns it off. A notice only -- the auto-switch itself is unconditional.
         self._tui_autobox_notice = cfg.get('tui_autobox_notice') != 'false'
         # OSC types the user has muted individually (still neutralized, just no
-        # notice): a set of feature keys, comma-separated in config.
-        self._osc_notice_off = set(
-            k.strip() for k in cfg.get('osc_notice_off', '').split(',') if k.strip())
+        # notice): a set of feature keys, comma-separated in config. Some types
+        # (OSC_NOTICE_DEFAULT_OFF: title, palette) are muted by DEFAULT -- they
+        # fire on routine output and the notice is noise. An ABSENT key takes the
+        # default; a present value (even empty) is the user's own choice, honoured
+        # verbatim -- an explicit empty means notify about every type. The lock is
+        # enforced downstream (set_osc_notice_type, the settings dialog).
+        _raw_notice_off = cfg.get('osc_notice_off')
+        if _raw_notice_off is None:
+            self._osc_notice_off = set(OSC_NOTICE_DEFAULT_OFF)
+        else:
+            self._osc_notice_off = set(
+                k.strip() for k in _raw_notice_off.split(',') if k.strip())
         # global "always allow clipboard read": auto-answers OSC 52 read in any tab
         # that has made no explicit decision, WITHOUT prompting. Off by default and
         # security-relevant (any untrusted output could then exfiltrate the
@@ -4722,11 +4732,25 @@ class MainWindow(QMainWindow):
             osc_section.addRow(_lbl, _cb)
             osc_checks[_key] = _cb
 
+        # Notice controls: the master "All OSC notices" plus one toggle per type,
+        # mirroring the View > Notify on OSC use submenu and the OSC-features rows
+        # above. A type notifies when the master is on AND its own box is ticked;
+        # the title/palette types are unticked by default (OSC_NOTICE_DEFAULT_OFF).
+        notice_section = _section('Notify on OSC use')
         osc = QCheckBox()
         osc.setChecked(self._osc_notice)
-        _tip_row(osc_section, 'Notify on OSC use', osc,
+        _tip_row(notice_section, 'All OSC notices', osc,
                  'Show a one-time notice when a program uses an OSC escape you '
-                 'have not enabled, so a silent attempt does not go unseen.')
+                 'have not enabled, so a silent attempt does not go unseen. Untick '
+                 'a single type below to mute just that one.')
+        osc_notice_checks = {}
+        for _key, _label, _codes, _dflt, _risk, _hint in OSC_FEATURES:
+            _ncb = QCheckBox()
+            _ncb.setChecked(_key not in self._osc_notice_off)   # ticked == notify
+            _tip_row(notice_section, _label + '  (OSC ' + _codes + ')', _ncb,
+                     'Notify when untrusted output uses this OSC escape (it stays '
+                     'neutralized either way).')
+            osc_notice_checks[_key] = _ncb
 
         session_box = _section('Paste and session')
         pdelay = QComboBox()
@@ -4861,6 +4885,12 @@ class MainWindow(QMainWindow):
         # greys osc_title/osc_notify (same reason _apply_global uses it).
         for _key, _cb in osc_checks.items():
             _cb.setEnabled(not self._osc_locked(_key))
+        # Per-type notice checkboxes are all governed by the single osc_notice_off
+        # key, so an admin lock on it greys every one (a per-type edit the apply
+        # would discard would mislead worse than a greyed control).
+        if 'osc_notice_off' in self._locked:
+            for _ncb in osc_notice_checks.values():
+                _ncb.setEnabled(False)
 
         scroll.setWidget(content)           # all sections scroll; buttons pinned below
         outer.addWidget(scroll)
@@ -4963,6 +4993,8 @@ class MainWindow(QMainWindow):
             'tui': tui.isChecked(),
             'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
             'osc_notice': osc.isChecked(),
+            'osc_notice_types': {k: cb.isChecked()      # True == notify
+                                 for k, cb in osc_notice_checks.items()},
             'tui_autobox_notice': tui_autobox_notice.isChecked(),
             'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
             'escape_limit': esc_limit.currentData(),
@@ -5003,6 +5035,16 @@ class MainWindow(QMainWindow):
                 osc[key] = self._osc_defaults.get(key, False)
         if 'osc_notice' in opts:
             self.act_osc_notice.setChecked(self._osc_notice)
+        # Per-type notice mutes (ticked == notify). A lock on osc_notice_off keeps
+        # the current set (the dialog greyed the controls, so opts carries the old
+        # values, but guard anyway to match every other locked-key path).
+        if 'osc_notice_types' in opts and 'osc_notice_off' not in self._locked:
+            off = {k for k, notify in opts['osc_notice_types'].items() if not notify}
+            self._osc_notice_off = off
+            for k, act in self._osc_notice_actions.items():   # keep View menu in sync
+                act.setChecked(k not in off)
+            if off:
+                self._clear_advisories('osc')   # drop a showing notice for a muted type
         if 'tui_autobox_notice' in opts:
             self.act_tui_autobox_notice.setChecked(self._tui_autobox_notice)
         for key, value in osc.items():
