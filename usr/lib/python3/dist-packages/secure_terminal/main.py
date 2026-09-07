@@ -820,6 +820,12 @@ class MainWindow(QMainWindow):
         # double-click a tab to rename it; right-click for rename/colour/close.
         self.tabs.tabBarDoubleClicked.connect(self.rename_tab)
         bar = self.tabs.tabBar()
+        # Elide in the MIDDLE, not the (default) right: many same-prefixed tabs
+        # (claude-rc-session opens dev46x/dev47x/... as one tab each) collapse to
+        # window_width/tab_count, and ElideRight drops the trailing session NUMBER
+        # -- every tab reads "dev47" and is indistinguishable. ElideMiddle keeps the
+        # number ("dev...471"), which is the part that tells the tabs apart.
+        bar.setElideMode(Qt.TextElideMode.ElideMiddle)
         # keep the 1..N tab numbers correct after a drag-reorder
         bar.tabMoved.connect(lambda *_: self._renumber_tabs())
         bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -3500,12 +3506,68 @@ class MainWindow(QMainWindow):
     def open_current_screen(self):
         self._open_capture('screen.txt', SecureTerminal.transcript_text)
 
+    def copy_transcript_path(self):
+        """Write this tab's scrollback to the app's default transcript file and show
+        its path with a one-click copy, so it can be found or shared without hunting.
+        Independent of any env var: it uses the SAME default state-dir file Open
+        Transcript writes (the one place AppArmor permits writes), refreshed NOW so
+        the shown path always names a real, current file."""
+        term = self.current()
+        if term is None or not self._tab_is_live(term):
+            return
+        path = os.path.join(session._state_dir(), 'transcript.txt')
+        try:
+            session.ensure_state_dir()
+            # 0600 + O_NOFOLLOW, exactly as Open Transcript writes it: owner-only, and
+            # a planted symlink at the target fails the open rather than redirecting.
+            fd = os.open(path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.write(term.scrollback_text())
+        except OSError as exc:
+            QMessageBox.warning(
+                self, 'Transcript file path',
+                'Could not write the transcript file:\n%s\n\n%s'
+                % (path, exc.strerror or exc))
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Transcript file path')
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("This tab's transcript file:", dlg))
+        field = QLineEdit(path, dlg)     # read-only + selectable: copy by hand too
+        field.setReadOnly(True)
+        field.setCursorPosition(0)
+        lay.addWidget(field)
+        row = QHBoxLayout()
+        copied = QLabel('', dlg)
+        copy_btn = QPushButton('&Copy path', dlg)
+        # Copy does NOT close the dialog, so the confirmation is visible; the path is
+        # a plain ASCII filesystem path (no untrusted bytes), safe to place verbatim.
+        copy_btn.clicked.connect(
+            lambda: (QApplication.clipboard().setText(path), copied.setText('Copied.')))
+        close_btn = QPushButton('Close', dlg)
+        close_btn.clicked.connect(dlg.accept)
+        row.addWidget(copy_btn)
+        row.addWidget(copied)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+        lay.addLayout(row)
+        dlg.exec()
+
     def _save_capture(self, title, default_name, getter):
         term = self.current()
         if term is None:
             return
+        # Open the dialog IN a folder the AppArmor profile permits writes to (the
+        # app's state dir): the home directory is confined read-only, so defaulting
+        # there (Qt's default) offers only locations the save would then be denied.
+        try:
+            session.ensure_state_dir()
+            start_path = os.path.join(session._state_dir(), default_name)
+        except OSError:
+            start_path = default_name
         path, _ = QFileDialog.getSaveFileName(
-            self, title, default_name, 'Text files (*.txt);;All files (*)')
+            self, title, start_path, 'Text files (*.txt);;All files (*)')
         if not path:
             return
         # The tab's shell may have exited during the save dialog, deleting term;
@@ -3515,8 +3577,15 @@ class MainWindow(QMainWindow):
         try:
             with open(path, 'w', encoding='utf-8') as handle:
                 handle.write(getter(term))
-        except OSError:
-            pass            # a failed save (bad path, no space) is not fatal
+        except OSError as exc:
+            # A denied/failed save must TELL the user, never vanish -- a silently
+            # swallowed AppArmor denial (writing outside the state dir) looks
+            # exactly like a successful save. Name the reason and the writeable dir.
+            QMessageBox.warning(
+                self, title,
+                'Could not save to:\n%s\n\n%s\n\nWrites are confined to %s -- '
+                'choose a location there.'
+                % (path, exc.strerror or exc, session._state_dir()))
 
     def _open_capture(self, filename, getter):
         term = self.current()
@@ -3771,6 +3840,15 @@ class MainWindow(QMainWindow):
             'your system default text editor. Sanitized plain ASCII, safe anywhere.')
         self.act_open_screen.triggered.connect(self.open_current_screen)
         file_menu.addAction(self.act_open_screen)
+
+        self.act_transcript_path = QAction('Copy Transcript File Pat&h...', self)
+        self._bind(self.act_transcript_path, 'copy_transcript_path', '')
+        self.act_transcript_path.setToolTip(
+            "Show the path of this tab's live transcript file (written continuously "
+            'when started with SECURE_TERMINAL_TRANSCRIPT_FILE) and copy it in one '
+            'click.')
+        self.act_transcript_path.triggered.connect(self.copy_transcript_path)
+        file_menu.addAction(self.act_transcript_path)
 
         file_menu.addSeparator()
         self.act_terminate = QAction(
