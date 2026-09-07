@@ -4998,6 +4998,13 @@ class MainWindow(QMainWindow):
             _set(osc, lambda: osc.setChecked(True))
             for _rk, _rcb in osc_checks.items():
                 _set(_rcb, lambda _rcb=_rcb: _rcb.setChecked(False))
+            # Per-type notice toggles: ticked == notify, so reset to the shipped
+            # default mute set (title/palette OFF, the rest ON). Missing here, Reset
+            # left them as the user set them and a following Apply persisted a mute
+            # set that was not the default.
+            for _rk, _ncb in osc_notice_checks.items():
+                _set(_ncb, lambda _ncb=_ncb, _rk=_rk:
+                     _ncb.setChecked(_rk not in OSC_NOTICE_DEFAULT_OFF))
             _set(pdelay, lambda: pdelay.setCurrentIndex(pdelay.findData(3)))
             _set(esc_limit, lambda: esc_limit.setCurrentIndex(esc_limit.findData(4096)))
             _set(paste_warn,
