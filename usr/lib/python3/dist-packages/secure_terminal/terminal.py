@@ -5260,6 +5260,20 @@ class SecureTerminal(QPlainTextEdit):
         # In TUI mode the running program owns the keyboard: Ctrl+Shift+<key>
         # still reaches the window shortcuts, but everything else is encoded as
         # VT input (arrows, function keys, control bytes) and sent raw.
+        # In TUI mode with NATIVE scrollback -- the claude-rc-session / tmux profile
+        # keeps the program on the PRIMARY grid (alternate-screen off), so ST has its
+        # own scrollback -- reserve Shift+PageUp/PageDown/Home/End for THAT scrollback,
+        # exactly as konsole/gnome-terminal do, instead of forwarding them to the child.
+        # Without this there is no emulator-side "jump to bottom" in TUI mode: a wheel
+        # scroll leaves _tui_follow off and the program never sees the wheel, so new
+        # output cannot pull the view down (konsole has no such problem). Shift+End
+        # lands the bar at max, which _on_scroll_value reads as "at bottom" and RESTORES
+        # auto-follow. The ALTERNATE screen is a fixed canvas with no scrollback, so
+        # there the program keeps these keys.
+        if (self.tui_active() and shift and not ctrl and not self._alt_screen
+                and self._scroll_key(key, True)):
+            return
+
         if self.tui_active() and not (ctrl and shift):
             # Typing resumes input: clear a held selection so the grid rebuild (frozen by
             # _render_tui while a selection is active) resumes -- TUI keys go straight to the
