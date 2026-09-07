@@ -67,6 +67,14 @@ jobs:
           path: _corpus
           persist-credentials: false
 
+      - name: Checkout dist-ai (holds wl-headless-run, the headless-Wayland compositor helper)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: org-ai-assisted/dist-ai
+          ref: master
+          path: _dist-ai
+          persist-credentials: false
+
       - name: Resolve the declared dependency set
         id: deps
         ## Read the package list from .github/dm-consumer.yml rather than copying
@@ -101,11 +109,15 @@ jobs:
         working-directory: _corpus
         env:
           SECURE_TERMINAL_REPO: ${{ github.workspace }}
-          QT_QPA_PLATFORM: offscreen
         run: |
-          python3 harness/run.py --self-test
-          python3 harness/adversarial.py --self-test
-          python3 harness/adversarial.py
+          # Run the harness on a REAL headless Wayland compositor (labwc, via wl-headless-run);
+          # secure-terminal is a wayland client, so no X / Xwayland is needed. There is no
+          # offscreen fallback -- wl-headless-run exports QT_QPA_PLATFORM=wayland + WAYLAND_DISPLAY.
+          wl_run="${GITHUB_WORKSPACE}/_dist-ai/usr/share/dist-ai-tests-common/wl-headless-run"
+          "${wl_run}" --no-autoconfirm -- bash -ec '
+            python3 harness/run.py --self-test
+            python3 harness/adversarial.py --self-test
+            python3 harness/adversarial.py'
 
   git-diffs-lie-corpus:
     ## Run the corpus suite against the REAL git-diffs-lie checkout. test_corpus.py
