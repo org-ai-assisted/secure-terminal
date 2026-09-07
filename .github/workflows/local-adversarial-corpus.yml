@@ -105,9 +105,11 @@ jobs:
         env:
           PACKAGES: ${{ steps.deps.outputs.packages }}
         run: |
+          # safe-rm: wl-headless-run's cleanup trap calls it (a Debian package, part of the
+          # dist-ai CI base set; not in dm-consumer's test list, so add it here explicitly).
           # word splitting is intended: PACKAGES is a space-separated apt list
           # shellcheck disable=SC2086
-          sudo apt-get install --yes --no-install-recommends ${PACKAGES}
+          sudo apt-get install --yes --no-install-recommends ${PACKAGES} safe-rm
 
       - name: Provide helper-scripts runtime at the system path
         ## wl-headless-run sources /usr/libexec/helper-scripts/has.sh (an absolute path),
