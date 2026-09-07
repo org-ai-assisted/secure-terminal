@@ -192,11 +192,17 @@ def load():
     return Config(merged, locked, sorted(set(violations)))
 
 
-def save(values, locked=()):
+def save(values, defaults=None, locked=()):
     """Write the application's settings to the user drop-in file. Locked keys are
     NOT written -- the user cannot control them, so persisting them would be dead,
-    ignored config. Never raises."""
+    ignored config. A key whose value EQUALS its default (`defaults[key]`) is also
+    not written: the generated file holds only real OVERRIDES, so a later change to
+    a shipped default reaches everyone who has not customised that key -- no
+    migration, and no stale default pinned on disk. Keys absent from `defaults` are
+    always written (a caller that owns one key, e.g. the clipboard tray, passes no
+    defaults). Never raises."""
     locked = frozenset(locked)
+    defaults = defaults or {}
     path = user_config_file()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -205,13 +211,15 @@ def save(values, locked=()):
             '## file is overwritten on the next settings change. To override,',
             '## drop a higher-numbered .conf (e.g. 50_user.conf) in this',
             '## directory; it is read after this file and wins. One KEY=value',
-            '## per line. Admin-locked keys (via `lock=` in a system directory)',
-            '## are not written here; they cannot be overridden from home.',
+            '## per line. Only settings that DIFFER from the default are written;',
+            '## admin-locked keys (via `lock=` in a system directory) are not.',
         ]
         for key in sorted(values):
             if key in locked:
                 continue
             value = values[key]
+            if defaults.get(key) == value:
+                continue        # equals the default -> omit (and prune it from the file)
             # A newline/CR in a key or value would split into extra lines and
             # smuggle unrelated KEY=value settings back on the next load; drop it.
             if any(c in key or c in value for c in ('\n', '\r')):
@@ -266,16 +274,19 @@ def set_user_key(key, value):
             os.close(handle)
 
 
-def update_user(values, locked=()):
+def update_user(values, defaults=None, locked=()):
     """Merge-preserving multi-key update of the app's OWN user file: set each key in
     `values`, keeping the other keys the file already holds -- e.g. a key ANOTHER
     process persisted via set_user_key (clip_warn_any, from the clipboard-watch
-    tray) must not be clobbered by a bulk write here. `locked` (the caller's STARTUP
-    snapshot) is UNIONed with the CURRENT load() locks, so a key locked at launch OR
-    now is never written back as a user override -- neither a lock removed nor a lock
-    added while the app is open can pin a stale value. The read-modify-write is
-    serialized against the other writer (_user_write_lock); a non-UTF-8 user file is
-    left untouched (never clobbered). Never raises."""
+    tray) must not be clobbered by a bulk write here. `defaults` (a key->default-value
+    map) is forwarded to save, which omits any key equal to its default -- so the
+    file keeps only real overrides and a stale default already on disk is pruned on
+    the next write. `locked` (the caller's STARTUP snapshot) is UNIONed with the
+    CURRENT load() locks, so a key locked at launch OR now is never written back as a
+    user override -- neither a lock removed nor a lock added while the app is open can
+    pin a stale value. The read-modify-write is serialized against the other writer
+    (_user_write_lock); a non-UTF-8 user file is left untouched (never clobbered).
+    Never raises."""
     all_locked = load().locked | frozenset(locked or ())   # tolerate None: never raises
     handle = _user_write_lock()
     try:
@@ -283,7 +294,7 @@ def update_user(values, locked=()):
         if current is None:
             return              # unreadable base -> skip rather than clobber
         current.update(values)
-        save(current, locked=all_locked)
+        save(current, defaults=defaults, locked=all_locked)
     finally:
         if handle is not None:
             os.close(handle)
