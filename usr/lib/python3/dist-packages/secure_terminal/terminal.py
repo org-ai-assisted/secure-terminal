@@ -3900,8 +3900,17 @@ class SecureTerminal(QPlainTextEdit):
         # to the document FIRST: _feed_stream fed the pre-marker primary bytes (this read's
         # output right up to the switch) to pyte before calling us, but rendering is
         # debounced, so a bare document walk would drop that final unpainted primary output.
+        # Force the PRIMARY render path: _read_and_render already flipped _alt_screen on for
+        # this read, and _render_tui_body's alt branch renders ONLY the live grid and
+        # _reset_grid_view()s away the carried-in scrollback -- which would drop the
+        # pre-existing history from the frozen primary (keeping only the visible rows).
         if self._grid_mode():
-            self._render_tui()
+            _was_alt, _was_view = self._alt_screen, self._alt_view
+            self._alt_screen = False
+            try:
+                self._render_tui()
+            finally:
+                self._alt_screen, self._alt_view = _was_alt, _was_view
         self._alt_primary_text = self._walk_document_text()
         s = self._screen
         self._alt_saved = (
