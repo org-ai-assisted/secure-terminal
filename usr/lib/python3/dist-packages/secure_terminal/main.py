@@ -463,6 +463,16 @@ class InfoTip(QLabel):
             y = below
         x = min(max(rect.left(), avail.left()), avail.right() - size.width() + 1)
         y = min(max(y, avail.top()), avail.bottom() - size.height() + 1)
+        # A tip too tall for the room above AND below a screen-edge widget would clamp
+        # ONTO the widget and cover it (the reported un-clickable countdown Paste button).
+        # When neither stack fits, place the tip BESIDE the widget -- on the side with
+        # more room, clamped on-screen -- so it never overlaps the source.
+        if QRect(QPoint(x, y), size).intersects(rect):
+            if avail.right() - rect.right() >= rect.left() - avail.left():
+                x = min(rect.right() + 1 + gap, avail.right() - size.width() + 1)
+            else:
+                x = max(rect.left() - gap - size.width(), avail.left())
+            y = min(max(rect.top(), avail.top()), avail.bottom() - size.height() + 1)
         return QPoint(x, y)
 
     def _place(self, widget):
