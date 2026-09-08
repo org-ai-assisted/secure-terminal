@@ -5663,22 +5663,43 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _confirm_terminate(windows):
+    """True if it is OK to terminate. Asked ONCE, aggregated across every window:
+    when confirm-on-close is on and any terminal still runs a foreground program,
+    prompt. Returns True (proceed) when nothing is running or the setting is off.
+    A single decision is what makes a signal atomic -- a veto must keep EVERY
+    window, so the count and the prompt span all of them, not one at a time."""
+    terms = [t for window in windows for t in window._real_terms()]
+    running = sum(1 for t in terms if t.has_foreground_program())
+    host = next((w for w in windows if w._confirm_close), windows[0])
+    return host._confirm_running_close(
+        'Quit?',
+        'A program is still running in %d tab%s. Quit anyway?'
+        % (running, '' if running == 1 else 's'),
+        terms)
+
+
 def _signal_close_windows(app):
-    """Crash-safe close of every window on a terminate signal, run on the LIVE
-    event loop. Each window's NORMAL closeEvent fires -- so a still-running
-    program prompts for confirmation -- never a silent force-close, and quit() is
-    never called directly: Qt quits when the last window closes, and aboutToQuit
-    then tears the ptys down while the loop is still up (see main). The modal thus
-    opens while XCB is alive, never during the teardown that a direct quit() would
-    start (a modal run mid-teardown segfaults). app._signal_close_pending is
-    cleared on return, so a vetoed close re-arms for the next signal."""
+    """Crash-safe, ATOMIC terminate on a signal, run on the LIVE event loop. A
+    signal is one decision for the whole app: confirm ONCE across all windows (see
+    _confirm_terminate), and a veto keeps EVERY window -- never close some (an idle
+    tab) while another's prompt is still unanswered, which would apply the terminate
+    only partly. On confirm, force every window closed (the decision is made, so no
+    per-window re-prompt); Qt quits when the last closes and aboutToQuit tears the
+    ptys down while the loop is up. The single modal thus opens while XCB is alive,
+    never during the teardown a direct quit() would start (a modal run mid-teardown
+    segfaults). app._signal_close_pending is cleared on return, so a vetoed
+    terminate re-arms for the next signal."""
     try:
         windows = [w for w in app.topLevelWidgets() if isinstance(w, MainWindow)]
         if not windows:
             app.quit()                  # no window to confirm -- honor the signal
             return
+        if not _confirm_terminate(windows):
+            return                      # a running program, vetoed -> abort; nothing closes
         for window in windows:
-            window.close()              # normal closeEvent -> confirm if a program runs
+            window._force_close = True  # decided once -> close without re-asking
+            window.close()
     finally:
         app._signal_close_pending = False
 
