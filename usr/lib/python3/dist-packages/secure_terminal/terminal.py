@@ -344,7 +344,8 @@ from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData, QRect, QSize)
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
                          QTextFormat, QGuiApplication, QSyntaxHighlighter,
-                         QTextBlockUserData, QPainter, QPen, QClipboard)
+                         QTextBlockUserData, QPainter, QPen, QClipboard,
+                         QFontMetricsF)
 from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QApplication,
                              QWidget)
@@ -1205,6 +1206,7 @@ class SecureTerminal(QPlainTextEdit):
         # flipping to TUI mode shows the program's current frame instantly (no
         # restart). Maintained from the output stream (alt-screen enter/leave).
         self._alt_screen = False
+        self._alt_owner_pgrp = None   # fg pgrp that entered alt from output (liveness on exit)
         self._wheel_accum = 0         # accumulated wheel delta for alt-screen scroll
         # The set of mouse DEC modes the child has enabled (1000/1002/1003 tracking,
         # 1004 focus, 1006 SGR), tracked off the output stream. When it requests
@@ -2263,10 +2265,16 @@ class SecureTerminal(QPlainTextEdit):
         the LINE-mode winsize, so it tracks the actual text width (scrollbar
         excluded), matching how the shell wraps and fills the prompt."""
         metrics = self.fontMetrics()
-        char_w = metrics.horizontalAdvance('M') or 1
+        # cols from the FRACTIONAL advance: the document engine lays glyphs out at the
+        # font's real (fractional) advance, but horizontalAdvance('M') is qRound()ed.
+        # Flooring the rounded value gave one column too many whenever the true advance
+        # rounded down -> `cols` glyphs laid out wider than the text area and the last
+        # column(s) clipped with no h-scrollbar (the zoom right-truncation bug). Flooring
+        # width / fractional-advance guarantees cols * advance <= width at every size.
+        char_wf = QFontMetricsF(self.font()).horizontalAdvance('M') or 1.0
         char_h = metrics.height() or 1
         width, height = self._text_area()
-        cols = max(2, width // char_w)
+        cols = max(2, int(width / char_wf))
         rows = max(2, height // char_h)
         return cols, rows
 
@@ -2276,10 +2284,16 @@ class SecureTerminal(QPlainTextEdit):
         scrollbar (the grid has scrollback), so its width is part of the viewport
         and is not reclaimed."""
         metrics = self.fontMetrics()
-        char_w = metrics.horizontalAdvance('M') or 1
+        # cols from the FRACTIONAL advance: the document engine lays glyphs out at the
+        # font's real (fractional) advance, but horizontalAdvance('M') is qRound()ed.
+        # Flooring the rounded value gave one column too many whenever the true advance
+        # rounded down -> `cols` glyphs laid out wider than the text area and the last
+        # column(s) clipped with no h-scrollbar (the zoom right-truncation bug). Flooring
+        # width / fractional-advance guarantees cols * advance <= width at every size.
+        char_wf = QFontMetricsF(self.font()).horizontalAdvance('M') or 1.0
         char_h = metrics.height() or 1
         width, height = self._text_area()
-        cols = max(2, width // char_w)
+        cols = max(2, int(width / char_wf))
         rows = max(2, height // char_h)
         return cols, rows
 
@@ -3582,6 +3596,19 @@ class SecureTerminal(QPlainTextEdit):
         fg = self.has_foreground_program()
         if self._bracket_had_fg and not fg and self._screen is not None:
             self._screen.mode.discard(_BRACKETED_PASTE_MODE)
+        # A `cat` of a file that enters the alt screen (?1049h) but never leaves it
+        # (no ?1049l) would strand the terminal in the alt buffer -- no scrollback,
+        # vertical scrolling dead -- once the shell regains the foreground. Restore
+        # the primary screen on that edge, but ONLY when the program that entered alt
+        # is GONE: a full-screen app merely SUSPENDED (Ctrl-Z) into the background
+        # also yields the foreground to the shell yet must keep its held frame, so a
+        # still-alive alt-owner pgrp is left untouched.
+        if (self._bracket_had_fg and not fg
+                and self._alt_screen and self._alt_owner_dead()):
+            self._alt_leave()
+            self._alt_screen = False
+            self._alt_view = False
+            self._alt_owner_pgrp = None
         if fg != self._bracket_had_fg:
             # ANY foreground-program transition invalidates a HELD multi-line paste's
             # reviewed context, so drop the remainder proactively:
@@ -3904,11 +3931,31 @@ class SecureTerminal(QPlainTextEdit):
             # is untouched, so only the crashing byte's in-flight parse is lost.
             self._stream = _Utf8CharsetByteStream(self._screen)
 
+    def _alt_owner_dead(self):
+        """True when the pgrp that entered the alt screen from output no longer
+        exists, so its alt frame is stale leftover to clear; False when it is still
+        alive (a SUSPENDED full-screen program whose held frame must be kept). An
+        unknown owner (None) is treated as dead -- there is nothing live to protect."""
+        pg = self._alt_owner_pgrp
+        if pg is None:
+            return True
+        try:
+            os.killpg(pg, 0)
+        except ProcessLookupError:
+            return True                   # the program that drew the alt frame is gone
+        except OSError:
+            return False                  # exists but not signalable by us -> keep it
+        return False                      # alive (running or stopped) -> keep the frame
+
     def _alt_enter(self):
         """A full-screen program took the alternate screen: snapshot the primary
         screen so it can be restored intact on exit (pyte has no alt buffer)."""
         if self._alt_saved is not None or self._screen is None:
             return                        # already in the alt screen; do not nest
+        # Record the pgrp that entered alt, so a leftover alt frame from an EXITED
+        # program (a `cat` of ?1049h with no ?1049l) can be told apart from a still
+        # alive SUSPENDED program's held frame when the shell later regains the fg.
+        self._alt_owner_pgrp = self._foreground_pgrp()
         # Freeze the primary scrollback text NOW, so 'Save Transcript' keeps returning it
         # while the program runs instead of the ephemeral alt grid. Render the pyte model
         # to the document FIRST: _feed_stream fed the pre-marker primary bytes (this read's
@@ -3951,6 +3998,7 @@ class SecureTerminal(QPlainTextEdit):
         self._screen.buffer, self._screen.history, self._screen.cursor = \
             self._alt_saved
         self._alt_saved = None
+        self._alt_owner_pgrp = None
         self._alt_primary_text = ''       # the frozen primary is now restored, live again
         self._reset_grid_view()           # rebuild scrollback from restored history
 
@@ -4418,7 +4466,9 @@ class SecureTerminal(QPlainTextEdit):
         self._mouse_scan_carry = ''
         self._alt_screen = False
         self._alt_saved = None
+        self._alt_owner_pgrp = None
         self._alt_view = False
+        self._osc_palette = {}            # OSC 4/10/11/12 colour overrides do not outlive the child
         self._mouse_modes = set()
         self.setMouseTracking(False)
         self._mouse_report_btns = set()
