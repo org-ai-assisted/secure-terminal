@@ -70,6 +70,10 @@ jobs:
       - name: Checkout dist-ai (holds wl-headless-run, the headless-Wayland compositor helper)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          # dist-ai is tracked at @master ON PURPOSE (not SHA-pinned): the trust boundary
+          # is the org account, not the ref -- pinning blocks nothing real, breaks
+          # one-fix-everywhere, and leaves CI on stale tooling. Policy:
+          # developer-meta-files agents/github-actions.md G-A-004 (branch-tracking).
           repository: org-ai-assisted/dist-ai
           ref: master
           path: _dist-ai
