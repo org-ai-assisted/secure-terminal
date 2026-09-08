@@ -102,6 +102,14 @@ jobs:
           import yaml
           with open('.github/dm-consumer.yml', encoding='utf-8') as handle:
               declared = yaml.safe_load(handle)['dist-ai-tests']['apt-packages']
+          # dm-consumer's list targets the debian:trixie-slim CONTAINER the reusable
+          # dist-ai-tests job runs in; THIS workflow installs it on the bare ubuntu-24.04
+          # host, where a few Qt6 packages are split differently. apt aborts the WHOLE
+          # install on the first "Unable to locate package", so translate the trixie
+          # names that do not exist on noble. Qt6 SVG imageformats plugin (libqsvg.so):
+          # trixie ships it in qt6-svg-plugins, noble bundles it into libqt6svg6.
+          trixie_to_noble = {'qt6-svg-plugins': 'libqt6svg6'}
+          declared = ' '.join(trixie_to_noble.get(p, p) for p in declared.split())
           print('packages=%s' % declared)
           PY
 
