@@ -917,23 +917,32 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
         # combining range fall through to the per-character handling as before.
         m = _SAFE_RUN_RE.match(raw, i)
         if m:
-            if max_line and col >= max_line:
-                # deferred autowrap: a filled line wraps before the next char lands
-                completed.append(cells)
-                wraps.append(True)
-                cells, col = [], 0
-            run = m.group(0)
-            if max_line:
-                avail = max_line - col
-                if len(run) > avail:
-                    run = run[:avail]           # the rest is re-matched next iteration -> wraps there
-            new_cells = [(c, state) for c in run]
-            if col == len(cells):
-                cells.extend(new_cells)          # appending at the end of the line
-            else:
-                cells[col:col + len(run)] = new_cells   # overwrite in place (extends if past the end)
-            col += len(run)
-            i += len(run)
+            # Match the safe-char run ONCE, then consume it in autowrap-sized chunks WITHOUT
+            # re-matching. Re-matching (and m.group(0)) on every wrap made a long run
+            # QUADRATIC: a filled line wrapping every max_line chars re-scanned and re-copied
+            # the whole REMAINING run each time (a megabyte-long space flood on a reflow could
+            # hang the UI for minutes). Chunked consumption is linear; the cells produced are
+            # identical -- same chars, same SGR state, same deferred-autowrap boundaries.
+            run_end = m.end()
+            while i < run_end:
+                if max_line and col >= max_line:
+                    # deferred autowrap: a filled line wraps before the next char lands
+                    completed.append(cells)
+                    wraps.append(True)
+                    cells, col = [], 0
+                take = run_end - i
+                if max_line:
+                    avail = max_line - col
+                    if take > avail:
+                        take = avail            # the rest wraps on the next loop iteration
+                chunk = raw[i:i + take]
+                new_cells = [(c, state) for c in chunk]
+                if col == len(cells):
+                    cells.extend(new_cells)      # appending at the end of the line
+                else:
+                    cells[col:col + take] = new_cells   # overwrite in place (extends past the end)
+                col += take
+                i += take
             continue
         ch = raw[i]
         if ch == '\x1b':
