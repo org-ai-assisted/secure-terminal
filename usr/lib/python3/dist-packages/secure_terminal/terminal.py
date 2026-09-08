@@ -344,7 +344,8 @@ from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
                           QMimeData, QRect, QSize)
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
                          QTextFormat, QGuiApplication, QSyntaxHighlighter,
-                         QTextBlockUserData, QPainter, QPen, QClipboard)
+                         QTextBlockUserData, QPainter, QPen, QClipboard,
+                         QFontMetricsF)
 from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QApplication,
                              QWidget)
@@ -2263,10 +2264,16 @@ class SecureTerminal(QPlainTextEdit):
         the LINE-mode winsize, so it tracks the actual text width (scrollbar
         excluded), matching how the shell wraps and fills the prompt."""
         metrics = self.fontMetrics()
-        char_w = metrics.horizontalAdvance('M') or 1
+        # cols from the FRACTIONAL advance: the document engine lays glyphs out at the
+        # font's real (fractional) advance, but horizontalAdvance('M') is qRound()ed.
+        # Flooring the rounded value gave one column too many whenever the true advance
+        # rounded down -> `cols` glyphs laid out wider than the text area and the last
+        # column(s) clipped with no h-scrollbar (the zoom right-truncation bug). Flooring
+        # width / fractional-advance guarantees cols * advance <= width at every size.
+        char_wf = QFontMetricsF(self.font()).horizontalAdvance('M') or 1.0
         char_h = metrics.height() or 1
         width, height = self._text_area()
-        cols = max(2, width // char_w)
+        cols = max(2, int(width / char_wf))
         rows = max(2, height // char_h)
         return cols, rows
 
@@ -2276,10 +2283,16 @@ class SecureTerminal(QPlainTextEdit):
         scrollbar (the grid has scrollback), so its width is part of the viewport
         and is not reclaimed."""
         metrics = self.fontMetrics()
-        char_w = metrics.horizontalAdvance('M') or 1
+        # cols from the FRACTIONAL advance: the document engine lays glyphs out at the
+        # font's real (fractional) advance, but horizontalAdvance('M') is qRound()ed.
+        # Flooring the rounded value gave one column too many whenever the true advance
+        # rounded down -> `cols` glyphs laid out wider than the text area and the last
+        # column(s) clipped with no h-scrollbar (the zoom right-truncation bug). Flooring
+        # width / fractional-advance guarantees cols * advance <= width at every size.
+        char_wf = QFontMetricsF(self.font()).horizontalAdvance('M') or 1.0
         char_h = metrics.height() or 1
         width, height = self._text_area()
-        cols = max(2, width // char_w)
+        cols = max(2, int(width / char_wf))
         rows = max(2, height // char_h)
         return cols, rows
 

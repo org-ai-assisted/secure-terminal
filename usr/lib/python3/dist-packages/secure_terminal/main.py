@@ -4610,6 +4610,11 @@ class MainWindow(QMainWindow):
         body.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction)
         layout.addWidget(body)
+        # Base body size captured once (like the title): a RichText QLabel does NOT
+        # re-lay-out from the dialog font that _select_labels propagates, so the body
+        # would not zoom while the explicitly-sized title did. Scale it explicitly below.
+        _bpt = body.font().pointSizeF()
+        _body_base = _bpt if _bpt > 0 else 10.0
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         close = QPushButton('Close')
@@ -4617,12 +4622,16 @@ class MainWindow(QMainWindow):
         buttons.addWidget(close)
         layout.addLayout(buttons)
 
-        def _apply_about_scale(scale, _dlg=dialog, _title=title, _base=_title_base):
-            _select_labels(_dlg, scale)             # body + selectable labels
+        def _apply_about_scale(scale, _dlg=dialog, _title=title, _base=_title_base,
+                               _body=body, _bbase=_body_base):
+            _select_labels(_dlg, scale)             # selectable labels + dialog font
             tf = _title.font()
             tf.setBold(True)
             tf.setPointSizeF(_base * 1.45 * scale / 100.0)   # heading tracks the zoom
             _title.setFont(tf)
+            bf = _body.font()
+            bf.setPointSizeF(_bbase * scale / 100.0)   # body tracks the zoom too
+            _body.setFont(bf)
 
         # Ctrl+wheel zoom is LOCAL to this dialog (does not change the global menu size
         # or persist), so reading the About box never mutates a setting.
@@ -5125,28 +5134,44 @@ class MainWindow(QMainWindow):
                 self._ui_scale = prev_ui_scale
                 self._persist()
             return
-        self._apply_global({
-            'theme': theme.currentData(), 'zoom': zoom.value(),
-            'font_family': font_family.currentFont().family(),
-            'font_size': font_size.value(),
-            'ui_scale': ui_scale.value(),
-            'mode': mode.currentData(), 'colors': colors.isChecked(),
-            'line_edits': line_edits.isChecked(),
-            'tui': tui.isChecked(),
-            'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
-            'osc_notice': osc.isChecked(),
-            'osc_notice_types': {k: cb.isChecked()      # True == notify
-                                 for k, cb in osc_notice_checks.items()},
-            'tui_autobox_notice': tui_autobox_notice.isChecked(),
-            'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
-            'escape_limit': esc_limit.currentData(),
-            'paste_warn': paste_warn.currentData(), 'copy_warn': copy_warn.currentData(),
-            'persist': persist.isChecked(),
-            'systray': systray.isChecked(),
-            'auto_tab_colors': auto_tab_colors.isChecked(),
-            'clip_warn_any': clip_warn_any.isChecked(),
-            'clip_autostart': clip_autostart.isChecked(),
-        })
+        # Backstop the whole gather + apply: this runs inside the act_global
+        # triggered slot, and under PyQt6 an uncaught exception in a slot calls
+        # abort() -- a single bad setting would destroy the user's terminal
+        # session and every program running in it. A settings apply must never
+        # do that, so catch, log the full traceback (the bug stays diagnosable),
+        # and tell the user; the session keeps running. The leaf setters remain
+        # individually hardened -- this only guarantees no apply can ever be fatal.
+        try:
+            self._apply_global({
+                'theme': theme.currentData(), 'zoom': zoom.value(),
+                'font_family': font_family.currentFont().family(),
+                'font_size': font_size.value(),
+                'ui_scale': ui_scale.value(),
+                'mode': mode.currentData(), 'colors': colors.isChecked(),
+                'line_edits': line_edits.isChecked(),
+                'tui': tui.isChecked(),
+                'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
+                'osc_notice': osc.isChecked(),
+                'osc_notice_types': {k: cb.isChecked()      # True == notify
+                                     for k, cb in osc_notice_checks.items()},
+                'tui_autobox_notice': tui_autobox_notice.isChecked(),
+                'scrollback': scrollback.currentData(), 'paste_delay': pdelay.currentData(),
+                'escape_limit': esc_limit.currentData(),
+                'paste_warn': paste_warn.currentData(), 'copy_warn': copy_warn.currentData(),
+                'persist': persist.isChecked(),
+                'systray': systray.isChecked(),
+                'auto_tab_colors': auto_tab_colors.isChecked(),
+                'clip_warn_any': clip_warn_any.isChecked(),
+                'clip_autostart': clip_autostart.isChecked(),
+            })
+        except Exception:
+            import traceback as _tb
+            sys.stderr.write('secure-terminal: applying settings failed:\n'
+                             + _tb.format_exc())
+            QMessageBox.warning(
+                self, 'Settings',
+                'Some settings could not be applied; your session is '
+                'unaffected. Details are on the terminal output.')
 
     def _apply_global(self, opts):
         """Apply the global-settings choices to every open tab and store the new
