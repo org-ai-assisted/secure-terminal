@@ -362,8 +362,10 @@ _QWIDGETSIZE_MAX = (1 << 24) - 1   # Qt's QWIDGETSIZE_MAX (no-maximum sentinel; 
 # Tooltip card colours (background, foreground, border) by theme. Single source shared by
 # the custom InfoTip widget AND the app-level QToolTip stylesheet, so the native menu
 # tooltip (which cannot use InfoTip) reads the same and never renders dark-on-dark.
-_TIP_COLORS = {'dark':  ('#252a31', '#e7ebf1', '#3b434f'),
-               'light': ('#fbfbfd', '#23262b', '#d3d9e2')}
+# Minimal-crisp tooltip (VSCode/GitHub idiom): near-black on dark (borderless, the
+# border == bg), a hairline-bordered white card on light. (bg, fg, border) per theme.
+_TIP_COLORS = {'dark':  ('#0f1216', '#e6e6e6', '#0f1216'),
+               'light': ('#ffffff', '#1f2328', '#d0d7de')}
 
 
 class InfoTip(QLabel):
@@ -407,8 +409,8 @@ class InfoTip(QLabel):
         terminal background, not a fixed light card that jars on a dark terminal."""
         bg, fg, border = _TIP_COLORS['dark' if theme == 'dark' else 'light']
         self.setStyleSheet('QLabel{background:%s;color:%s;'
-                           'border:1px solid %s;border-radius:8px;'
-                           'padding:8px 11px}' % (bg, fg, border))
+                           'border:1px solid %s;border-radius:4px;'
+                           'padding:5px 9px}' % (bg, fg, border))
 
     def show_for(self, widget, text, zoom, theme):
         self._source = widget
@@ -2372,7 +2374,7 @@ class MainWindow(QMainWindow):
         pal.setColor(QPalette.ColorRole.ToolTipText, QColor(fg))
         QToolTip.setPalette(pal)
         app.setStyleSheet('QToolTip{background:%s;color:%s;border:1px solid %s;'
-                          'border-radius:6px;padding:5px 8px}' % (bg, fg, border))
+                          'border-radius:4px;padding:5px 8px}' % (bg, fg, border))
 
     # -- copy / paste route through the current tab (paste stays sanitized) ----
     def copy_selection(self):
