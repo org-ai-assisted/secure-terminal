@@ -20,7 +20,7 @@ SVG imageformats plugin (libqsvg.so): trixie ships it in qt6-svg-plugins, noble
 bundles it into libqt6svg6.
 """
 
-import yaml
+import yaml  # type: ignore[import-untyped]  # python3-yaml ships no type stubs
 
 TRIXIE_TO_NOBLE = {'qt6-svg-plugins': 'libqt6svg6'}
 
