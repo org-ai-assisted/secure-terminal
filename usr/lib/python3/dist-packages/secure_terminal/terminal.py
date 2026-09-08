@@ -581,6 +581,12 @@ for _k, _lbl, _codes, *_rest in OSC_FEATURES:
     for _c in _codes.replace(' ', '').split(','):
         _OSC_CODE_KEY.setdefault(int(_c), _k)
 
+# A line's trailing whitespace FILL, before its newline. A shell pads its prompt to
+# the terminal width; re-wrapping that fill at a NARROWER width on a reflow spilled it
+# onto blank continuation rows (repeated zoom scattered a screen of prompts with blank
+# lines). Trailing spaces before a newline are invisible, so a reflow drops them.
+_RE_EOL_FILL = re.compile(r'[ ]+(\r?\n)')
+
 # Alternate-screen enter/leave, as BYTES: pyte has no alt buffer, so the feed path
 # acts on these to snapshot/restore the primary screen at the exact boundary.
 _ALT_ENTER_BYTES = (b'\x1b[?1049h', b'\x1b[?1047h', b'\x1b[?47h')
@@ -1644,9 +1650,13 @@ class SecureTerminal(QPlainTextEdit):
             # resize can afford it, and the tail sub-cap would silently DELETE older
             # scrollback on every resize (the retained _raw is already bounded at
             # _RAW_MAX, and the document caps at _scrollback blocks regardless).
-            self._feed_line(self._raw if (self._preview or full)
-                            else tail_from_escape_boundary(self._raw,
-                                                           self._RERENDER_TAIL))
+            _src = (self._raw if (self._preview or full)
+                    else tail_from_escape_boundary(self._raw, self._RERENDER_TAIL))
+            # Drop each line's trailing whitespace fill before the re-wrap so a shell's
+            # prompt padding cannot spill onto blank continuation rows at a narrower width
+            # (the repeated-zoom scatter). Invisible spaces before a newline only; live
+            # output is untouched (this path is re-render/reflow, not the live feed).
+            self._feed_line(_RE_EOL_FILL.sub(r'\1', _src))
 
     def current_mode(self):
         return self._mode
