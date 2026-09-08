@@ -18,7 +18,7 @@ import argparse
 import json
 
 from PyQt6.QtCore import (
-    QTimer, Qt, QUrl, QRect, QPoint, QByteArray, QObject, QEvent,
+    QTimer, Qt, QUrl, QRect, QPoint, QSize, QByteArray, QObject, QEvent,
     qInstallMessageHandler)
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QIcon, QColor, QPalette, QPixmap,
@@ -197,7 +197,17 @@ def _app_icon():
     for path in ('/usr/share/icons/hicolor/scalable/apps/secure-terminal.svg',
                  os.path.join(base, rel)):
         if os.path.exists(path):
-            return QIcon(path)
+            # A QIcon built straight from an SVG path reports NO availableSizes(), so Qt's
+            # X11 _NET_WM_ICON export emits nothing and the window/taskbar icon silently
+            # falls back to the WM's default placeholder (the installed hicolor-theme path
+            # above does carry sizes, so this only bites a source checkout / uncached /
+            # bare-desktop run). Render the SVG to concrete pixmaps so the icon carries
+            # real sizes and the window icon actually shows.
+            src = QIcon(path)
+            icon = QIcon()
+            for size in (16, 22, 24, 32, 48, 64, 128, 256):
+                icon.addPixmap(src.pixmap(QSize(size, size)))
+            return icon
     return QIcon()
 
 
@@ -1321,7 +1331,7 @@ class MainWindow(QMainWindow):
         if (isinstance(_cmd, str) and _cmd == '') or (
                 isinstance(_cmd, (list, tuple))
                 and (not _cmd or not str(_cmd[0]).strip())):
-            return
+            return False              # opened NO tab -> caller must not count it
         term = SecureTerminal(tui=tui, command=_cmd or None,
                               line_edits=bool(_tab('line_edits',
                                                    self._default_line_edits)),
@@ -1366,6 +1376,7 @@ class MainWindow(QMainWindow):
             # consent dialog) -- else a bidi/RLO or homoglyph title spoofs those.
             self._user_titles[term] = sanitize_title(spec['title'])
             self._refresh_tab_label(term)
+        return True                   # a real tab was added
 
     # -- single-instance IPC server (owner-only socket) -----------------------
     def start_instance_server(self, group='default'):
@@ -1644,10 +1655,10 @@ class MainWindow(QMainWindow):
                     continue
                 if key is not None:
                     present.add(key)        # also dedup within this one batch
-            self._open_launch_tab(spec)
-            opened += 1
+            if self._open_launch_tab(spec):
+                opened += 1                 # count ONLY a tab that was actually created
         if opened == 0 and skipped == 0:
-            self.new_tab()                  # a bare reuse: give the user a new tab
+            self.new_tab()                  # a bare reuse (or an all-declined batch): a tab
         self.show()
         self.raise_()
         self.activateWindow()
@@ -2625,9 +2636,9 @@ class MainWindow(QMainWindow):
     def set_line_edits(self, enabled):
         if 'line_edits' in self._locked:
             return                        # admin-locked; not user-changeable
-        term = self.current()
-        if term is not None:
-            term.apply_line_edits(enabled)
+        for t in self._real_terms():      # EVERY tab, not just current() -- a background
+            t.apply_line_edits(enabled)   # tab must not silently keep the old line-editing
+                                          # policy (mirrors set_paste_warn / set_copy_warn)
         self.act_line_edits.setChecked(enabled)
         self._default_line_edits = bool(enabled)
         self._persist()
@@ -3864,9 +3875,9 @@ class MainWindow(QMainWindow):
         self.act_transcript_path = QAction('Copy Transcript File Pat&h...', self)
         self._bind(self.act_transcript_path, 'copy_transcript_path', '')
         self.act_transcript_path.setToolTip(
-            "Show the path of this tab's live transcript file (written continuously "
-            'when started with SECURE_TERMINAL_TRANSCRIPT_FILE) and copy it in one '
-            'click.')
+            "Write this tab's transcript to the app's default file (the same file Open "
+            'Transcript uses, in the state directory), then show and copy its path in '
+            'one click.')
         self.act_transcript_path.triggered.connect(self.copy_transcript_path)
         file_menu.addAction(self.act_transcript_path)
 
@@ -4372,6 +4383,24 @@ class MainWindow(QMainWindow):
         if (QKeySequence(seq).toString() != QKeySequence(default).toString()
                 and self._is_reserved_shortcut(seq)):
             seq = default
+        # Cross-action collision: a config `keybindings=` override duplicating another
+        # action's chord makes Qt render BOTH dead ("ambiguous shortcut") -- e.g.
+        # copy=Ctrl+Shift+K silently disables the Terminate panic key. The OVERRIDE loses
+        # (reverts to its own default); a built-in default is protected. _bind runs per
+        # action during _build_menu, so resolve against the already-registered ones
+        # (_set_shortcuts guards the interactive dialog with the same rule).
+        norm = QKeySequence(seq).toString()
+        this_override = bool(norm) and norm != QKeySequence(default).toString()
+        if norm:
+            for _oact, _odef, _olbl in self._shortcuts.values():
+                if QKeySequence(_oact.shortcut()).toString() != norm:
+                    continue
+                if this_override:
+                    seq = default                          # this override collides -> drop it
+                elif (QKeySequence(_oact.shortcut()).toString()
+                        != QKeySequence(_odef).toString()):
+                    _oact.setShortcut(QKeySequence(_odef))  # the OTHER was the override -> revert it
+                break
         action.setShortcut(QKeySequence(seq))
         label = action.text().replace('&', '').replace('...', '').strip()
         self._shortcuts[ident] = (action, default, label)
@@ -4765,7 +4794,15 @@ class MainWindow(QMainWindow):
         scrollback = QComboBox()
         for label, lines in SCROLLBACK_CHOICES:
             scrollback.addItem(label, lines)
-        scrollback.setCurrentIndex(scrollback.findData(self._scrollback))
+        sidx = scrollback.findData(self._scrollback)
+        if sidx < 0:
+            # a custom /scrollback value (any int) is not a preset; add it so the combo
+            # shows the REAL current value instead of a blank -- a blank selection makes
+            # OK read currentData()=None, so _apply_global writes scrollback=None and the
+            # next launch's int('None') crashes, silently resetting to Unlimited.
+            scrollback.addItem('{:,} lines'.format(self._scrollback), self._scrollback)
+            sidx = scrollback.count() - 1
+        scrollback.setCurrentIndex(sidx)
         _tip_row(appearance, 'Scrollback', scrollback,
                  'How many lines of past output each tab keeps for scrolling back.')
 
@@ -6087,6 +6124,7 @@ def _clipboard_watch_main():
     if not _require_default_font():
         return 1
     app.setApplicationName('secure-terminal')
+    app.setDesktopFileName('secure-terminal')   # associate the .desktop for WM icon resolution
     icon = _app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
@@ -6248,6 +6286,11 @@ def main(cg_base=None):
     if _shot_mode():
         app.setCursorFlashTime(0)     # no caret blink -> no frame depends on its phase
     app.setApplicationName('secure-terminal')
+    # Associate with the shipped .desktop by default so a WM resolves the window's
+    # titlebar/taskbar icon (Wayland app-id / X11 WM_CLASS -> secure-terminal.desktop ->
+    # Icon= -> icon theme); without it the window shows the WM's generic fallback. --class
+    # overrides it below.
+    app.setDesktopFileName('secure-terminal')
     _icon = _app_icon()
     if not _icon.isNull():
         app.setWindowIcon(_icon)
