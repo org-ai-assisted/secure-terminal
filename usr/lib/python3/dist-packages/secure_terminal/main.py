@@ -905,8 +905,12 @@ class MainWindow(QMainWindow):
         # render tooltips as interactive, zoom-aware popups (selectable + copyable)
         self._tip_filter = _ToolTipFilter(self)
         app = QApplication.instance()
+        # Snapshot the desktop style + palette so the light theme restores them exactly.
+        self._base_app_palette = app.palette() if app is not None else None
+        self._base_style_name = app.style().objectName() if app is not None else None
         if app is not None:
             app.installEventFilter(self._tip_filter)
+        self._apply_app_palette(self._default_theme)   # chrome (menus/toolbar) follows ST theme
         # Style Qt's native QToolTip: MENU action hints use it (not InfoTip), and the
         # platform default can paint dark-on-dark. Follows the window default theme.
         self._apply_tooltip_style(self._default_theme)
@@ -2414,6 +2418,54 @@ class MainWindow(QMainWindow):
         self.tabs.setStyleSheet(
             'QTabWidget::pane, QStackedWidget { background: %s; }' % base)
 
+    # Chrome palette for the dark theme -- modern soft-dark (near-black slate, off-white
+    # text), matching the tab container. Base is the terminal's OWN dark bg (#14161b) so
+    # the content/input surface stays identical to the terminal theme; Window is a shade
+    # above (#1b1e24) so the menu bar/toolbar read as a raised surface over the content.
+    _DARK_PALETTE = {
+        'Window': '#1b1e24', 'Base': '#14161b', 'AlternateBase': '#1b1e24',
+        'WindowText': '#e7ebf1', 'Text': '#e7ebf1', 'ButtonText': '#e7ebf1',
+        'Button': '#2b3038', 'Light': '#3a4049', 'Midlight': '#333a43',
+        'Mid': '#9aa4b2', 'Dark': '#0e1013', 'Shadow': '#000000',
+        'Highlight': '#3b7ddd', 'HighlightedText': '#ffffff',
+        'ToolTipBase': '#0f1216', 'ToolTipText': '#e6e6e6',
+    }
+
+    def _apply_app_palette(self, theme):
+        """Make the whole chrome (menu bar, toolbar chips, dialogs) follow ST's OWN
+        theme. The platform default style ignores the palette for parts of the chrome,
+        so dark uses the Fusion style (which honours it fully); light restores the
+        desktop style + palette, so the shipped default and the (light) competitor
+        comparison shots are byte-for-byte unchanged. setStyle resets every widget
+        palette, so the per-tab terminal theme is re-applied afterwards."""
+        app = QApplication.instance()
+        if app is None:
+            return
+        if theme != 'dark':
+            if self._base_style_name:
+                app.setStyle(self._base_style_name)
+            if self._base_app_palette is not None:
+                app.setPalette(self._base_app_palette)
+        else:
+            app.setStyle('Fusion')                # honours the palette for all chrome
+            pal = QPalette()
+            role = QPalette.ColorRole
+            for name, hexv in self._DARK_PALETTE.items():
+                pal.setColor(getattr(role, name), QColor(hexv))
+            for r in (role.WindowText, role.Text, role.ButtonText):
+                pal.setColor(QPalette.ColorGroup.Disabled, r, QColor('#6a7280'))
+            app.setPalette(pal)
+        for w in app.allWidgets():             # re-resolve cached palette(...) stylesheets
+            s = w.style()
+            s.unpolish(w)
+            s.polish(w)
+            w.update()
+        # LAST -- AFTER the repolish, which re-applies the style's default palette and
+        # would otherwise clobber this: restore each terminal's own theme Base/Text so
+        # the body keeps its dark/light background (not the chrome's surface colour).
+        for term in self._real_terms():
+            term.apply_theme(term.current_theme())
+
     def _update_render_active(self):
         """Only the foreground tab repaints at interactive speed. Every hidden tab
         still feeds its pyte model on each read, but coalesces the expensive
@@ -2528,7 +2580,16 @@ class MainWindow(QMainWindow):
             term.apply_theme(theme)
             self._apply_container_theme(theme)   # container follows the current tab
         self._default_theme = theme
+        self._apply_app_palette(theme)       # chrome (menus/toolbar/dialogs) follows the theme
         self._apply_tooltip_style(theme)     # native menu tooltip follows the theme
+        # _apply_tooltip_style's app-level setStyleSheet re-polishes every widget and
+        # resets each per-tab terminal palette -- so re-assert the terminal theme LAST,
+        # keeping the body's own dark/light background (not the chrome surface colour).
+        # The scroll-area VIEWPORT (which paints the empty body) is a separate child that
+        # setStyle gave its own palette, so sync it to the terminal's too.
+        for _t in self._real_terms():
+            _t.apply_theme(_t.current_theme())
+            _t.viewport().setPalette(_t.palette())
         self._review_bar.rerender_mirror()   # an open review follows the theme
         self._persist()
 
@@ -5241,6 +5302,7 @@ class MainWindow(QMainWindow):
             # dialog has no bell field, so touching it would silently reset each
             # tab's per-tab bell choice; the bell is managed via the View menu only.
         self._apply_container_theme(opts['theme'])   # keep the container in step
+        self._apply_app_palette(opts['theme'])        # chrome follows the applied theme
         # An OPEN review mirrors the reviewed tab's theme/mode/font/zoom, and this
         # global-settings apply just changed all of them on that tab -- so refresh the
         # mirror too, exactly as the per-tab setters do (a no-op when no review is open).
