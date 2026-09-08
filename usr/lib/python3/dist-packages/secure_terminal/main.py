@@ -5663,33 +5663,50 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _signal_close_windows(app):
+    """Crash-safe close of every window on a terminate signal, run on the LIVE
+    event loop. Each window's NORMAL closeEvent fires -- so a still-running
+    program prompts for confirmation -- never a silent force-close, and quit() is
+    never called directly: Qt quits when the last window closes, and aboutToQuit
+    then tears the ptys down while the loop is still up (see main). The modal thus
+    opens while XCB is alive, never during the teardown that a direct quit() would
+    start (a modal run mid-teardown segfaults). app._signal_close_pending is
+    cleared on return, so a vetoed close re-arms for the next signal."""
+    try:
+        windows = [w for w in app.topLevelWidgets() if isinstance(w, MainWindow)]
+        if not windows:
+            app.quit()                  # no window to confirm -- honor the signal
+            return
+        for window in windows:
+            window.close()              # normal closeEvent -> confirm if a program runs
+    finally:
+        app._signal_close_pending = False
+
+
 def _install_signal_quit(app):
-    """Terminate on the usual signals from the launching terminal: Ctrl+C
-    (SIGINT), plus SIGTERM and SIGHUP. Qt's C++ event loop does not deliver
+    """Confirm-then-terminate on the usual signals from the launching terminal:
+    Ctrl+C (SIGINT), plus SIGTERM and SIGHUP. Qt's C++ event loop does not deliver
     Python signal handlers on its own, so a periodic no-op timer wakes it often
-    enough for the handler to run. quit() emits aboutToQuit, which tears every
-    tab's pty down inside the event loop (see main), so nothing fires into a
-    half-destroyed object during the XCB teardown that follows.
+    enough for the handler to run.
 
-    The quit is QUEUED (QTimer.singleShot), not called directly: a signal can be
-    delivered after this handler is installed but before app.exec() starts, and a
-    bare quit() before the loop is running is a no-op that would drop the request.
-    A queued quit is honored the moment the loop starts instead.
+    The close is QUEUED (QTimer.singleShot onto the live loop), never done in the
+    handler: a signal can arrive after this is installed but before app.exec()
+    starts, and the queued close is honored the moment the loop starts. Deferring
+    it is also what makes the confirm crash-safe -- the "a program is still
+    running" modal opens on the running loop with XCB up, not during the teardown
+    a direct quit() would start (a modal run mid-teardown segfaults).
 
-    A signal is an unconditional "go down now": there is no user to answer the
-    "a program is still running" confirmation, and a modal opened while the XCB
-    connection is torn down (the harness windowkills then kills) segfaults. So
-    every window is marked _force_close first, and its closeEvent tears down
-    directly instead of prompting."""
+    Re-entrant-safe: a second signal while a close is already queued or its prompt
+    is up is ignored (app._signal_close_pending), so prompts never stack."""
+    app._signal_close_pending = False
     wake = QTimer(app)
     wake.timeout.connect(lambda: None)
 
     def handler(_signum, _frame):
-        wake.stop()                     # no more wake ticks racing teardown
-        for window in app.topLevelWidgets():
-            if isinstance(window, MainWindow):
-                window._force_close = True
-        QTimer.singleShot(0, app.quit)  # queued: honored even before exec() starts
+        if app._signal_close_pending:
+            return                      # a close is already queued / prompting
+        app._signal_close_pending = True
+        QTimer.singleShot(0, lambda: _signal_close_windows(app))
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         try:
             signal.signal(sig, handler)
@@ -6331,10 +6348,10 @@ def main(cg_base=None):
 
     window = MainWindow(launch=launch, cg_base=cg_base)
     # Install the terminate-on-signal handler only now, after the window exists:
-    # its handler force-closes every window (see _install_signal_quit), so a
-    # signal arriving mid-construction would otherwise flip _force_close on a
-    # half-built window that __init__ then resets. Before this point a signal
-    # takes its default disposition (prompt termination) -- correct for startup.
+    # its handler queues a normal close of every top-level window (see
+    # _install_signal_quit), so the window must already be built and shown for a
+    # signal-driven close to find and confirm it. Before this point a signal takes
+    # its default disposition (terminate) -- correct for startup.
     _install_signal_quit(app)
 
     # Adopt the group socket claimed above so --reuse/ctl can target this window
