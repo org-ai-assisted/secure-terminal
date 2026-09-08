@@ -766,7 +766,7 @@ def cli_terminfo_dir():
             if _fresh(cache):
                 return cache
         except (OSError, subprocess.SubprocessError):
-            pass
+            pass   # tic missing / build failed -> no cached terminfo; caller uses None
     return None
 
 
@@ -3447,7 +3447,7 @@ class SecureTerminal(QPlainTextEdit):
                 try:
                     os.chdir(self._cwd)
                 except (OSError, ValueError):
-                    pass
+                    pass   # keep the inherited cwd; a gone/malformed dir must not fail the spawn
             try:
                 os.execvp(argv[0], argv)
             except (OSError, ValueError):
@@ -4972,7 +4972,7 @@ class SecureTerminal(QPlainTextEdit):
                 try:
                     act.triggered.disconnect()
                 except TypeError:
-                    pass
+                    pass   # no prior connection -> nothing to disconnect
                 act.triggered.connect(lambda _checked=False: self.copy())
         # Let the owning window append its app-level toggles (system tray, clipboard
         # sanitizer), so they are reachable from the right-click menu too. A preview
