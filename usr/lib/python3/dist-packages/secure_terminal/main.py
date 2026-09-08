@@ -6124,6 +6124,7 @@ def _clipboard_watch_main():
     if not _require_default_font():
         return 1
     app.setApplicationName('secure-terminal')
+    app.setDesktopFileName('secure-terminal')   # associate the .desktop for WM icon resolution
     icon = _app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
@@ -6285,6 +6286,11 @@ def main(cg_base=None):
     if _shot_mode():
         app.setCursorFlashTime(0)     # no caret blink -> no frame depends on its phase
     app.setApplicationName('secure-terminal')
+    # Associate with the shipped .desktop by default so a WM resolves the window's
+    # titlebar/taskbar icon (Wayland app-id / X11 WM_CLASS -> secure-terminal.desktop ->
+    # Icon= -> icon theme); without it the window shows the WM's generic fallback. --class
+    # overrides it below.
+    app.setDesktopFileName('secure-terminal')
     _icon = _app_icon()
     if not _icon.isNull():
         app.setWindowIcon(_icon)

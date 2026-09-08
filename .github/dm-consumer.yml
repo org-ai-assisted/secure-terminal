@@ -74,4 +74,8 @@ dist-ai-tests:
   ## qt6-svg-plugins: the app icon is an SVG; QIcon renders it via this plugin. It is only a
   ## Recommends of libqt6gui6, so a --no-install-recommends CI install drops it and the window
   ## icon (and the _app_icon availableSizes regression test) would silently break. Pin it.
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia qt6-wayland qt6-svg-plugins labwc python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git procps"
+  ## papirus-icon-theme: the shots harness points labwc's SSD titlebar at the Papirus icon theme
+  ## so each captured window resolves an HONEST per-app favicon (Papirus carries the competitors'
+  ## declared icon names bare hicolor lacks; it inherits hicolor, so secure-terminal's own
+  ## session-installed icon resolves too). Absent, every favicon silently reverts to labwc's logo.
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia qt6-wayland qt6-svg-plugins labwc papirus-icon-theme python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git procps"
