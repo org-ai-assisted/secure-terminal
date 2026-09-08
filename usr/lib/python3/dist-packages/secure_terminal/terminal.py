@@ -581,6 +581,48 @@ for _k, _lbl, _codes, *_rest in OSC_FEATURES:
     for _c in _codes.replace(' ', '').split(','):
         _OSC_CODE_KEY.setdefault(int(_c), _k)
 
+
+def _trim_blank_wrap_fill(completed, wraps):
+    """Drop a wrapped line's TRAILING all-blank autowrap continuation rows.
+
+    A shell pads its prompt to the terminal width with trailing spaces; re-wrapped at a
+    NARROWER width on a reflow that fill lands on phantom blank continuation rows, so
+    repeated zoom scattered a screen of prompts with blank lines. Runs on feed_line_edits'
+    POST-overwrite cells (a `\\r`/`\\b`/CSI-G wipe is already applied, so a blanked
+    password stays blank -- never resurrected), and only removes a continuation that is
+    ENTIRELY blank AND trailing (a blank MIDDLE continuation, which shifts later text, and
+    a genuine standalone blank line are both kept; at least one row of an all-blank line
+    survives). Linear in the number of rows.
+
+    `completed` is a list of cell-lists (a cell is (char, sgr_state)); `wraps[i]` is True
+    when row i ended by a soft autowrap (continues onto row i+1). A blank fill cell is a
+    space with a DEFAULT background: fg/bold do not render on a space glyph, so only a
+    background colour makes a trailing space visible -- a coloured bar is kept, plain fill
+    is dropped. (The sgr model carries only fg/bg/bold; there is no reverse.)"""
+    def _blank(cl):
+        for char, sgr in cl:
+            if char != ' ':
+                return False
+            for k, v in sgr:
+                if k == 'bg' and v is not None:
+                    return False
+        return True
+    out_c, out_w, line = [], [], []
+    for cl, w in zip(completed, wraps):
+        line.append((cl, w))
+        if not w:                            # a wraps=False row ends a logical line
+            while len(line) > 1 and _blank(line[-1][0]):
+                line.pop()                   # trailing blank continuation -> drop
+            last = len(line) - 1
+            for j, (seg, _w) in enumerate(line):
+                out_c.append(seg)
+                out_w.append(j < last)       # only non-last rows still wrap
+            line = []
+    for seg, w in line:                      # dangling (unfinished) line: leave untouched
+        out_c.append(seg)
+        out_w.append(w)
+    return out_c, out_w
+
 # Alternate-screen enter/leave, as BYTES: pyte has no alt buffer, so the feed path
 # acts on these to snapshot/restore the primary screen at the exact boundary.
 _ALT_ENTER_BYTES = (b'\x1b[?1049h', b'\x1b[?1047h', b'\x1b[?47h')
@@ -4570,6 +4612,11 @@ class SecureTerminal(QPlainTextEdit):
         completed, self._line_cells, self._line_col, self._sgr, wraps = \
             feed_line_edits(self._line_cells, self._line_col, self._sgr, text,
                             wrap, self._line_edits)
+        # Drop a wrapped line's trailing all-blank fill rows so a shell's prompt padding,
+        # re-wrapped narrower on a reflow, does not scatter phantom blank rows (task 6).
+        # Post-overwrite + trailing-only, so a wiped line stays wiped and mid-line blanks
+        # and genuine blank lines are kept.
+        completed, wraps = _trim_blank_wrap_fill(completed, wraps)
         self._paint_pending.extend(completed)
         self._paint_pending_wraps.extend(wraps)
         # Bound the debounced backlog. A hidden tab coalesces at the slow cadence, so a
