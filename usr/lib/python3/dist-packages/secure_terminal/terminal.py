@@ -545,6 +545,12 @@ def _cache_bounded(cache, key, fmt):
 # real OSC, no spurious advisory, no read<->write misclassification, no str-vs-bytes gap).
 _OSC_ANY = re.compile(rb'\x1b\](\d{1,8});([^\x07\x1b]*)(?:\x07|\x1b\\)')
 _OSC_CLIP_MAX = 64 * 1024        # cap a clipboard payload; no unbounded writes
+# OSC 52 clipboard-WRITE flood: >= _CLIP_FLOOD_COUNT writes within _CLIP_FLOOD_WINDOW seconds.
+# A time-throttle cannot tell a flood from legitimate rapid distinct writes (it would drop the
+# latter), so the write always applies (sanitized ASCII) and instead a program flooding the
+# clipboard is REPORTED once per tab.
+_CLIP_FLOOD_WINDOW = 2.0
+_CLIP_FLOOD_COUNT = 12
 # Whether an OSC body (the bytes after its "\x1b]") contains a terminator (BEL or
 # ST). Used to decide if a trailing OSC introducer is incomplete and must be held
 # back and prepended to the next read, so a sequence split across PTY reads (a
@@ -1172,6 +1178,8 @@ class SecureTerminal(QPlainTextEdit):
         # (True/False) always wins over this global default.
         self._clipboard_read_always = False
         self._last_clip_read = 0.0
+        self._clip_write_times = []   # OSC 52 write monotonic timestamps (flood detection)
+        self._clip_flood_advised = False   # the flood notice fires once per tab
         self._seeding = False         # True while replaying _raw into pyte (no bell)
         self._last_title = ''
         self._reported_cwd = ''       # OSC 7 working directory, when osc_cwd is on
@@ -4230,6 +4238,18 @@ class SecureTerminal(QPlainTextEdit):
         except ValueError:
             return
         QGuiApplication.clipboard().setText(sanitize_clipboard(text))
+        # The write always applies (a throttle would drop legitimate rapid distinct writes);
+        # instead REPORT a program flooding the clipboard, ONCE per tab, so a runaway is visible
+        # without breaking a real program's rapid writes.
+        now = time.monotonic()
+        self._clip_write_times = [t for t in self._clip_write_times
+                                  if now - t < _CLIP_FLOOD_WINDOW]
+        self._clip_write_times.append(now)
+        if len(self._clip_write_times) >= _CLIP_FLOOD_COUNT and not self._clip_flood_advised:
+            self._clip_flood_advised = True
+            self._advise("A program is rapidly overwriting the clipboard (OSC 52). The writes "
+                         "are sanitized to plain ASCII; turn off System clipboard (write) in "
+                         "View to stop it.")
 
     def _osc_cwd(self, params):
         """OSC 7: file://HOST/PATH working-directory report. Used for the tab; the
