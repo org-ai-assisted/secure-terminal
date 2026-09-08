@@ -84,4 +84,4 @@ jobs:
       - name: Run the formal verification against the real checkout
         env:
           PYTHONPATH: ${{ github.workspace }}/usr/lib/python3/dist-packages
-        run: python3 _dist-ai/usr/share/secure-terminal-tests/verify_formal.py
+        run: _dist-ai/usr/share/secure-terminal-tests/verify_formal.py
