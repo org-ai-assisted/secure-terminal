@@ -95,23 +95,13 @@ jobs:
         ## falls behind does not fail with "missing PyQt6.QtMultimedia" -- the app
         ## never starts, the --test-canary positive control does not fire, and the
         ## harness refuses to trust the whole run. One source of truth instead.
+        ## The trixie->noble package-name translation and the dm-consumer read live
+        ## in the script (a file can be linted/tested; an inline -c/stdin program
+        ## cannot -- R-193).
         run: |
           sudo apt-get update --quiet
           sudo apt-get install --yes --no-install-recommends python3-yaml
-          python3 - <<'PY' >> "${GITHUB_OUTPUT}"
-          import yaml
-          with open('.github/dm-consumer.yml', encoding='utf-8') as handle:
-              declared = yaml.safe_load(handle)['dist-ai-tests']['apt-packages']
-          # dm-consumer's list targets the debian:trixie-slim CONTAINER the reusable
-          # dist-ai-tests job runs in; THIS workflow installs it on the bare ubuntu-24.04
-          # host, where a few Qt6 packages are split differently. apt aborts the WHOLE
-          # install on the first "Unable to locate package", so translate the trixie
-          # names that do not exist on noble. Qt6 SVG imageformats plugin (libqsvg.so):
-          # trixie ships it in qt6-svg-plugins, noble bundles it into libqt6svg6.
-          trixie_to_noble = {'qt6-svg-plugins': 'libqt6svg6'}
-          declared = ' '.join(trixie_to_noble.get(p, p) for p in declared.split())
-          print('packages=%s' % declared)
-          PY
+          .github/scripts/resolve-apt-packages.py >> "${GITHUB_OUTPUT}"
 
       - name: Install dependencies (apt only)
         env:
@@ -131,7 +121,7 @@ jobs:
 
       - name: Validate the corpus (schema + sanitization lint)
         working-directory: _corpus
-        run: python3 tools/validate.py
+        run: tools/validate.py
 
       - name: Positive control + adversarial corpus
         working-directory: _corpus
@@ -143,9 +133,9 @@ jobs:
           # offscreen fallback -- wl-headless-run exports QT_QPA_PLATFORM=wayland + WAYLAND_DISPLAY.
           wl_run="${GITHUB_WORKSPACE}/_dist-ai/usr/share/dist-ai-tests-common/wl-headless-run"
           "${wl_run}" --no-autoconfirm -- bash -ec '
-            python3 harness/run.py --self-test
-            python3 harness/adversarial.py --self-test
-            python3 harness/adversarial.py'
+            harness/run.py --self-test
+            harness/adversarial.py --self-test
+            harness/adversarial.py'
 
   git-diffs-lie-corpus:
     ## Run the corpus suite against the REAL git-diffs-lie checkout. test_corpus.py
@@ -206,4 +196,4 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/usr/lib/python3/dist-packages
           GIT_DIFFS_LIE_DIR: ${{ github.workspace }}/_git-diffs-lie
-        run: python3 _dist-ai/usr/share/secure-terminal-tests/test_corpus.py
+        run: _dist-ai/usr/share/secure-terminal-tests/test_corpus.py
