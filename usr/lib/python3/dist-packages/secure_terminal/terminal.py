@@ -596,16 +596,21 @@ def _trim_blank_wrap_fill(completed, wraps):
 
     `completed` is a list of cell-lists (a cell is (char, sgr_state)); `wraps[i]` is True
     when row i ended by a soft autowrap (continues onto row i+1). A blank fill cell is a
-    space with a DEFAULT background: fg/bold do not render on a space glyph, so only a
-    background colour makes a trailing space visible -- a coloured bar is kept, plain fill
-    is dropped. (The sgr model carries only fg/bg/bold; there is no reverse.)"""
+    space with a DEFAULT background carrying no sentinel: fg/bold do not render on a space
+    glyph, so only a background colour makes a trailing space visible; a space cell that
+    carries any NON-display sentinel key (the no-trailing-newline marker _NO_NEWLINE_MARK,
+    sgr `(('_no_newline', True),)`, whose gutter glyph must survive a reflow) is content,
+    not fill. So a coloured bar and a marker row are kept; plain fill is dropped."""
     def _blank(cl):
         for char, sgr in cl:
             if char != ' ':
                 return False
             for k, v in sgr:
-                if k == 'bg' and v is not None:
-                    return False
+                if k in ('fg', 'bold'):
+                    continue                 # invisible on a blank space glyph
+                if k == 'bg' and v is None:
+                    continue                 # default background
+                return False                 # coloured bg, or a sentinel (e.g. _no_newline)
         return True
     out_c, out_w, line = [], [], []
     for cl, w in zip(completed, wraps):
