@@ -350,8 +350,11 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
         else:
             # over-cap incomplete NON-string escape (CSI or generic ESC): enter the
             # same O(1) discard state as an over-cap string sequence, so the
-            # continuation cannot leak as literal text on the next chunk.
-            drop = '[' if g[1] == '[' else '\x1b'
+            # continuation cannot leak as literal text on the next chunk. The
+            # len(g) >= 2 guard also covers a lone trailing ESC (len 1) that reaches
+            # here only under a tiny cap (cap <= 0), where neither branch above fires:
+            # treat it as a generic-ESC discard, never index g[1] out of range.
+            drop = '[' if len(g) >= 2 and g[1] == '[' else '\x1b'
             dropped = len(g)
             text = text[:m.start()]
     return text, carry, drop, dropped
@@ -976,12 +979,16 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                     elif num == 1:
                         for j in range(0, min(col + 1, len(cells))):
                             cells[j] = (' ', state)   # erase uses current SGR
-                    elif num == 2:                      # erase whole line; per
-                        # ECMA-48 the cursor does NOT move (like n=0/n=1). Blank
-                        # every cell but keep col; INV col <= len holds because
-                        # col <= len(cells) already, so the line is exactly col
-                        # blanks with the cursor at its end -- a following write
-                        # lands at its column instead of being homed to 0.
+                    elif num == 2:                      # erase whole line; the
+                        # cursor does NOT move (like n=0/n=1). This intentionally
+                        # trims the line to col blank cells rather than blanking
+                        # every cell in place as strict ECMA-48 EL2 would: the cells
+                        # past col were about to become blanks anyway, so dropping
+                        # them only under-displays (never leaks), exactly as EL0's
+                        # `del cells[col:]` already does -- both keep this model's
+                        # trim-to-cursor invariant col <= len(cells). Preserving
+                        # trailing length here would buy no visual/security gain and
+                        # would diverge from EL0, so it is deliberately not done.
                         cells = [(' ', state)] * col
                 # A cursor/erase op clears the pending autowrap (the implicit
                 # col == max_line "phantom" past the last column), so a following
