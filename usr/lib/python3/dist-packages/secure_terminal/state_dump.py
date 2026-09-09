@@ -1,0 +1,283 @@
+#!/usr/bin/python3 -Bsu
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+"""
+Deterministic terminal-state dump.
+
+Serializes the CURRENT terminal state -- the pyte grid (TUI mode) or the line
+document plus SGR pen (CLI mode), together with the wrapper-level flags that pyte
+does not model (alternate screen, mouse-reporting modes) -- into a form a human can
+read and diff, and a machine can round-trip. Two dumps taken while the terminal is
+idle are byte-identical: only pyte MODEL state is read (cell fg/bg colour names,
+bold, ...), never the theme/contrast-guarded display colours, and no volatile field
+(a pid/pgrp, a timer, an object address, a cache) is ever included.
+
+Pure: no Qt. `collect()` reads a pyte Screen (or a CLI snapshot) into a plain dict;
+`dump_text()` / `dump_json()` render that dict. The text form elides blank cells and
+fully-blank rows (a row's surviving index shows the gap) so the file stays small and
+diffs stay minimal; a cell is "blank" only when it equals the screen's default cell,
+so a coloured space (bg set, data == ' ') is kept.
+
+Format is versioned (FORMAT_VERSION) and designed to be round-trippable; a loader is
+a deliberate follow-up, not shipped here.
+"""
+
+import json
+
+import pyte.modes
+import pyte.charsets as _charsets
+
+FORMAT_VERSION = 1
+
+# pyte private modes are stored in Screen.mode shifted left 5 (see pyte.modes); the
+# widget stores bracketed paste (DEC private 2004) the same way but pyte has no name
+# for it. Build a value -> stable-name map from pyte.modes' public constants plus that
+# one, so a dumped mode reads as e.g. "DECAWM" not the raw int.
+_MODE_NAMES = {
+    value: name
+    for name, value in vars(pyte.modes).items()
+    if name.isupper() and isinstance(value, int)
+}
+_MODE_NAMES[2004 << 5] = 'BRACKETED_PASTE'
+
+# ANSI (non-private) modes are NOT shifted; pyte's two are small ints. Everything else
+# a program can set via DECSET is a private mode (shifted). Split on that so the dump
+# lists them under the right heading.
+_ANSI_MODE_VALUES = frozenset((pyte.modes.LNM, pyte.modes.IRM))
+
+# Mouse-reporting DEC private mode numbers -> short names (mirrors sanitize._MOUSE_*).
+_MOUSE_NAMES = {
+    1000: 'button-track',
+    1002: 'drag-track',
+    1003: 'any-motion',
+    1004: 'focus',
+    1006: 'sgr-ext',
+}
+
+# The eight pyte Char attribute fields, in namedtuple order; `data` is handled
+# separately (it is the glyph, not a rendition attribute).
+_ATTR_FIELDS = ('fg', 'bg', 'bold', 'italics', 'underscore', 'strikethrough',
+                'reverse')
+
+
+def _mode_name(value):
+    return _MODE_NAMES.get(value, 'mode:%d' % value)
+
+
+def _charset_id(table):
+    """A stable identity for a pyte G0/G1 charset table (a 256-char translation
+    string), so a dump names the DESIGNATION (LAT1 / VT100 special-graphics / ...)
+    rather than emitting 256 characters. Unknown tables read as 'custom'."""
+    for name in ('LAT1_MAP', 'VT100_MAP', 'IBM_PC_MAP', 'VAX42_MAP'):
+        if table is getattr(_charsets, name, None):
+            return name[:-4]              # strip the '_MAP' suffix
+    return 'custom'
+
+
+def _attrs_dict(cell, default):
+    """The non-default rendition attributes of `cell` vs the screen's `default` cell,
+    as a plain dict (empty when the cell carries default rendition). Colours are the
+    pyte MODEL names/hex ('default', 'red', 'ff0000'), never display colours."""
+    out = {}
+    for field in _ATTR_FIELDS:
+        value = getattr(cell, field)
+        if value != getattr(default, field):
+            out[field] = value
+    return out
+
+
+def _row_runs(row, columns, default):
+    """(text, runs, blank) for one grid row. `text` is the row glyphs up to the last
+    SIGNIFICANT cell (one that differs from `default`), trailing default cells dropped.
+    `runs` is the list of maximal column spans that share one non-default attribute set:
+    {'start', 'end' (exclusive), 'attrs'}. `blank` is True when every cell equals the
+    default cell (data and rendition) -- such a row is elided by the caller."""
+    last = -1
+    for x in range(columns):
+        if row[x] != default:
+            last = x
+    if last < 0:
+        return '', [], True
+    text = ''.join(row[x].data for x in range(last + 1))
+    runs = []
+    cur = None
+    for x in range(last + 1):
+        attrs = _attrs_dict(row[x], default)
+        if attrs:
+            if cur is not None and cur['attrs'] == attrs and cur['end'] == x:
+                cur['end'] = x + 1
+            else:
+                cur = {'start': x, 'end': x + 1, 'attrs': attrs}
+                runs.append(cur)
+        else:
+            cur = None
+    return text, runs, False
+
+
+def collect(screen, *, mode, columns, alt_screen, saved_primary, mouse_modes,
+            title, cli_pen=None, document=None):
+    """Read a terminal into a plain, deterministic snapshot dict.
+
+    - `screen`: the pyte Screen in TUI mode; None in CLI mode.
+    - `mode`: 'tui' or 'cli'.
+    - `columns`: the child's column count (self._cols) -- used in CLI mode where there
+      is no pyte grid.
+    - `alt_screen`: bool, whether a full-screen program holds the alternate screen.
+    - `saved_primary`: None, or (columns, lines) of the frozen primary while in alt.
+    - `mouse_modes`: iterable of active mouse-reporting mode ints.
+    - `title`: the (already sanitized) window title string.
+    - `cli_pen`: the CLI-mode SGR pen dict {'fg','bg','bold'} (fg/bg None == default).
+    - `document`: CLI-mode rendered line-document text.
+    """
+    snap = {
+        'version': FORMAT_VERSION,
+        'mode': mode,
+        'alt_screen': bool(alt_screen),
+        'saved_primary': (None if saved_primary is None
+                          else {'columns': saved_primary[0],
+                                'lines': saved_primary[1]}),
+        'mouse_modes': sorted(int(m) for m in mouse_modes),
+        'title': title or '',
+    }
+    if mode == 'cli' or screen is None:
+        snap['columns'] = int(columns)
+        snap['pen'] = _cli_pen(cli_pen)
+        snap['document'] = document or ''
+        return snap
+
+    default = screen.default_char
+    snap['columns'] = screen.columns
+    snap['lines'] = screen.lines
+    cursor_y = min(screen.cursor.y, screen.lines - 1)
+    snap['cursor'] = {
+        'x': screen.cursor.x,
+        'y': cursor_y,
+        'visible': not screen.cursor.hidden,
+        'pen': _attrs_dict(screen.cursor.attrs, default),
+    }
+    dec, ansi = [], []
+    for value in sorted(screen.mode):
+        (ansi if value in _ANSI_MODE_VALUES else dec).append(_mode_name(value))
+    snap['dec_modes'] = dec
+    snap['ansi_modes'] = ansi
+    margins = screen.margins
+    snap['scroll_region'] = (None if margins is None
+                             else {'top': margins.top, 'bottom': margins.bottom})
+    snap['charset'] = {
+        'active': screen.charset,
+        'g0': _charset_id(screen.g0_charset),
+        'g1': _charset_id(screen.g1_charset),
+    }
+    default_tabs = set(range(8, screen.columns, 8))
+    tabs = set(screen.tabstops)
+    snap['tabstops'] = ('default' if tabs == default_tabs
+                        else sorted(tabs))
+    rows = []
+    for y in range(screen.lines):
+        text, runs, blank = _row_runs(screen.buffer[y], screen.columns, default)
+        if not blank:
+            rows.append({'y': y, 'text': text, 'runs': runs})
+    snap['rows'] = rows
+    return snap
+
+
+def _cli_pen(pen):
+    """Normalize the CLI-mode SGR pen ({'fg','bg','bold'}, fg/bg None == default) to
+    the same non-default-only attr dict shape the TUI pen uses."""
+    if not pen:
+        return {}
+    out = {}
+    if pen.get('fg') is not None:
+        out['fg'] = pen['fg']
+    if pen.get('bg') is not None:
+        out['bg'] = pen['bg']
+    if pen.get('bold'):
+        out['bold'] = True
+    return out
+
+
+def dump_json(snap):
+    """Machine round-trip form: sorted keys, ASCII-safe, deterministic byte output."""
+    return json.dumps(snap, sort_keys=True, ensure_ascii=True, indent=1) + '\n'
+
+
+def _fmt_attrs(attrs):
+    """Render a non-default attr dict as `fg=red bold reverse`: a boolean flag prints
+    as the bare field name, a colour (str name/hex, or a CLI-pen int palette index)
+    as field=value. Field order stable."""
+    parts = []
+    for field in _ATTR_FIELDS:
+        if field not in attrs:
+            continue
+        value = attrs[field]
+        # bool is an int subclass -> test it first, so a True flag is bare and a
+        # numeric palette index still prints its value.
+        parts.append(field if isinstance(value, bool)
+                     else '%s=%s' % (field, value))
+    return ' '.join(parts)
+
+
+def _fmt_pen(pen):
+    return _fmt_attrs(pen) if pen else 'default'
+
+
+def dump_text(snap):
+    """Human + technical, diffable form (see module docstring / the plan format)."""
+    out = []
+    out.append('# secure-terminal state dump v%d' % snap['version'])
+    if snap['mode'] == 'cli':
+        out.append('mode: cli            width: %d' % snap['columns'])
+        out.append('pen: %s' % _fmt_pen(snap['pen']))
+        out.append('alt-screen: %s' % ('yes' if snap['alt_screen'] else 'no'))
+        out.append('mouse: %s' % _fmt_mouse(snap['mouse_modes']))
+        out.append('title: %r' % snap['title'])
+        out.append('--- document (line mode; no cell grid) ---')
+        out.append(snap['document'])
+        return '\n'.join(out) + '\n'
+
+    cur = snap['cursor']
+    out.append('mode: tui            size: %dx%d'
+               % (snap['columns'], snap['lines']))
+    out.append('cursor: x=%d y=%d visible=%s'
+               % (cur['x'], cur['y'], 'yes' if cur['visible'] else 'no'))
+    out.append('pen: %s' % _fmt_pen(cur['pen']))
+    out.append('dec-modes: %s' % (' '.join(snap['dec_modes']) or '(none)'))
+    out.append('ansi-modes: %s' % (' '.join(snap['ansi_modes']) or '(none)'))
+    saved = snap['saved_primary']
+    out.append('alt-screen: %s    saved-primary: %s'
+               % ('yes' if snap['alt_screen'] else 'no',
+                  'none' if saved is None
+                  else '%dx%d' % (saved['columns'], saved['lines'])))
+    region = snap['scroll_region']
+    out.append('scroll-region: %s'
+               % ('full' if region is None
+                  else 'top=%d bottom=%d' % (region['top'], region['bottom'])))
+    cs = snap['charset']
+    out.append('charset: active=G%d G0=%s G1=%s'
+               % (cs['active'], cs['g0'], cs['g1']))
+    out.append('mouse: %s' % _fmt_mouse(snap['mouse_modes']))
+    out.append('title: %r' % snap['title'])
+    tabs = snap['tabstops']
+    out.append('tabstops: %s'
+               % ('default(8)' if tabs == 'default'
+                  else ' '.join(str(t) for t in tabs) or '(none)'))
+    out.append('--- grid ---  (blank cells and fully-blank rows elided; '
+               'row index shows gaps)')
+    for row in snap['rows']:
+        line = '%4d: %s' % (row['y'], row['text'])
+        ann = '  '.join('@%d-%d %s' % (r['start'], r['end'] - 1, _fmt_attrs(r['attrs']))
+                        for r in row['runs'])
+        if ann:
+            line = '%s   %s' % (line, ann)
+        out.append(line)
+    return '\n'.join(out) + '\n'
+
+
+def _fmt_mouse(modes):
+    if not modes:
+        return '(none)'
+    names = ' '.join(_MOUSE_NAMES.get(m, str(m)) for m in modes)
+    return '%s (%s)' % (' '.join(str(m) for m in modes), names)

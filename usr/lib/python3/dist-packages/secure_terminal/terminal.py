@@ -377,6 +377,7 @@ from secure_terminal.sanitize import (
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 from secure_terminal import resource_isolation
+from secure_terminal import state_dump
 
 # Custom char-format property carrying a marked cell's SOURCE code point, so the
 # widget can describe the real character on hover/click regardless of how it is
@@ -4867,6 +4868,41 @@ class SecureTerminal(QPlainTextEdit):
             if a <= docpos < b:
                 return cp
         return None
+
+    def _collect_state(self):
+        """A deterministic snapshot of the CURRENT terminal state, branching on the
+        display mode: TUI reads the live pyte grid + its scalar state; CLI (no escape
+        interpreter, self._screen is None) reads the line document + the SGR pen. The
+        wrapper-level flags pyte does not model -- the alternate screen and mouse
+        reporting -- are added in both modes. Volatile fields (the alt-owner pgrp,
+        timers) are deliberately excluded so two idle snapshots are identical. See
+        secure_terminal.state_dump for the format."""
+        tui = self._grid_mode() and self._screen is not None
+        alt_active = self._alt_saved is not None
+        # While a full-screen program holds the alt screen the live pyte screen carries
+        # the alt content and the frozen primary shares its dimensions; report those
+        # dims (never the frozen buffer's identity, which is not a stable value).
+        saved_primary = None
+        if alt_active and self._screen is not None:
+            saved_primary = (self._screen.columns, self._screen.lines)
+        return state_dump.collect(
+            self._screen if tui else None,
+            mode='tui' if tui else 'cli',
+            columns=self._screen.columns if tui else self._cols,
+            alt_screen=alt_active,
+            saved_primary=saved_primary,
+            mouse_modes=self._mouse_modes,
+            title=self._last_title,
+            cli_pen=None if tui else self._sgr,
+            document=None if tui else self.transcript_text())
+
+    def dump_state(self, fmt='text'):
+        """The current terminal state as a string: 'text' (human + technical, diffable;
+        blank cells/rows elided) or 'json' (machine round-trip). Deterministic -- an
+        idle terminal dumps identical bytes on repeat calls."""
+        snap = self._collect_state()
+        return state_dump.dump_json(snap) if fmt == 'json' \
+            else state_dump.dump_text(snap)
 
     def transcript_text(self):
         """The CURRENT frame/screen as lossless, pure-ASCII (except the real glyphs Show
