@@ -1043,7 +1043,7 @@ class MainWindow(QMainWindow):
         term.clipboard_read_requested.connect(
             lambda t=term: self._on_clipboard_read_requested(t))
         term.advise_signal.connect(lambda msg, t=term: self._on_advise(t, msg))
-        term.osc_used.connect(lambda key, t=term: self._on_osc_used(t, key))
+        term.osc_used.connect(lambda key, code, t=term: self._on_osc_used(t, key, code))
         term.escape_suppressed.connect(
             lambda t=term: self._on_escape_suppressed(t))
         term.unreviewed_risk.connect(self._on_unreviewed_risk)
@@ -1134,8 +1134,9 @@ class MainWindow(QMainWindow):
         if term is self.current():
             self._refresh_banner()
 
-    def _on_osc_used(self, term, key):
-        """A program used an OSC escape of TYPE `key` that pure CLI mode strips.
+    def _on_osc_used(self, term, key, code):
+        """A program used an OSC escape of TYPE `key` (numeric OSC `code`, or -1 when
+        unknowable) that pure CLI mode strips.
         Surface a dismissible notice at most once per TYPE per tab, unless notices
         are off globally or for that type. De-duplicating here (not in the terminal)
         means re-enabling a notice re-arms a tab that was never actually shown it."""
@@ -1154,7 +1155,15 @@ class MainWindow(QMainWindow):
             return
         self._osc_notified.add((term, key))
         entry = OSC_FEATURE_BY_KEY.get(key)
-        label = entry[0].lower() if entry else 'an escape'
+        if entry:
+            label = entry[0].lower()
+        elif code >= 0:
+            # An unregistered OSC code (e.g. iTerm2 OSC 1337, shell-integration OSC 133):
+            # name it by number rather than the generic 'an escape'.
+            label = 'OSC ' + str(code)
+        else:
+            # Over-cap dropped OSC: the type is unknowable from the truncated head.
+            label = 'an escape'
         self._on_advise(term, 'An application used an OSC escape (' + label + '), '
                         'which secure-terminal neutralized. Enable it in TUI mode '
                         'under View > OSC features if you trust the source; turn '
