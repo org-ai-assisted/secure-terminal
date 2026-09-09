@@ -953,8 +953,10 @@ class SecureTerminal(QPlainTextEdit):
     # a program emitted an OSC escape (window title, clipboard, hyperlink, ...)
     # while in line mode, where it is stripped for safety. Carries the FEATURE KEY
     # (see OSC_FEATURES; 'osc_other' for an unrecognized code) so the window can
-    # notice each TYPE at most once per tab.
-    osc_used = pyqtSignal(str)
+    # notice each TYPE at most once per tab, PLUS the numeric OSC CODE so an
+    # 'osc_other' notice can name the exact escape ('OSC <n>'); the code is -1 only
+    # when unknowable (an over-cap OSC whose truncated head was dropped).
+    osc_used = pyqtSignal(str, int)
     # an unterminated / over-long string sequence (OSC/DCS/...) has silently
     # suppressed a lot of CLI-mode output (the escape_limit threshold). The
     # suppression is NOT lifted (no escape byte is rendered); the window shows a
@@ -2032,8 +2034,8 @@ class SecureTerminal(QPlainTextEdit):
             # An over-cap open OSC was let go by _osc_split (no unbounded buffer); its type
             # is unknowable from the truncated head, so surface a generic attempt
             # (osc_other is never gated) -- padding an OSC past the cap must not silently
-            # evade the notice.
-            self.osc_used.emit('osc_other')
+            # evade the notice. Code -1: the truncated head makes the type unknowable.
+            self.osc_used.emit('osc_other', -1)
         if b'\x1b]' not in data:
             return
         # Parse with the SAME matcher the enforcement path uses (_OSC_ANY): a full
@@ -2054,7 +2056,7 @@ class SecureTerminal(QPlainTextEdit):
             if not (self.tui_active() and self.osc_enabled(key)):
                 if key not in emitted:
                     emitted.add(key)
-                    self.osc_used.emit(key)
+                    self.osc_used.emit(key, code)
 
     # -- bell (BEL 0x07) -------------------------------------------------------
     # Notification channels are INDEPENDENT (not mutually exclusive): a bell may
