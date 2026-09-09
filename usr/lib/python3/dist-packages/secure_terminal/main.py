@@ -846,6 +846,9 @@ class MainWindow(QMainWindow):
         # (default off = only deceptive characters). Persisted; the daemon reads it.
         self._clip_warn_any = cfg.get('clip_warn_any') == 'true'
         self._clip_reviewer = None    # in-process one-shot ClipboardWatcher (review now)
+        self._clip_bg_watcher = None  # in-process CONTINUOUS ClipboardWatcher (run in bg)
+        self._really_quit = False     # set by an explicit Quit so closeEvent tears down
+                                      # instead of hiding to tray (close-to-tray)
         # user overrides for window keyboard shortcuts: "ident=Seq ident=Seq ...".
         # Only overrides (bindings differing from the built-in default) are stored;
         # _bind() applies them as each action is created, and the Keyboard
@@ -3258,8 +3261,14 @@ class MainWindow(QMainWindow):
         menu.addAction('New Tab').triggered.connect(
             lambda: (self._restore_window(), self.new_tab()))
         menu.addSeparator()
-        menu.addAction('Quit').triggered.connect(self.close)
+        menu.addAction('Quit').triggered.connect(self._quit_from_tray)
         return menu
+
+    def _quit_from_tray(self):
+        """An explicit Quit really tears down, even when close-to-tray would otherwise
+        keep the background sanitizer alive: set the flag closeEvent checks, then close."""
+        self._really_quit = True
+        self.close()
 
     def _on_tray_activated(self, reason):
         from PyQt6.QtWidgets import QSystemTrayIcon
@@ -3387,7 +3396,8 @@ class MainWindow(QMainWindow):
         enabled = self._clip_controls_enabled()
         run_act = menu.addAction('Run in the background')
         run_act.setCheckable(True)
-        run_act.setChecked(clipboard_watch.is_running())
+        run_act.setChecked(clipboard_watch.is_running()
+                           or self._clip_bg_watcher is not None)
         # gated HERE as well as in the setter (like warn_act below): an admin-locked
         # control must be un-clickable from this ephemeral tray menu, not only refused.
         run_act.setEnabled(enabled and 'clip_run' not in self._locked)
@@ -3415,17 +3425,28 @@ class MainWindow(QMainWindow):
         auto_act.toggled.connect(self.set_clip_autostart)
 
     def set_clip_run(self, on):
-        """Start or stop the background clipboard-sanitizer daemon (a singleton, so a
-        second start is idempotent)."""
+        """Start or stop the background clipboard sanitizer. Runs IN-PROCESS (a
+        continuous ClipboardWatcher held on self), NOT a separate --clipboard-watch
+        daemon -- so it shares this window's single tray icon instead of adding a
+        SECOND one. Close-to-tray (closeEvent) keeps it alive after the window is
+        hidden; an explicit Quit stops it. Idempotent. If an autostart daemon is
+        already watching, defer to it rather than double-watch; turning OFF stops
+        whichever is running (the in-process watcher AND any daemon)."""
         if 'clip_run' in self._locked:
             return                        # admin-locked; not user-changeable
         from secure_terminal import clipboard_watch   # noqa: PLC0415
         if on:
-            if not clipboard_watch.is_running():
-                from PyQt6.QtCore import QProcess   # noqa: PLC0415
-                QProcess.startDetached(sys.argv[0], ['--clipboard-watch'])
+            if clipboard_watch.is_running():
+                return                    # an autostart daemon already watches
+            if self._clip_bg_watcher is None:
+                self._clip_bg_watcher = clipboard_watch.ClipboardWatcher(
+                    QApplication.instance(), theme=self._default_theme,
+                    any_mode=self._clip_warn_any, watch=True)
         else:
-            clipboard_watch.stop_running()
+            clipboard_watch.stop_running()   # stop an autostart daemon if one runs
+            if self._clip_bg_watcher is not None:
+                self._clip_bg_watcher.stop()
+                self._clip_bg_watcher = None
 
     def set_clip_warn_any(self, on):
         if 'clip_warn_any' in self._locked:
@@ -3437,6 +3458,8 @@ class MainWindow(QMainWindow):
         settings.set_user_key('clip_warn_any', 'true' if on else 'false')
         from secure_terminal import clipboard_watch   # noqa: PLC0415
         clipboard_watch.push_warn_any(self._clip_warn_any)   # live-update a running daemon
+        if self._clip_bg_watcher is not None:
+            self._clip_bg_watcher.set_any_mode(self._clip_warn_any)   # + the in-process watcher
 
     def _clip_review_now(self):
         """Review whatever is on the clipboard now, in-process (no daemon needed).
@@ -5840,6 +5863,17 @@ class MainWindow(QMainWindow):
         # be pruned by session.save).
         while self._deferred_restore:
             self._swap_placeholder(self._deferred_restore.pop(0))
+        # Close-to-tray: when the tray icon is on AND the in-process clipboard sanitizer
+        # is running in the background, a window close HIDES to tray and keeps the process
+        # (and the sanitizer) alive rather than quitting -- the "background" in "run in the
+        # background" means it outlives the window. An explicit Quit (tray menu -> sets
+        # _really_quit) tears down instead. Guarded on a live tray, so there is always
+        # somewhere to hide from -- never a stranded invisible window.
+        if (self._systray and self._tray is not None
+                and self._clip_bg_watcher is not None and not self._really_quit):
+            event.ignore()
+            self.hide()
+            return
         # Real terminals only: a restore placeholder can survive the drain above (an
         # unknown placeholder is a safe swap no-op), and has_foreground_program /
         # shutdown are SecureTerminal methods a bare QWidget placeholder has neither of
@@ -5861,6 +5895,9 @@ class MainWindow(QMainWindow):
                          self.tabs.currentIndex())
         else:
             session.clear()
+        if self._clip_bg_watcher is not None:   # real quit: stop the in-process sanitizer
+            self._clip_bg_watcher.stop()
+            self._clip_bg_watcher = None
         for t in terms:
             t.shutdown()
         super().closeEvent(event)

@@ -224,6 +224,19 @@ class ClipboardWatcher:
     def set_any_mode(self, on):
         self._any_mode = bool(on)
 
+    def stop(self):
+        """Stop watching and close any open review, so the watcher can be dropped.
+        The QClipboard.dataChanged connection holds a reference to this watcher, so
+        merely dropping the last Python reference would leave it alive and still
+        reacting -- disconnect explicitly. Idempotent (a watch=False reviewer, or a
+        second stop, disconnects nothing)."""
+        try:
+            self._clipboard.dataChanged.disconnect(self._on_change)
+        except (TypeError, RuntimeError):
+            pass                 # not connected (watch=False) or already stopped
+        self._popup.bar.hide_review()
+        self._popup.hide()
+
     def review_now(self):
         """Review whatever is on the clipboard right now (even clean text), so a
         user can sanitize on demand."""
