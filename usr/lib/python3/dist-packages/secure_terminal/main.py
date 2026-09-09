@@ -16,6 +16,7 @@ import time
 import fcntl
 import argparse
 import json
+import tempfile
 
 from PyQt6.QtCore import (
     QTimer, Qt, QUrl, QRect, QPoint, QSize, QByteArray, QObject, QEvent,
@@ -1877,8 +1878,12 @@ class MainWindow(QMainWindow):
                 # re-enabling a risk='high' OSC feature (OSC-52 clipboard) the saved
                 # value says is disabled. A non-bool falls back to the feature's own
                 # secure default, exactly as the locked branch and the legacy field do.
+                # get() with NO default: an absent key (a session saved before this
+                # feature existed) yields None -> non-bool -> the feature's default,
+                # NOT a forced False. get(key, False) would hand _saved_bool a real
+                # bool for an absent key, pinning it off even where the default is on.
                 term.apply_osc(_f[0], self._osc_defaults.get(_f[0], False) if locked
-                               else _saved_bool(osc_state.get(_f[0], False),
+                               else _saved_bool(osc_state.get(_f[0]),
                                                 self._osc_defaults.get(_f[0], False)))
         else:
             # a legacy session carries only the allow_title bool, which maps to
@@ -2489,7 +2494,17 @@ class MainWindow(QMainWindow):
             if self._base_style_name:
                 app.setStyle(self._base_style_name)
             if self._base_app_palette is not None:
-                app.setPalette(self._base_app_palette)
+                # The base palette is captured from the DESKTOP theme, which may be DARK.
+                # Under the native (non-Fusion) light style Qt can paint QToolTip from the
+                # APP palette, so a dark desktop leaks dark-on-dark tooltips -- QToolTip's
+                # own palette + the QToolTip{} stylesheet are not honoured by every platform
+                # style. Pin the light tooltip roles onto the restored palette so the menu
+                # hints stay readable regardless of the desktop's Qt platform theme.
+                pal = QPalette(self._base_app_palette)
+                _tt_bg, _tt_fg, _ = _TIP_COLORS['light']
+                pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(_tt_bg))
+                pal.setColor(QPalette.ColorRole.ToolTipText, QColor(_tt_fg))
+                app.setPalette(pal)
         else:
             app.setStyle('Fusion')                # honours the palette for all chrome
             pal = QPalette()
@@ -3844,6 +3859,7 @@ class MainWindow(QMainWindow):
         ('font_size', 'font_size', '_default_font_size'),
         ('ui_scale', 'ui_scale', '_ui_scale'),
         ('colors', 'colors', '_default_colors'),
+        ('colored_markings', 'markings', '_default_markings'),
         ('line_edits', 'line_edits', '_default_line_edits'),
         ('tui', 'tui', '_default_tui'),
         ('osc_notice', 'osc_notice', '_osc_notice'),
@@ -4683,7 +4699,16 @@ class MainWindow(QMainWindow):
     def show_about(self):
         dialog = _ZoomDialog(self)      # Ctrl+wheel live-zooms the dialog (below)
         dialog.setWindowTitle('About secure-terminal')
-        layout = QVBoxLayout(dialog)
+        outer = QVBoxLayout(dialog)
+        # The body scales with the Ctrl+wheel zoom, so at a large scale (or a small
+        # screen) it can exceed the dialog; host it in a scroll area so it SCROLLS
+        # rather than overflowing/overlapping the fixed frame (the reported zoom bug) --
+        # same pattern as the settings dialog. The Close button stays pinned below.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         icon = _app_icon()
         if not icon.isNull():
             logo = QLabel()
@@ -4722,12 +4747,31 @@ class MainWindow(QMainWindow):
         # would not zoom while the explicitly-sized title did. Scale it explicitly below.
         _bpt = body.font().pointSizeF()
         _body_base = _bpt if _bpt > 0 else 10.0
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         close = QPushButton('Close')
         close.clicked.connect(dialog.accept)
         buttons.addWidget(close)
-        layout.addLayout(buttons)
+        outer.addLayout(buttons)
+
+        def _fit_about(_dlg=dialog, _scroll=scroll, _content=content, _outer=outer,
+                       _close=close):
+            # Resize to the scaled content, capped to the screen; beyond that the scroll
+            # area engages. Mirrors the settings dialog's open-to-fit sizing so a zoomed
+            # (or maximized-parent) About never overlaps its own text.
+            _screen = QApplication.primaryScreen()
+            if _screen is None:
+                return
+            _avail = _screen.availableGeometry()
+            _chint = _content.sizeHint()
+            _m = _outer.contentsMargins()
+            _need_h = (_chint.height() + _close.sizeHint().height()
+                       + _m.top() + _m.bottom() + _outer.spacing() + 8)
+            _need_w = _chint.width() + 2 * _scroll.frameWidth() + 24
+            _dlg.resize(min(_avail.width(), max(_dlg.width(), _need_w)),
+                        min(int(_avail.height() * 0.9), _need_h))
 
         def _apply_about_scale(scale, _dlg=dialog, _title=title, _base=_title_base,
                                _body=body, _bbase=_body_base):
@@ -4739,6 +4783,7 @@ class MainWindow(QMainWindow):
             bf = _body.font()
             bf.setPointSizeF(_bbase * scale / 100.0)   # body tracks the zoom too
             _body.setFont(bf)
+            _fit_about()                            # re-fit the dialog to the scaled content
 
         # Ctrl+wheel zoom is LOCAL to this dialog (does not change the global menu size
         # or persist), so reading the About box never mutates a setting.
@@ -4939,6 +4984,13 @@ class MainWindow(QMainWindow):
                  "Honour a program's ANSI colour escapes. Off shows plain text; "
                  'risk-class markings still apply either way.')
 
+        markings = QCheckBox()
+        markings.setChecked(self._default_markings)
+        _tip_row(rendering, 'Colored markings', markings,
+                 'Tint characters by risk class (confusable, control, invisible) so a '
+                 'disguised character stands out. On by default; the unicode display '
+                 'mode above still applies. Off shows them untinted.')
+
         line_edits = QCheckBox()
         line_edits.setChecked(self._default_line_edits)
         _tip_row(rendering, 'Line editing', line_edits,
@@ -4982,6 +5034,13 @@ class MainWindow(QMainWindow):
                 + ' <span style="color:#5b9bd5">(i)</span>', _hint, self)
             osc_section.addRow(_lbl, _cb)
             osc_checks[_key] = _cb
+
+        clip_read_always = QCheckBox()
+        clip_read_always.setChecked(self._osc_clipboard_read_always)
+        _tip_row(osc_section, 'Always allow clipboard read', clip_read_always,
+                 'Let a program read the system clipboard (OSC 52) WITHOUT a per-request '
+                 'prompt. OFF by default -- persisting this lets programs read your '
+                 'clipboard silently every session. Also on the View menu.')
 
         # Notice controls: the master "All OSC notices" plus one toggle per type,
         # mirroring the View > Notify on OSC use submenu and the OSC-features rows
@@ -5123,7 +5182,9 @@ class MainWindow(QMainWindow):
             (theme, 'theme'), (font_family, 'font_family'),
             (font_size, 'font_size'), (ui_scale, 'ui_scale'), (zoom, 'zoom'),
             (scrollback, 'scrollback'), (mode, 'unicode_mode'),
-            (colors, 'colors'), (line_edits, 'line_edits'), (tui, 'tui'),
+            (colors, 'colors'), (markings, 'colored_markings'),
+            (line_edits, 'line_edits'), (tui, 'tui'),
+            (clip_read_always, 'osc_clipboard_read_always'),
             (tui_autobox_notice, 'tui_autobox_notice'), (osc, 'osc_notice'),
             (pdelay, 'paste_delay'), (esc_limit, 'escape_limit'),
             (paste_warn, 'paste_warn'),
@@ -5165,6 +5226,8 @@ class MainWindow(QMainWindow):
             _set(scrollback, lambda: scrollback.setCurrentIndex(scrollback.findData(0)))
             _set(mode, lambda: mode.setCurrentIndex(mode.findData('detail')))
             _set(colors, lambda: colors.setChecked(True))
+            _set(markings, lambda: markings.setChecked(True))
+            _set(clip_read_always, lambda: clip_read_always.setChecked(False))
             _set(line_edits, lambda: line_edits.setChecked(True))
             _set(tui, lambda: tui.setChecked(False))
             _set(tui_autobox_notice, lambda: tui_autobox_notice.setChecked(True))
@@ -5255,6 +5318,8 @@ class MainWindow(QMainWindow):
                 'font_size': font_size.value(),
                 'ui_scale': ui_scale.value(),
                 'mode': mode.currentData(), 'colors': colors.isChecked(),
+                'markings': markings.isChecked(),
+                'osc_clipboard_read_always': clip_read_always.isChecked(),
                 'line_edits': line_edits.isChecked(),
                 'tui': tui.isChecked(),
                 'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
@@ -5334,6 +5399,7 @@ class MainWindow(QMainWindow):
             term.set_font_size(self._default_font_size)
             term.apply_mode(opts['mode'])
             term.apply_colors(opts['colors'])
+            term.apply_markings(self._default_markings)   # _GLOBAL_KEYS resolved it (lock-aware)
             term.apply_line_edits(opts['line_edits'])
             for key, value in osc.items():
                 term.apply_osc(key, value)
@@ -5365,6 +5431,10 @@ class MainWindow(QMainWindow):
             self.set_clip_warn_any(opts['clip_warn_any'])
         if 'clip_autostart' in opts:
             self.set_clip_autostart(opts['clip_autostart'])
+        if 'osc_clipboard_read_always' in opts:
+            # Applied via its setter (pushes to every tab + honours its own admin lock),
+            # like the other window-scoped toggles above; _persist() below stores it.
+            self.set_clipboard_read_always(opts['osc_clipboard_read_always'])
         self._sync_paste_delay_menu()   # menu check reflects the applied delay
         self.set_persist_session(opts['persist'])
         self._sync_chrome_to_tab()
@@ -6223,12 +6293,19 @@ def _ctl_main(argv):
     elif args.cmd == 'dump-state':
         text = reply.get('text', '')
         if args.file:
-            # Atomic write: a reader (a test asserting on the dump) never sees a
-            # half-written file. Same tmp-then-rename pattern as _write_transcript_file.
-            tmp = args.file + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as handle:
+            # Atomic write via a UNIQUE mkstemp temp (O_CREAT|O_EXCL + 0o600) in the
+            # target's own dir, then rename -- the same hardening as
+            # _write_transcript_file. args.file may be a user-chosen path in a shared
+            # dir (e.g. /tmp): a fixed, predictable <path>.tmp opened with plain open()
+            # would let a co-resident attacker pre-plant a symlink there and redirect
+            # the write onto an arbitrary victim file (or a world-readable file whose
+            # mode is reused, leaking the dump). An unguessable O_EXCL name defeats
+            # both; a reader also never sees a half-written file.
+            directory = os.path.dirname(args.file) or '.'
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix='.st-dump-', suffix='.tmp')
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 handle.write(text)
-            os.replace(tmp, args.file)
+            os.replace(tmp, args.file)          # atomic; replaces a symlink, not its target
         else:
             sys.stdout.write(text)
     elif args.cmd == 'zoom':
@@ -6288,7 +6365,11 @@ def _test_canary():
         # invariant ipc.ensure_socket_dir enforces. Create it there, then the leaf.
         ipc.ensure_socket_dir()
         os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
-        with open(marker, 'w', encoding='ascii') as handle:
+        # 0600 + O_NOFOLLOW, matching copy_transcript_path / _open_capture: a planted
+        # symlink at the marker fails the open rather than redirecting the write, even
+        # though the marker lives in a same-UID 0700 subtree.
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='ascii') as handle:
             handle.write(CANARY_TOKEN + '\n')
     except OSError as exc:
         sys.stderr.write('secure-terminal: --test-canary: cannot write the canary '

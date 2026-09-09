@@ -275,14 +275,19 @@ def _fit_snapshot(snap, max_bytes):
         snap['truncated_rows'] = dropped
     if 'document' in snap and _encoded_len(snap) > max_bytes:
         doc = snap['document']
+        _orig_doc_len = len(doc)
         # Keep the TAIL (the current screen / most recent output), dropping from the
         # front -- consistent with the text path's _fit_dump_reply, and because the live
         # screen is what a debugger wants, not the oldest scrollback.
         while doc and _encoded_len({**snap, 'document': doc,
                                     'document_truncated': True}) > max_bytes:
             doc = doc[len(doc) // 8 + 1:]
-        snap['document'] = doc
-        snap['document_truncated'] = True
+        # Flag ONLY when the document was actually shortened: an empty (or already-fitting)
+        # document, with the overflow coming from another field, must not be mislabelled
+        # document-truncated.
+        if len(doc) < _orig_doc_len:
+            snap['document'] = doc
+            snap['document_truncated'] = True
     # An explicit tab-stop list can itself blow the budget (a program can HTS every column
     # of a 65535-wide screen), and rows/document shrinking never touches it -- collapse it
     # to a count so the bound holds.
@@ -293,10 +298,18 @@ def _fit_snapshot(snap, max_bytes):
     # of named modes), fall back to a minimal VALID JSON that names the overflow rather
     # than emit an over-budget document the transport frame would silently drop.
     if _encoded_len(snap) > max_bytes:
-        return {'version': snap.get('version', FORMAT_VERSION),
-                'mode': snap.get('mode'),
-                'truncated': True,
-                'note': 'state exceeds the dump budget; fields dropped'}
+        minimal = {'version': snap.get('version', FORMAT_VERSION),
+                   'mode': snap.get('mode'),
+                   'truncated': True,
+                   'note': 'state exceeds the dump budget; fields dropped'}
+        # Bound the fallback ITSELF: shed its own optional fields until it fits, so even a
+        # tiny budget yields valid JSON UNDER it -- never an over-budget frame the transport
+        # would silently drop (the bare {version, truncated} is the irreducible minimum).
+        for _drop in ('note', 'mode'):
+            if _encoded_len(minimal) <= max_bytes:
+                break
+            minimal.pop(_drop, None)
+        return minimal
     return snap
 
 
