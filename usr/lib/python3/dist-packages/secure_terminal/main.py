@@ -16,6 +16,7 @@ import time
 import fcntl
 import argparse
 import json
+import tempfile
 
 from PyQt6.QtCore import (
     QTimer, Qt, QUrl, QRect, QPoint, QSize, QByteArray, QObject, QEvent,
@@ -1877,8 +1878,12 @@ class MainWindow(QMainWindow):
                 # re-enabling a risk='high' OSC feature (OSC-52 clipboard) the saved
                 # value says is disabled. A non-bool falls back to the feature's own
                 # secure default, exactly as the locked branch and the legacy field do.
+                # get() with NO default: an absent key (a session saved before this
+                # feature existed) yields None -> non-bool -> the feature's default,
+                # NOT a forced False. get(key, False) would hand _saved_bool a real
+                # bool for an absent key, pinning it off even where the default is on.
                 term.apply_osc(_f[0], self._osc_defaults.get(_f[0], False) if locked
-                               else _saved_bool(osc_state.get(_f[0], False),
+                               else _saved_bool(osc_state.get(_f[0]),
                                                 self._osc_defaults.get(_f[0], False)))
         else:
             # a legacy session carries only the allow_title bool, which maps to
@@ -6262,12 +6267,19 @@ def _ctl_main(argv):
     elif args.cmd == 'dump-state':
         text = reply.get('text', '')
         if args.file:
-            # Atomic write: a reader (a test asserting on the dump) never sees a
-            # half-written file. Same tmp-then-rename pattern as _write_transcript_file.
-            tmp = args.file + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as handle:
+            # Atomic write via a UNIQUE mkstemp temp (O_CREAT|O_EXCL + 0o600) in the
+            # target's own dir, then rename -- the same hardening as
+            # _write_transcript_file. args.file may be a user-chosen path in a shared
+            # dir (e.g. /tmp): a fixed, predictable <path>.tmp opened with plain open()
+            # would let a co-resident attacker pre-plant a symlink there and redirect
+            # the write onto an arbitrary victim file (or a world-readable file whose
+            # mode is reused, leaking the dump). An unguessable O_EXCL name defeats
+            # both; a reader also never sees a half-written file.
+            directory = os.path.dirname(args.file) or '.'
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix='.st-dump-', suffix='.tmp')
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 handle.write(text)
-            os.replace(tmp, args.file)
+            os.replace(tmp, args.file)          # atomic; replaces a symlink, not its target
         else:
             sys.stdout.write(text)
     elif args.cmd == 'zoom':
@@ -6327,7 +6339,11 @@ def _test_canary():
         # invariant ipc.ensure_socket_dir enforces. Create it there, then the leaf.
         ipc.ensure_socket_dir()
         os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
-        with open(marker, 'w', encoding='ascii') as handle:
+        # 0600 + O_NOFOLLOW, matching copy_transcript_path / _open_capture: a planted
+        # symlink at the marker fails the open rather than redirecting the write, even
+        # though the marker lives in a same-UID 0700 subtree.
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='ascii') as handle:
             handle.write(CANARY_TOKEN + '\n')
     except OSError as exc:
         sys.stderr.write('secure-terminal: --test-canary: cannot write the canary '
