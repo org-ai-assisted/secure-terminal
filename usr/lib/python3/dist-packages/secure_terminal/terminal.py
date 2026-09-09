@@ -3129,6 +3129,44 @@ class SecureTerminal(QPlainTextEdit):
         # palette indexes (or None for default) + bold; folded by parse_sgr.
         self._sgr = {'fg': None, 'bg': None, 'bold': False}
 
+    def _reset_vt_to_prompt_baseline(self):
+        """Restore the terminal to a clean prompt baseline WITHOUT clearing the
+        buffer/scrollback, so a program that exits -- or a restart_as_shell -- cannot
+        leak its VT state into the returning shell prompt. Shared by the ordinary
+        foreground-exit edge (_read_and_render) and restart_as_shell so BOTH routes
+        leave the identical baseline (the reset asymmetry between them was the bug).
+
+        Model state only, never the theme/contrast-guarded display colours:
+        - the pyte screen (when one exists): the DEC/ANSI mode set back to a fresh
+          screen's defaults -- which drops a stuck bracketed-paste bit (DEC 2004), an
+          origin/reverse/autowrap-off mode, and any mouse DECSET pyte tracks; the
+          scroll region (DECSTBM margins); a hidden cursor (DECTCEM); the SGR pen; and
+          the G0/G1 charset designation (an ESC ( 0 special-graphics selection would
+          else render the shell's ASCII q/x/j/k/l/m/n as box-drawing at the prompt);
+        - the wrapper flags pyte does not model: mouse reporting, the OSC 4/10/11/12
+          palette overrides, the CLI SGR pen, cursor visibility.
+
+        A direct `screen.mode` assignment is used (not pyte set_mode/reset_mode) so the
+        buffer + scrollback survive; because that bypasses pyte's cursor-visibility and
+        SGR bookkeeping, cursor.hidden and cursor.attrs are cleared explicitly here.
+        pyte does not model DECCKM (application cursor keys) or the application keypad,
+        so those are outside this reset -- CLI strips them, TUI ignores them."""
+        if self._screen is not None:
+            self._screen.mode = set(_DEFAULT_DEC_MODES)
+            self._screen.margins = None
+            self._screen.cursor.hidden = False
+            self._screen.cursor.attrs = self._screen.default_char
+            self._screen.charset = 0
+            self._screen.g0_charset = pyte.charsets.LAT1_MAP
+            self._screen.g1_charset = pyte.charsets.VT100_MAP
+        self._osc_palette = {}
+        self._mouse_modes = set()
+        self.setMouseTracking(False)
+        self._mouse_report_btns = set()
+        self._mouse_report_cell = None
+        self._sgr_reset()
+        self._cursor_visible = True
+
     def _reset_leftover_sgr(self, text):
         """Guard the shell prompt against a finished command's leftover colour.
 
@@ -3574,23 +3612,11 @@ class SecureTerminal(QPlainTextEdit):
                 # the winsize to the NEW pty.
                 self._stream = _Utf8CharsetByteStream(self._screen)
                 self._set_winsize(*self._tui_grid_size())
-                # SECURITY: the reused screen carries the EXITED program's DEC private
-                # modes; a fresh _make_screen would not. A stale bracketed-paste bit
-                # (DEC 2004) would make a later NON-bracketed program read as bracketed,
-                # so _bracketed_paste_active() trusts it to buffer a paste inert -- and a
-                # multiline paste's embedded \r SKIPS the mandatory staging and auto-runs.
-                # The read-path fg-exit clear does not fire on this restart path, so reset
-                # the whole mode set to a fresh screen's default here (also drops a stale
-                # hidden cursor / autowrap-off); the buffer + scrollback are untouched.
-                self._screen.mode = set(_DEFAULT_DEC_MODES)
-                # Same threat class for the CHARSET designation: a program that selected
-                # DEC special-graphics (ESC ( 0) leaves g0_charset/charset set on the
-                # reused screen, so the new shell's ASCII (q,x,j,k,l,m,n) would render as
-                # box-drawing glyphs. Reset to a fresh screen's charset defaults without
-                # clearing the buffer (mirrors pyte Screen.reset's charset lines).
-                self._screen.charset = 0
-                self._screen.g0_charset = pyte.charsets.LAT1_MAP
-                self._screen.g1_charset = pyte.charsets.VT100_MAP
+                # SECURITY: the reused screen carries the EXITED program's DEC modes,
+                # scroll region, hidden cursor and charset -- a fresh _make_screen would
+                # not. restart_as_shell has already baselined them via
+                # _reset_vt_to_prompt_baseline() before calling us (the sole keep_screen
+                # caller); the buffer + scrollback are preserved. Do NOT re-scrub here.
             else:
                 self._make_screen()
 
@@ -3647,21 +3673,29 @@ class SecureTerminal(QPlainTextEdit):
         # shell that truly supports bracketed paste re-arms it by re-emitting ?2004h on
         # its next prompt (has_foreground_program is a cheap syscall pair; reads coalesce).
         fg = self.has_foreground_program()
-        if self._bracket_had_fg and not fg and self._screen is not None:
-            self._screen.mode.discard(_BRACKETED_PASTE_MODE)
         # A `cat` of a file that enters the alt screen (?1049h) but never leaves it
         # (no ?1049l) would strand the terminal in the alt buffer -- no scrollback,
         # vertical scrolling dead -- once the shell regains the foreground. Restore
         # the primary screen on that edge, but ONLY when the program that entered alt
         # is GONE: a full-screen app merely SUSPENDED (Ctrl-Z) into the background
         # also yields the foreground to the shell yet must keep its held frame, so a
-        # still-alive alt-owner pgrp is left untouched.
-        if (self._bracket_had_fg and not fg
-                and self._alt_screen and self._alt_owner_dead()):
+        # still-alive alt-owner pgrp is left untouched. Leave alt FIRST, then baseline
+        # the restored primary screen (alt-leave restores the saved buffer/cursor but
+        # not the screen-level mode/margins/charset the program changed).
+        exited = self._bracket_had_fg and not fg
+        if exited and self._alt_screen and self._alt_owner_dead():
             self._alt_leave()
             self._alt_screen = False
             self._alt_view = False
             self._alt_owner_pgrp = None
+        if exited:
+            # The foreground program is gone and the shell prompt is returning: restore
+            # the clean VT baseline (mouse tracking, charset, scroll region, palette,
+            # SGR, a stuck bracketed-paste bit or hidden cursor all cleared) so nothing
+            # leaks into the prompt. The shell re-arms whatever it wants (e.g. re-emits
+            # ?2004h). Identical to the baseline restart_as_shell restores -- the two
+            # exit routes must not diverge.
+            self._reset_vt_to_prompt_baseline()
         if fg != self._bracket_had_fg:
             # ANY foreground-program transition invalidates a HELD multi-line paste's
             # reviewed context, so drop the remainder proactively:
@@ -4521,11 +4555,12 @@ class SecureTerminal(QPlainTextEdit):
         self._alt_saved = None
         self._alt_owner_pgrp = None
         self._alt_view = False
-        self._osc_palette = {}            # OSC 4/10/11/12 colour overrides do not outlive the child
-        self._mouse_modes = set()
-        self.setMouseTracking(False)
-        self._mouse_report_btns = set()
-        self._mouse_report_cell = None
+        # Clear the VT display/input baseline (mouse reporting, OSC palette, SGR pen,
+        # cursor visibility) and -- when the grid screen survives via keep_screen below
+        # -- its DEC/ANSI modes, scroll region, hidden cursor and G0/G1 charset. Shared
+        # with the ordinary foreground-exit edge so the two paths leave the identical
+        # baseline; the buffer + scrollback are untouched.
+        self._reset_vt_to_prompt_baseline()
         self._bracket_had_fg = False
         self._sync_update = False
         self._line_dirty = False
@@ -4898,6 +4933,7 @@ class SecureTerminal(QPlainTextEdit):
             saved_primary=saved_primary,
             mouse_modes=self._mouse_modes,
             title=self._last_title,
+            palette=self._osc_palette,
             cli_pen=None if tui else self._sgr,
             document=None if tui else self.transcript_text())
 

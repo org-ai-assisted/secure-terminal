@@ -9,8 +9,8 @@ Deterministic terminal-state dump.
 
 Serializes the CURRENT terminal state -- the pyte grid (TUI mode) or the line
 document plus SGR pen (CLI mode), together with the wrapper-level flags that pyte
-does not model (alternate screen, mouse-reporting modes) -- into a form a human can
-read and diff, and a machine can round-trip. Two dumps taken while the terminal is
+does not model (alternate screen, mouse-reporting modes, OSC 4/10/11/12 palette
+overrides) -- into a form a human can read and diff, and a machine can round-trip. Two dumps taken while the terminal is
 idle are byte-identical: only pyte MODEL state is read (cell fg/bg colour names,
 bold, ...), never the theme/contrast-guarded display colours, and no volatile field
 (a pid/pgrp, a timer, an object address, a cache) is ever included.
@@ -30,7 +30,7 @@ import json
 import pyte.modes
 import pyte.charsets as _charsets
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # pyte private modes are stored in Screen.mode shifted left 5 (see pyte.modes); the
 # widget stores bracketed paste (DEC private 2004) the same way but pyte has no name
@@ -65,6 +65,47 @@ _ATTR_FIELDS = ('fg', 'bg', 'bold', 'italics', 'underscore', 'strikethrough',
 
 def _mode_name(value):
     return _MODE_NAMES.get(value, 'mode:%d' % value)
+
+
+def _palette_dict(palette):
+    """Normalize the wrapper's OSC 4/10/11/12 overrides -- {int palette index or the
+    'fg'/'bg'/'cursor' role -> '#rrggbb'} -- to a str-keyed dict so the JSON dump is
+    deterministic (sort_keys orders the string keys). These are PROGRAM-set overrides
+    that outlive nothing but the child; they leak into the next prompt unless reset,
+    so the dump must expose them to make that measurable. The values are already the
+    ASCII hex strings sanitize/_parse_osc_color produced -- no display colour here."""
+    if not palette:
+        return {}
+    return {str(key): value for key, value in palette.items()}
+
+
+# The canonical clean prompt baseline, expressed against the DUMP schema: a fresh
+# screen's DEC mode set and charset, no mouse reporting, no scroll region, a visible
+# cursor carrying the default pen, and no palette override. terminal.py's
+# _reset_vt_to_prompt_baseline() drives the terminal here on a program exit / restart.
+_BASELINE_DEC_MODES = frozenset(('DECAWM', 'DECTCEM'))
+_BASELINE_CHARSET = {'active': 0, 'g0': 'LAT1', 'g1': 'VT100'}
+
+
+def is_baseline(snap):
+    """True when a collect() snapshot carries NO leaked VT state -- i.e. it is at the
+    clean prompt baseline -- IGNORING the scrollback (the document / grid rows) and the
+    alternate-screen flag (owned by the fg-exit alt-leave, not the VT reset). This is the
+    single oracle shared by the reset regression sweep, the INV-7 Hypothesis property and
+    the T10 formal check, so 'clean' cannot drift between the fix and its proofs; keying it
+    to the dump schema means a newly-dumped leak field also has to be cleared to stay
+    baseline. `snap` is the dict collect() returns (either mode)."""
+    if snap.get('mouse_modes') or snap.get('palette_overrides'):
+        return False
+    if snap['mode'] != 'tui':
+        return not snap.get('pen')
+    cursor = snap['cursor']
+    return (frozenset(snap['dec_modes']) == _BASELINE_DEC_MODES
+            and not snap['ansi_modes']
+            and snap['scroll_region'] is None
+            and snap['charset'] == _BASELINE_CHARSET
+            and cursor['visible'] is True
+            and not cursor['pen'])
 
 
 def _charset_id(table):
@@ -118,7 +159,7 @@ def _row_runs(row, columns, default):
 
 
 def collect(screen, *, mode, columns, alt_screen, saved_primary, mouse_modes,
-            title, cli_pen=None, document=None):
+            title, palette=None, cli_pen=None, document=None):
     """Read a terminal into a plain, deterministic snapshot dict.
 
     - `screen`: the pyte Screen in TUI mode; None in CLI mode.
@@ -129,6 +170,9 @@ def collect(screen, *, mode, columns, alt_screen, saved_primary, mouse_modes,
     - `saved_primary`: None, or (columns, lines) of the frozen primary while in alt.
     - `mouse_modes`: iterable of active mouse-reporting mode ints.
     - `title`: the (already sanitized) window title string.
+    - `palette`: the wrapper's OSC 4/10/11/12 overrides (index/role -> '#rrggbb'); a
+      program-set field that leaks into the next prompt unless reset, so it is dumped
+      in BOTH modes.
     - `cli_pen`: the CLI-mode SGR pen dict {'fg','bg','bold'} (fg/bg None == default).
     - `document`: CLI-mode rendered line-document text.
     """
@@ -140,6 +184,7 @@ def collect(screen, *, mode, columns, alt_screen, saved_primary, mouse_modes,
                           else {'columns': saved_primary[0],
                                 'lines': saved_primary[1]}),
         'mouse_modes': sorted(int(m) for m in mouse_modes),
+        'palette_overrides': _palette_dict(palette),
         'title': title or '',
     }
     if mode == 'cli' or screen is None:
@@ -290,6 +335,7 @@ def dump_text(snap):
         out.append('pen: %s' % _fmt_pen(snap['pen']))
         out.append('alt-screen: %s' % ('yes' if snap['alt_screen'] else 'no'))
         out.append('mouse: %s' % _fmt_mouse(snap['mouse_modes']))
+        out.append('palette: %s' % _fmt_palette(snap['palette_overrides']))
         out.append('title: %r' % snap['title'])
         out.append('--- document (line mode; no cell grid) ---')
         out.append(snap['document'])
@@ -316,6 +362,7 @@ def dump_text(snap):
     out.append('charset: active=G%d G0=%s G1=%s'
                % (cs['active'], cs['g0'], cs['g1']))
     out.append('mouse: %s' % _fmt_mouse(snap['mouse_modes']))
+    out.append('palette: %s' % _fmt_palette(snap['palette_overrides']))
     out.append('title: %r' % snap['title'])
     tabs = snap['tabstops']
     out.append('tabstops: %s'
@@ -338,3 +385,11 @@ def _fmt_mouse(modes):
         return '(none)'
     names = ' '.join(_MOUSE_NAMES.get(m, str(m)) for m in modes)
     return '%s (%s)' % (' '.join(str(m) for m in modes), names)
+
+
+def _fmt_palette(overrides):
+    """`1=#ff0000 fg=#00ff00` (sorted, stable), or `(none)` when the program set no
+    OSC 4/10/11/12 override."""
+    if not overrides:
+        return '(none)'
+    return ' '.join('%s=%s' % (key, overrides[key]) for key in sorted(overrides))
