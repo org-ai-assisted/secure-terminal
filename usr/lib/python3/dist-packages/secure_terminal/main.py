@@ -4683,7 +4683,16 @@ class MainWindow(QMainWindow):
     def show_about(self):
         dialog = _ZoomDialog(self)      # Ctrl+wheel live-zooms the dialog (below)
         dialog.setWindowTitle('About secure-terminal')
-        layout = QVBoxLayout(dialog)
+        outer = QVBoxLayout(dialog)
+        # The body scales with the Ctrl+wheel zoom, so at a large scale (or a small
+        # screen) it can exceed the dialog; host it in a scroll area so it SCROLLS
+        # rather than overflowing/overlapping the fixed frame (the reported zoom bug) --
+        # same pattern as the settings dialog. The Close button stays pinned below.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         icon = _app_icon()
         if not icon.isNull():
             logo = QLabel()
@@ -4722,12 +4731,31 @@ class MainWindow(QMainWindow):
         # would not zoom while the explicitly-sized title did. Scale it explicitly below.
         _bpt = body.font().pointSizeF()
         _body_base = _bpt if _bpt > 0 else 10.0
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         close = QPushButton('Close')
         close.clicked.connect(dialog.accept)
         buttons.addWidget(close)
-        layout.addLayout(buttons)
+        outer.addLayout(buttons)
+
+        def _fit_about(_dlg=dialog, _scroll=scroll, _content=content, _outer=outer,
+                       _close=close):
+            # Resize to the scaled content, capped to the screen; beyond that the scroll
+            # area engages. Mirrors the settings dialog's open-to-fit sizing so a zoomed
+            # (or maximized-parent) About never overlaps its own text.
+            _screen = QApplication.primaryScreen()
+            if _screen is None:
+                return
+            _avail = _screen.availableGeometry()
+            _chint = _content.sizeHint()
+            _m = _outer.contentsMargins()
+            _need_h = (_chint.height() + _close.sizeHint().height()
+                       + _m.top() + _m.bottom() + _outer.spacing() + 8)
+            _need_w = _chint.width() + 2 * _scroll.frameWidth() + 24
+            _dlg.resize(min(_avail.width(), max(_dlg.width(), _need_w)),
+                        min(int(_avail.height() * 0.9), _need_h))
 
         def _apply_about_scale(scale, _dlg=dialog, _title=title, _base=_title_base,
                                _body=body, _bbase=_body_base):
@@ -4739,6 +4767,7 @@ class MainWindow(QMainWindow):
             bf = _body.font()
             bf.setPointSizeF(_bbase * scale / 100.0)   # body tracks the zoom too
             _body.setFont(bf)
+            _fit_about()                            # re-fit the dialog to the scaled content
 
         # Ctrl+wheel zoom is LOCAL to this dialog (does not change the global menu size
         # or persist), so reading the About box never mutates a setting.
