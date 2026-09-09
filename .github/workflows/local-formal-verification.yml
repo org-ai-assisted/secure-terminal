@@ -10,16 +10,21 @@
 ## plus dist-ai, so this lane is what makes the proof actually run in CI on every
 ## change to secure-terminal.
 ##
-## It discharges two theorems with Z3 (SMT) + exhaustive enumeration:
+## It discharges a family of theorems (T1..T10) with Z3 (SMT) + exhaustive
+## enumeration; the two flagship ones:
 ##   T1  strict-mode output inertness -- render_output emits only inert display
 ##       bytes for ANY input (the CLI output-becomes-input closure);
 ##   T2  line-editor containment -- feed_line_edits keeps 0 <= col <= len(cells)
 ##       inductively, so output never reaches an earlier line (INV-2, pure level).
+## T3-T9 cover the input/clipboard/title/cell sanitizers and the chunk-boundary +
+## GUI-render paths; T10 (reset-to-prompt baseline) enumerates against pyte as the
+## reference oracle -- which is why this lane needs python3-pyte.
 ##
-## The suite is Qt-free (it imports only secure_terminal.sanitize), so this lane
-## installs just Z3 and the sanitizer's own hard dependencies (python3-regex,
-## python3-confusable-homoglyphs) rather than the full Qt/pyte test set -- a fast,
-## focused signal. python3-confusable-homoglyphs is a HARD dependency of the
+## The suite is Qt-free (no PyQt6), but it imports secure_terminal.sanitize AND
+## secure_terminal.state_dump plus pyte (the reference oracle for the state_dump
+## baseline theorem T10), so this lane installs Z3, the sanitizer's own hard
+## dependencies (python3-regex, python3-confusable-homoglyphs) and python3-pyte --
+## still far lighter than the full Qt test set. python3-confusable-homoglyphs is a HARD dependency of the
 ## sanitizer: without it the confusables set is empty and is_structural / the
 ## show-mode whitelist would be checked against the wrong alphabet.
 
@@ -74,12 +79,15 @@ jobs:
 
       - name: Install dependencies (apt only)
         ## Z3 is the proof engine; python3-regex + python3-confusable-homoglyphs are
-        ## the sanitizer's own hard runtime dependencies (a missing one makes the
-        ## suite FAIL loud, never skip -- it is a security-relevant proof).
+        ## the sanitizer's own hard runtime dependencies; python3-pyte is the reference
+        ## oracle the state_dump baseline theorem (T10) enumerates against (verify_formal
+        ## imports pyte + secure_terminal.state_dump). A missing one makes the suite FAIL
+        ## loud, never skip -- it is a security-relevant proof. Same apt python3-pyte the
+        ## consumer dist-ai-tests lane uses (debian/control depends on it); no fork checkout.
         run: |
           sudo apt-get update --quiet
           sudo apt-get install --yes --no-install-recommends \
-            python3 python3-z3 python3-regex python3-confusable-homoglyphs
+            python3 python3-z3 python3-regex python3-confusable-homoglyphs python3-pyte
 
       - name: Run the formal verification against the real checkout
         env:
