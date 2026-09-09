@@ -1622,7 +1622,16 @@ class MainWindow(QMainWindow):
                 if fmt not in ('text', 'json'):
                     return {'ok': False,
                             'error': "format must be 'text' or 'json'"}
-                return {'ok': True, 'text': _fit_dump_reply(term.dump_state(fmt))}
+                if fmt == 'json':
+                    # Bound the JSON at the SNAPSHOT level (drop whole rows / truncate the
+                    # document) so it stays VALID JSON, never a byte-sliced fragment that
+                    # reports ok:true but fails a consumer's json.load. Half the frame is a
+                    # safe budget: the reply's JSON-string envelope at most doubles it (only
+                    # " \ and newline expand), so 2 * (MAX/2) stays under the frame cap.
+                    text = term.dump_state('json', max_bytes=ipc._MAX_REQUEST // 2)
+                else:
+                    text = _fit_dump_reply(term.dump_state('text'))
+                return {'ok': True, 'text': text}
             title = request.get('title')
             if not isinstance(title, str):
                 return {'ok': False, 'error': 'title must be a string'}

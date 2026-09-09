@@ -199,8 +199,47 @@ def _cli_pen(pen):
     return out
 
 
-def dump_json(snap):
-    """Machine round-trip form: sorted keys, ASCII-safe, deterministic byte output."""
+def _encoded_len(snap):
+    return len(json.dumps(snap, sort_keys=True, ensure_ascii=True, indent=1)) + 1
+
+
+def _fit_snapshot(snap, max_bytes):
+    """Shrink `snap` (a shallow copy) so its JSON stays UNDER max_bytes while remaining
+    VALID JSON -- by dropping whole trailing grid rows (TUI) and/or truncating the line
+    document (CLI), never by byte-slicing the serialized text (which would emit a broken
+    fragment). Truncation is recorded so a consumer sees the dump is partial."""
+    if _encoded_len(snap) <= max_bytes:
+        return snap
+    snap = dict(snap)
+    rows = list(snap.get('rows') or [])
+    if rows:
+        dropped = 0
+        # Drop from the END (keep the top of the screen); geometric step so a huge grid
+        # converges in a few re-encodes, not one row at a time.
+        while rows and _encoded_len({**snap, 'rows': rows,
+                                     'truncated_rows': dropped}) > max_bytes:
+            step = max(1, len(rows) // 8)
+            dropped += step
+            rows = rows[:-step]
+        snap['rows'] = rows
+        snap['truncated_rows'] = dropped
+    if 'document' in snap and _encoded_len(snap) > max_bytes:
+        doc = snap['document']
+        while doc and _encoded_len({**snap, 'document': doc,
+                                    'document_truncated': True}) > max_bytes:
+            doc = doc[:len(doc) * 7 // 8]
+        snap['document'] = doc
+        snap['document_truncated'] = True
+    return snap
+
+
+def dump_json(snap, max_bytes=None):
+    """Machine round-trip form: sorted keys, ASCII-safe, deterministic byte output.
+    When max_bytes is given, the snapshot is shrunk (whole rows / document truncated,
+    recorded via truncated_rows / document_truncated) so the result stays VALID JSON
+    under the budget -- an oversized dump must never become an unparseable fragment."""
+    if max_bytes is not None:
+        snap = _fit_snapshot(snap, max_bytes)
     return json.dumps(snap, sort_keys=True, ensure_ascii=True, indent=1) + '\n'
 
 

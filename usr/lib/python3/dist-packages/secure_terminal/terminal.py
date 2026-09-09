@@ -4877,18 +4877,20 @@ class SecureTerminal(QPlainTextEdit):
         reporting -- are added in both modes. Volatile fields (the alt-owner pgrp,
         timers) are deliberately excluded so two idle snapshots are identical. See
         secure_terminal.state_dump for the format."""
-        tui = self._grid_mode() and self._screen is not None
+        # Bind the narrowed screen once: `screen is not None` IS the TUI test, so every
+        # attribute read below narrows cleanly (no unguarded self._screen.<attr>).
+        screen = self._screen if self._grid_mode() else None
+        tui = screen is not None
         alt_active = self._alt_saved is not None
         # While a full-screen program holds the alt screen the live pyte screen carries
         # the alt content and the frozen primary shares its dimensions; report those
         # dims (never the frozen buffer's identity, which is not a stable value).
-        saved_primary = None
-        if alt_active and self._screen is not None:
-            saved_primary = (self._screen.columns, self._screen.lines)
+        saved_primary = ((screen.columns, screen.lines)
+                         if alt_active and screen is not None else None)
         return state_dump.collect(
-            self._screen if tui else None,
+            screen,
             mode='tui' if tui else 'cli',
-            columns=self._screen.columns if tui else self._cols,
+            columns=screen.columns if screen is not None else self._cols,
             alt_screen=alt_active,
             saved_primary=saved_primary,
             mouse_modes=self._mouse_modes,
@@ -4896,12 +4898,14 @@ class SecureTerminal(QPlainTextEdit):
             cli_pen=None if tui else self._sgr,
             document=None if tui else self.transcript_text())
 
-    def dump_state(self, fmt='text'):
+    def dump_state(self, fmt='text', max_bytes=None):
         """The current terminal state as a string: 'text' (human + technical, diffable;
         blank cells/rows elided) or 'json' (machine round-trip). Deterministic -- an
-        idle terminal dumps identical bytes on repeat calls."""
+        idle terminal dumps identical bytes on repeat calls. For 'json', max_bytes bounds
+        the output by dropping whole rows / truncating the document so it stays VALID
+        JSON under a transport frame cap (the text form has no such structural need)."""
         snap = self._collect_state()
-        return state_dump.dump_json(snap) if fmt == 'json' \
+        return state_dump.dump_json(snap, max_bytes=max_bytes) if fmt == 'json' \
             else state_dump.dump_text(snap)
 
     def transcript_text(self):
