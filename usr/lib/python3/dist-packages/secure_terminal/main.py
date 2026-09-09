@@ -3859,6 +3859,7 @@ class MainWindow(QMainWindow):
         ('font_size', 'font_size', '_default_font_size'),
         ('ui_scale', 'ui_scale', '_ui_scale'),
         ('colors', 'colors', '_default_colors'),
+        ('colored_markings', 'markings', '_default_markings'),
         ('line_edits', 'line_edits', '_default_line_edits'),
         ('tui', 'tui', '_default_tui'),
         ('osc_notice', 'osc_notice', '_osc_notice'),
@@ -4983,6 +4984,13 @@ class MainWindow(QMainWindow):
                  "Honour a program's ANSI colour escapes. Off shows plain text; "
                  'risk-class markings still apply either way.')
 
+        markings = QCheckBox()
+        markings.setChecked(self._default_markings)
+        _tip_row(rendering, 'Colored markings', markings,
+                 'Tint characters by risk class (confusable, control, invisible) so a '
+                 'disguised character stands out. On by default; the unicode display '
+                 'mode above still applies. Off shows them untinted.')
+
         line_edits = QCheckBox()
         line_edits.setChecked(self._default_line_edits)
         _tip_row(rendering, 'Line editing', line_edits,
@@ -5026,6 +5034,13 @@ class MainWindow(QMainWindow):
                 + ' <span style="color:#5b9bd5">(i)</span>', _hint, self)
             osc_section.addRow(_lbl, _cb)
             osc_checks[_key] = _cb
+
+        clip_read_always = QCheckBox()
+        clip_read_always.setChecked(self._osc_clipboard_read_always)
+        _tip_row(osc_section, 'Always allow clipboard read', clip_read_always,
+                 'Let a program read the system clipboard (OSC 52) WITHOUT a per-request '
+                 'prompt. OFF by default -- persisting this lets programs read your '
+                 'clipboard silently every session. Also on the View menu.')
 
         # Notice controls: the master "All OSC notices" plus one toggle per type,
         # mirroring the View > Notify on OSC use submenu and the OSC-features rows
@@ -5167,7 +5182,9 @@ class MainWindow(QMainWindow):
             (theme, 'theme'), (font_family, 'font_family'),
             (font_size, 'font_size'), (ui_scale, 'ui_scale'), (zoom, 'zoom'),
             (scrollback, 'scrollback'), (mode, 'unicode_mode'),
-            (colors, 'colors'), (line_edits, 'line_edits'), (tui, 'tui'),
+            (colors, 'colors'), (markings, 'colored_markings'),
+            (line_edits, 'line_edits'), (tui, 'tui'),
+            (clip_read_always, 'osc_clipboard_read_always'),
             (tui_autobox_notice, 'tui_autobox_notice'), (osc, 'osc_notice'),
             (pdelay, 'paste_delay'), (esc_limit, 'escape_limit'),
             (paste_warn, 'paste_warn'),
@@ -5209,6 +5226,8 @@ class MainWindow(QMainWindow):
             _set(scrollback, lambda: scrollback.setCurrentIndex(scrollback.findData(0)))
             _set(mode, lambda: mode.setCurrentIndex(mode.findData('detail')))
             _set(colors, lambda: colors.setChecked(True))
+            _set(markings, lambda: markings.setChecked(True))
+            _set(clip_read_always, lambda: clip_read_always.setChecked(False))
             _set(line_edits, lambda: line_edits.setChecked(True))
             _set(tui, lambda: tui.setChecked(False))
             _set(tui_autobox_notice, lambda: tui_autobox_notice.setChecked(True))
@@ -5299,6 +5318,8 @@ class MainWindow(QMainWindow):
                 'font_size': font_size.value(),
                 'ui_scale': ui_scale.value(),
                 'mode': mode.currentData(), 'colors': colors.isChecked(),
+                'markings': markings.isChecked(),
+                'osc_clipboard_read_always': clip_read_always.isChecked(),
                 'line_edits': line_edits.isChecked(),
                 'tui': tui.isChecked(),
                 'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
@@ -5378,6 +5399,7 @@ class MainWindow(QMainWindow):
             term.set_font_size(self._default_font_size)
             term.apply_mode(opts['mode'])
             term.apply_colors(opts['colors'])
+            term.apply_markings(self._default_markings)   # _GLOBAL_KEYS resolved it (lock-aware)
             term.apply_line_edits(opts['line_edits'])
             for key, value in osc.items():
                 term.apply_osc(key, value)
@@ -5409,6 +5431,10 @@ class MainWindow(QMainWindow):
             self.set_clip_warn_any(opts['clip_warn_any'])
         if 'clip_autostart' in opts:
             self.set_clip_autostart(opts['clip_autostart'])
+        if 'osc_clipboard_read_always' in opts:
+            # Applied via its setter (pushes to every tab + honours its own admin lock),
+            # like the other window-scoped toggles above; _persist() below stores it.
+            self.set_clipboard_read_always(opts['osc_clipboard_read_always'])
         self._sync_paste_delay_menu()   # menu check reflects the applied delay
         self.set_persist_session(opts['persist'])
         self._sync_chrome_to_tab()
