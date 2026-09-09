@@ -211,8 +211,25 @@ def _app_icon():
     return QIcon()
 
 
-# cap on a `ctl dump-tab` reply so it stays under the IPC frame limit.
+# cap on a `ctl dump-tab` / `ctl dump-state` reply so it stays under the IPC frame limit.
 _DUMP_MAX = 512 * 1024
+
+
+def _fit_dump_reply(text):
+    """Trim a dump-reply body so its JSON-encoded {'ok': True, 'text': ...} frame fits
+    under the IPC frame cap. A plain character cap is not enough: json.dumps
+    (ensure_ascii) expands each non-ASCII char to a 6-byte \\uXXXX escape (and doubles
+    "/\\), so the ENCODED reply can still overflow -- which the client then drops,
+    silently failing the dump. Fast-cap by character count first, then trim the tail
+    (dropping from the FRONT, keeping the most recent output) until the encoded payload
+    fits. Shared by dump-tab and dump-state."""
+    if len(text) > _DUMP_MAX:
+        text = text[-_DUMP_MAX:]             # fast tail-cap by character count
+    while text and len(
+            json.dumps({'ok': True, 'text': text}).encode('utf-8')
+            ) > ipc._MAX_REQUEST:
+        text = text[len(text) // 8 + 1:]
+    return text
 
 # The shipped default (persisted-string form) of every key _persist writes. save()
 # omits a key equal to its default, so the generated config holds ONLY real
@@ -1528,7 +1545,8 @@ class MainWindow(QMainWindow):
                              'mode': term.current_mode(),
                              'tui': term.tui_active()})
             return {'ok': True, 'tabs': tabs}
-        if op in ('ctl-send-text', 'ctl-set-tab-title', 'ctl-dump-tab', 'ctl-zoom'):
+        if op in ('ctl-send-text', 'ctl-set-tab-title', 'ctl-dump-tab',
+                  'ctl-dump-state', 'ctl-zoom'):
             term = self._find_tab(request.get('tab'))
             if term is None:
                 return {'ok': False, 'error': 'no tab matched %r'
@@ -1595,17 +1613,24 @@ class MainWindow(QMainWindow):
                     # (a negative start would instead return only the last `lines % len`).
                     parts = text.split('\n')
                     text = '\n'.join(parts[max(0, len(parts) - lines):])
-                if len(text) > _DUMP_MAX:
-                    text = text[-_DUMP_MAX:]     # fast tail-cap by character count
-                # A character cap is not enough: json.dumps (ensure_ascii) expands
-                # each non-ASCII char to a 6-byte \uXXXX escape (and doubles "/\), so
-                # the ENCODED reply can still overflow the IPC frame -- which the
-                # client then drops, silently failing the dump. Trim the tail until
-                # the encoded payload fits under the frame cap. (F4)
-                while text and len(
-                        json.dumps({'ok': True, 'text': text}).encode('utf-8')
-                        ) > ipc._MAX_REQUEST:
-                    text = text[len(text) // 8 + 1:]
+                return {'ok': True, 'text': _fit_dump_reply(text)}
+            if op == 'ctl-dump-state':
+                # A deterministic, full-grid, per-cell state dump (modes, cursor, pen,
+                # alt-screen, mouse modes) -- richer than dump-tab's rendered text, for
+                # debugging and state-leak regression tests. text | json.
+                fmt = request.get('format', 'text')
+                if fmt not in ('text', 'json'):
+                    return {'ok': False,
+                            'error': "format must be 'text' or 'json'"}
+                if fmt == 'json':
+                    # Bound the JSON at the SNAPSHOT level (drop whole rows / truncate the
+                    # document) so it stays VALID JSON, never a byte-sliced fragment that
+                    # reports ok:true but fails a consumer's json.load. Half the frame is a
+                    # safe budget: the reply's JSON-string envelope at most doubles it (only
+                    # " \ and newline expand), so 2 * (MAX/2) stays under the frame cap.
+                    text = term.dump_state('json', max_bytes=ipc._MAX_REQUEST // 2)
+                else:
+                    text = _fit_dump_reply(term.dump_state('text'))
                 return {'ok': True, 'text': text}
             title = request.get('title')
             if not isinstance(title, str):
@@ -2449,8 +2474,8 @@ class MainWindow(QMainWindow):
         comparison shots are byte-for-byte unchanged. setStyle resets every widget
         palette, so the per-tab terminal theme is re-applied afterwards."""
         app = QApplication.instance()
-        if app is None:
-            return
+        if app is None:                       # pragma: no cover -- defensive; the app always
+            return                            #   has a QApplication when a window applies a theme
         if theme != 'dark':
             if self._base_style_name:
                 app.setStyle(self._base_style_name)
@@ -6139,6 +6164,14 @@ def _ctl_main(argv):
     dump.add_argument('--tab', required=True, metavar='MATCH')
     dump.add_argument('--lines', type=int, metavar='N',
                       help='only the last N lines (0 = none)')
+    state = sub.add_parser('dump-state',
+                           help="print a tab's deterministic full terminal state "
+                                "(grid cells, modes, cursor, alt-screen; for tests)")
+    state.add_argument('--tab', required=True, metavar='MATCH')
+    state.add_argument('--format', choices=('text', 'json'), default='text',
+                       help='text (human + diffable, default) or json (machine)')
+    state.add_argument('--file', metavar='PATH',
+                       help='write the dump to PATH instead of stdout')
     zoom = sub.add_parser('zoom',
                           help='live font-zoom a tab (no restart)')
     zoom.add_argument('--tab', required=True, metavar='MATCH')
@@ -6147,8 +6180,10 @@ def _ctl_main(argv):
     args = parser.parse_args(argv)
 
     request = {'op': 'ctl-' + args.cmd}
-    if args.cmd in ('send-text', 'set-tab-title', 'dump-tab', 'zoom'):
+    if args.cmd in ('send-text', 'set-tab-title', 'dump-tab', 'dump-state', 'zoom'):
         request['tab'] = args.tab
+    if args.cmd == 'dump-state':
+        request['format'] = args.format
     if args.cmd == 'zoom':
         request['level'] = args.level
     if args.cmd == 'send-text':
@@ -6176,6 +6211,17 @@ def _ctl_main(argv):
                 '  [tui]' if tab.get('tui') else ''))
     elif args.cmd == 'dump-tab':
         sys.stdout.write(reply.get('text', ''))
+    elif args.cmd == 'dump-state':
+        text = reply.get('text', '')
+        if args.file:
+            # Atomic write: a reader (a test asserting on the dump) never sees a
+            # half-written file. Same tmp-then-rename pattern as _write_transcript_file.
+            tmp = args.file + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+            os.replace(tmp, args.file)
+        else:
+            sys.stdout.write(text)
     elif args.cmd == 'zoom':
         sys.stdout.write('%s\n' % reply.get('zoom', ''))
     return 0

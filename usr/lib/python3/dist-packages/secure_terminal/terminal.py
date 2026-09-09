@@ -377,6 +377,7 @@ from secure_terminal.sanitize import (
     _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 from secure_terminal import resource_isolation
+from secure_terminal import state_dump
 
 # Custom char-format property carrying a marked cell's SOURCE code point, so the
 # widget can describe the real character on hover/click regardless of how it is
@@ -1058,7 +1059,10 @@ class SecureTerminal(QPlainTextEdit):
         # apply_theme keeps the CTOR's own apply_theme idempotent, and the saved
         # scrollback below is coloured for this theme with no post-hoc re-render
         # (mirrors the mode/colours/markings ctor kwargs -- #78 render-once).
-        self._theme = theme if theme in THEMES else 'light'
+        # isinstance guard: THEMES is a dict, so `theme in THEMES` on a non-hashable
+        # (list/dict) would raise instead of falling back -- crash-safe at the sink, like
+        # the mode kwarg (DISPLAY_MODES is a tuple, safe for any type).
+        self._theme = theme if isinstance(theme, str) and theme in THEMES else 'light'
         self.apply_theme(self._theme)
 
         # display mode for non-ASCII output, and an incremental UTF-8 decoder so
@@ -1490,7 +1494,9 @@ class SecureTerminal(QPlainTextEdit):
         # 'light' + its identical fallback). The old 'dark' here meant a bad name gave
         # a DIFFERENT theme depending on whether it arrived at construction or via a
         # later apply (a corrupt session, a settings dialog forwarding an unknown name).
-        theme = theme if theme in THEMES else 'light'
+        # isinstance: THEMES is a dict, so `theme in THEMES` on a non-hashable would raise
+        # instead of falling back (crash-safe at the sink, like the DISPLAY_MODES tuple).
+        theme = theme if isinstance(theme, str) and theme in THEMES else 'light'
         changed = theme != getattr(self, '_theme', None)
         base, text = THEMES[theme]
         self._theme = theme
@@ -3990,8 +3996,8 @@ class SecureTerminal(QPlainTextEdit):
             os.killpg(pg, 0)
         except ProcessLookupError:
             return True                   # the program that drew the alt frame is gone
-        except OSError:
-            return False                  # exists but not signalable by us -> keep it
+        except OSError:                   # pragma: no cover -- defensive: a pgrp we cannot
+            return False                  #   signal (EPERM); exists but not ours -> keep it
         return False                      # alive (running or stopped) -> keep the frame
 
     def _alt_enter(self):
@@ -4863,6 +4869,48 @@ class SecureTerminal(QPlainTextEdit):
                 return cp
         return None
 
+    def _collect_state(self):
+        """A deterministic snapshot of the CURRENT terminal state, branching on the
+        display mode: TUI reads the live pyte grid + its scalar state; CLI (no escape
+        interpreter, self._screen is None) reads the line document + the SGR pen. The
+        wrapper-level flags pyte does not model -- the alternate screen and mouse
+        reporting -- are added in both modes. Volatile fields (the alt-owner pgrp,
+        timers) are deliberately excluded so two idle snapshots are identical. See
+        secure_terminal.state_dump for the format."""
+        # Bind the narrowed screen once: `screen is not None` IS the TUI test, so every
+        # attribute read below narrows cleanly (no unguarded self._screen.<attr>).
+        screen = self._screen if self._grid_mode() else None
+        tui = screen is not None
+        alt_active = self._alt_saved is not None
+        # A frozen primary is held whenever alt is active, and a TUI->CLI switch leaves it
+        # held (apply_tui does not _alt_leave, and _screen is never cleared), so key the
+        # saved-primary dims on the LIVE pyte screen, not the grid-mode-gated `screen` --
+        # else a CLI dump reports alt_screen:true with saved_primary:null. Report the dims,
+        # never the frozen buffer's identity (not a stable value).
+        live = self._screen
+        saved_primary = ((live.columns, live.lines)
+                         if alt_active and live is not None else None)
+        return state_dump.collect(
+            screen,
+            mode='tui' if tui else 'cli',
+            columns=screen.columns if screen is not None else self._cols,
+            alt_screen=alt_active,
+            saved_primary=saved_primary,
+            mouse_modes=self._mouse_modes,
+            title=self._last_title,
+            cli_pen=None if tui else self._sgr,
+            document=None if tui else self.transcript_text())
+
+    def dump_state(self, fmt='text', max_bytes=None):
+        """The current terminal state as a string: 'text' (human + technical, diffable;
+        blank cells/rows elided) or 'json' (machine round-trip). Deterministic -- an
+        idle terminal dumps identical bytes on repeat calls. For 'json', max_bytes bounds
+        the output by dropping whole rows / truncating the document so it stays VALID
+        JSON under a transport frame cap (the text form has no such structural need)."""
+        snap = self._collect_state()
+        return state_dump.dump_json(snap, max_bytes=max_bytes) if fmt == 'json' \
+            else state_dump.dump_text(snap)
+
     def transcript_text(self):
         """The CURRENT frame/screen as lossless, pure-ASCII (except the real glyphs Show
         mode keeps) text. In TUI this is the live grid -- what 'Save Current Screen'
@@ -5168,8 +5216,8 @@ class SecureTerminal(QPlainTextEdit):
             return ''       # no child, or self._pid was freed and reused by a stranger
         try:
             return os.readlink('/proc/%d/cwd' % self._pid)
-        except OSError:
-            return ''
+        except OSError:                   # pragma: no cover -- defensive: a current child's
+            return ''                     #   /proc/<pid>/cwd is normally readable
 
     @staticmethod
     def _read_exe(pid):
@@ -5215,9 +5263,19 @@ class SecureTerminal(QPlainTextEdit):
         the pid-reuse TOCTOU: after the child exits, reap_pty_children frees the pid before
         _release_pty clears self._pid, so getpgid(self._pid) / /proc/<self._pid> would trust
         whatever process reused the slot. Compare the live /proc start-time to the spawn
-        baseline. Falls back to True when no baseline was captured (unreadable at spawn), to
-        preserve the prior behaviour rather than over-refuse."""
+        baseline. An exec-failed launch is refused outright (no child ever ran); otherwise
+        falls back to True when no baseline was captured for a child that DID exec
+        (starttime unreadable at spawn), to preserve the prior behaviour rather than
+        over-refuse."""
         if self._pid is None:
+            return False
+        if self._command_exec_failed:
+            # The program never exec'd (missing / non-executable -- PROGRAM): the child
+            # wrote its failure byte and exited at once, so self._pid is a corpse whose slot
+            # the OS may already have reused. There is no live child of ours to signal or to
+            # read /proc for -- refuse, so no caller (SIGHUP, killpg, /proc/<pid>/cwd) trusts
+            # a reused pid. _spawn_starttime is None here too, so this MUST precede the
+            # unreadable-at-spawn fallback below, which is only for a child that really ran.
             return False
         if self._spawn_starttime is None:
             return True
