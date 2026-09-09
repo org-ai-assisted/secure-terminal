@@ -219,7 +219,11 @@ def save(values, locked=(), defaults=None):
     system value would silently re-apply on restart, a security downgrade. Keys absent
     from BOTH layers are always written (a caller that owns one key, e.g. the clipboard
     tray, passes no defaults). Never raises."""
-    locked = frozenset(locked)
+    # PRIVILEGED_ONLY keys (remote_control) are admin-only and MUST never land in the
+    # user drop-in regardless of the caller's `locked` set -- persisting one would be
+    # dead config at best and a latent privilege downgrade if a future caller omits
+    # locked=. Exclude them independently, not only via the caller-supplied set.
+    locked = frozenset(locked) | PRIVILEGED_ONLY
     defaults = defaults or {}
     # Only consult the system layer when omit-defaults is in play (a defaults map was
     # passed); a single-key owner write (set_user_key, no defaults) writes as before.
@@ -274,7 +278,11 @@ def _user_write_lock():
     path = user_config_file()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        handle = os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        # O_NOFOLLOW: a planted symlink at the .lock path fails the open rather than
+        # redirecting the create/flock onto an attacker-chosen file, matching save()'s
+        # tmp open above.
+        handle = os.open(path + '.lock',
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     except OSError:
         return None
     try:
