@@ -820,18 +820,25 @@ def cli_terminfo_dir():
 
 
 def sound_file_allowed(path):
-    """True if `path` is a real file inside one of BELL_SOUND_DIRS (symlinks
-    resolved), so a bell sound cannot escape the AppArmor-granted directories."""
+    """The resolved REAL path of `path` if it is a real file inside one of
+    BELL_SOUND_DIRS (symlinks resolved), else None -- truthy exactly when allowed.
+    Callers store and play the RETURNED realpath, never the original `path`:
+    validating the realpath but then using the original leaves a validate-then-use
+    TOCTOU -- a symlink inside an allowed dir, repointed after this check, would be
+    followed to its new target at play time. Returning the resolved path closes that
+    at the app layer (the AppArmor profile is the outer boundary)."""
     if not path:
-        return False
+        return None
     try:
         real = os.path.realpath(path)
     except OSError:
-        return False
+        return None
     if not os.path.isfile(real):
-        return False
-    return any(real == base or real.startswith(base + os.sep)
-               for base in (os.path.realpath(p) for p in BELL_SOUND_DIRS))
+        return None
+    if any(real == base or real.startswith(base + os.sep)
+           for base in (os.path.realpath(p) for p in BELL_SOUND_DIRS)):
+        return real
+    return None
 
 
 def _rgb(color):
@@ -2090,7 +2097,7 @@ class SecureTerminal(QPlainTextEdit):
         """Set the audible-channel sound file. Accepted only if it resolves inside
         an allowed sound directory (so the AppArmor profile stays enforceable); an
         empty or disallowed path falls back to the plain system beep."""
-        self._bell_sound = path if sound_file_allowed(path) else ''
+        self._bell_sound = sound_file_allowed(path) or ''   # store the RESOLVED realpath
         self._sound_effect = None       # rebuilt lazily on next ring
 
     def _ring(self):

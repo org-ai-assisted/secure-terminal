@@ -3176,7 +3176,7 @@ class MainWindow(QMainWindow):
         directory), apply it to every tab, and persist."""
         if self._bell_sound_locked():
             return
-        self._default_bell_sound = path if sound_file_allowed(path) else ''
+        self._default_bell_sound = sound_file_allowed(path) or ''   # RESOLVED realpath
         for t in self._real_terms():
             t.apply_bell_sound(self._default_bell_sound)
         if hasattr(self, 'act_bell_sound'):
