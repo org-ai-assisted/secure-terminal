@@ -2489,7 +2489,17 @@ class MainWindow(QMainWindow):
             if self._base_style_name:
                 app.setStyle(self._base_style_name)
             if self._base_app_palette is not None:
-                app.setPalette(self._base_app_palette)
+                # The base palette is captured from the DESKTOP theme, which may be DARK.
+                # Under the native (non-Fusion) light style Qt can paint QToolTip from the
+                # APP palette, so a dark desktop leaks dark-on-dark tooltips -- QToolTip's
+                # own palette + the QToolTip{} stylesheet are not honoured by every platform
+                # style. Pin the light tooltip roles onto the restored palette so the menu
+                # hints stay readable regardless of the desktop's Qt platform theme.
+                pal = QPalette(self._base_app_palette)
+                _tt_bg, _tt_fg, _ = _TIP_COLORS['light']
+                pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(_tt_bg))
+                pal.setColor(QPalette.ColorRole.ToolTipText, QColor(_tt_fg))
+                app.setPalette(pal)
         else:
             app.setStyle('Fusion')                # honours the palette for all chrome
             pal = QPalette()
