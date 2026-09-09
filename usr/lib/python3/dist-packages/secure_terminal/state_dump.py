@@ -158,7 +158,8 @@ def collect(screen, *, mode, columns, alt_screen, saved_primary, mouse_modes,
         'visible': not screen.cursor.hidden,
         'pen': _attrs_dict(screen.cursor.attrs, default),
     }
-    dec, ansi = [], []
+    dec: list[str] = []
+    ansi: list[str] = []
     for value in sorted(screen.mode):
         (ansi if value in _ANSI_MODE_VALUES else dec).append(_mode_name(value))
     snap['dec_modes'] = dec
@@ -225,11 +226,28 @@ def _fit_snapshot(snap, max_bytes):
         snap['truncated_rows'] = dropped
     if 'document' in snap and _encoded_len(snap) > max_bytes:
         doc = snap['document']
+        # Keep the TAIL (the current screen / most recent output), dropping from the
+        # front -- consistent with the text path's _fit_dump_reply, and because the live
+        # screen is what a debugger wants, not the oldest scrollback.
         while doc and _encoded_len({**snap, 'document': doc,
                                     'document_truncated': True}) > max_bytes:
-            doc = doc[:len(doc) * 7 // 8]
+            doc = doc[len(doc) // 8 + 1:]
         snap['document'] = doc
         snap['document_truncated'] = True
+    # An explicit tab-stop list can itself blow the budget (a program can HTS every column
+    # of a 65535-wide screen), and rows/document shrinking never touches it -- collapse it
+    # to a count so the bound holds.
+    if (isinstance(snap.get('tabstops'), list)
+            and _encoded_len(snap) > max_bytes):
+        snap['tabstops'] = 'truncated(%d)' % len(snap['tabstops'])
+    # Final guarantee: if some other field still overflows (a pathological title, a flood
+    # of named modes), fall back to a minimal VALID JSON that names the overflow rather
+    # than emit an over-budget document the transport frame would silently drop.
+    if _encoded_len(snap) > max_bytes:
+        return {'version': snap.get('version', FORMAT_VERSION),
+                'mode': snap.get('mode'),
+                'truncated': True,
+                'note': 'state exceeds the dump budget; fields dropped'}
     return snap
 
 

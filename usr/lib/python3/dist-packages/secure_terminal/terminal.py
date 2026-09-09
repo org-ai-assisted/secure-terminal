@@ -4882,11 +4882,14 @@ class SecureTerminal(QPlainTextEdit):
         screen = self._screen if self._grid_mode() else None
         tui = screen is not None
         alt_active = self._alt_saved is not None
-        # While a full-screen program holds the alt screen the live pyte screen carries
-        # the alt content and the frozen primary shares its dimensions; report those
-        # dims (never the frozen buffer's identity, which is not a stable value).
-        saved_primary = ((screen.columns, screen.lines)
-                         if alt_active and screen is not None else None)
+        # A frozen primary is held whenever alt is active, and a TUI->CLI switch leaves it
+        # held (apply_tui does not _alt_leave, and _screen is never cleared), so key the
+        # saved-primary dims on the LIVE pyte screen, not the grid-mode-gated `screen` --
+        # else a CLI dump reports alt_screen:true with saved_primary:null. Report the dims,
+        # never the frozen buffer's identity (not a stable value).
+        live = self._screen
+        saved_primary = ((live.columns, live.lines)
+                         if alt_active and live is not None else None)
         return state_dump.collect(
             screen,
             mode='tui' if tui else 'cli',
