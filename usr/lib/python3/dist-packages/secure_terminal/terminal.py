@@ -1058,7 +1058,10 @@ class SecureTerminal(QPlainTextEdit):
         # apply_theme keeps the CTOR's own apply_theme idempotent, and the saved
         # scrollback below is coloured for this theme with no post-hoc re-render
         # (mirrors the mode/colours/markings ctor kwargs -- #78 render-once).
-        self._theme = theme if theme in THEMES else 'light'
+        # isinstance guard: THEMES is a dict, so `theme in THEMES` on a non-hashable
+        # (list/dict) would raise instead of falling back -- crash-safe at the sink, like
+        # the mode kwarg (DISPLAY_MODES is a tuple, safe for any type).
+        self._theme = theme if isinstance(theme, str) and theme in THEMES else 'light'
         self.apply_theme(self._theme)
 
         # display mode for non-ASCII output, and an incremental UTF-8 decoder so
@@ -1490,7 +1493,9 @@ class SecureTerminal(QPlainTextEdit):
         # 'light' + its identical fallback). The old 'dark' here meant a bad name gave
         # a DIFFERENT theme depending on whether it arrived at construction or via a
         # later apply (a corrupt session, a settings dialog forwarding an unknown name).
-        theme = theme if theme in THEMES else 'light'
+        # isinstance: THEMES is a dict, so `theme in THEMES` on a non-hashable would raise
+        # instead of falling back (crash-safe at the sink, like the DISPLAY_MODES tuple).
+        theme = theme if isinstance(theme, str) and theme in THEMES else 'light'
         changed = theme != getattr(self, '_theme', None)
         base, text = THEMES[theme]
         self._theme = theme
@@ -3990,8 +3995,8 @@ class SecureTerminal(QPlainTextEdit):
             os.killpg(pg, 0)
         except ProcessLookupError:
             return True                   # the program that drew the alt frame is gone
-        except OSError:
-            return False                  # exists but not signalable by us -> keep it
+        except OSError:                   # pragma: no cover -- defensive: a pgrp we cannot
+            return False                  #   signal (EPERM); exists but not ours -> keep it
         return False                      # alive (running or stopped) -> keep the frame
 
     def _alt_enter(self):
@@ -5168,8 +5173,8 @@ class SecureTerminal(QPlainTextEdit):
             return ''       # no child, or self._pid was freed and reused by a stranger
         try:
             return os.readlink('/proc/%d/cwd' % self._pid)
-        except OSError:
-            return ''
+        except OSError:                   # pragma: no cover -- defensive: a current child's
+            return ''                     #   /proc/<pid>/cwd is normally readable
 
     @staticmethod
     def _read_exe(pid):

@@ -2449,8 +2449,8 @@ class MainWindow(QMainWindow):
         comparison shots are byte-for-byte unchanged. setStyle resets every widget
         palette, so the per-tab terminal theme is re-applied afterwards."""
         app = QApplication.instance()
-        if app is None:
-            return
+        if app is None:                       # pragma: no cover -- defensive; the app always
+            return                            #   has a QApplication when a window applies a theme
         if theme != 'dark':
             if self._base_style_name:
                 app.setStyle(self._base_style_name)
