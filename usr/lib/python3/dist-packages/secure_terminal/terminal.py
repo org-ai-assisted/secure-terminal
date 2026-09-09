@@ -5256,9 +5256,19 @@ class SecureTerminal(QPlainTextEdit):
         the pid-reuse TOCTOU: after the child exits, reap_pty_children frees the pid before
         _release_pty clears self._pid, so getpgid(self._pid) / /proc/<self._pid> would trust
         whatever process reused the slot. Compare the live /proc start-time to the spawn
-        baseline. Falls back to True when no baseline was captured (unreadable at spawn), to
-        preserve the prior behaviour rather than over-refuse."""
+        baseline. An exec-failed launch is refused outright (no child ever ran); otherwise
+        falls back to True when no baseline was captured for a child that DID exec
+        (starttime unreadable at spawn), to preserve the prior behaviour rather than
+        over-refuse."""
         if self._pid is None:
+            return False
+        if self._command_exec_failed:
+            # The program never exec'd (missing / non-executable -- PROGRAM): the child
+            # wrote its failure byte and exited at once, so self._pid is a corpse whose slot
+            # the OS may already have reused. There is no live child of ours to signal or to
+            # read /proc for -- refuse, so no caller (SIGHUP, killpg, /proc/<pid>/cwd) trusts
+            # a reused pid. _spawn_starttime is None here too, so this MUST precede the
+            # unreadable-at-spawn fallback below, which is only for a child that really ran.
             return False
         if self._spawn_starttime is None:
             return True
