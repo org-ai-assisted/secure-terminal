@@ -20,29 +20,20 @@ history; it inspects the current text transiently and forgets it.
 SCOPE -- sanitizes the LOCAL (in-VM) clipboard via Qt (X11 or Wayland). It does
 NOT touch the Qubes inter-VM global clipboard (Ctrl+Shift+C / Ctrl+Shift+V).
 
-Two consumers of the same core:
-  * ClipboardWatcher -- the reusable core: watch + review, no tray/IPC. The
-    TERMINAL embeds one (watch=False) for its "Review clipboard now" action.
-  * ClipboardWatchApp -- the standalone tray daemon (`--clipboard-watch`): a
-    continuous ClipboardWatcher + a tray icon + a SINGLETON IPC server, so only
-    one clipboard watcher runs and the terminal can start / stop / query it
-    (the 'clipboard-watch' instance group).
+The reusable core is ClipboardWatcher: watch + review, no tray/IPC. The MAIN
+WINDOW embeds it in-process -- a continuous one for "Run in the background" (and
+the `--tray` hidden-to-tray login autostart) and a one-shot one (watch=False) for
+"Review clipboard now" -- so the sanitizer shares the app's single tray icon
+rather than running as a separate daemon process with a second icon.
 
 Reuses the terminal's own ReviewBar and the Qt-free sanitize core.
 """
 
-import fcntl
-import json
 import os
-import signal
-import sys
 
-from PyQt6.QtCore import QTimer
-from PyQt6.QtWidgets import (
-    QMenu, QSystemTrayIcon, QVBoxLayout, QWidget,
-)
+from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
-from secure_terminal import ipc, settings
+from secure_terminal import settings
 from secure_terminal.review import ReviewBar
 from secure_terminal.sanitize import (
     THEMES, classify_paste, sanitize_clipboard, sanitize_clipboard_unicode,
@@ -50,19 +41,7 @@ from secure_terminal.sanitize import (
 from secure_terminal.unicode_tag import tag_text
 
 
-class _SingletonBindError(Exception):
-    """The singleton flock was taken but the control socket did not bind.
-
-    A startup failure distinct from 'another watcher already runs': the daemon
-    would otherwise run with no stop_running() socket and a held lock that blocks
-    every replacement. The lock and server are released before this is raised.
-    """
-
-
 _AUTOSTART_BASENAME = 'sclip-clipboard-watch.desktop'
-## The fixed instance group whose owner-only socket makes the watcher a singleton
-## and lets the terminal ping / start / stop it. See ipc.socket_path.
-INSTANCE_GROUP = 'clipboard-watch'
 
 ## The review only scans/displays the first SecureTerminal._RAW_MAX chars, so bound the
 ## per-change TRIGGER scan (tag_text / classify_paste, both O(n) with an O(n) allocation)
@@ -92,13 +71,6 @@ def _load_theme():
     cfg = settings.load()
     theme = cfg.get('theme')
     return theme if theme in THEMES else 'light'
-
-
-def warn_any_default():
-    """The persisted 'warn on any non-ASCII' preference (settings key
-    `clip_warn_any`, default off). The terminal persists it; the daemon reads it at
-    startup so an autostarted watcher honours the user's choice."""
-    return settings.load().get('clip_warn_any') == 'true'
 
 
 def _user_autostart_path():
@@ -138,30 +110,13 @@ def set_autostart(enabled):
     content = ('[Desktop Entry]\n'
                'Type=Application\n'
                'Name=secure-terminal clipboard sanitizer\n'
-               'Exec=secure-terminal --clipboard-watch\n'
+               'Exec=secure-terminal --tray\n'
                'X-GNOME-Autostart-enabled=false\n'
                'Hidden=true\n')
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as handle:
         handle.write(content)
     os.replace(tmp, path)        # atomic, so a reader never sees a half-written file
-
-
-def is_running():
-    """True if a clipboard-watch daemon already owns the singleton socket -- a raw
-    CONNECT probe that succeeds the instant it binds (see ipc.socket_is_live)."""
-    return ipc.socket_is_live(INSTANCE_GROUP)
-
-
-def stop_running():
-    """Ask a running daemon to quit; returns True if one answered. `None` (no
-    server) means it was already not running."""
-    return ipc.send_request(INSTANCE_GROUP, {'op': 'quit'}) is not None
-
-
-def push_warn_any(value):
-    """Live-update a running daemon's trigger mode; no-op if none runs."""
-    ipc.send_request(INSTANCE_GROUP, {'op': 'set-warn-any', 'value': bool(value)})
 
 
 class _ClipboardReview:
@@ -204,8 +159,8 @@ class _ReviewPopup(QWidget):
 class ClipboardWatcher:
     """The reusable clipboard-review core: optionally watch the clipboard, and/or
     review its current contents once, hosting the shared ReviewBar in a popup. No
-    tray, no IPC, no event loop of its own -- embeddable by the tray daemon
-    (watch=True) and by the terminal's "Review clipboard now" (watch=False)."""
+    tray, no IPC, no event loop of its own -- embedded in-process by the main window
+    for "Run in the background" (watch=True) and "Review clipboard now" (watch=False)."""
 
     def __init__(self, app, theme=None, any_mode=False, watch=False):
         self._clipboard = app.clipboard()
@@ -301,233 +256,3 @@ class ClipboardWatcher:
             self._clipboard.setText(safe)
         self._popup.bar.hide_review()
         self._popup.hide()
-
-
-class ClipboardWatchApp:
-    """The standalone tray daemon (`--clipboard-watch`): a continuous
-    ClipboardWatcher + a tray icon + a SINGLETON IPC server. Only one runs; the
-    terminal starts / stops / pings it over the 'clipboard-watch' group."""
-
-    def __init__(self, app):
-        self._app = app
-        self._watcher = ClipboardWatcher(app, any_mode=warn_any_default(), watch=True)
-        self._tray = None
-        self._server = None
-        self._lock_fd = None
-
-    # -- singleton IPC server -------------------------------------------------
-    def _claim_singleton(self):
-        """Claim the 'clipboard-watch' singleton ATOMICALLY. Returns False if another
-        live watcher already holds it (the caller should exit).
-
-        The gate is an flock(LOCK_EX|LOCK_NB) on a lock file: the kernel grants it to
-        exactly one process and releases it automatically when that process dies, so a
-        crashed watcher never wedges the next one. A socket_is_live()+removeServer()+
-        listen() sequence could NOT be the gate -- that check-then-act leaves a window
-        where two watchers both see 'not live' and both bind, each removeServer()
-        unlinking the other's just-bound socket, so BOTH run and race duplicate review
-        bars. Here the QLocalServer socket is bound by the SOLE lock holder, so clearing
-        a crashed predecessor's stale socket cannot race a live peer.
-
-        (MainWindow.start_instance_server keeps the lighter socket_is_live gate on
-        purpose: terminals are meant to coexist, so its residual bind race only orphans
-        a ctl target -- benign. A clipboard watcher must be a true singleton.)"""
-        try:
-            ipc.ensure_socket_dir()
-        except OSError:
-            return True                     # no runtime dir -> cannot singleton; proceed
-        path = ipc.socket_path(INSTANCE_GROUP)
-        # Primary gate: an flock held for process lifetime. If the lock file cannot be
-        # opened, or flock is unsupported on this fs, fall through with no lock -- best
-        # effort drops the flock gate, never the socket claim below. os.open and flock
-        # are separate try blocks so os.close only ever runs on a real fd (an EAGAIN from
-        # os.open itself must not reach os.close(None)).
-        lock_fd = None
-        try:
-            lock_fd = os.open(
-                path + '.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
-        except OSError:
-            pass                            # lock file unusable -> best effort (lock_fd stays None)
-        if lock_fd is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                os.close(lock_fd)
-                return False                # another live watcher holds the lock -> exit
-            except OSError:
-                os.close(lock_fd)           # flock unsupported on this fs
-                lock_fd = None              # best effort: drop the flock, still claim the socket
-        from PyQt6.QtNetwork import QLocalServer   # noqa: PLC0415
-        # Defer to any live incumbent socket rather than stealing it -- a watcher still
-        # running the PRE-flock code holds no lock, and a best-effort start (no usable
-        # lock file) holds none either, so the flock alone cannot see them; only clear a
-        # confirmed-stale socket. Best effort drops the flock gate, never the socket claim.
-        if ipc.socket_is_live(INSTANCE_GROUP):
-            if lock_fd is not None:
-                os.close(lock_fd)
-            return False
-        self._lock_fd = lock_fd             # the flock (held for process life), or None (best effort)
-        QLocalServer.removeServer(path)     # stale socket from a crashed predecessor
-        self._server = QLocalServer(self._app)
-        self._server.setSocketOptions(
-            QLocalServer.SocketOption.UserAccessOption)   # 0700, same-UID only
-        if not self._server.listen(path):
-            # The flock is held but the control socket did not bind: the daemon
-            # would run uncontrollable (stop_running() has no socket to reach)
-            # and its held lock would block every replacement. Release both and
-            # fail startup -- never return True (proceed) or False (another
-            # watcher active).
-            self._server = None
-            if self._lock_fd is not None:
-                os.close(self._lock_fd)
-                self._lock_fd = None
-            raise _SingletonBindError(path)
-        self._server.newConnection.connect(self._on_ipc_connection)
-        return True
-
-    def _on_ipc_connection(self):
-        assert self._server is not None   # newConnection only fires on a live server
-        conn = self._server.nextPendingConnection()
-        if conn is None:                    # pragma: no cover - Qt only signals with one pending
-            return
-        conn.disconnected.connect(conn.deleteLater)
-        framer = ipc.Framer()
-
-        def on_ready():
-            try:
-                payload = framer.feed(bytes(conn.readAll()))
-            except ValueError:
-                conn.abort()
-                return
-            if payload is None:             # pragma: no cover - one-shot frame arrives whole locally
-                return
-            reply = self._dispatch(payload)
-            conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
-            conn.flush()
-            conn.disconnectFromServer()
-
-        conn.readyRead.connect(on_ready)
-
-    def _dispatch(self, payload):
-        """Handle one IPC request; return a reply dict. Owner-only socket, but still
-        type-validated. Ops: ping (running probe), quit, set-warn-any (live trigger)."""
-        try:
-            request = json.loads(payload.decode('utf-8'))
-        # RecursionError: json.loads raises it (not ValueError) on deeply-nested JSON,
-        # which would else SIGABRT this same-UID daemon. main.py's IPC dispatch catches
-        # it too; the sibling here must not be the one uncaught crash path.
-        except (ValueError, UnicodeDecodeError, RecursionError):
-            return {'ok': False, 'error': 'malformed request'}
-        if not isinstance(request, dict):
-            return {'ok': False, 'error': 'malformed request'}
-        op = request.get('op')
-        if op == 'ping':
-            return {'ok': True, 'pid': os.getpid()}
-        if op == 'quit':
-            # Reply first, then quit, so the caller gets its acknowledgement.
-            QTimer.singleShot(0, self._app.quit)
-            return {'ok': True}
-        if op == 'set-warn-any':
-            # honour an admin lock over IPC too: clip_warn_any is an admin POLICY the
-            # user must not override through ANY path. The main window already refuses
-            # a locked change before it push_warn_any's here, but a direct same-UID
-            # set-warn-any request must be refused as well (the tray + main-window
-            # guards' sibling), or the lock is enforced only at the UI, not the daemon.
-            if 'clip_warn_any' in settings.load().locked:
-                return {'ok': False, 'error': 'clip_warn_any is admin-locked'}
-            self._watcher.set_any_mode(bool(request.get('value')))
-            return {'ok': True}
-        return {'ok': False, 'error': 'unknown op: %r' % (op,)}
-
-    # -- tray -----------------------------------------------------------------
-    def _build_tray(self):
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            return None
-        tray = QSystemTrayIcon(self._app.windowIcon())
-        tray.setToolTip('secure-terminal clipboard sanitizer')   # fixed string
-        tray.setContextMenu(self._build_menu())
-        tray.show()
-        return tray
-
-    def _build_menu(self):
-        """SAFE, fixed actions only -- like the terminal tray, nothing here is derived
-        from clipboard/program text (an out-of-grid surface must not carry a phish)."""
-        menu = QMenu()
-        act_watch = menu.addAction('Watch clipboard')
-        act_watch.setCheckable(True)
-        act_watch.setChecked(True)
-        act_watch.toggled.connect(self._watcher.set_enabled)
-
-        act_any = menu.addAction('Warn on any non-ASCII')
-        act_any.setCheckable(True)
-        act_any.setChecked(warn_any_default())
-        act_any.setToolTip('Off: warn only on hidden/deceptive characters. '
-                           'On: warn on any non-ASCII (accents, CJK, emoji) too.')
-        # greyed when admin-locked, so it is not clickable-but-inert (the setter also
-        # refuses a locked change, but a disabled control does not lie about it).
-        act_any.setEnabled('clip_warn_any' not in settings.load().locked)
-        act_any.toggled.connect(self._set_warn_any)
-
-        act_autostart = menu.addAction('Start on login')
-        act_autostart.setCheckable(True)
-        act_autostart.setChecked(autostart_enabled())
-        act_autostart.toggled.connect(lambda on: set_autostart(bool(on)))
-
-        menu.addSeparator()
-        menu.addAction('Review clipboard now').triggered.connect(
-            self._watcher.review_now)
-        menu.addSeparator()
-        menu.addAction('Quit').triggered.connect(self._app.quit)
-        return menu
-
-    def _set_warn_any(self, on):
-        ## A tray toggle is a real user choice: live-update this watcher AND
-        ## PERSIST it (like 'Start on login'), so it survives a daemon restart --
-        ## warn_any_default() reads clip_warn_any at startup. A SINGLE-KEY user-file
-        ## update: it must NOT rewrite the merged config (that would pin a system/
-        ## admin key into user config, overriding a later admin change); set_user_key
-        ## no-ops a locked key.
-        on = bool(on)
-        # Honour an admin lock on clip_warn_any for the LIVE watcher, not only the
-        # persisted write: set_user_key already no-ops a locked key, but set_any_mode
-        # would still change the running session, so the daemon's tray toggle bypassed
-        # the lock. Gate the live change on the lock too (main-window guard's sibling).
-        if 'clip_warn_any' in settings.load().locked:
-            return
-        self._watcher.set_any_mode(on)
-        settings.set_user_key('clip_warn_any', 'true' if on else 'false')
-
-    # -- lifecycle ------------------------------------------------------------
-    def run(self):
-        self._app.setQuitOnLastWindowClosed(False)   # tray-only: no window closes it
-        try:
-            claimed = self._claim_singleton()
-        except _SingletonBindError as exc:
-            sys.stderr.write('secure-terminal: clipboard-watch could not bind its '
-                             'control socket (%s); not starting.\n' % exc)
-            return 1
-        if not claimed:
-            # Another clipboard watcher already runs -- not an error.
-            return 0
-        self._tray = self._build_tray()
-        if self._tray is None:
-            sys.stderr.write('secure-terminal: no system tray is available; '
-                             '--clipboard-watch needs one.\n')
-            return 1
-        _install_sigterm(self._app)
-        return self._app.exec()
-
-
-def _install_sigterm(app):
-    """Quit cleanly on SIGTERM/SIGINT (a logout or a `kill` from the launcher). A
-    periodic no-op timer lets the interpreter run the Python signal handler while
-    the otherwise-idle Qt loop waits (Qt does not wake for a Python signal on its
-    own)."""
-    try:
-        signal.signal(signal.SIGTERM, lambda *_: app.quit())
-        signal.signal(signal.SIGINT, lambda *_: app.quit())
-    except (OSError, ValueError):   # pragma: no cover - only off the main thread; run() is main-thread only
-        pass
-    timer = QTimer(app)
-    timer.start(400)
-    timer.timeout.connect(lambda: None)

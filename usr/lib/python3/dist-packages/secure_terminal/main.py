@@ -842,8 +842,13 @@ class MainWindow(QMainWindow):
         # channel works; when off, no tray icon is ever created.
         self._systray = cfg.get('systray') == 'true'
         self._tray = None             # shared system-tray icon, created on first use
-        # clipboard sanitizer: whether the background watcher warns on ANY non-ASCII
-        # (default off = only deceptive characters). Persisted; the daemon reads it.
+        # Only the group PRIMARY shows the single tray icon, so N coexisting windows
+        # never stack N icons. Defaults True (a directly-constructed / single window);
+        # main() calls _apply_primary() with the real bind outcome for the multi-process
+        # case (a non-primary launch suppresses its icon).
+        self._is_primary = True
+        # clipboard sanitizer: whether the in-process watcher warns on ANY non-ASCII
+        # (default off = only deceptive characters). Persisted.
         self._clip_warn_any = cfg.get('clip_warn_any') == 'true'
         self._clip_reviewer = None    # in-process one-shot ClipboardWatcher (review now)
         self._clip_bg_watcher = None  # in-process CONTINUOUS ClipboardWatcher (run in bg)
@@ -3235,9 +3240,11 @@ class MainWindow(QMainWindow):
 
     def _tray_icon(self):
         """The shared system-tray icon. Created lazily on first use, but ONLY when
-        the tray is enabled in settings (opt-in, default off). Returns None if the
-        tray is disabled or the platform has no tray."""
-        if not self._systray:
+        the tray is enabled in settings (opt-in, default off) AND this window is the
+        group PRIMARY -- so multiple coexisting windows never stack multiple icons
+        (the reported second-icon class). Returns None if the tray is disabled, this
+        window is non-primary, or the platform has no tray."""
+        if not self._systray or not self._is_primary:
             return None
         if self._tray is None:
             from PyQt6.QtWidgets import QSystemTrayIcon
@@ -3249,6 +3256,35 @@ class MainWindow(QMainWindow):
             self._tray.activated.connect(self._on_tray_activated)
             self._tray.show()
         return self._tray
+
+    def _sync_tray_presence(self):
+        """Create or drop the tray icon to match the current state: shown only when
+        the tray is enabled AND this window is the group primary. Idempotent -- safe
+        to call at startup, on a systray toggle, and when the primary role is set."""
+        if self._systray and self._is_primary:
+            self._tray_icon()
+        elif self._tray is not None:
+            self._tray.hide()
+            self._tray = None
+
+    def _apply_primary(self, is_primary):
+        """main() reports whether this launch became the group primary. Only the
+        primary shows the single tray icon; a coexisting / non-primary window
+        suppresses it, so N windows never stack N icons."""
+        self._is_primary = bool(is_primary)
+        self._sync_tray_presence()
+
+    def _enter_tray_mode(self):
+        """--tray login autostart: run HIDDEN with the tray icon + the clipboard
+        sanitizer armed, in this single app process (window not shown; close-to-tray
+        keeps it alive). The caller (main()) has already confirmed a system tray is
+        available. Forces the tray on for this session WITHOUT persisting (a launch
+        mode, not a settings change)."""
+        self._systray = True
+        self.act_systray.setChecked(True)
+        self._sync_tray_presence()          # we are the primary -> the single icon
+        self._update_bell_tray_action()
+        self.set_clip_run(True)             # arm the in-process sanitizer (admin-lock aware)
 
     def _build_tray_menu(self):
         """The tray context menu: SAFE, fixed actions only. Nothing here is derived
@@ -3345,11 +3381,7 @@ class MainWindow(QMainWindow):
                 return
         self._systray = enabled
         self.act_systray.setChecked(enabled)
-        if not enabled and self._tray is not None:
-            self._tray.hide()
-            self._tray = None
-        elif enabled:
-            self._tray_icon()          # create now, so the effect is immediate
+        self._sync_tray_presence()     # create/drop now, so the effect is immediate
         if not enabled:
             # Coupling: the clipboard watcher is a tray app, so turning the tray OFF
             # also disables its start-on-login -- autostarting it with no tray just
@@ -3375,12 +3407,12 @@ class MainWindow(QMainWindow):
                     'this channel.')
         act.setToolTip(tip)
 
-    # -- clipboard sanitizer (controls the tray-only --clipboard-watch daemon) --
+    # -- clipboard sanitizer (in-process; shares this window's single tray icon) --
     def _clip_controls_enabled(self):
-        """The clipboard watcher is tray-only, so its Run / Start-on-login controls
-        make sense only when the user wants a tray AND one is available -- the
-        systray <-> autostart coupling. Turning trays off disables them (and clears
-        autostart in set_systray)."""
+        """The clipboard sanitizer is tray-coupled, so its Run / Start-on-login
+        controls make sense only when the user wants a tray AND one is available --
+        the systray <-> autostart coupling. Turning trays off disables them (and
+        clears autostart in set_systray)."""
         from PyQt6.QtWidgets import QSystemTrayIcon   # noqa: PLC0415
         return bool(self._systray) and QSystemTrayIcon.isSystemTrayAvailable()
 
@@ -3390,21 +3422,20 @@ class MainWindow(QMainWindow):
 
     def _populate_clipboard_menu(self, menu):
         """Fill a Clipboard-sanitizer menu with FRESH actions reflecting the live
-        state (is the daemon running, the warn-any setting, autostart). Shared by the
+        state (is the watcher running, the warn-any setting, autostart). Shared by the
         View submenu (repopulated on show) and the right-click context menu."""
         from secure_terminal import clipboard_watch   # noqa: PLC0415
         enabled = self._clip_controls_enabled()
         run_act = menu.addAction('Run in the background')
         run_act.setCheckable(True)
-        run_act.setChecked(clipboard_watch.is_running()
-                           or self._clip_bg_watcher is not None)
+        run_act.setChecked(self._clip_bg_watcher is not None)
         # gated HERE as well as in the setter (like warn_act below): an admin-locked
         # control must be un-clickable from this ephemeral tray menu, not only refused.
         run_act.setEnabled(enabled and 'clip_run' not in self._locked)
         run_act.setToolTip(
             'Start / stop the background clipboard watcher: it pops a review only '
             'when copied text hides deceptive Unicode.' if enabled else
-            'Needs the system tray on -- the watcher is a tray app.')
+            'Needs the system tray on.')
         run_act.toggled.connect(self.set_clip_run)
         warn_act = menu.addAction('Warn on any non-ASCII')
         warn_act.setCheckable(True)
@@ -3426,44 +3457,35 @@ class MainWindow(QMainWindow):
 
     def set_clip_run(self, on):
         """Start or stop the background clipboard sanitizer. Runs IN-PROCESS (a
-        continuous ClipboardWatcher held on self), NOT a separate --clipboard-watch
-        daemon -- so it shares this window's single tray icon instead of adding a
-        SECOND one. Close-to-tray (closeEvent) keeps it alive after the window is
-        hidden; an explicit Quit stops it. Idempotent. If an autostart daemon is
-        already watching, defer to it rather than double-watch; turning OFF stops
-        whichever is running (the in-process watcher AND any daemon)."""
+        continuous ClipboardWatcher held on self) sharing this window's single tray
+        icon -- never a separate daemon process with a second icon. Close-to-tray
+        (closeEvent) keeps it alive after the window is hidden; an explicit Quit stops
+        it. Idempotent."""
         if 'clip_run' in self._locked:
             return                        # admin-locked; not user-changeable
         from secure_terminal import clipboard_watch   # noqa: PLC0415
         if on:
-            if clipboard_watch.is_running():
-                return                    # an autostart daemon already watches
             if self._clip_bg_watcher is None:
                 self._clip_bg_watcher = clipboard_watch.ClipboardWatcher(
                     QApplication.instance(), theme=self._default_theme,
                     any_mode=self._clip_warn_any, watch=True)
-        else:
-            clipboard_watch.stop_running()   # stop an autostart daemon if one runs
-            if self._clip_bg_watcher is not None:
-                self._clip_bg_watcher.stop()
-                self._clip_bg_watcher = None
+        elif self._clip_bg_watcher is not None:
+            self._clip_bg_watcher.stop()
+            self._clip_bg_watcher = None
 
     def set_clip_warn_any(self, on):
         if 'clip_warn_any' in self._locked:
             return                        # admin-locked; not user-changeable
         self._clip_warn_any = bool(on)
-        ## clip_warn_any is shared with the clipboard-watch daemon; persist it with a
-        ## single-key write (not the bulk _persist) so the two processes do not
-        ## clobber each other's value.
+        ## Persist with a single-key write (not the bulk _persist) so a concurrent
+        ## config write by another instance does not clobber the value.
         settings.set_user_key('clip_warn_any', 'true' if on else 'false')
-        from secure_terminal import clipboard_watch   # noqa: PLC0415
-        clipboard_watch.push_warn_any(self._clip_warn_any)   # live-update a running daemon
         if self._clip_bg_watcher is not None:
-            self._clip_bg_watcher.set_any_mode(self._clip_warn_any)   # + the in-process watcher
+            self._clip_bg_watcher.set_any_mode(self._clip_warn_any)   # live-update the watcher
 
     def _clip_review_now(self):
-        """Review whatever is on the clipboard now, in-process (no daemon needed).
-        Held on self so the popup survives until the user resolves it."""
+        """Review whatever is on the clipboard now, in-process. Held on self so the
+        popup survives until the user resolves it."""
         from secure_terminal import clipboard_watch   # noqa: PLC0415
         # Re-invoking this while a previous review popup is still open would reassign
         # self._clip_reviewer and silently GC the first ClipboardWatcher (and its
@@ -4360,12 +4382,11 @@ class MainWindow(QMainWindow):
         # action is kept as the state-holder set_systray ticks; the tray-icon and
         # bell-channel wiring below still run at startup.
         self._update_bell_tray_action()
-        if self._systray:
-            self._tray_icon()          # show the icon at startup when enabled
+        self._sync_tray_presence()     # show the icon at startup when enabled + primary
 
-        # Clipboard sanitizer: discover + control the background watcher (the
-        # tray-only --clipboard-watch daemon) from the terminal. Repopulated on show
-        # so "Run in the background" reflects whether the daemon is actually alive.
+        # Clipboard sanitizer: discover + control the in-process background watcher
+        # from the terminal. Repopulated on show so "Run in the background" reflects
+        # whether the watcher is actually running.
         clip_menu = view_menu.addMenu('Clipboard sanitizer')
         clip_menu.aboutToShow.connect(lambda: self._refresh_clipboard_menu(clip_menu))
         self._refresh_clipboard_menu(clip_menu)   # populate once so it is never empty
@@ -6042,7 +6063,7 @@ class _Launch:
         self.qt_args = []          # unrecognized args, handed to Qt
         self.tabs = []             # [{title, tui, mode, command}]
         self.test_canary = False   # --test-canary -> headless positive control, exit
-        self.clipboard_watch = False  # --clipboard-watch/--tray -> tray sanitizer, no window
+        self.tray = False          # --tray -> start hidden-to-tray with the sanitizer armed
 
 
 def _launch_parser(with_globals):
@@ -6093,13 +6114,13 @@ def _launch_parser(with_globals):
         p.add_argument('--test-canary', action='store_true',
                        help='fire the safe EICAR-style test canary and exit '
                             '(positive control for security-test harnesses)')
-        # Handled by an early dispatch in main() (before the launch grammar); listed
-        # here only so --help documents it. See _clipboard_watch_main.
-        p.add_argument('--clipboard-watch', '--tray', dest='clipboard_watch',
-                       action='store_true',
-                       help='run as a tray-only clipboard sanitizer: watch the '
-                            'system clipboard and offer to strip deceptive Unicode, '
-                            'opening no terminal window')
+        # The login-autostart mode: run the app HIDDEN with only the tray icon + the
+        # in-process clipboard sanitizer (no window shown). Becomes the group primary
+        # or defers to an existing one. See main()'s tray handling.
+        p.add_argument('--tray', dest='tray', action='store_true',
+                       help='start hidden to the system tray with the clipboard '
+                            'sanitizer watching (no terminal window opens); used by '
+                            'the login autostart entry')
     p.add_argument('--title', help='initial tab title')
     p.add_argument('--tui', action='store_true', default=None,
                    help='start this tab in TUI mode')
@@ -6167,7 +6188,7 @@ def _parse_launch_args(argv):
             # VALUE to --title/-e does not set them, and an argparse abbreviation still
             # does); dispatched from main() before Qt.
             launch.test_canary = namespace.test_canary
-            launch.clipboard_watch = namespace.clipboard_watch
+            launch.tray = namespace.tray
         else:
             namespace = parser.parse_args(group)
         launch.tabs.append({
@@ -6425,23 +6446,6 @@ def _shot_mode():
     return os.environ.get('SECURE_TERMINAL_SHOT') == '1'
 
 
-def _clipboard_watch_main():
-    """Tray-only clipboard-sanitizer mode (secure-terminal --clipboard-watch / --tray):
-    watches the system clipboard and offers to sanitize deceptive Unicode, opening no
-    terminal window. Dispatched early in main() so it needs only a QApplication, not the
-    launch grammar. See secure_terminal.clipboard_watch (flag-and-offer, never auto-swap)."""
-    app = QApplication([sys.argv[0]])
-    if not _require_default_font():
-        return 1
-    app.setApplicationName('secure-terminal')
-    app.setDesktopFileName('secure-terminal')   # associate the .desktop for WM icon resolution
-    icon = _app_icon()
-    if not icon.isNull():
-        app.setWindowIcon(icon)
-    from secure_terminal.clipboard_watch import ClipboardWatchApp
-    return ClipboardWatchApp(app).run()
-
-
 def _acquire_group_lock(group):
     """Blocking exclusive flock that serializes the claim of a group's socket across
     processes (a lock file beside the socket). Held only for the brief
@@ -6560,10 +6564,6 @@ def main(cg_base=None):
     # See CANARY_TOKEN.
     if launch.test_canary:
         return _test_canary()
-    # Tray-only clipboard-sanitizer mode: opens NO terminal window, needs only a
-    # QApplication, so it runs before the instance handoff and the window build.
-    if launch.clipboard_watch:
-        return _clipboard_watch_main()
 
     # New INDEPENDENT instance per launch (konsole/qterminal model): every launch
     # opens its own window+process. Reuse is opt-IN via --reuse, which hands the
@@ -6627,6 +6627,11 @@ def main(cg_base=None):
     server = None
     if not launch.new_instance:
         server, status = _bind_instance_server(launch.instance_group)
+        if launch.tray and status == 'peer_owns':
+            # A primary already owns the group -- it already provides the single tray
+            # icon and the in-process sanitizer, so a second --tray must NOT start a
+            # second hidden process (that was the second-icon class). Defer + exit.
+            return 0
         if launch.reuse and status == 'peer_owns':
             reply = _handoff(launch.instance_group, request)
             if reply is not None:
@@ -6638,6 +6643,16 @@ def main(cg_base=None):
             # leave the group with NO primary, so every later --reuse opens yet
             # another window (the reported duplicate-window regression).
             server, status = _bind_instance_server(launch.instance_group)
+
+    # --tray needs a system tray to live in; check BEFORE building a window so a
+    # tray-less session exits cleanly instead of running hidden with no icon (a
+    # peer_owns --tray already deferred + exited above).
+    if launch.tray:
+        from PyQt6.QtWidgets import QSystemTrayIcon   # noqa: PLC0415
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            sys.stderr.write('secure-terminal: no system tray is available; '
+                             '--tray needs one.\n')
+            return 1
 
     window = MainWindow(launch=launch, cg_base=cg_base)
     # Install the terminate-on-signal handler only now, after the window exists:
@@ -6652,7 +6667,16 @@ def main(cg_base=None):
     # A server-less coexisting instance leaves `server` None and never adopts.
     if server is not None:
         window.adopt_instance_server(server, launch.instance_group)
-    window.show()
+    # Only the group PRIMARY shows the single tray icon; a coexisting non-primary
+    # window suppresses it. --tray is always the tray owner here (a peer_owns launch
+    # already deferred + exited above), even if the socket bind degraded.
+    window._apply_primary(server is not None or launch.tray)
+    if launch.tray:
+        # Login autostart: run hidden-to-tray with the sanitizer armed (no window
+        # shown; close-to-tray keeps the process + sanitizer alive).
+        window._enter_tray_mode()
+    else:
+        window.show()
 
     # On ANY quit -- a SIGTERM/SIGHUP from the launching terminal (via
     # _install_signal_quit -> app.quit()), an explicit app.quit(), or the last
