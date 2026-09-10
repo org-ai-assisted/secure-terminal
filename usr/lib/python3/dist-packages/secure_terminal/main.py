@@ -6199,6 +6199,18 @@ def _parse_launch_args(argv):
     if command is not None:
         launch.tabs[-1]['command'] = command
 
+    # --tray (the login-autostart, hidden-to-tray SINGLETON that owns the one tray icon
+    # + the in-process clipboard sanitizer and defers to a running primary) and
+    # --new-instance (a standalone process that never becomes the group primary and never
+    # binds the group socket) contradict: --new-instance skips the peer_owns dedup entirely,
+    # so the pair would spawn a SECOND tray icon + ClipboardWatcher next to a running primary
+    # -- the exact duplication the single-process --tray design forbids. Reject the combo.
+    if launch.tray and launch.new_instance:
+        sys.stderr.write('secure-terminal: --tray cannot be combined with --new-instance '
+                         '(--tray is the single tray/sanitizer owner and defers to a '
+                         'running primary)\n')
+        raise SystemExit(2)
+
     # Fail CLOSED on a malformed -e STRING, before Qt starts: a locked-down launch
     # (run ONLY this program) must not silently drop to a login shell on a bad quote.
     # A LIST command (-- prog args) is verbatim (never shlex'd) EXCEPT its first element
