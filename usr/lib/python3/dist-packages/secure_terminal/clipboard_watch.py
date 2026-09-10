@@ -89,7 +89,11 @@ def autostart_enabled():
     try:
         with open(path, 'r', encoding='utf-8') as handle:
             body = handle.read().lower()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Unreadable, or not valid UTF-8 (a hand edit / a Latin-1 tool / a crash
+        # mid-write): treat an unparseable override as ENABLED -- the same fallback as
+        # an unreadable file, and it must never crash the callers (the clipboard menu,
+        # set_systray, the settings dialog) that ask on every open.
         return True
     return ('x-gnome-autostart-enabled=false' not in body
             and 'hidden=true' not in body)

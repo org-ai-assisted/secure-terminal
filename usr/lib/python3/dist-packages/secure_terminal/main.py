@@ -3278,8 +3278,8 @@ class MainWindow(QMainWindow):
         """--tray login autostart: run HIDDEN with the tray icon + the clipboard
         sanitizer armed, in this single app process (window not shown; close-to-tray
         keeps it alive). The caller (main()) has already confirmed a system tray is
-        available. Forces the tray on for this session WITHOUT persisting (a launch
-        mode, not a settings change)."""
+        available AND that no admin systray lock forbids it. Forces the tray on for this
+        session WITHOUT persisting (a launch mode, not a settings change)."""
         self._systray = True
         self.act_systray.setChecked(True)
         self._sync_tray_presence()          # we are the primary -> the single icon
@@ -6653,6 +6653,14 @@ def main(cg_base=None):
             sys.stderr.write('secure-terminal: no system tray is available; '
                              '--tray needs one.\n')
             return 1
+        # Honor an admin systray lock: a tray locked OFF must NOT be force-enabled by
+        # the autostart --tray (every in-app setter checks this lock too). There is
+        # nothing to run hidden for, so exit cleanly rather than bypass the policy.
+        _cfg = settings.load()
+        if 'systray' in _cfg.locked and _cfg.get('systray') != 'true':
+            sys.stderr.write('secure-terminal: the system tray is disabled by policy; '
+                             '--tray has nothing to do.\n')
+            return 0
 
     window = MainWindow(launch=launch, cg_base=cg_base)
     # Install the terminate-on-signal handler only now, after the window exists:
