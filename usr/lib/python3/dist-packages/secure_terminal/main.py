@@ -19,12 +19,12 @@ import json
 import tempfile
 
 from PyQt6.QtCore import (
-    QTimer, Qt, QUrl, QRect, QPoint, QSize, QByteArray, QObject, QEvent,
+    QTimer, Qt, QUrl, QRect, QRectF, QPoint, QSize, QByteArray, QObject, QEvent,
     qInstallMessageHandler)
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QIcon, QColor, QPalette, QPixmap,
-    QPainter, QBrush, QFont, QFontDatabase, QDesktopServices, QCursor,
-    QTextCharFormat, QTextCursor, QTextDocument,
+    QPainter, QPainterPath, QPen, QBrush, QFont, QFontDatabase, QDesktopServices,
+    QCursor, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QTabBar, QToolBar, QSpinBox, QLabel,
@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import (
 from secure_terminal import settings, session, ipc, resource_isolation
 from secure_terminal.sanitize import (
     OSC_FEATURES, OSC_FEATURE_BY_KEY, OSC_NOTICE_DEFAULT_OFF, luminance,
-    sanitize_title)
+    osc_code_description, sanitize_title)
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
@@ -361,17 +361,48 @@ def _select_labels(widget, scale=100):
 class _ZoomDialog(QDialog):
     """A dialog whose Ctrl+mousewheel live-zooms the chrome (UI) scale, so a
     settings dialog can be enlarged on the fly like the terminal text. Set
-    `on_zoom(direction)` (+1 up / -1 down); a plain wheel scrolls as normal."""
+    `on_zoom(direction)` (+1 up / -1 down); a plain wheel scrolls as normal.
+
+    Zoom is caught with an application event filter (installed while shown), not
+    only the dialog's own wheelEvent: a QSpinBox/QComboBox under the pointer eats
+    Ctrl+wheel as a value change, and a scrollable QScrollArea viewport eats it as
+    a scroll, so the event never bubbles to the dialog. Filtering every wheel whose
+    window() is this dialog makes the WHOLE surface zoomable regardless of the child
+    beneath the pointer."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.on_zoom = None
 
+    def _zoom_wheel(self, event):
+        if self.on_zoom is None \
+                or not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            return False
+        self.on_zoom(1 if event.angleDelta().y() >= 0 else -1)
+        event.accept()
+        return True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    def hideEvent(self, event):
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+        super().hideEvent(event)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Wheel and isinstance(obj, QWidget) \
+                and obj.window() is self and self._zoom_wheel(event):
+            return True
+        return super().eventFilter(obj, event)
+
     def wheelEvent(self, event):
-        if self.on_zoom is not None \
-                and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.on_zoom(1 if event.angleDelta().y() >= 0 else -1)
-            event.accept()
-        else:
+        # Fallback for a wheel that reaches the dialog directly (e.g. over its own
+        # background); the event filter above handles wheels over child widgets.
+        if not self._zoom_wheel(event):
             super().wheelEvent(event)
 
 
@@ -424,11 +455,35 @@ class InfoTip(QLabel):
 
     def _apply_palette(self, theme):
         """Colours from the active tab's theme -- an elevated surface over the
-        terminal background, not a fixed light card that jars on a dark terminal."""
+        terminal background, not a fixed light card that jars on a dark terminal.
+        The card background + border are ALSO painted explicitly in paintEvent: a
+        QLabel `background:` stylesheet is not reliably honoured under
+        WA_TranslucentBackground on every platform style (it left dark text on a
+        dark, see-through card -- the reported black-on-black tooltip). The
+        stylesheet keeps the padding/radius/fg; paintEvent guarantees the fill."""
         bg, fg, border = _TIP_COLORS['dark' if theme == 'dark' else 'light']
+        self._card_bg = QColor(bg)
+        self._card_border = QColor(border)
         self.setStyleSheet('QLabel{background:%s;color:%s;'
                            'border:1px solid %s;border-radius:4px;'
                            'padding:5px 9px}' % (bg, fg, border))
+
+    def paintEvent(self, event):
+        # Fill the rounded card ourselves before QLabel draws its stylesheet layer +
+        # text, so the background is opaque and readable regardless of whether the
+        # platform style honours the QLabel `background:` under WA_TranslucentBackground.
+        bg = getattr(self, '_card_bg', None)
+        if bg is not None:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5),
+                                4.0, 4.0)
+            painter.fillPath(path, self._card_bg)
+            painter.setPen(QPen(self._card_border, 1))
+            painter.drawPath(path)
+            painter.end()
+        super().paintEvent(event)
 
     def show_for(self, widget, text, zoom, theme):
         self._source = widget
@@ -587,6 +642,13 @@ class _ToolTipFilter(QObject):
             if isinstance(obj, QMenu):
                 return super().eventFilter(obj, event)
             text = obj.toolTip()
+            if isinstance(obj, QTabBar):
+                # A tab's own tooltip (name / program / cwd, set per index) is what Qt
+                # would otherwise show via the native, dark-on-dark tab tooltip. Prefer
+                # the tab under the pointer, else the bar-level hint -- both via InfoTip.
+                idx = obj.tabAt(event.pos())
+                if idx >= 0 and obj.tabToolTip(idx):
+                    text = obj.tabToolTip(idx)
             if text:
                 self._tip.show_for(obj, text,
                                    self._window.current_zoom_percent(),
@@ -1163,12 +1225,13 @@ class MainWindow(QMainWindow):
         if self._advisories.get(term, (None,))[0] == 'escape':
             return
         self._osc_notified.add((term, key))
-        entry = OSC_FEATURE_BY_KEY.get(key)
-        if entry:
-            label = entry[0].lower()
+        desc = osc_code_description(key, code)
+        if code >= 0 and desc:
+            # Name the code AND say what it does in plain terms (OSC 52 read/write is
+            # disambiguated by key), so a non-expert can judge whether to trust the source.
+            label = 'OSC ' + str(code) + ': ' + desc
         elif code >= 0:
-            # An unregistered OSC code (e.g. iTerm2 OSC 1337, shell-integration OSC 133):
-            # name it by number rather than the generic 'an escape'.
+            # A code we cannot describe accurately: name it by number, never guess.
             label = 'OSC ' + str(code)
         else:
             # Over-cap dropped OSC: the type is unknowable from the truncated head.

@@ -6031,16 +6031,31 @@ class SecureTerminal(QPlainTextEdit):
         painter.fillRect(self._cursor_rect(), self._cursor_color())
         painter.end()
 
-    def reset_caret(self):
+    def reset_caret(self, keep_view=False):
         """Snap the visible caret back to the output cursor (where typed input
         goes), clearing any selection. Used after a search moves the caret to a
-        match, so closing the find bar returns the caret to where you can type."""
-        if self._out_cursor is not None:
-            self.setTextCursor(self._out_cursor)
-        else:
-            tc = self.textCursor()
-            tc.movePosition(QTextCursor.MoveOperation.End)
-            self.setTextCursor(tc)
+        match, so closing the find bar returns the caret to where you can type.
+
+        keep_view preserves the current scroll offset across the caret move: a
+        mouse click in the scrollback must not yank a scrolled-up view down to the
+        live bottom (only typed input snaps to the tail). setTextCursor implicitly
+        ensureCursorVisible()s, so without this a click would scroll to _out_cursor
+        at the document end. The move runs under _programmatic_scroll so restoring
+        the offset does not rewrite the follow-tail intent."""
+        bar = self.verticalScrollBar()
+        prev = bar.value()
+        self._programmatic_scroll = keep_view
+        try:
+            if self._out_cursor is not None:
+                self.setTextCursor(self._out_cursor)
+            else:
+                tc = self.textCursor()
+                tc.movePosition(QTextCursor.MoveOperation.End)
+                self.setTextCursor(tc)
+            if keep_view:
+                bar.setValue(prev)
+        finally:
+            self._programmatic_scroll = False
 
     def _shift(self, event):
         return bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -6253,7 +6268,7 @@ class SecureTerminal(QPlainTextEdit):
             if self.textCursor().hasSelection():
                 self._publish_primary()
             else:
-                self.reset_caret()
+                self.reset_caret(keep_view=True)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -6270,7 +6285,7 @@ class SecureTerminal(QPlainTextEdit):
         # type). Keep a drag-selection for copy; otherwise snap the caret back.
         if self.textCursor().hasSelection():
             return
-        self.reset_caret()
+        self.reset_caret(keep_view=True)
 
     def mouseMoveEvent(self, event):
         # Report motion to a child that asked: a drag (button held) under 1002/1003,
