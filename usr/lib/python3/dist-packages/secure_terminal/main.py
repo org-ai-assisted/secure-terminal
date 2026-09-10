@@ -3281,7 +3281,12 @@ class MainWindow(QMainWindow):
         available AND that no admin systray lock forbids it. Forces the tray on for this
         session WITHOUT persisting (a launch mode, not a settings change)."""
         self._systray = True
+        # Display-only: block signals so setChecked does not emit `toggled` -> set_systray
+        # -> _persist, which would write systray=true to the user config and leave the tray
+        # permanently on for later NORMAL launches (breaking the no-persist contract above).
+        _blocked = self.act_systray.blockSignals(True)
         self.act_systray.setChecked(True)
+        self.act_systray.blockSignals(_blocked)
         self._sync_tray_presence()          # we are the primary -> the single icon
         self._update_bell_tray_action()
         self.set_clip_run(True)             # arm the in-process sanitizer (admin-lock aware)
@@ -6198,6 +6203,18 @@ def _parse_launch_args(argv):
             'bell': namespace.bell, 'osc': namespace.osc})
     if command is not None:
         launch.tabs[-1]['command'] = command
+
+    # --tray (the login-autostart, hidden-to-tray SINGLETON that owns the one tray icon
+    # + the in-process clipboard sanitizer and defers to a running primary) and
+    # --new-instance (a standalone process that never becomes the group primary and never
+    # binds the group socket) contradict: --new-instance skips the peer_owns dedup entirely,
+    # so the pair would spawn a SECOND tray icon + ClipboardWatcher next to a running primary
+    # -- the exact duplication the single-process --tray design forbids. Reject the combo.
+    if launch.tray and launch.new_instance:
+        sys.stderr.write('secure-terminal: --tray cannot be combined with --new-instance '
+                         '(--tray is the single tray/sanitizer owner and defers to a '
+                         'running primary)\n')
+        raise SystemExit(2)
 
     # Fail CLOSED on a malformed -e STRING, before Qt starts: a locked-down launch
     # (run ONLY this program) must not silently drop to a login shell on a bad quote.

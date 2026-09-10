@@ -29,6 +29,7 @@ rather than running as a separate daemon process with a second icon.
 Reuses the terminal's own ReviewBar and the Qt-free sanitize core.
 """
 
+import configparser
 import os
 
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
@@ -36,35 +37,27 @@ from PyQt6.QtWidgets import QVBoxLayout, QWidget
 from secure_terminal import settings
 from secure_terminal.review import ReviewBar
 from secure_terminal.sanitize import (
-    THEMES, classify_paste, sanitize_clipboard, sanitize_clipboard_unicode,
+    THEMES, has_paste_finding, sanitize_clipboard, sanitize_clipboard_unicode,
 )
-from secure_terminal.unicode_tag import tag_text
+from secure_terminal.unicode_tag import has_deceptive
 
 
 _AUTOSTART_BASENAME = 'sclip-clipboard-watch.desktop'
 
-## The review only scans/displays the first SecureTerminal._RAW_MAX chars, so bound the
-## per-change TRIGGER scan (tag_text / classify_paste, both O(n) with an O(n) allocation)
-## to the same prefix -- an unbounded scan over a 20M-char clipboard would freeze the app
-## on every copy. The full text still reaches the review (so an un-edited Replace
-## sanitizes the whole clipboard); only the trigger DECISION is prefix-bounded.
-_TRIGGER_SCAN_CAP = 1_000_000
-
 
 def _deceptive(text):
     """True when text carries an ACTIVE deception -- an invisible / bidi / control
-    character, or a homoglyph posing as ASCII. Reuses tag_text, which replaces
-    exactly those classes and passes honest text (accents, CJK, emoji) through
-    unchanged, so 'tag_text changed something' == 'deceptive'. The DEFAULT trigger:
-    it does not fire on innocent accented or non-Latin text, only on a real hazard,
-    so the user is not trained to dismiss reflexively."""
-    return bool(text) and tag_text(text) != text
+    character, or a homoglyph posing as ASCII. The DEFAULT trigger: it does not fire on
+    innocent accented or non-Latin text, only on a real hazard, so the user is not
+    trained to dismiss reflexively. has_deceptive is the allocation-free, early-exit
+    boolean behind tag_text, so the whole clipboard is scanned at any size with no cap."""
+    return has_deceptive(text)
 
 
 def _any_nonascii(text):
     """True when text carries ANY non-plain-ASCII character -- the broader, noisier
     trigger the tray menu can opt into (fires on accents / CJK / emoji too)."""
-    return bool(classify_paste(text))
+    return has_paste_finding(text)
 
 
 def _load_theme():
@@ -88,15 +81,26 @@ def autostart_enabled():
         return True
     try:
         with open(path, 'r', encoding='utf-8') as handle:
-            body = handle.read().lower()
+            body = handle.read()
     except (OSError, UnicodeDecodeError):
         # Unreadable, or not valid UTF-8 (a hand edit / a Latin-1 tool / a crash
         # mid-write): treat an unparseable override as ENABLED -- the same fallback as
         # an unreadable file, and it must never crash the callers (the clipboard menu,
         # set_systray, the settings dialog) that ask on every open.
         return True
-    return ('x-gnome-autostart-enabled=false' not in body
-            and 'hidden=true' not in body)
+    # Parse the actual Key=Value in the [Desktop Entry] section. A raw whole-file
+    # substring match false-reports 'disabled' when a Comment=/Name= VALUE merely
+    # CONTAINS the literal 'Hidden=true', or when a [Desktop Action ...] section (not
+    # [Desktop Entry]) carries the key. interpolation=None: an Exec= line with a % field
+    # code must not raise; strict=False: tolerate a lenient hand-edited file.
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        parser.read_string(body)
+        entry = parser['Desktop Entry']
+    except (configparser.Error, KeyError):
+        return True                      # malformed / no [Desktop Entry] -> fail-safe enabled
+    return not (entry.get('X-GNOME-Autostart-enabled', '').strip().lower() == 'false'
+                or entry.get('Hidden', '').strip().lower() == 'true')
 
 
 def set_autostart(enabled):
@@ -226,7 +230,7 @@ class ClipboardWatcher:
         if text == self._dismissed:        # the user already chose to keep this
             return
         trigger = _any_nonascii if self._any_mode else _deceptive
-        if not trigger(text[:_TRIGGER_SCAN_CAP]):
+        if not trigger(text):
             return                         # clean (or innocent) -> stay silent
         self._show_review(text)
 

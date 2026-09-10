@@ -1845,6 +1845,14 @@ def classify_paste(text):
     return [(label, counts[label]) for label in order if label in counts]
 
 
+def has_paste_finding(text):
+    """True if text carries ANY non-plain-ASCII character -- the allocation-free,
+    early-exit boolean form of `bool(classify_paste(text))` (which builds a full count
+    dict). Reuses _paste_class, the single per-char predicate, so it can never disagree
+    with classify_paste; scans a clipboard of any size without materializing a copy."""
+    return any(_paste_class(ch) is not None for ch in text)
+
+
 def classify_paste_detail(text):
     """Full breakdown for the paste/copy review bar: a per-class count for every
     class in PASTE_DETAIL_CLASSES (including zeros, so the table can show what is

@@ -91,12 +91,11 @@ def _tag(cp):
     return '[U+%04X %s]' % (cp, _name(cp))
 
 
-def _confusable_positions(text):
-    """Character indices to tag as homoglyphs. Only code points inside a token
-    that mixes scripts / poses as ASCII (is_dangerous) qualify, so an honest
-    foreign word stays untouched and an all-ASCII look-alike -- which no
-    cross-script check can catch -- is left as-is."""
-    marked = set()
+def _dangerous_tokens(text):
+    """Yield (start, token) for each \\w token that mixes scripts / poses as ASCII
+    (is_dangerous). The single homoglyph-scope scan shared by _confusable_positions
+    (which needs the character indices) and _has_confusable (a boolean); a generator,
+    so a boolean caller stops at the first dangerous token."""
     for match in _WORD.finditer(text):
         token = match.group()
         if not any(ord(ch) > 0x7F for ch in token):
@@ -105,12 +104,31 @@ def _confusable_positions(text):
             dangerous = bool(is_dangerous(token))
         except Exception:                  # pylint: disable=broad-except
             dangerous = False              # data hiccup: skip the refinement, never crash
-        if not dangerous:
-            continue
+        if dangerous:
+            yield match.start(), token
+
+
+def _confusable_positions(text):
+    """Character indices to tag as homoglyphs. Only code points inside a token
+    that mixes scripts / poses as ASCII (is_dangerous) qualify, so an honest
+    foreign word stays untouched and an all-ASCII look-alike -- which no
+    cross-script check can catch -- is left as-is."""
+    marked = set()
+    for start, token in _dangerous_tokens(text):
         for offset, ch in enumerate(token):
             if marking_class(ord(ch)) == 'confusable':
-                marked.add(match.start() + offset)
+                marked.add(start + offset)
     return marked
+
+
+def _has_confusable(text):
+    """True at the FIRST homoglyph inside a mixed-script / ASCII-posing token -- the
+    early-exit boolean behind has_deceptive. Shares _dangerous_tokens, so it can never
+    disagree with _confusable_positions about which tokens qualify."""
+    for _start, token in _dangerous_tokens(text):
+        if any(marking_class(ord(ch)) == 'confusable' for ch in token):
+            return True
+    return False
 
 
 def tag_text(text):
@@ -131,6 +149,24 @@ def tag_text(text):
         else:
             out.append(ch)                 # honest foreign / combining / scoped-out
     return ''.join(out)
+
+
+def has_deceptive(text):
+    """True when text carries an ACTIVE deception -- the boolean behind tag_text
+    (`tag_text(text) != text`) WITHOUT building the tagged copy, so it answers for a
+    clipboard of ANY size in O(1) extra memory and early-exits at the first hazard.
+    The decision matches tag_text exactly: a surrogateescape raw byte or a
+    never-legitimate bidi/control/invisible code point (per char, early-exit), or a
+    homoglyph inside a mixed-script token (token-scoped, via _has_confusable)."""
+    for ch in text:
+        cp = ord(ch)
+        if 0xDC80 <= cp <= 0xDCFF:             # surrogateescape: a raw undecodable byte
+            return True
+        if ch in ('\n', '\t') or 0x20 <= cp <= 0x7E:
+            continue                           # allowlisted whitespace / printable ASCII
+        if marking_class(cp) in _ALWAYS_TAG:
+            return True                        # never-legitimate active deception
+    return _has_confusable(text)
 
 
 def tag_bytes(data):
