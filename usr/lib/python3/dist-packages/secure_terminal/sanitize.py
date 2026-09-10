@@ -420,6 +420,46 @@ OSC_FEATURE_BY_KEY = {f[0]: f[1:] for f in OSC_FEATURES}
 # the default mute set (config key osc_notice_off).
 OSC_NOTICE_DEFAULT_OFF = frozenset({'osc_title', 'osc_colors'})
 
+# Terse, accurate human description of what each OSC code does, for the neutralization
+# notice. Covers every code in OSC_FEATURES (drift-guarded in the tests) plus well-known
+# always-neutralized codes, so the notice can say what the escape would have done rather
+# than just its number. Only codes we can describe accurately are listed; an unlisted code
+# shows a bare "OSC <n>" (honest-claims: never guess what an unknown escape does).
+OSC_CODE_DESCRIPTIONS = {
+    0: 'set the window title and icon name',
+    1: 'set the window icon name',
+    2: 'set the window title',
+    3: 'set an X11 window property',
+    4: 'set a palette colour',
+    7: 'report the working directory',
+    8: 'open a hyperlink',
+    9: 'raise a desktop notification',
+    10: 'set the default text colour',
+    11: 'set the default background colour',
+    12: 'set the cursor colour',
+    50: 'change the terminal font',
+    52: 'access the system clipboard',
+    99: 'raise a desktop notification (kitty protocol)',
+    104: 'reset the colour palette',
+    110: 'reset the default text colour',
+    111: 'reset the default background colour',
+    112: 'reset the cursor colour',
+    133: 'shell-integration prompt marks',
+    777: 'urxvt extension command (e.g. notify)',
+    1337: 'iTerm2 file transfer / set variables',
+}
+
+
+def osc_code_description(key, code):
+    """Human description of what OSC `code` does, or None if unknown. `key` refines the
+    two senses of OSC 52 (same code, read vs write)."""
+    if code == 52:
+        if key == 'osc_clipboard_read':
+            return 'read the system clipboard'
+        if key == 'osc_clipboard':
+            return 'write to the system clipboard'
+    return OSC_CODE_DESCRIPTIONS.get(code)
+
 
 def colors_allowed():
     """False only when NO_COLOR is set (per no-color.org: presence, any value),
