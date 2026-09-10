@@ -485,7 +485,10 @@ class InfoTip(QLabel):
             painter.end()
         super().paintEvent(event)
 
-    def show_for(self, widget, text, zoom, theme):
+    def show_for(self, widget, text, zoom, theme, at_rect=None):
+        # at_rect (a GLOBAL QRect) anchors the tip to a sub-region of the widget -- the
+        # hovered glyph for the terminal's per-character/gutter tips -- instead of the
+        # whole widget, so a terminal-wide source does not push the tip below the terminal.
         self._source = widget
         self._apply_palette(theme)
         # Release any size lock from a previous tip so this text can size freely
@@ -508,7 +511,7 @@ class InfoTip(QLabel):
         # un-closable tip. Capping max = content makes maximize a no-op; the poll
         # then hides the tip normally on leave.
         self.setMaximumSize(self.size())
-        self._place(widget)
+        self._place(widget, at_rect)
         self.show()
         # A frameless stay-on-top tool window can still be painted under a modal
         # dialog or a menu popup that opened after it; raise it so it floats above
@@ -548,14 +551,16 @@ class InfoTip(QLabel):
             y = min(max(rect.top(), avail.top()), avail.bottom() - size.height() + 1)
         return QPoint(x, y)
 
-    def _place(self, widget):
-        """Anchor the tip to the SOURCE widget's rectangle, never over it, so the
-        widget stays clickable the instant it is hovered: below it by preference,
-        flipped above when there is no room (e.g. a bottom status-bar lamp), and
-        clamped to the screen so a wide tip never runs off-edge. The old placement
-        (cursor + (12,18)) landed the opaque tip on the hovered chip and swallowed
-        the next click. The flip/clamp math is _placement (testable in isolation)."""
-        rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+    def _place(self, widget, at_rect=None):
+        """Anchor the tip to the SOURCE widget's rectangle (or the GLOBAL at_rect
+        sub-region when given -- the hovered glyph), never over it, so the widget stays
+        clickable the instant it is hovered: below it by preference, flipped above when
+        there is no room (e.g. a bottom status-bar lamp), and clamped to the screen so a
+        wide tip never runs off-edge. The old placement (cursor + (12,18)) landed the
+        opaque tip on the hovered chip and swallowed the next click. The flip/clamp math
+        is _placement (testable in isolation)."""
+        rect = at_rect if at_rect is not None \
+            else QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
         screen = widget.screen() or QApplication.primaryScreen()
         self.move(self._placement(rect, self.size(), screen.availableGeometry(), self._GAP))
 
@@ -2453,6 +2458,26 @@ class MainWindow(QMainWindow):
             return
         tip.show_for(anchor, text, self.current_zoom_percent(),
                      self.current_theme_key())
+
+    def show_hover_tip(self, anchor, text, at_rect=None):
+        """Show the shared copyable, zoom/theme-aware InfoTip for a DYNAMIC hover (the
+        terminal's per-character / gutter tooltips), so those go through the one readable
+        InfoTip path instead of Qt's native QToolTip -- restoring select + zoom. at_rect
+        anchors it at the hovered glyph. Idempotent while the pointer rests on the same
+        target and text (a hover is not a click, so it never toggles)."""
+        tip = self._tip_filter._tip
+        if tip.isVisible() and tip._source is anchor and tip.text() == text:
+            return
+        tip.show_for(anchor, text, self.current_zoom_percent(),
+                     self.current_theme_key(), at_rect)
+
+    def hide_hover_tip(self, anchor):
+        """Hide the shared InfoTip when it is showing THIS anchor's hover (the pointer
+        left the marked glyph); scoped to the anchor so it never hides an unrelated tip."""
+        tip = self._tip_filter._tip
+        if tip.isVisible() and tip._source is anchor:
+            tip.hide()
+            tip._poll.stop()
 
     def current_zoom_percent(self):
         """The active tab's zoom (percent), so tooltip text scales with it. Falls
