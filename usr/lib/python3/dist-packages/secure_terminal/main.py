@@ -3281,7 +3281,12 @@ class MainWindow(QMainWindow):
         available AND that no admin systray lock forbids it. Forces the tray on for this
         session WITHOUT persisting (a launch mode, not a settings change)."""
         self._systray = True
+        # Display-only: block signals so setChecked does not emit `toggled` -> set_systray
+        # -> _persist, which would write systray=true to the user config and leave the tray
+        # permanently on for later NORMAL launches (breaking the no-persist contract above).
+        _blocked = self.act_systray.blockSignals(True)
         self.act_systray.setChecked(True)
+        self.act_systray.blockSignals(_blocked)
         self._sync_tray_presence()          # we are the primary -> the single icon
         self._update_bell_tray_action()
         self.set_clip_run(True)             # arm the in-process sanitizer (admin-lock aware)
