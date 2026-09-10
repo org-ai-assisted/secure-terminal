@@ -5854,17 +5854,37 @@ class SecureTerminal(QPlainTextEdit):
                 return o
         return None
 
+    def _hover_tip_window(self):
+        """The MainWindow if it exposes the shared InfoTip hover API (the app case);
+        None for a bare terminal outside a window (fall back to the plain QToolTip)."""
+        win = self.window()
+        return win if hasattr(win, 'show_hover_tip') else None
+
+    def _glyph_rect(self, pos):
+        """Global rect of the glyph at viewport point pos, to anchor a hover tip on it."""
+        rect = self.cursorRect(self.cursorForPosition(pos))
+        return QRect(self.viewport().mapToGlobal(rect.topLeft()), rect.size())
+
     def event(self, e):
         # Hovering a neutralized/revealed character explains what it actually is --
         # name, category, escape -- because the display (a box, a <U+XXXX> badge, or
-        # a look-alike glyph) does not, on its own, reveal its identity.
+        # a look-alike glyph) does not, on its own, reveal its identity. Route through the
+        # window's InfoTip (selectable + zoomable), anchored at the hovered glyph; fall back
+        # to the plain QToolTip only for a terminal used outside the app window.
         if e.type() == QEvent.Type.ToolTip:
             pos = self.viewport().mapFromGlobal(e.globalPos())
             cp = self._cp_at(pos)
+            win = self._hover_tip_window()
             if cp is not None:
-                QToolTip.showText(e.globalPos(), describe_codepoint(cp), self)
+                if win is not None:
+                    win.show_hover_tip(self, describe_codepoint(cp), self._glyph_rect(pos))
+                else:
+                    QToolTip.showText(e.globalPos(), describe_codepoint(cp), self)
                 return True
-            QToolTip.hideText()
+            if win is not None:
+                win.hide_hover_tip(self)
+            else:
+                QToolTip.hideText()
             e.ignore()
             return True
         return super().event(e)
