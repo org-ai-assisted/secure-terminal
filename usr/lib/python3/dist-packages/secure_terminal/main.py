@@ -6385,7 +6385,19 @@ def _parse_launch_args(argv):
             raise SystemExit(2)
 
     def _empty(spec):
-        return not any(spec.get(k) is not None
+        # A spec carries content only if some field is set. `command` is special: an
+        # EMPTY list ([] from a bare trailing `--` with nothing after it) names no
+        # program and is content-free -- treat it like an absent command so a lone `--`
+        # collapses to bare-invocation startup (restore the session) instead of taking
+        # the launch branch, skipping restore, and then OVERWRITING the saved session
+        # with one blank tab on close. (`-- ""` / `-e ""`, an explicit empty program
+        # NAME, already fail closed above; they never reach here.)
+        def _set(k):
+            v = spec.get(k)
+            if k == 'command' and isinstance(v, (list, tuple, str)) and not v:
+                return False
+            return v is not None
+        return not any(_set(k)
                        for k in ('title', 'tui', 'mode', 'command',
                                  'colors', 'line_edits', 'bell', 'osc'))
 
