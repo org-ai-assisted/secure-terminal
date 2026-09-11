@@ -163,15 +163,15 @@ ANSI_RE = re.compile(
     # well-formed CSI/OSC/DCS is still consumed whole; only a malformed one
     # reaches here, where dropping the introducer is right.
     r'|\x1b[ -/]*[0-~]'
-    # An INTERRUPTED generic escape -- ESC + intermediate bytes (0x20-0x2F) with NO final,
-    # cut short by a byte outside both the intermediate and final classes (another ESC, or a
-    # C0 such as BEL: "\x1b#\x07"). Without this the whole run matches no arm above, so the
-    # intermediate bytes leak as text AND a bare "\x1b\x1b" leaves the first ESC unstripped
-    # (violating the "no ESC byte is rendered" invariant the proofs verify). LAST, so every
-    # complete/specific form is consumed first; this only catches a lone ESC (zero
-    # intermediates) or ESC + intermediates that no final terminates. (A generic escape
-    # genuinely split across reads is held by feed_chunk_carry's `[ -/]*` arm, not leaked.)
-    r'|\x1b[ -/]*'
+    # An INTERRUPTED generic escape -- ESC + one-or-more intermediate bytes (0x20-0x2F) with
+    # NO final, cut short by a byte outside both the intermediate and final classes (another
+    # ESC, or a C0 such as BEL: "\x1b#\x07"). Without this the intermediate bytes leak as
+    # literal text. LAST, so every complete/specific form is consumed first. REQUIRES at least
+    # one intermediate (`+`, not `*`): a LONE ESC is deliberately NOT matched here -- it is a
+    # control CHARACTER the per-code-point classifier neutralizes by MARKING it (a visible
+    # box/badge), which the formal proofs (T1) require; stripping it here would erase that
+    # mark. (A generic escape genuinely split across reads is held by feed_chunk_carry.)
+    r'|\x1b[ -/]+'
 )
 
 # SGR: ESC [ <params> m -- the only escape sequence honored, and only when
