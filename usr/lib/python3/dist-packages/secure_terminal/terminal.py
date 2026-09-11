@@ -5861,9 +5861,30 @@ class SecureTerminal(QPlainTextEdit):
         return win if hasattr(win, 'show_hover_tip') else None
 
     def _glyph_rect(self, pos):
-        """Global rect of the glyph at viewport point pos, to anchor a hover tip on it."""
-        rect = self.cursorRect(self.cursorForPosition(pos))
-        return QRect(self.viewport().mapToGlobal(rect.topLeft()), rect.size())
+        """Global visual box of the glyph under viewport point pos -- anchors the hover tip
+        AND scopes its leave-poll. The native caret is hidden (setCursorWidth 0), so a single
+        cursorRect is 0-width; build the box from the two boundary caret rects (min/max), the
+        same way _cp_in_box does, or the leave-poll would treat only a ~12px sliver at the
+        cell's left edge as 'on the glyph' and self-dismiss over a wide cell / at high zoom."""
+        cursor = self.cursorForPosition(pos)
+        doc = self.document()
+        for step in (QTextCursor.MoveOperation.NextCharacter,
+                     QTextCursor.MoveOperation.PreviousCharacter):
+            probe = QTextCursor(cursor)
+            if not probe.movePosition(step, QTextCursor.MoveMode.KeepAnchor):
+                continue
+            ca, cb = QTextCursor(doc), QTextCursor(doc)
+            ca.setPosition(probe.selectionStart())
+            cb.setPosition(probe.selectionEnd())
+            ra, rb = self.cursorRect(ca), self.cursorRect(cb)
+            if min(ra.x(), rb.x()) <= pos.x() <= max(ra.x(), rb.x()):
+                box = QRect(min(ra.x(), rb.x()), min(ra.top(), rb.top()),
+                            max(abs(rb.x() - ra.x()), 1),
+                            max(ra.height(), rb.height()))
+                return QRect(self.viewport().mapToGlobal(box.topLeft()), box.size())
+        rect = self.cursorRect(cursor)
+        return QRect(self.viewport().mapToGlobal(rect.topLeft()),
+                     QSize(max(rect.width(), 1), rect.height()))
 
     def event(self, e):
         # Hovering a neutralized/revealed character explains what it actually is --
