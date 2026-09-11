@@ -2321,6 +2321,9 @@ class MainWindow(QMainWindow):
             for t in self._real_terms():
                 if t is not term:
                     t.setExtraSelections([])
+            if term is None:                 # current tab is a restore placeholder, no doc
+                self._find_bar.count.setText('')
+                return
             total = self._highlight_matches(term, query, flags)
             if not query:
                 self._find_bar.count.setText('')
@@ -2420,6 +2423,16 @@ class MainWindow(QMainWindow):
             color = QColor(cname) if cname else None
             self.tabs.setTabIcon(i, self._number_icon(i + 1, color))
 
+    def _tab_index(self, term):
+        """indexOf(term) that tolerates a term whose C++ object was DELETED while a menu was
+        open. menu.exec spins a nested event loop; if that tab's shell exits during it, the
+        SecureTerminal is deleteLater'd and processed by the loop, so a later indexOf(term)
+        on the dead wrapper RAISES RuntimeError rather than returning -1. _tab_is_live compares
+        by IDENTITY (never enters C++, safe on a freed term), so gate indexOf on it and return
+        -1 (a no-op for every consumer) otherwise -- a shell-exit racing an open menu cannot
+        then abort the whole window from inside a Qt slot."""
+        return self.tabs.indexOf(term) if self._tab_is_live(term) else -1
+
     def _tab_context_menu(self, point):
         index = self.tabs.tabBar().tabAt(point)
         if index < 0:
@@ -2427,23 +2440,23 @@ class MainWindow(QMainWindow):
         # Bind the actions to the tab WIDGET, re-resolving its index when they fire:
         # menu.exec spins a nested loop during which a background tab can close (a
         # shell exit -> _on_shell_exited), shifting indices, so a captured `index`
-        # would then act on the WRONG tab. indexOf() re-resolves (-1 if it is gone,
-        # which every target below tolerates as a no-op).
+        # would then act on the WRONG tab. _tab_index() re-resolves (-1 if it is gone OR
+        # its C++ object was deleted during the menu), which every target tolerates as a no-op.
         term = self.tabs.widget(index)
         menu = QMenu(self)
-        menu.addAction('Rename...', lambda: self.rename_tab(self.tabs.indexOf(term)))
+        menu.addAction('Rename...', lambda: self.rename_tab(self._tab_index(term)))
         color_menu = menu.addMenu('Colour')
         for name, value in (('Red', '#d83933'), ('Green', '#1f8a54'),
                             ('Blue', '#3b82f6'), ('Yellow', '#e5a50a'),
                             ('Purple', '#8b5cf6')):
             color_menu.addAction(
-                name, lambda v=value: self.set_tab_color(self.tabs.indexOf(term), QColor(v)))
+                name, lambda v=value: self.set_tab_color(self._tab_index(term), QColor(v)))
         color_menu.addAction(
-            'Custom...', lambda: self._pick_custom_tab_color(self.tabs.indexOf(term)))
+            'Custom...', lambda: self._pick_custom_tab_color(self._tab_index(term)))
         color_menu.addAction(
-            'Clear', lambda: self.set_tab_color(self.tabs.indexOf(term), None))
+            'Clear', lambda: self.set_tab_color(self._tab_index(term), None))
         menu.addSeparator()
-        menu.addAction('Close Tab', lambda: self.close_tab(self.tabs.indexOf(term)))
+        menu.addAction('Close Tab', lambda: self.close_tab(self._tab_index(term)))
         menu.exec(self.tabs.tabBar().mapToGlobal(point))
 
     def terminate_foreground(self):

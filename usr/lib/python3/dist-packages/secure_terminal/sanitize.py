@@ -161,7 +161,12 @@ ANSI_RE = re.compile(
     # = leaked their final byte -- unmarked, so the neutralization marking was
     # bypassed rather than broken. The introducer arms above run first, so a
     # well-formed CSI/OSC/DCS is still consumed whole; only a malformed one
-    # reaches here, where dropping the introducer is right.
+    # reaches here, where dropping the introducer is right. An ESC + intermediate(s) with NO
+    # final (e.g. "\x1b#\x07", or a dangling "\x1b!!!" tail) is deliberately NOT matched: the
+    # intermediates are harmless printable ASCII (0x20-0x2F) and the incomplete-escape PAYLOAD
+    # is rendered on the EOF flush so a program's final output is not lost (silent-final-
+    # output-loss regression). The dangerous case -- CSI params like "31m" -- is caught by the
+    # interrupted-CSI arm above; a generic remnant is left for the per-code-point classifier.
     r'|\x1b[ -/]*[0-~]'
 )
 
