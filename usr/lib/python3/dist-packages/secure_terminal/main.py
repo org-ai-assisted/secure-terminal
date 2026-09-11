@@ -2006,6 +2006,13 @@ class MainWindow(QMainWindow):
                 locked = key in self._locked or 'allow_title' in self._locked
                 term.apply_osc(key, self._osc_defaults.get(key, False)
                                if locked else legacy_title)
+        # Seed the global 'always allow clipboard READ (no prompt)' default, exactly as
+        # _apply_osc_defaults does for new tabs -- a restored tab that omitted it reverted
+        # to per-request prompting, silently dropping the persisted preference. This is the
+        # no-prompt policy, NOT the osc_clipboard_read capability (handled per-key above);
+        # self._osc_clipboard_read_always already reflects any lock (set_clipboard_read_always
+        # early-returns when locked, so config's value stands).
+        term.set_clipboard_read_always(self._osc_clipboard_read_always)
         # an admin-locked bell must win over whatever the saved session carried
         term.apply_bell(self._default_bell if 'bell' in self._locked
                         else info.get('bell', self._default_bell))
@@ -6626,11 +6633,15 @@ def _acquire_group_lock(group):
     path = ipc.socket_path(group) + '.lock'
     for attempt in (1, 2):
         try:
-            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+            fd = os.open(path,
+                         os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         except OSError:
             # A stale lock file with the wrong owner/mode (e.g. from a root-context
-            # launch) blocks os.open. Our socket dir is 0700 and ours, so we may
-            # unlink any file in it; drop the bad one and retry once, else degrade.
+            # launch), or a symlink planted at the predictable path (O_NOFOLLOW makes
+            # it an ELOOP here, matching the canary marker in this same dir), blocks
+            # os.open. Our socket dir is 0700 and ours, so we may unlink any entry in
+            # it; drop the bad one (unlink removes the symlink itself, not its target)
+            # and retry once, else degrade.
             if attempt == 1:
                 try:
                     os.unlink(path)
