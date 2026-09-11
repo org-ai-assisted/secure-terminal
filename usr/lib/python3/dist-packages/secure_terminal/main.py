@@ -449,6 +449,8 @@ class InfoTip(QLabel):
         self.setMargin(0)
         self.setMaximumWidth(340)
         self._source = None
+        self._src_rect = None      # global hit-rect for the leave-poll (a glyph, when set)
+        self._zoom = 100           # current tip zoom (percent); Ctrl+wheel adjusts it
         self._poll = QTimer(self)
         self._poll.setInterval(150)
         self._poll.timeout.connect(self._check_pointer)
@@ -490,27 +492,16 @@ class InfoTip(QLabel):
         # hovered glyph for the terminal's per-character/gutter tips -- instead of the
         # whole widget, so a terminal-wide source does not push the tip below the terminal.
         self._source = widget
+        # Scope the leave-poll to the glyph (at_rect) when given, so a per-character hover
+        # tip hides on moving OFF the glyph -- not only on leaving the whole terminal.
+        self._src_rect = at_rect
         self._apply_palette(theme)
         # Release any size lock from a previous tip so this text can size freely
         # (keep the 340px width cap that drives the word wrap; height unbounded).
         self.setMaximumSize(340, _QWIDGETSIZE_MAX)
         self.setText(text)
-        font = QFont()
-        base = font.pointSizeF() if font.pointSizeF() > 0 else 10.0
-        font.setPointSizeF(base * max(50, min(400, zoom)) / 100.0)
-        self.setFont(font)
-        self.adjustSize()
-        # QLabel + wordWrap UNDER-computes its height in adjustSize once the text
-        # wraps at maximumWidth (a long tip at a high zoom), clipping the last
-        # line(s) -- "Applies to..." would vanish. Recompute the height the wrapped
-        # text actually needs at the settled width so the whole tip is visible.
-        self.resize(self.width(), self.heightForWidth(self.width()))
-        # Lock the max size to the content: some window managers decorate this
-        # frameless tool window and let the user MAXIMIZE it full-screen, where the
-        # pointer-leave poll can never fire and the WM close is ignored -- an
-        # un-closable tip. Capping max = content makes maximize a no-op; the poll
-        # then hides the tip normally on leave.
-        self.setMaximumSize(self.size())
+        self._zoom = max(50, min(400, zoom))
+        self._apply_tip_font()
         self._place(widget, at_rect)
         self.show()
         # A frameless stay-on-top tool window can still be painted under a modal
@@ -520,6 +511,38 @@ class InfoTip(QLabel):
         # would destroy the shared tip when that dialog closes).
         self.raise_()
         self._poll.start()
+
+    def _apply_tip_font(self):
+        """Size the card to the current tip zoom (self._zoom, percent). Split out so
+        Ctrl+wheel can re-zoom a shown tip in place without re-anchoring it."""
+        font = QFont()
+        base = font.pointSizeF() if font.pointSizeF() > 0 else 10.0
+        font.setPointSizeF(base * self._zoom / 100.0)
+        # Release any prior size lock so the text can re-size freely (keep the 340px
+        # width cap that drives the word wrap; height unbounded).
+        self.setMaximumSize(340, _QWIDGETSIZE_MAX)
+        self.setFont(font)
+        self.adjustSize()
+        # QLabel + wordWrap UNDER-computes its height in adjustSize once the text wraps at
+        # maximumWidth (a long tip at a high zoom), clipping the last line(s). Recompute the
+        # height the wrapped text actually needs at the settled width so the whole tip shows.
+        self.resize(self.width(), self.heightForWidth(self.width()))
+        # Lock the max size to the content: some window managers decorate this frameless tool
+        # window and let the user MAXIMIZE it full-screen, where the pointer-leave poll can
+        # never fire -- an un-closable tip. Capping max = content makes maximize a no-op.
+        self.setMaximumSize(self.size())
+
+    def wheelEvent(self, event):
+        # Ctrl+wheel zooms THIS tip live and in place (like the terminal and dialogs are
+        # Ctrl+wheel-zoomable), so a hovered tip you are reading can be enlarged. Tip-local:
+        # it does not touch the terminal or app zoom. A plain wheel scrolls normally.
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            step = 10 if event.angleDelta().y() >= 0 else -10
+            self._zoom = max(50, min(400, self._zoom + step))
+            self._apply_tip_font()
+            event.accept()
+        else:
+            super().wheelEvent(event)
 
     @staticmethod
     def _placement(rect, size, avail, gap):
@@ -574,9 +597,14 @@ class InfoTip(QLabel):
         over_src = False
         if self._source is not None:
             try:
-                top_left = self._source.mapToGlobal(QPoint(0, 0))
-                over_src = QRect(top_left, self._source.size()).adjusted(
-                    -pad, -pad, pad, pad).contains(pos)
+                if self._src_rect is not None:
+                    # glyph-scoped hover (terminal per-character tip): hide on leaving the
+                    # glyph, not the whole terminal.
+                    over_src = self._src_rect.adjusted(-pad, -pad, pad, pad).contains(pos)
+                else:
+                    top_left = self._source.mapToGlobal(QPoint(0, 0))
+                    over_src = QRect(top_left, self._source.size()).adjusted(
+                        -pad, -pad, pad, pad).contains(pos)
             except RuntimeError:                       # the source was destroyed
                 self._source = None
         if not over_tip and not over_src:
