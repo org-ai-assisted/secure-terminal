@@ -540,6 +540,11 @@ class InfoTip(QLabel):
             step = 10 if event.angleDelta().y() >= 0 else -10
             self._zoom = max(50, min(400, self._zoom + step))
             self._apply_tip_font()
+            # Re-anchor: growing from the fixed top-left would let the enlarged card cover
+            # the source (e.g. a bottom-anchored tip flipped above a status-bar lamp), so the
+            # next click lands on the tip. _place re-runs the flip/clamp against the new size.
+            if self._source is not None:
+                self._place(self._source, self._src_rect)
             event.accept()
         else:
             super().wheelEvent(event)
@@ -2494,8 +2499,9 @@ class MainWindow(QMainWindow):
         anchors it at the hovered glyph. Idempotent while the pointer rests on the same
         target and text (a hover is not a click, so it never toggles)."""
         tip = self._tip_filter._tip
-        if tip.isVisible() and tip._source is anchor and tip.text() == text:
-            return
+        if tip.isVisible() and tip._source is anchor and tip.text() == text \
+                and tip._src_rect == at_rect:
+            return                                     # same glyph AND same anchor: no re-show
         tip.show_for(anchor, text, self.current_zoom_percent(),
                      self.current_theme_key(), at_rect)
 
