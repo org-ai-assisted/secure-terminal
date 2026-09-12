@@ -5092,16 +5092,17 @@ class MainWindow(QMainWindow):
                     'Terminate: nothing was terminated -- run /terminate-debug for why',
                     6000)
         elif cmd in ('terminate-debug', 'terminatedebug'):
-            # A copyable diagnostic of the foreground-kill decision, for a field report
-            # where the button is enabled yet the program survives.
+            # Diagnoses the foreground-kill decision AND performs the real Terminate,
+            # reporting its result -- one correlated attempt, for a field report where the
+            # button is enabled yet the program survives.
             term = self.current()
             if term is None:
                 self.statusBar().showMessage('No terminal tab is current', 5000)
                 return False
             box = QMessageBox(self)
-            box.setWindowTitle('Terminate diagnostics')
+            box.setWindowTitle('Terminate (diagnostic + result)')
             box.setIcon(QMessageBox.Icon.Information)
-            box.setText('Terminate decision path (select all, copy, and send it over):')
+            box.setText('Ran Terminate; decision path + result (select all, copy, send it over):')
             box.setInformativeText(term.terminate_debug())
             box.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse
