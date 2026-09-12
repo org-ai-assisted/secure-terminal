@@ -5044,6 +5044,8 @@ class MainWindow(QMainWindow):
         '  /scrollback <lines, 0 = unlimited>\n'
         '  /paste-delay <seconds>\n'
         '  /escape-limit <chars suppressed before a notice, 0 = never>\n'
+        '  /terminate            (terminate the foreground program, like the button)\n'
+        '  /terminate-debug      (why Terminate did or did not act -- copyable)\n'
         '  /help')
 
     def show_command_palette(self):
@@ -5075,6 +5077,29 @@ class MainWindow(QMainWindow):
             self.set_tui(on)
         elif cmd == 'title' and (on or off):
             self.set_allow_title(on)
+        elif cmd == 'terminate':
+            # The Terminate action as a command (parity with the toolbar/menu button).
+            term = self.current()
+            if term is not None and not term.terminate_foreground():
+                self.statusBar().showMessage(
+                    'Terminate: nothing was terminated -- run /terminate-debug for why',
+                    6000)
+        elif cmd in ('terminate-debug', 'terminatedebug'):
+            # A copyable diagnostic of the foreground-kill decision, for a field report
+            # where the button is enabled yet the program survives.
+            term = self.current()
+            if term is None:
+                self.statusBar().showMessage('No terminal tab is current', 5000)
+                return False
+            box = QMessageBox(self)
+            box.setWindowTitle('Terminate diagnostics')
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText('Terminate decision path (select all, copy, and send it over):')
+            box.setInformativeText(term.terminate_debug())
+            box.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+            box.exec()
         # All-ASCII digits AND a bounded length: str.isdigit() also accepts non-ASCII
         # digit-likes (superscripts) that int() rejects, and an all-ASCII-digit string
         # over CPython's int_max_str_digits (~4300) makes int() ITSELF raise ValueError
