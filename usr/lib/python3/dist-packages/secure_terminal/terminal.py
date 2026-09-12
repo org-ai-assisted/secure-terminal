@@ -3320,7 +3320,7 @@ class SecureTerminal(QPlainTextEdit):
             return QColor(self._osc_palette.get(val, ANSI_PALETTE[val]))
         return QColor(val)                # '#rrggbb' from color_256 / truecolor
 
-    def _format_for(self, state, structural=False):
+    def _format_for(self, state, structural=False, glyphless=False):
         """Build the QTextCharFormat for an SGR state dict, guarding against an
         unreadable foreground/background combination.
 
@@ -3329,7 +3329,11 @@ class SecureTerminal(QPlainTextEdit):
         guard must NOT run for it: a half-block colour ramp deliberately sets a
         cell's fg (its top pixel) and bg (its bottom pixel) near-equal, and clamping
         them would drop the truecolor background and band the gradient. For a
-        structural glyph, fill both colours verbatim."""
+        structural glyph, fill both colours verbatim.
+
+        `glyphless` (a whitespace-only run) likewise carries no foreground ink to
+        hide, so the guard has nothing to protect -- running it only drops the
+        program's background (a dark bg-only space in the light theme went white)."""
         fmt = QTextCharFormat()
         fg_i, bg_i, bold = state['fg'], state['bg'], state['bold']
         if fg_i is None and bg_i is None and not bold:
@@ -3337,7 +3341,7 @@ class SecureTerminal(QPlainTextEdit):
         base_bg, base_fg = THEMES.get(self._theme, THEMES['dark'])
         fg = self._sgr_qcolor(fg_i, base_fg)
         bg = self._sgr_qcolor(bg_i, None)
-        if not structural:
+        if not structural and not glyphless:
             eff_bg = bg if bg is not None else QColor(base_bg)
             if too_close(_rgb(fg), _rgb(eff_bg)):
                 fg = QColor(base_fg)          # never let the text vanish
@@ -3377,9 +3381,12 @@ class SecureTerminal(QPlainTextEdit):
         },
     }
 
-    def _fmt_from_key(self, key):
+    def _fmt_from_key(self, key, glyphless=False):
         """QTextCharFormat for a cell's SGR key (a sorted-items tuple), or the
-        default format for None. A (MARK_KEY, colour, codepoint) key colours a
+        default format for None. `glyphless` (a whitespace-only run) skips the
+        fg-vs-bg readability guard so a bg-only space keeps the program's background
+        (only meaningful on the plain-SGR path; a marking is a visible glyph).
+        A (MARK_KEY, colour, codepoint) key colours a
         neutralized / revealed marking -- by its risk class (a class-name string),
         by the program's own SGR (an items-tuple, when colored markings are off but
         ANSI colours are on), or not at all (None) -- and carries the source code
@@ -3409,10 +3416,11 @@ class SecureTerminal(QPlainTextEdit):
                 fmt.setProperty(_CP_PROP, key[2])
                 return _cache_bounded(self._line_fmt_cache, key, fmt)
             return fmt
-        fmt = self._line_fmt_cache.get(key)
+        cache_key = (key, 'glyphless') if glyphless else key
+        fmt = self._line_fmt_cache.get(cache_key)
         if fmt is None:
-            fmt = self._format_for(dict(key))
-            return _cache_bounded(self._line_fmt_cache, key, fmt)
+            fmt = self._format_for(dict(key), glyphless=glyphless)
+            return _cache_bounded(self._line_fmt_cache, cache_key, fmt)
         return fmt
 
     # -- mouse reporting (konsole/xterm parity) -------------------------------
@@ -4307,7 +4315,10 @@ class SecureTerminal(QPlainTextEdit):
         for match in _OSC_ANY.finditer(data):
             code = int(match.group(1))
             params = match.group(2)
-            if code in (0, 2) and self._osc['osc_title']:
+            if code in (0, 1, 2) and self._osc['osc_title']:
+                # OSC 1 sets only the icon name, OSC 2 only the window title, OSC 0
+                # both; secure-terminal has one title surface, so all three feed it
+                # (OSC 2, if a prompt also sends it, arrives last and wins).
                 # Read the title out of the bytes arriving NOW, never out of
                 # pyte's screen.title: pyte LATCHES the last title it ever saw, so
                 # a title set while osc_title was off would be adopted by the next
@@ -4864,7 +4875,10 @@ class SecureTerminal(QPlainTextEdit):
                 blk = edit.block()
                 blk.setUserState(_blk_flags(blk) | _BLK_NO_NEWLINE)
             else:
-                edit.insertText(text, self._fmt_from_key(key))
+                # A whitespace-only run has no fg ink to protect, so keep the
+                # program's background (the fg-vs-bg guard would otherwise drop a
+                # dark bg-only space to the theme default -> white).
+                edit.insertText(text, self._fmt_from_key(key, glyphless=not text.strip()))
         disp = cells_display_col(self._line_cells, self._line_col, self._mode)
         target = blk_start + prefix + disp
         cursor.setPosition(min(target, self.document().characterCount() - 1))
