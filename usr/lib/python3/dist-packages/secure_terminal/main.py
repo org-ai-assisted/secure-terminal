@@ -1480,7 +1480,7 @@ class MainWindow(QMainWindow):
         # `-- ""` do (SystemExit there), rather than let `command or None` below drop to a
         # LOGIN SHELL: a locked-down launcher must not be bypassed via the socket. An
         # ABSENT command is None (the deliberate 'no command -> shell') and is untouched.
-        if (isinstance(_cmd, str) and _cmd == '') or (
+        if (isinstance(_cmd, str) and not _cmd.strip()) or (
                 isinstance(_cmd, (list, tuple))
                 and (not _cmd or not str(_cmd[0]).strip())):
             return False              # opened NO tab -> caller must not count it
@@ -1941,15 +1941,27 @@ class MainWindow(QMainWindow):
             history=history,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
             mode=_locked('unicode_mode', mode, self._default_mode),
-            colors=_locked('colors', _saved_bool(info.get('colors', True), True), self._default_colors),
-            line_edits=_locked('line_edits', _saved_bool(info.get('line_edits', True), True),
+            colors=_locked('colors',
+                           _saved_bool(info.get('colors', self._default_colors),
+                                       self._default_colors),
+                           self._default_colors),
+            line_edits=_locked('line_edits',
+                               _saved_bool(info.get('line_edits', self._default_line_edits),
+                                           self._default_line_edits),
                                self._default_line_edits),
-            markings=_locked('colored_markings', _saved_bool(info.get('markings', True), True),
+            markings=_locked('colored_markings',
+                             _saved_bool(info.get('markings', self._default_markings),
+                                         self._default_markings),
                              self._default_markings),
             theme=theme,
             cg_path=self._alloc_cgroup())
         term.apply_theme(theme)          # idempotent (ctor set it): no re-render
+        # Clamp to the app's supported ZOOM_MIN..ZOOM_MAX BEFORE applying, like config
+        # load / ctl-zoom / set_zoom -- session.json is untrusted, and apply_zoom's own
+        # internal clamp is a wider [10, 1000] that would restore below the 25% minimum and
+        # desync the toolbar zoom spinbox (which clamps its display to ZOOM_MIN).
         zoom = _saved_int(info.get('zoom'), self._default_zoom)
+        zoom = max(ZOOM_MIN, min(ZOOM_MAX, zoom))
         term.apply_zoom(_locked('zoom', zoom, self._default_zoom))
         # font_family comes from the session JSON, like zoom/font_size/scrollback, so
         # a corrupt or hand-edited record must fall back to the default rather than
@@ -4021,7 +4033,11 @@ class MainWindow(QMainWindow):
             if key in self._locked:
                 for act in actions:
                     act.setEnabled(False)
-                    act.setToolTip(act.toolTip() + note)
+                    # Some actions are gated by TWO lock keys (act_title by allow_title +
+                    # osc_title/osc_notify; the bell-sound actions by bell + bell_sound), so
+                    # append the note only once -- else it is concatenated back-to-back.
+                    if note not in act.toolTip():
+                        act.setToolTip(act.toolTip() + note)
         # disable the matching toolbar chip groups too, so a locked setting is
         # visibly un-clickable in both the menu and the toolbar.
         for key, buttons in (('unicode_mode', self._mode_buttons),
@@ -5628,7 +5644,14 @@ class MainWindow(QMainWindow):
         # push the stale value to a running daemon).
         if 'clip_warn_any' in opts and opts['clip_warn_any'] != self._clip_warn_any:
             self.set_clip_warn_any(opts['clip_warn_any'])
-        if 'clip_autostart' in opts:
+        from secure_terminal import clipboard_watch   # noqa: PLC0415
+        if 'clip_autostart' in opts \
+                and opts['clip_autostart'] != clipboard_watch.autostart_enabled():
+            # Guard against the stale dialog snapshot, like clip_warn_any above: the
+            # checkbox was seeded from autostart_enabled() at dialog-open time, so an
+            # unconditional apply would re-write the OPEN-time value and clobber a change
+            # made on disk since (e.g. the tray's login toggle). Re-read the live state
+            # and apply only a genuine difference.
             self.set_clip_autostart(opts['clip_autostart'])
         if 'osc_clipboard_read_always' in opts:
             # Applied via its setter (pushes to every tab + honours its own admin lock),
