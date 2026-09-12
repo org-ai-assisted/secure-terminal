@@ -966,6 +966,11 @@ class MainWindow(QMainWindow):
         self._shortcuts = {}          # ident -> (action, default_seq_str, label)
         # session persistence is on unless explicitly disabled
         self._persist_session = cfg.get('persist_session') != 'false'
+        # A coexisting standalone window (--new-instance) is EPHEMERAL: it must not restore
+        # the shared session (that clones the primary's tabs -- the "opens the same tabs"
+        # bug) nor save/geometry over it. Distinct from the persist_session SETTING, which
+        # this window leaves untouched (so it cannot clobber the config for the primary).
+        self._ephemeral = launch is not None and getattr(launch, 'new_instance', False)
         # confirm before closing a tab/window that still runs a foreground program
         self._confirm_close = cfg.get('confirm_close') != 'false'
         # remote control (the ctl inject-into-tab surface) is OFF unless an admin
@@ -1105,12 +1110,13 @@ class MainWindow(QMainWindow):
             # + scrollback now (the window opens usable), the rest one per event-loop
             # turn AFTER the window is shown. The bar no longer grows one tab at a
             # time and the first paint is never blocked by a big multi-tab session.
-            restored = [i for i in (session.load() if self._persist_session else [])
+            _restore_ok = self._persist_session and not self._ephemeral
+            restored = [i for i in (session.load() if _restore_ok else [])
                         if isinstance(i, dict)]
             # The tab focused last time is restored FIRST (real content), so it -- not
             # tab 0 -- is what shows the instant the window opens (no first-tab flash);
             # it stays current as the placeholders around it swap in their real shells.
-            active = session.load_active() if self._persist_session else None
+            active = session.load_active() if _restore_ok else None
             if not (isinstance(active, int) and 0 <= active < len(restored)):
                 active = 0
             self._deferred_restore = []
@@ -3495,8 +3501,9 @@ class MainWindow(QMainWindow):
 
     def _restore_window_geometry(self):
         """Reopen at the last session's window size + maximized state. A no-op when
-        session persistence is off or nothing was saved (keeps the default size)."""
-        if not self._persist_session:
+        session persistence is off, nothing was saved, or this is an ephemeral
+        (--new-instance) window (keeps the default size)."""
+        if not self._persist_session or self._ephemeral:
             return
         blob = session.load_window()
         if isinstance(blob, str) and blob:
@@ -6132,7 +6139,7 @@ class MainWindow(QMainWindow):
                 terms):
             event.ignore()
             return
-        if self._persist_session:
+        if self._persist_session and not self._ephemeral:   # ephemeral window: never clobber
             session.save(self._session_tabs(), self._window_state(),
                          self.tabs.currentIndex())
         else:
