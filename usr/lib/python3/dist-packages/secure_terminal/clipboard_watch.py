@@ -32,6 +32,7 @@ Reuses the terminal's own ReviewBar and the Qt-free sanitize core.
 import configparser
 import os
 
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from secure_terminal import settings
@@ -164,13 +165,38 @@ class _ReviewPopup(QWidget):
         layout.addWidget(self.bar)
 
 
-class ClipboardWatcher:
+class _ScanTask(QRunnable):
+    """Run the (uncapped, potentially multi-second) deceptive / non-ASCII scan OFF the
+    GUI thread and report the result back through the watcher's _scan_done signal --
+    emitted cross-thread, so Qt delivers _on_scan_done on the GUI thread. `trigger` is a
+    module-level pure function (_deceptive / _any_nonascii); it touches no Qt state, so
+    running it on a pool thread is safe."""
+
+    def __init__(self, watcher, generation, text, trigger):
+        super().__init__()
+        self._watcher = watcher
+        self._generation = generation
+        self._text = text
+        self._trigger = trigger
+
+    def run(self):
+        self._watcher._scan_done.emit(
+            self._generation, self._text, bool(self._trigger(self._text)))
+
+
+class ClipboardWatcher(QObject):
     """The reusable clipboard-review core: optionally watch the clipboard, and/or
     review its current contents once, hosting the shared ReviewBar in a popup. No
     tray, no IPC, no event loop of its own -- embedded in-process by the main window
     for "Run in the background" (watch=True) and "Review clipboard now" (watch=False)."""
 
+    # Carries a worker scan's result (generation, scanned text, trigger bool) back to the
+    # GUI thread. A QObject signal so a cross-thread emit is delivered queued on this
+    # thread, where _show_review's Qt widget work is legal.
+    _scan_done = pyqtSignal(int, str, bool)
+
     def __init__(self, app, theme=None, any_mode=False, watch=False):
+        super().__init__()
         self._clipboard = app.clipboard()
         self._enabled = True
         self._any_mode = bool(any_mode)
@@ -178,6 +204,10 @@ class ClipboardWatcher:
         self._dismissed = None             # exact text the user chose to keep
         self._theme = theme if theme in THEMES else _load_theme()
         self._popup = _ReviewPopup()
+        # A monotonically increasing scan id: a newer clipboard change bumps it, so an
+        # in-flight worker's result is recognised as stale and dropped (see _on_scan_done).
+        self._scan_gen = 0
+        self._scan_done.connect(self._on_scan_done)
         if watch:
             self._clipboard.dataChanged.connect(self._on_change)
 
@@ -193,6 +223,7 @@ class ClipboardWatcher:
         merely dropping the last Python reference would leave it alive and still
         reacting -- disconnect explicitly. Idempotent (a watch=False reviewer, or a
         second stop, disconnects nothing)."""
+        self._scan_gen += 1                # invalidate any in-flight worker scan result
         try:
             self._clipboard.dataChanged.disconnect(self._on_change)
         except (TypeError, RuntimeError):
@@ -229,9 +260,31 @@ class ClipboardWatcher:
             return
         if text == self._dismissed:        # the user already chose to keep this
             return
+        # Offload the scan: _deceptive / _any_nonascii are O(n) per character and run with
+        # NO cap, so on a large or space-free CJK clipboard they take seconds -- and this
+        # slot fires on dataChanged on the GUI thread, so a synchronous scan froze the whole
+        # app. Hand it to a worker; a newer change bumps _scan_gen so this scan's result is
+        # dropped as stale when it lands (see _on_scan_done). No cap is lost.
+        self._scan_gen += 1
         trigger = _any_nonascii if self._any_mode else _deceptive
-        if not trigger(text):
+        QThreadPool.globalInstance().start(
+            _ScanTask(self, self._scan_gen, text, trigger))
+
+    def _on_scan_done(self, generation, text, flagged):
+        """GUI-thread continuation of _on_change once the worker scan finishes. Drop a
+        result that a newer clipboard change has superseded, that came back clean, or
+        whose text is no longer what the clipboard currently holds (it changed while the
+        scan ran -- the review/reply must act on the CURRENT clipboard, the same TOCTOU
+        discipline resolve() uses). A stop() while a scan was in flight bumps _scan_gen and
+        clears _enabled, so a late result is dropped here too."""
+        if generation != self._scan_gen:
+            return                         # a newer clipboard change superseded this scan
+        if not flagged:
             return                         # clean (or innocent) -> stay silent
+        if not self._enabled:
+            return                         # disabled / stopped since the scan started
+        if self._clipboard.text() != text:
+            return                         # clipboard changed under us -> do not review stale text
         self._show_review(text)
 
     def _show_review(self, text):
