@@ -3920,7 +3920,15 @@ class MainWindow(QMainWindow):
         if not self._tab_is_live(term):
             return
         try:
-            with open(path, 'w', encoding='utf-8') as handle:
+            # O_NOFOLLOW + 0600: a symlink planted at the chosen path (the pre-filled
+            # default is predictable) must fail the open -- caught below and reported --
+            # never silently follow-and-overwrite the link target. Owner-only, matching
+            # every sibling transcript writer (_open_capture, copy_transcript_path,
+            # the dump-state file). An existing REGULAR file the user picked is still
+            # truncated and written; only a symlink final component is refused.
+            fd = os.open(path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 handle.write(getter(term))
         except OSError as exc:
             # A denied/failed save must TELL the user, never vanish -- a silently
