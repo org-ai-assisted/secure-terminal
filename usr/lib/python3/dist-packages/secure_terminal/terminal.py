@@ -5473,71 +5473,72 @@ class SecureTerminal(QPlainTextEdit):
         exe = self._read_exe(self._pid)
         return exe is not None and exe != self._spawn_exe
 
+    def _is_killable_fg(self, pgrp, child_pgrp, our):
+        """True when foreground process group `pgrp` is a program Terminate should signal:
+        a real program in front -- not our own group, and (for a LOGIN-shell tab) not the
+        bare shell's own group unless the shell was `exec`-replaced. A `-- PROGRAM` tab's
+        child IS the program (nano, htop), so its own pgrp qualifies. Single source for
+        the button-enable check (has_foreground_program) and the kill target (terminate)."""
+        if pgrp is None or pgrp == our:
+            # None: no foreground / the tty is not taken yet. our: the tty is still OUR
+            # group (between pty.fork() and the child's execvp) -- us, not a program to
+            # terminate. Without the `our` guard a just-opened tab wrongly reads "busy".
+            return False
+        if child_pgrp is not None and pgrp == child_pgrp:
+            # The direct child's OWN group: a bare LOGIN-shell prompt (nothing to
+            # terminate) UNLESS launched as `-- PROGRAM` (_command set) or the shell was
+            # replaced via the `exec` builtin (_child_execd, caught by process identity).
+            return self._command is not None or self._child_execd()
+        return True
+
     def has_foreground_program(self):
-        """True when a program holds the foreground, i.e. there is something for
-        Terminate to act on. The direct child (_pid) in the foreground means the
-        shell is at its bare prompt for a LOGIN-shell tab (nothing to terminate) --
-        but for a `-- PROGRAM` tab _pid IS that program (nano, htop), so it is
-        exactly the foreground program to terminate. A login-shell tab whose child was
-        replaced via the `exec` builtin also counts: same pid/pgrp, but _child_execd()
-        catches it by process identity."""
-        pgrp = self._foreground_pgrp()
-        if pgrp is None:
-            return False
+        """True when a program holds the foreground, i.e. there is something for Terminate
+        to act on (drives the toolbar/menu button-enable poll)."""
         if self._pid is not None and not self._pid_is_current_child():
-            # our child exited: the pid is gone, or was freed and reused by a stranger.
-            # Nothing of ours holds the foreground (same outcome as the getpgid
-            # ProcessLookupError path below, but also closed against a REUSED pid).
-            return False
+            return False                  # our child exited / pid freed + reused by a stranger
         try:
             child_pgrp = os.getpgid(self._pid) if self._pid is not None else None
         except ProcessLookupError:
             return False                  # child already gone (auto-reaped)
-        if child_pgrp is not None and pgrp == child_pgrp:
-            # A launched program (_command set), or a login shell REPLACED via `exec`.
-            return self._command is not None or self._child_execd()
-        if pgrp == os.getpgrp():
-            # The tty is still owned by OUR process group: between pty.fork() and
-            # the child's execvp the shell has not yet taken the terminal, so
-            # "some other pgrp holds it" is us, not a program worth terminating.
-            # Without this, a tab closed within milliseconds of opening asked "A
-            # program is still running in this tab", and the test harness -- which
-            # cannot answer a modal -- blocked forever on that dialog.
-            return False
-        return True
+        return self._is_killable_fg(self._foreground_pgrp(), child_pgrp, os.getpgrp())
+
+    def _foreground_target(self):
+        """The process group Terminate should SIGTERM, or None. Samples the foreground pgrp
+        briefly, because it can FLIP: a shell that keeps reclaiming the terminal (an async
+        prompt drawing between commands) makes a single tcgetpgrp sometimes catch the SHELL
+        even while a job runs -- which would wrongly hit the bare-shell guard and no-op the
+        panic button (a field-reported "Terminate does nothing"). Returns the first sample
+        that is a killable foreground, so a real job is caught even when other samples show
+        the shell; None only when NO killable foreground appears across the window, so a
+        true bare prompt stays protected."""
+        if self._pid is not None and not self._pid_is_current_child():
+            return None
+        try:
+            child_pgrp = os.getpgid(self._pid) if self._pid is not None else None
+        except ProcessLookupError:
+            return None
+        our = os.getpgrp()
+        for i in range(8):
+            pgrp = self._foreground_pgrp()
+            if self._is_killable_fg(pgrp, child_pgrp, our):
+                return pgrp
+            if i < 7:
+                time.sleep(0.02)          # ~160ms window; a stable foreground returns at once
+        return None
 
     def terminate_foreground(self):
         """Guaranteed escape hatch for a program that ignores Ctrl+C / Ctrl+\\
         (a stuck TUI): SIGTERM the foreground process group now, then SIGKILL any
         survivor after a grace period. A no-op when only the shell is in the
         foreground, so the panic button never kills your shell out from under a
-        bare prompt. Returns True when a program was actually signalled."""
-        pgrp = self._foreground_pgrp()
+        bare prompt. Returns True when a program was actually signalled.
+
+        The target comes from _foreground_target, which SAMPLES the foreground pgrp (it
+        can flip under an async-prompt shell) so a real job is not missed by a single read
+        that happened to catch the shell -- while a genuine bare prompt still yields None."""
+        pgrp = self._foreground_target()
         if pgrp is None:
             return False
-        # Never signal our OWN process group: the panic button must not kill
-        # secure-terminal itself. A child always runs in its own pty session, so a
-        # match here means the foreground pgrp was misresolved -- refuse it.
-        if pgrp == os.getpgrp():
-            return False
-        if self._pid is not None and not self._pid_is_current_child():
-            # our child exited (pid gone / freed + reused): nothing of ours to signal, and
-            # we must not trust a reused self._pid below (nor killpg a coincidental match).
-            return False
-        # The direct child is in the foreground: a bare LOGIN-shell prompt (nothing
-        # to terminate), but for a `-- PROGRAM` tab that child IS the program to kill.
-        # getpgid can race the child's death (it may exit between the enable-poll and
-        # the click) -- a gone child means nothing to signal (as has_foreground_program).
-        # A login shell REPLACED via `exec` (_child_execd) is NOT a bare prompt: the
-        # exec'd program owns the shell's pgrp, so fall through and killpg it -- else
-        # the panic button silently no-ops on exactly the stuck program it exists for.
-        if self._pid is not None and self._command is None:
-            try:
-                child_pgrp = os.getpgid(self._pid)
-            except ProcessLookupError:
-                return False
-            if pgrp == child_pgrp and not self._child_execd():
-                return False
         try:
             os.killpg(pgrp, signal.SIGTERM)
         except OSError:
@@ -5556,13 +5557,13 @@ class SecureTerminal(QPlainTextEdit):
         return True
 
     def terminate_debug(self):
-        """A copyable diagnostic for the Terminate action: every input the foreground-kill
-        decision reads, which guard (if any) blocks it, a NON-destructive killpg(0)
-        permission/existence probe, then the real terminate_foreground() result. For
-        diagnosing a field report where the button is enabled yet the program survives --
-        it names the exact reason (a blocking guard, an EPERM on a privileged group, or a
-        SIGTERM that WAS sent so the program is ignoring it). Each os-level probe captures
-        its own error inline rather than aborting the report."""
+        """A copyable, NON-DESTRUCTIVE diagnostic for the Terminate action -- it sends no
+        terminating signal (only signal-0 existence probes), so it is safe to run
+        repeatedly and does not perturb the state it reports. Reports every input the
+        foreground-kill decision reads, SAMPLES the foreground process group several times
+        (a foreground that keeps changing -- e.g. a shell reclaiming the terminal for an
+        async prompt -- makes a single-snapshot Terminate race and no-op), states what
+        Terminate WOULD do, and probes signal permission. Run /terminate to actually act."""
         import errno as _errno
         out = []
 
@@ -5576,16 +5577,16 @@ class SecureTerminal(QPlainTextEdit):
         line('pty fd', self._fd)
         our = os.getpgrp()
         line('our process group', our)
-        fpg = None
-        if self._fd is None:
-            line('foreground pgrp', 'None (no pty fd)')
-        else:
-            try:
-                raw = os.tcgetpgrp(self._fd)
-                fpg = raw if raw > 0 else None
-                line('foreground pgrp', raw)
-            except OSError as exc:
-                line('foreground pgrp', err(exc))
+        # Sample the foreground pgrp repeatedly (~250ms) to expose a FLIPPING foreground:
+        # a stable value means a single read is reliable; alternating values are exactly
+        # what makes a single-read Terminate race. Same reader terminate uses.
+        samples = []
+        for i in range(10):
+            samples.append(self._foreground_pgrp())
+            if i < 9:
+                time.sleep(0.025)
+        line('foreground pgrp samples', samples)
+        fpg = samples[-1]
         line('child _pid', self._pid)
         line('_command', repr(self._command))
         cpg = None
@@ -5598,27 +5599,33 @@ class SecureTerminal(QPlainTextEdit):
         line('pid is current child', self._pid_is_current_child())
         line('child exec-replaced', self._child_execd())
         line('has_foreground_program', self.has_foreground_program())
-        # Which early return terminate_foreground would hit (mirrors its guards in order).
-        if fpg is None:
-            verdict = 'BLOCKED: no foreground process group (tcgetpgrp failed or <= 0)'
+        # Distinct FOREGROUND-JOB pgrps seen: a real program in front sits in its own group,
+        # != our group and != the shell's. Any such value across the window is a program
+        # Terminate should be able to kill, even if other samples caught the bare shell.
+        jobs = sorted({s for s in samples if isinstance(s, int) and s != our and s != cpg})
+        line('foreground job pgrps', jobs if jobs else '(none seen -- only shell/self)')
+        if len({s for s in samples if s is not None}) > 1:
+            line('FLIPPING', 'YES -- the foreground process group is not stable; a single '
+                            'read (what a naive Terminate uses) will sometimes catch the '
+                            'shell and no-op. terminate_foreground now samples to avoid this.')
+        if jobs:
+            verdict = ('a real foreground job runs (pgrp %s) -- Terminate SHOULD signal it'
+                       % jobs[-1])
+        elif fpg is None:
+            verdict = 'no foreground process group'
         elif fpg == our:
-            verdict = 'BLOCKED: the foreground group is OUR OWN (never signal ourselves)'
-        elif self._pid is not None and not self._pid_is_current_child():
-            verdict = 'BLOCKED: our child has exited / its pid was reused'
-        elif (self._pid is not None and self._command is None
-              and cpg is not None and fpg == cpg and not self._child_execd()):
-            verdict = 'BLOCKED: only the bare login shell is in front (nothing to terminate)'
+            verdict = 'the foreground group is our own -- nothing to do'
         else:
-            verdict = 'would SIGTERM process group %s' % fpg
-        line('decision', verdict)
-        if fpg is not None:                       # signal 0 sends nothing -- a pure probe
+            verdict = 'only the bare login shell is in front -- nothing to terminate'
+        line('would terminate', verdict)
+        probe = jobs[-1] if jobs else (fpg if isinstance(fpg, int) else None)
+        if probe is not None:                     # signal 0 sends NOTHING -- a pure probe
             try:
-                os.killpg(fpg, 0)
-                line('killpg(pgrp, 0) probe', 'ok -- group exists and is signalable')
+                os.killpg(probe, 0)
+                line('killpg(%d, 0) probe' % probe, 'ok -- group exists and is signalable')
             except OSError as exc:
-                line('killpg(pgrp, 0) probe', err(exc))
-        line('terminate_foreground()',
-             '%s (True = a SIGTERM was sent)' % self.terminate_foreground())
+                line('killpg(%d, 0) probe' % probe, err(exc))
+        line('note', 'no signal was sent; run /terminate to actually terminate')
         return '\n'.join(out)
 
     # Pids of OUR pty shells. The app's SIGCHLD handler reaps ONLY these, never a
