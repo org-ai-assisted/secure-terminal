@@ -5555,6 +5555,72 @@ class SecureTerminal(QPlainTextEdit):
         QTimer.singleShot(2000, _kill_survivor)
         return True
 
+    def terminate_debug(self):
+        """A copyable diagnostic for the Terminate action: every input the foreground-kill
+        decision reads, which guard (if any) blocks it, a NON-destructive killpg(0)
+        permission/existence probe, then the real terminate_foreground() result. For
+        diagnosing a field report where the button is enabled yet the program survives --
+        it names the exact reason (a blocking guard, an EPERM on a privileged group, or a
+        SIGTERM that WAS sent so the program is ignoring it). Each os-level probe captures
+        its own error inline rather than aborting the report."""
+        import errno as _errno
+        out = []
+
+        def line(key, val):
+            out.append('%-24s %s' % (key, val))
+
+        def err(exc):
+            code = _errno.errorcode.get(getattr(exc, 'errno', None), getattr(exc, 'errno', '?'))
+            return 'ERROR %s: %s' % (code, exc)
+
+        line('pty fd', self._fd)
+        our = os.getpgrp()
+        line('our process group', our)
+        fpg = None
+        if self._fd is None:
+            line('foreground pgrp', 'None (no pty fd)')
+        else:
+            try:
+                raw = os.tcgetpgrp(self._fd)
+                fpg = raw if raw > 0 else None
+                line('foreground pgrp', raw)
+            except OSError as exc:
+                line('foreground pgrp', err(exc))
+        line('child _pid', self._pid)
+        line('_command', repr(self._command))
+        cpg = None
+        if self._pid is not None:
+            try:
+                cpg = os.getpgid(self._pid)
+                line('child process group', cpg)
+            except OSError as exc:
+                line('child process group', err(exc))
+        line('pid is current child', self._pid_is_current_child())
+        line('child exec-replaced', self._child_execd())
+        line('has_foreground_program', self.has_foreground_program())
+        # Which early return terminate_foreground would hit (mirrors its guards in order).
+        if fpg is None:
+            verdict = 'BLOCKED: no foreground process group (tcgetpgrp failed or <= 0)'
+        elif fpg == our:
+            verdict = 'BLOCKED: the foreground group is OUR OWN (never signal ourselves)'
+        elif self._pid is not None and not self._pid_is_current_child():
+            verdict = 'BLOCKED: our child has exited / its pid was reused'
+        elif (self._pid is not None and self._command is None
+              and cpg is not None and fpg == cpg and not self._child_execd()):
+            verdict = 'BLOCKED: only the bare login shell is in front (nothing to terminate)'
+        else:
+            verdict = 'would SIGTERM process group %s' % fpg
+        line('decision', verdict)
+        if fpg is not None:                       # signal 0 sends nothing -- a pure probe
+            try:
+                os.killpg(fpg, 0)
+                line('killpg(pgrp, 0) probe', 'ok -- group exists and is signalable')
+            except OSError as exc:
+                line('killpg(pgrp, 0) probe', err(exc))
+        line('terminate_foreground()',
+             '%s (True = a SIGTERM was sent)' % self.terminate_foreground())
+        return '\n'.join(out)
+
     # Pids of OUR pty shells. The app's SIGCHLD handler reaps ONLY these, never a
     # subprocess.run child -- a blanket SIGCHLD=SIG_IGN would auto-reap those too and make
     # their returncode read 0 (a fail-open: e.g. terminfo `tic ... check=True` would never
