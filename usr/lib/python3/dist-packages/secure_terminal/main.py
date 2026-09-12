@@ -5091,7 +5091,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     'Terminate: nothing was terminated -- run /terminate-debug for why',
                     6000)
-        elif cmd in ('terminate-debug', 'terminatedebug'):
+        elif cmd == 'terminate-debug':
             # Diagnoses the foreground-kill decision AND performs the real Terminate,
             # reporting its result -- one correlated attempt, for a field report where the
             # button is enabled yet the program survives.
