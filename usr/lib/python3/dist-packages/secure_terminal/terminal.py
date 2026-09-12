@@ -249,6 +249,13 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                     # data is not purely printable and renders the placeholder.
                     self._merge_invisible(target, ch)
                     continue
+                # A genuine combining mark: merge it in place ourselves rather than via
+                # super().draw(), whose top-of-loop deferred-wrap resolution would eat a
+                # width-filling line's pending wrap and leave a spurious blank row (see
+                # _merge_combining). super().draw() below is now reached only by a real
+                # printable (wcwidth >= 1) char.
+                self._merge_combining(target, ch)
+                continue
             super().draw(ch)
 
     def _mark_own_cell(self, ch):
@@ -282,6 +289,31 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         else:
             row, col = self.cursor.y - 1, self.columns - 1
         self.buffer[row][col] = target._replace(data=target.data + ch)
+        self.dirty.add(row)
+
+    def _merge_combining(self, target, ch):
+        """Merge a real combining mark into `target` (the cell before the cursor)
+        with NFC normalization -- exactly what pyte's draw() does for a zero-width
+        combining char -- but WITHOUT routing through super().draw().
+
+        pyte's draw() resolves a pending deferred wrap (cursor.x == columns ->
+        carriage_return()+linefeed()) at the TOP of its per-char loop, BEFORE it looks
+        at char width. For a combining mark on a width-filling line that consumes the
+        pending wrap onto a fresh row, so the real \\n that follows no longer sees
+        cursor.x == columns and linefeed()'s compensation is bypassed -- leaving a
+        spurious blank row (the row/blank/row artifact that linefeed() exists to
+        prevent). A combining mark is zero-width and never occupies a new cell, so it
+        must NOT trigger the wrap: merge it in place and leave cursor.x untouched, so
+        the pending wrap resolves on the next real printable char or linefeed, as a
+        real terminal does. Target selection matches pyte (this line's x-1, else the
+        previous line's last cell); the cap check upstream still bounds a Zalgo flood."""
+        x = self.cursor.x
+        if x:
+            row, col = self.cursor.y, x - 1
+        else:
+            row, col = self.cursor.y - 1, self.columns - 1
+        data = unicodedata.normalize('NFC', target.data + ch)
+        self.buffer[row][col] = target._replace(data=data)
         self.dirty.add(row)
 
     def erase_in_line(self, how=0, *args, **kwargs):
