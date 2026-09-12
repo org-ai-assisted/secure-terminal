@@ -81,6 +81,7 @@ import struct
 import termios
 import shlex
 import unicodedata
+import inspect
 
 import pyte
 import pyte.charsets
@@ -96,15 +97,22 @@ from wcwidth import wcwidth
 _TUI_COMBINE_CAP = 32
 
 class _SafeHistoryScreen(pyte.HistoryScreen):
-    """pyte 0.8.0's HistoryScreen.select_graphic_rendition() takes only
-    *attrs, but pyte's stream dispatches a private ("?"-prefixed) CSI with
-    private=True, so a private-marked SGR raises TypeError and _feed_bytes
-    drops the whole frame. Programs like vim, htop and tmux emit such
-    sequences, which showed up as dropped frames in that render. A private
-    SGR is not a standard colour operation, so ignore it (as upstream pyte
-    later did) instead of crashing; every other private CSI (set/reset mode)
-    already accepts private=. Nothing here weakens the cell filter: this only
-    governs how pyte parses, never what is allowed onto the screen."""
+    """pyte's stream dispatches a private ("?"-prefixed) CSI by calling the mapped
+    handler with private=True (streams.py: csi_dispatch[char](*params, private=True)).
+    Most pyte.Screen CSI handlers -- cursor moves, insert/delete lines+chars, margins,
+    DSR, clear_tab_stop, DECSED erase-in-display, and SGR -- take neither private= nor
+    **kwargs, so a private-marked variant (ESC[?4L, ESC[?2J, a private SGR from vim /
+    htop / tmux, ...) raises TypeError inside pyte's parser; _Utf8CharsetByteStream.feed
+    has no guard, so the REST of that PTY read chunk is silently dropped from the screen.
+
+    A private marker on these operations has no defined meaning for us, so run the
+    handler and ignore the marker instead of crashing. select_graphic_rendition and
+    erase_in_display below absorb private= explicitly (they carry other custom logic);
+    every remaining crashing handler is wrapped generically by
+    _install_private_tolerant_csi (keyed off pyte's OWN csi table + signatures, so it
+    tracks upstream and never shadows a handler pyte already made private-aware). None of
+    this weakens the cell filter: it only governs how pyte parses, never what reaches the
+    screen."""
 
     def select_graphic_rendition(self, *attrs, private=False, **kwargs):
         if private:
@@ -241,6 +249,13 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                     # data is not purely printable and renders the placeholder.
                     self._merge_invisible(target, ch)
                     continue
+                # A genuine combining mark: merge it in place ourselves rather than via
+                # super().draw(), whose top-of-loop deferred-wrap resolution would eat a
+                # width-filling line's pending wrap and leave a spurious blank row (see
+                # _merge_combining). super().draw() below is now reached only by a real
+                # printable (wcwidth >= 1) char.
+                self._merge_combining(target, ch)
+                continue
             super().draw(ch)
 
     def _mark_own_cell(self, ch):
@@ -276,6 +291,31 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         self.buffer[row][col] = target._replace(data=target.data + ch)
         self.dirty.add(row)
 
+    def _merge_combining(self, target, ch):
+        """Merge a real combining mark into `target` (the cell before the cursor)
+        with NFC normalization -- exactly what pyte's draw() does for a zero-width
+        combining char -- but WITHOUT routing through super().draw().
+
+        pyte's draw() resolves a pending deferred wrap (cursor.x == columns ->
+        carriage_return()+linefeed()) at the TOP of its per-char loop, BEFORE it looks
+        at char width. For a combining mark on a width-filling line that consumes the
+        pending wrap onto a fresh row, so the real \\n that follows no longer sees
+        cursor.x == columns and linefeed()'s compensation is bypassed -- leaving a
+        spurious blank row (the row/blank/row artifact that linefeed() exists to
+        prevent). A combining mark is zero-width and never occupies a new cell, so it
+        must NOT trigger the wrap: merge it in place and leave cursor.x untouched, so
+        the pending wrap resolves on the next real printable char or linefeed, as a
+        real terminal does. Target selection matches pyte (this line's x-1, else the
+        previous line's last cell); the cap check upstream still bounds a Zalgo flood."""
+        x = self.cursor.x
+        if x:
+            row, col = self.cursor.y, x - 1
+        else:
+            row, col = self.cursor.y - 1, self.columns - 1
+        data = unicodedata.normalize('NFC', target.data + ch)
+        self.buffer[row][col] = target._replace(data=data)
+        self.dirty.add(row)
+
     def erase_in_line(self, how=0, *args, **kwargs):
         # Erasing the cursor row's content clears its no-trailing-newline flag (the
         # gutter must not mark a row whose old content is gone).
@@ -284,10 +324,15 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             row.no_newline = False
         super().erase_in_line(how, *args, **kwargs)
 
-    def erase_in_display(self, how=0, *args, **kwargs):
+    def erase_in_display(self, how=0, *args, private=False, **kwargs):
         # Clear the flag on exactly the rows this erase blanks (whole screen for how
         # 2/3, cursor->end for 0, start->cursor for 1) so no stale gutter marker rides
         # a cleared region -- e.g. `clear` (ESC[H ESC[2J) after un-terminated output.
+        # `private` (DECSED, ESC[?nJ) is dispatched by pyte with private=True, but base
+        # erase_in_display takes only `how`; absorb the marker so a private ED does not
+        # TypeError out of the parser and drop the rest of the chunk (see the class
+        # docstring). Selective-erase collapses to a plain erase here, which is safe --
+        # cell neutralization is unchanged.
         if how in (2, 3):
             ys = range(self.lines)
         elif how == 1:
@@ -298,7 +343,34 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             row = self.buffer.get(y)
             if row is not None and getattr(row, 'no_newline', False):
                 row.no_newline = False
-        super().erase_in_display(how, *args, **kwargs)
+        super().erase_in_display(how)
+
+
+def _make_private_tolerant(base):
+    """A private-CSI-tolerant wrapper: run pyte's base handler with its positional
+    params and drop the meaningless private= marker (and any stray kwargs)."""
+    def _wrapped(self, *params, private=False, **_ignored):
+        return base(self, *params)
+    return _wrapped
+
+
+def _install_private_tolerant_csi(cls):
+    # Wrap every pyte CSI handler that would TypeError on a private ("?"-prefixed)
+    # dispatch. Skip the ones pyte already made private-aware (set_mode/reset_mode via
+    # **kwargs, erase_in_line) and the ones this class overrides itself (which absorb
+    # private= on their own). Driven by pyte's OWN csi table + live signatures, so a
+    # future pyte that adds private= to a handler is skipped automatically.
+    for name in set(pyte.Stream.csi.values()):
+        if name in cls.__dict__:
+            continue
+        base = getattr(pyte.HistoryScreen, name)
+        params = inspect.signature(base).parameters
+        if 'private' in params or any(p.kind == p.VAR_KEYWORD for p in params.values()):
+            continue
+        setattr(cls, name, _make_private_tolerant(base))
+
+
+_install_private_tolerant_csi(_SafeHistoryScreen)
 
 
 class _Utf8CharsetByteStream(pyte.ByteStream):
@@ -1087,6 +1159,14 @@ class SecureTerminal(QPlainTextEdit):
         # cannot grow it without limit; the oldest output is dropped first.
         self._raw = ''
         self._RAW_MAX = 1_000_000
+        # Bound a single paste before the GUI-thread paste pipeline (paste_findings,
+        # paste_is_multiline, sanitize_paste) scans it per character: an unbounded
+        # clipboard (a webpage / clipboard manager that set tens of MB, `cat huge |
+        # clipboard`) would otherwise freeze EVERY tab for seconds. 2M chars is far
+        # above any human paste (~0.4s worst case) yet keeps the freeze sub-second; a
+        # bulk transfer belongs in a file, not a paste. Mirrors the render path's
+        # _RAW_MAX cap. Oversized pastes are truncated with an advisory (below).
+        self._PASTE_MAX = 2_000_000
         self._preview_truncated = False   # render_preview capped a huge paste's render
         # cap alternate-screen enter/leave snapshots per read (anti-DoS: a flood of
         # alternating ?1049h/?1049l would otherwise deepcopy the screen thousands of
@@ -3203,6 +3283,16 @@ class SecureTerminal(QPlainTextEdit):
             self._osc_palette = {}
             self.apply_theme(self._theme)
             self._rerender()
+        if self._clipboard_read == 'pending':
+            # A program that raised an OSC 52 clipboard-READ consent dialog and then
+            # exited to the prompt (this foreground-exit edge) or was replaced
+            # (restart_as_shell) has abandoned that request. Drop the pending state so a
+            # late "Allow" on the still-open dialog replies NO clipboard into the
+            # RETURNING shell's pty (grant_clipboard_read treats a non-'pending' state as
+            # stale and no-ops). Only the in-flight 'pending' is cancelled -- a decided
+            # True/False (an explicit per-tab always-allow) is the user's standing choice
+            # and survives across a foreground program's exit.
+            self._clipboard_read = None
 
     def _reset_leftover_sgr(self, text):
         """Guard the shell prompt against a finished command's leftover colour.
@@ -4421,7 +4511,15 @@ class SecureTerminal(QPlainTextEdit):
         # keeps only '/dir' and a malformed 'file://dir' (no leading '/', so 'dir'
         # is the authority) does not smuggle the host in as the path -- unlike a
         # manual url[7:].split('/', 1)[-1], which treated a bare authority as a path.
-        path = urllib.parse.unquote(urllib.parse.urlparse(url).path)
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            # A malformed authority (e.g. 'file://[bad-ipv6') makes urlparse raise
+            # ValueError('Invalid IPv6 URL'). This runs on the PTY read path from
+            # untrusted child output, and every other _handle_osc branch is hardened
+            # against malformed input -- ignore rather than crash the read path.
+            return
+        path = urllib.parse.unquote(parsed.path)
         path = '/' + path if not path.startswith('/') else path
         # percent-decoding can reintroduce control/bidi/zero-width characters, so
         # run the decoded path through the same safe-ASCII sanitizer as titles
@@ -6422,6 +6520,14 @@ class SecureTerminal(QPlainTextEdit):
             self._insert_next_staged()
             return
         raw = source.text()
+        if len(raw) > self._PASTE_MAX:
+            # Cap before the per-character scans below run on the GUI thread (see
+            # _PASTE_MAX). Truncate + advise so the cut is honest; the truncated text
+            # still goes through the normal review/sanitize gates, so no hidden byte
+            # crosses and a multi-line remainder is still held for review.
+            raw = raw[:self._PASTE_MAX]
+            self._advise('The paste exceeded %d MB and was truncated.'
+                         % (self._PASTE_MAX // 1_000_000))
         # When to review the paste, per the paste_warn setting:
         #   'always'  -- every paste (even plain ASCII);
         #   'unicode' -- only when the clipboard carries unicode or control

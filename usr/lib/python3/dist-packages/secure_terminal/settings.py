@@ -32,12 +32,16 @@ nor unlock. load() returns a Config (a dict plus .locked and .violations).
 
 Loading is fully defensive: a missing/unreadable file, a malformed line or an
 unknown key never raises and never crashes; the value falls back to its default.
+A config path that is a symlink or a non-regular file (a planted FIFO would else
+hang the read forever) is refused and skipped, matching the write side's O_NOFOLLOW.
 Only these drop-in .conf files are read -- there is no legacy single-file config.
 """
 
 import os
 import glob
 import fcntl
+import stat
+import errno
 
 _APP = 'secure-terminal'
 # where the app writes its own settings. A low number leaves the higher slots for
@@ -100,16 +104,42 @@ def _parse_lines(lines, out):
             out[key] = value.strip()
 
 
+def _open_config_read(path):
+    """Open a drop-in .conf for reading, defensively, matching the write side's
+    hardening. Returns a UTF-8 text file object (the caller closes it via `with`), or
+    raises OSError -- which every caller already treats as "missing/unreadable ->
+    ignored", so a hostile file is skipped, never a crash or a hang.
+
+    - O_NOFOLLOW: a symlink planted at the config path fails the open (ELOOP) rather
+      than redirecting the read onto an attacker-chosen file, matching save()'s tmp
+      open and _user_write_lock()'s lock open.
+    - O_NONBLOCK + S_ISREG: a FIFO planted in a scanned config directory would make a
+      plain open() block forever (it waits for a writer), hanging load() at startup and
+      the clipboard-watch daemon -- contradicting this module's "never hangs" guarantee.
+      Open non-blocking and reject anything that is not a regular file, then clear
+      O_NONBLOCK (a no-op for a regular file) so the text read behaves normally."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, 'not a regular file', path)
+        fcntl.fcntl(fd, fcntl.F_SETFL,
+                    fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+    except OSError:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, encoding='utf-8')
+
+
 def _parse_into(path, out):
     # Parse into a temp then merge on FULL success: text is decoded in buffers, so a
     # bad byte after the first ~8 KiB would otherwise leave the lines already read
     # applied -- a partial drop-in, not the documented "ignored".
     parsed: dict[str, str] = {}
     try:
-        with open(path, encoding='utf-8') as handle:
+        with _open_config_read(path) as handle:
             _parse_lines(handle, parsed)
     except (OSError, ValueError):
-        return                  # missing / unreadable / non-UTF-8 drop-in -> ignored
+        return                  # missing / unreadable / non-regular / non-UTF-8 -> ignored
     # `lock` ACCUMULATES across files in a directory (union), unlike every other key
     # (last-write-wins): an admin may split locks over several .conf files (10-*.conf,
     # 20-*.conf), and last-write-wins would silently drop every lock but the last file's --
@@ -131,12 +161,12 @@ def _read_user_base():
     write creates it). Never raises."""
     out: dict[str, str] = {}
     try:
-        with open(user_config_file(), encoding='utf-8') as handle:
+        with _open_config_read(user_config_file()) as handle:
             _parse_lines(handle, out)
     except FileNotFoundError:
         return out              # no file yet -> empty base, the write creates it
     except (OSError, ValueError):
-        return None             # unreadable / non-UTF-8 -> do NOT clobber
+        return None             # unreadable / non-regular / symlink / non-UTF-8 -> do NOT clobber
     return out
 
 

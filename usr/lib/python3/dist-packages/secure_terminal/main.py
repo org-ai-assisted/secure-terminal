@@ -1480,7 +1480,7 @@ class MainWindow(QMainWindow):
         # `-- ""` do (SystemExit there), rather than let `command or None` below drop to a
         # LOGIN SHELL: a locked-down launcher must not be bypassed via the socket. An
         # ABSENT command is None (the deliberate 'no command -> shell') and is untouched.
-        if (isinstance(_cmd, str) and _cmd == '') or (
+        if (isinstance(_cmd, str) and not _cmd.strip()) or (
                 isinstance(_cmd, (list, tuple))
                 and (not _cmd or not str(_cmd[0]).strip())):
             return False              # opened NO tab -> caller must not count it
@@ -1941,15 +1941,27 @@ class MainWindow(QMainWindow):
             history=history,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
             mode=_locked('unicode_mode', mode, self._default_mode),
-            colors=_locked('colors', _saved_bool(info.get('colors', True), True), self._default_colors),
-            line_edits=_locked('line_edits', _saved_bool(info.get('line_edits', True), True),
+            colors=_locked('colors',
+                           _saved_bool(info.get('colors', self._default_colors),
+                                       self._default_colors),
+                           self._default_colors),
+            line_edits=_locked('line_edits',
+                               _saved_bool(info.get('line_edits', self._default_line_edits),
+                                           self._default_line_edits),
                                self._default_line_edits),
-            markings=_locked('colored_markings', _saved_bool(info.get('markings', True), True),
+            markings=_locked('colored_markings',
+                             _saved_bool(info.get('markings', self._default_markings),
+                                         self._default_markings),
                              self._default_markings),
             theme=theme,
             cg_path=self._alloc_cgroup())
         term.apply_theme(theme)          # idempotent (ctor set it): no re-render
+        # Clamp to the app's supported ZOOM_MIN..ZOOM_MAX BEFORE applying, like config
+        # load / ctl-zoom / set_zoom -- session.json is untrusted, and apply_zoom's own
+        # internal clamp is a wider [10, 1000] that would restore below the 25% minimum and
+        # desync the toolbar zoom spinbox (which clamps its display to ZOOM_MIN).
         zoom = _saved_int(info.get('zoom'), self._default_zoom)
+        zoom = max(ZOOM_MIN, min(ZOOM_MAX, zoom))
         term.apply_zoom(_locked('zoom', zoom, self._default_zoom))
         # font_family comes from the session JSON, like zoom/font_size/scrollback, so
         # a corrupt or hand-edited record must fall back to the default rather than
@@ -2736,14 +2748,18 @@ class MainWindow(QMainWindow):
         to the tab BAR on a switch, and window activation lands focus on no child at all,
         so without this the tab is visible but the caret is elsewhere -- the user must
         click once more before typing (konsole focuses the terminal directly). Skip while
-        the find bar is open so a tab switch / re-activation mid-search does not yank the
-        caret out of the field."""
+        the find bar OR the paste-review bar is open so a tab switch / re-activation
+        mid-search or mid-review does not yank the caret out of the field / away from the
+        review buttons -- else the held paste's Enter/Esc would reach the wrong PTY."""
         term = self.current()
         if not isinstance(term, SecureTerminal):
             return
         _fb = getattr(self, '_find_bar', None)
-        if not (_fb is not None and _fb.isVisible()):
-            term.setFocus()
+        _rb = getattr(self, '_review_bar', None)
+        if (_fb is not None and _fb.isVisible()) or \
+                (_rb is not None and _rb.reviewed_term() is not None):
+            return
+        term.setFocus()
 
     # -- zoom: per current tab ------------------------------------------------
     def set_zoom(self, percent):
@@ -3920,7 +3936,15 @@ class MainWindow(QMainWindow):
         if not self._tab_is_live(term):
             return
         try:
-            with open(path, 'w', encoding='utf-8') as handle:
+            # O_NOFOLLOW + 0600: a symlink planted at the chosen path (the pre-filled
+            # default is predictable) must fail the open -- caught below and reported --
+            # never silently follow-and-overwrite the link target. Owner-only, matching
+            # every sibling transcript writer (_open_capture, copy_transcript_path,
+            # the dump-state file). An existing REGULAR file the user picked is still
+            # truncated and written; only a symlink final component is refused.
+            fd = os.open(path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 handle.write(getter(term))
         except OSError as exc:
             # A denied/failed save must TELL the user, never vanish -- a silently
@@ -4013,7 +4037,11 @@ class MainWindow(QMainWindow):
             if key in self._locked:
                 for act in actions:
                     act.setEnabled(False)
-                    act.setToolTip(act.toolTip() + note)
+                    # Some actions are gated by TWO lock keys (act_title by allow_title +
+                    # osc_title/osc_notify; the bell-sound actions by bell + bell_sound), so
+                    # append the note only once -- else it is concatenated back-to-back.
+                    if note not in act.toolTip():
+                        act.setToolTip(act.toolTip() + note)
         # disable the matching toolbar chip groups too, so a locked setting is
         # visibly un-clickable in both the menu and the toolbar.
         for key, buttons in (('unicode_mode', self._mode_buttons),
@@ -4746,7 +4774,12 @@ class MainWindow(QMainWindow):
         if mods == ctrl and (Qt.Key.Key_At <= key <= Qt.Key.Key_Underscore
                              or key == Qt.Key.Key_Space):
             return True
-        if mods == Qt.KeyboardModifier.NoModifier and 0x20 <= key <= 0x7E:
+        # A printable key with NO modifier OR with Shift alone still produces TYPED text
+        # ('1'/'a' vs '!'/'A'), so a window shortcut on either would eat ordinary typing --
+        # e.g. a find:Shift+1 binding would make WindowShortcut swallow '!' app-wide, even
+        # at a password prompt. Reserve both; Ctrl/Alt printable combos (no typed text) stay
+        # rebindable.
+        if mods in (Qt.KeyboardModifier.NoModifier, shift) and 0x20 <= key <= 0x7E:
             return True
         # A bare key the terminal forwards to the running program: the cursor keys,
         # Home/End, PageUp/Down, Insert/Delete and every function key.
@@ -4759,6 +4792,15 @@ class MainWindow(QMainWindow):
         # `not (ctrl and shift)`), so it stays available to rebind. The bare (no modifier)
         # form is already reserved above, so reaching here means a modifier.
         if key in _modifiable_forwarded_keys() and not (mods & ctrl and mods & shift):
+            return True
+        # Shift+Tab is the back-tab (ESC[Z) the terminal forwards in TUI mode (vim
+        # shift-dedent, fzf, readline menu-complete-backward). It lives in _tui_key, not
+        # _build_tui_keys (whose bare Tab is \t), so the derived _modifiable_forwarded_keys
+        # above does not cover it -- reserve it explicitly so a window shortcut cannot shadow
+        # it. Qt reports the combo as Key_Tab+Shift OR the dedicated Key_Backtab (which IS
+        # the back-tab, mods-independent); cover both. Ctrl+Shift+Tab is routed to the window
+        # shortcuts, so only the bare Shift form of Key_Tab is reserved.
+        if key == Qt.Key.Key_Backtab or (key == Qt.Key.Key_Tab and mods == shift):
             return True
         # Ctrl+PageUp/Down (switch tab) and Ctrl+Shift+PageUp/Down (move tab) are
         # consumed by the widget itself, so a window shortcut there never fires.
@@ -5620,7 +5662,14 @@ class MainWindow(QMainWindow):
         # push the stale value to a running daemon).
         if 'clip_warn_any' in opts and opts['clip_warn_any'] != self._clip_warn_any:
             self.set_clip_warn_any(opts['clip_warn_any'])
-        if 'clip_autostart' in opts:
+        from secure_terminal import clipboard_watch   # noqa: PLC0415
+        if 'clip_autostart' in opts \
+                and opts['clip_autostart'] != clipboard_watch.autostart_enabled():
+            # Guard against the stale dialog snapshot, like clip_warn_any above: the
+            # checkbox was seeded from autostart_enabled() at dialog-open time, so an
+            # unconditional apply would re-write the OPEN-time value and clobber a change
+            # made on disk since (e.g. the tray's login toggle). Re-read the live state
+            # and apply only a genuine difference.
             self.set_clip_autostart(opts['clip_autostart'])
         if 'osc_clipboard_read_always' in opts:
             # Applied via its setter (pushes to every tab + honours its own admin lock),
@@ -6066,8 +6115,15 @@ class MainWindow(QMainWindow):
         if self._clip_bg_watcher is not None:   # real quit: stop the in-process sanitizer
             self._clip_bg_watcher.stop()
             self._clip_bg_watcher = None
-        for t in terms:
-            t.shutdown()
+        # RE-DERIVE the live terms rather than reuse the `terms` snapshot: a tab whose shell
+        # exited DURING the confirm modal's nested event loop was already closed and
+        # deleteLater()'d by close_tab, so the snapshot now holds a freed C++ object --
+        # shutdown() on it raises RuntimeError, aborting closeEvent before the later tabs
+        # hang up their PTYs (an fd/child leak). Guard each with _tab_is_live too, matching
+        # _save_capture, in case a deletion is mid-flight.
+        for t in self._real_terms():
+            if self._tab_is_live(t):
+                t.shutdown()
         super().closeEvent(event)
 
 
