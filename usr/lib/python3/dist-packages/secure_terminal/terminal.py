@@ -5557,13 +5557,14 @@ class SecureTerminal(QPlainTextEdit):
         return True
 
     def terminate_debug(self):
-        """A copyable, NON-DESTRUCTIVE diagnostic for the Terminate action -- it sends no
-        terminating signal (only signal-0 existence probes), so it is safe to run
-        repeatedly and does not perturb the state it reports. Reports every input the
-        foreground-kill decision reads, SAMPLES the foreground process group several times
-        (a foreground that keeps changing -- e.g. a shell reclaiming the terminal for an
-        async prompt -- makes a single-snapshot Terminate race and no-op), states what
-        Terminate WOULD do, and probes signal permission. Run /terminate to actually act."""
+        """A copyable diagnostic for the Terminate action that ALSO performs the real
+        Terminate and reports its outcome, so the diagnosis and the action are one and the
+        same attempt. Reports every input the kill decision reads, SAMPLES the foreground
+        process group several times (a foreground that keeps changing -- e.g. a shell
+        reclaiming the terminal for an async prompt -- makes a single-snapshot Terminate
+        race), probes signal permission with signal 0, then calls terminate_foreground() and
+        reports its result. A `would terminate ... SHOULD signal it` next to a
+        `terminate_foreground() False` pinpoints a real disagreement to fix."""
         import errno as _errno
         out = []
 
@@ -5625,7 +5626,13 @@ class SecureTerminal(QPlainTextEdit):
                 line('killpg(%d, 0) probe' % probe, 'ok -- group exists and is signalable')
             except OSError as exc:
                 line('killpg(%d, 0) probe' % probe, err(exc))
-        line('note', 'no signal was sent; run /terminate to actually terminate')
+        # Then ACTUALLY run the real Terminate and report its result RIGHT HERE, so the
+        # decision above and the outcome are the SAME attempt (no separate-moment guessing).
+        # A `would terminate ... SHOULD signal it` paired with `terminate_foreground() False`
+        # is the smoking gun that terminate_foreground and the decision disagree.
+        line('terminate_foreground()',
+             '%s (True = a real SIGTERM was just sent to the foreground group)'
+             % self.terminate_foreground())
         return '\n'.join(out)
 
     # Pids of OUR pty shells. The app's SIGCHLD handler reaps ONLY these, never a
