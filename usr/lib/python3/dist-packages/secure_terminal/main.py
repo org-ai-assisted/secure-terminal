@@ -45,7 +45,7 @@ from secure_terminal.terminal import (
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
     BASE_POINT_SIZE, FONT_SIZE_MIN, FONT_SIZE_MAX,
     route_ctrl_wheel_zoom,
-    _build_tui_keys, _build_line_edit_keys,
+    _build_tui_keys, _build_line_edit_keys, _command_display,
 )
 from secure_terminal.review import ReviewBar
 
@@ -1061,6 +1061,7 @@ class MainWindow(QMainWindow):
         self._osc_notice_actions = {}  # osc feature key -> its notice-toggle action
         self._user_titles = {}       # term -> user-set tab name
         self._prog_titles = {}       # term -> program (OSC) title
+        self._osc_cwd = {}           # term -> OSC-7 reported working directory
         self._pre_tui_mode = {}      # term -> display mode to restore after TUI
         self._tab_colors = {}        # term -> tab colour name (for persistence)
         self._advisories = {}        # term -> (kind, banner text); kind tui|osc|autobox
@@ -2110,6 +2111,7 @@ class MainWindow(QMainWindow):
             term.shutdown()
             self._user_titles.pop(term, None)
             self._prog_titles.pop(term, None)
+            self._osc_cwd.pop(term, None)
             self._tab_colors.pop(term, None)
             self._advisories.pop(term, None)
             self._pre_tui_mode.pop(term, None)   # else a closed auto-boxed tab lingers
@@ -2188,6 +2190,55 @@ class MainWindow(QMainWindow):
             self._user_titles[term] = sanitize_title(name.strip())   # ASCII-only, like every title
             self._refresh_tab_label(term)
 
+    @staticmethod
+    def _default_transcript_path():
+        """The on-save transcript file path (the one place AppArmor permits writes).
+        Shared by copy_transcript_path (which writes it) and the tab tooltip (which
+        shows it), so both name the same file rather than duplicating the join."""
+        return os.path.join(session._state_dir(), 'transcript.txt')
+
+    @staticmethod
+    def _tab_pts(term):
+        """The child's controlling pts (e.g. /dev/pts/24), read from the child's own
+        stdin symlink -- cheap, and NOT parsed out of the attacker-set OSC title. None
+        when there is no live child or it is unreadable."""
+        pid = term._pid
+        if pid is None or not term._pid_is_current_child():
+            return None
+        try:
+            dev = os.readlink('/proc/%d/fd/0' % pid)
+        except OSError:                     # pragma: no cover - a live child's fd 0 is readable
+            return None
+        if not dev.startswith('/dev/pts/'):  # pragma: no cover - a pty child's stdin is a pts
+            return None
+        return dev
+
+    def _tab_tooltip(self, term):
+        """One consistent multi-line 'field: value' tooltip for EVERY tab, so a renamed
+        tab and an OSC-titled tab read the same way instead of one showing 'name:' and
+        another 'program:'. Rich text: html.escape every value (the OSC program title is
+        attacker-set) and join with <br>. Cheap fields only; a line is omitted only when
+        its value is truly unavailable, order kept stable so all tabs read alike."""
+        rows = []
+
+        def add(field, value):
+            if value:
+                rows.append('%s: %s' % (field, html.escape(str(value))))
+
+        add('name', self._user_titles.get(term))
+        add('program', self._prog_titles.get(term))
+        add('command', _command_display(term._command) or '(login shell)')
+        add('mode', 'TUI' if term.current_tui() else 'CLI')
+        add('pid', term._pid)
+        add('pts', self._tab_pts(term))
+        add('cwd', self._osc_cwd.get(term) or term.shell_cwd() or term.cwd_basename())
+        live = term._transcript_path()
+        if live:
+            add('transcript', live)
+        else:
+            add('transcript (on save)', self._default_transcript_path())
+        return '<br>'.join(rows)
+
     def _refresh_tab_label(self, term):
         index = self.tabs.indexOf(term)
         if index < 0:
@@ -2201,16 +2252,7 @@ class MainWindow(QMainWindow):
         # filesystem name and could carry bidi/control/homoglyph into the tab bar.
         default = sanitize_title(term.cwd_basename() or '') or 'shell'
         self.tabs.setTabText(index, user or program or default)
-        parts = []
-        if user:
-            parts.append('name: ' + user)
-        if program:
-            parts.append('program: ' + program)
-        # setTabToolTip renders rich text (unlike setTabText), so an OSC-set program
-        # title with HTML-like content would render as markup in the tab chrome. Escape
-        # each part and join with an explicit <br>, so the untrusted title is shown
-        # literally rather than interpreted as markup.
-        self.tabs.setTabToolTip(index, '<br>'.join(html.escape(p) for p in parts))
+        self.tabs.setTabToolTip(index, self._tab_tooltip(term))
 
     def set_tab_color(self, index, color):
         if index < 0:
@@ -3690,13 +3732,13 @@ class MainWindow(QMainWindow):
         self._populate_clipboard_menu(menu.addMenu('Clipboard sanitizer'))
 
     def _on_cwd_changed(self, term, path):
-        # OSC 7 working directory (only when osc_cwd is enabled): show it as the tab's
-        # tooltip. The path is sanitize_title'd upstream (no control/bidi/homoglyph) but
-        # that keeps < > & verbatim, and setTabToolTip renders rich text -- so escape it,
-        # like _refresh_tab_label does, or an OSC-7 path could inject markup.
-        index = self.tabs.indexOf(term)
-        if index != -1:
-            self.tabs.setTabToolTip(index, html.escape(path))
+        # OSC 7 working directory changed (only when osc_cwd is enabled): remember the
+        # reported path and refresh the tab's UNIFIED tooltip, which shows it (html-escaped)
+        # on the cwd line -- instead of CLOBBERING the whole tooltip with a bare unlabeled
+        # path. The OSC-7 value is kept (it is the only cwd source for a remote/ssh session);
+        # _tab_tooltip escapes it, and falls back to the real /proc cwd when none was reported.
+        self._osc_cwd[term] = path
+        self._refresh_tab_label(term)
 
     def _on_clipboard_read_requested(self, term):
         """A program in `term` asked to READ the clipboard (OSC 52). Ask the user
@@ -3883,7 +3925,7 @@ class MainWindow(QMainWindow):
         term = self.current()
         if term is None or not self._tab_is_live(term):
             return
-        path = os.path.join(session._state_dir(), 'transcript.txt')
+        path = self._default_transcript_path()
         try:
             session.ensure_state_dir()
             # 0600 + O_NOFOLLOW, exactly as Open Transcript writes it: owner-only, and

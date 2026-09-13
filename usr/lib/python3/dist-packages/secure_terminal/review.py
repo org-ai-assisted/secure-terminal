@@ -653,14 +653,10 @@ class ReviewBar(QWidget):
         # (which still delivers), so mark them ">= N" rather than present them as a total.
         multiline = detail['multiline']
         plus = '+' if truncated else ''
-        # Only the PASTE direction executes the lines; a copy/clipboard review runs
-        # nothing, so reserve the "runs more than one command" wording for paste.
-        if not multiline:
-            note = ''
-        elif self._kind.get('paste_newline'):
-            note = ' &nbsp;(multi-line -- runs more than one command)'
-        else:
-            note = ' &nbsp;(multi-line)'
+        # Structure row is structural only: how many lines, not what happens on
+        # accept. The per-mode outcome (and the never-auto-run guarantee) is stated
+        # in the "If accepted" row below.
+        note = ' &nbsp;(multi-line)' if multiline else ''
         lines_val = '%d%s%s' % (detail['lines'], plus, note)
         struct = [_row(_LINES_GLYPH,
                        palette['invisible']['fg'] if multiline else _MUTED_FG,

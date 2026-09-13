@@ -1,5 +1,6 @@
 usr/bin/secure-terminal usr/bin/
 usr/bin/secure-terminal-cli usr/bin/
+usr/bin/secure-terminal-sigreport usr/bin/
 usr/bin/unicode-tag usr/bin/
 usr/bin/unicode-tag-stdin usr/bin/
 usr/bin/sclip usr/bin/

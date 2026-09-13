@@ -1,0 +1,63 @@
+#!/usr/bin/python3 -Bsu
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## Shell-invocation guard: under bash/sh the shebang is ignored and the `import`
+## lines below would run as shell commands (`import` is ImageMagick -> XGrabServer,
+## which freezes X). Re-exec under python3; inert as a string literal in python3.
+"exec" "python3" "-Bsu" "$0" "$@"
+
+"""Print every signal this process receives, then keep running -- a diagnostic
+target for the Terminate button / /terminate. Launch it as the terminal's program:
+
+    secure-terminal -- secure-terminal-sigreport
+
+Click Terminate (or run /terminate): you SEE "received SIGTERM (15)" as the panic
+button's SIGTERM lands, then ~2s later the uncatchable SIGKILL ends the process --
+proving the whole SIGTERM->SIGKILL escalation reached the foreground group. SIGKILL
+and SIGSTOP cannot be caught (the kernel never delivers them to a handler), so they
+are not trapped here; a SIGKILL simply makes the process vanish. Quit it yourself
+with SIGQUIT (Ctrl+\\) or by closing the terminal."""
+
+import os
+import signal
+import sys
+import time
+
+
+def _report(signum, _frame):
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:                    # pragma: no cover - a real signum always maps
+        name = 'SIG%d' % signum
+    sys.stdout.write('received %s (%d)\n' % (name, signum))
+    sys.stdout.flush()
+    if signum == signal.SIGQUIT:          # an explicit, easy way to end the process
+        sys.stdout.write('SIGQUIT -> exiting\n')
+        sys.stdout.flush()
+        sys.exit(0)
+
+
+def main():
+    # Trap every signal the kernel allows a handler for. SIGKILL/SIGSTOP are
+    # uncatchable by design; skip them (and the invalid 0) rather than crash.
+    for sig in signal.Signals:
+        if sig in (signal.SIGKILL, signal.SIGSTOP):
+            continue
+        try:
+            signal.signal(sig, _report)
+        except (OSError, ValueError, RuntimeError):
+            continue                      # real-time / reserved signals: not trappable here
+    sys.stdout.write('sigreport: PID %d ready -- waiting for signals '
+                     '(Terminate sends SIGTERM then SIGKILL; SIGQUIT/Ctrl-\\ quits)\n'
+                     % os.getpid())
+    sys.stdout.flush()
+    while True:
+        time.sleep(3600)                  # woken by any delivered signal; loops and waits again
+
+
+if __name__ == '__main__':
+    main()
