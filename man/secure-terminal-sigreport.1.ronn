@@ -1,0 +1,32 @@
+secure-terminal-sigreport(1) -- print received signals (a Terminate test target)
+=================================================================================
+
+<!--
+# Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+# See the file COPYING for copying conditions.
+-->
+
+## SYNOPSIS
+
+`secure-terminal --` `secure-terminal-sigreport`
+
+## DESCRIPTION
+
+secure-terminal-sigreport traps every catchable signal, prints `received
+SIG<NAME> (<num>)` when one arrives, and keeps running. It is a diagnostic
+target for the Terminate button (and the `/terminate` command): run it as the
+terminal's program, click Terminate, and watch the `SIGTERM` land, followed
+about two seconds later by the uncatchable `SIGKILL` that ends the process --
+confirming the whole SIGTERM-then-SIGKILL escalation reached the foreground
+group.
+
+`SIGKILL` and `SIGSTOP` cannot be caught (the kernel never delivers them to a
+handler), so they are not trapped; a `SIGKILL` simply makes the process vanish.
+
+## EXIT STATUS
+
+Exits 0 on `SIGQUIT` (Ctrl-\\). Otherwise it runs until killed.
+
+## SEE ALSO
+
+`secure-terminal`(1)

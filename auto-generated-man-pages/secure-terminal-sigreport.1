@@ -1,0 +1,15 @@
+.\" generated with Ronn-NG/v0.10.1
+.\" http://github.com/apjanke/ronn-ng/tree/0.10.1
+.TH "SECURE\-TERMINAL\-SIGREPORT" "1" "January 2020" "secure-terminal" "secure-terminal Manual"
+.SH "NAME"
+\fBsecure\-terminal\-sigreport\fR \- print received signals (a Terminate test target)
+.SH "SYNOPSIS"
+\fBsecure\-terminal \-\-\fR \fBsecure\-terminal\-sigreport\fR
+.SH "DESCRIPTION"
+secure\-terminal\-sigreport traps every catchable signal, prints \fBreceived SIG<NAME> (<num>)\fR when one arrives, and keeps running\. It is a diagnostic target for the Terminate button (and the \fB/terminate\fR command): run it as the terminal's program, click Terminate, and watch the \fBSIGTERM\fR land, followed about two seconds later by the uncatchable \fBSIGKILL\fR that ends the process \-\- confirming the whole SIGTERM\-then\-SIGKILL escalation reached the foreground group\.
+.P
+\fBSIGKILL\fR and \fBSIGSTOP\fR cannot be caught (the kernel never delivers them to a handler), so they are not trapped; a \fBSIGKILL\fR simply makes the process vanish\.
+.SH "EXIT STATUS"
+Exits 0 on \fBSIGQUIT\fR (Ctrl\-\e)\. Otherwise it runs until killed\.
+.SH "SEE ALSO"
+\fBsecure\-terminal\fR(1)

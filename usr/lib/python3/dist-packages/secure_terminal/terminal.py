@@ -1069,6 +1069,7 @@ class SecureTerminal(QPlainTextEdit):
         self.setCursorWidth(0)
         self._cursor_on = True         # blink phase: True = drawn this half-cycle
         self._cursor_visible = True    # a TUI program can hide it (DECTCEM); CLI always shows
+        self._blink_pos = None         # doc position the blink last reset SOLID at (cursor move)
         self._blink_timer = QTimer(self)
         self._blink_timer.timeout.connect(self._blink_cursor)
         # Optional live transcript file: when SECURE_TERMINAL_TRANSCRIPT_FILE names a path,
@@ -2010,6 +2011,19 @@ class SecureTerminal(QPlainTextEdit):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff if self._grid_mode()
             else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
+    def _apply_vscroll_policy(self):
+        """The alternate screen is a fixed canvas with NO scrollback -- the wheel is
+        sent to the child as arrow keys, not a Qt scroll -- so it must NEVER show a
+        vertical scrollbar (the vertical analog of the grid horizontal-bar suppression
+        above). The grid is laid out at QPlainTextEdit's lineSpacing() but SIZED by
+        fontMetrics().height() (no inter-line leading), so screen.lines blocks overrun
+        the viewport by the accumulated leading; under AsNeeded that raises a spurious
+        range that also GROWS as the font is zoomed up. Primary grid + CLI keep AsNeeded:
+        they have real scrollback."""
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if self._alt_screen
+            else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
     def _sync_display(self):
         """Match the on-screen view to the current mode. TUI mode shows the pyte
         grid with its scrollback; CLI mode shows the scrolling line document. The
@@ -2708,6 +2722,10 @@ class SecureTerminal(QPlainTextEdit):
                 self._alt_view = False
             self._render_primary_grid(screen)
         self.setUpdatesEnabled(True)
+        # Alt-screen has no scrollback -> no vertical scrollbar; primary keeps it.
+        # Re-applied every frame so it tracks alt<->primary flips AND a zoom (which
+        # re-renders) can never leave a grown range behind.
+        self._apply_vscroll_policy()
         if self._alt_screen:
             # The alternate screen is a fixed canvas with NO scrollback: its row 0 is the
             # TOP of the program's screen and must always be visible, exactly as a real
@@ -3148,8 +3166,7 @@ class SecureTerminal(QPlainTextEdit):
             tc.setPosition(min(pos, doc.characterCount() - 1))
             self.setTextCursor(tc)
             self._out_cursor = QTextCursor(tc)   # anchor our blinking cursor here (TUI)
-            self._cursor_on = True               # solid while output streams; the blink
-                                                 # timer resumes toggling once it settles
+            self._mark_cursor_moved(tc.position())   # solid while the caret MOVES; blinks idle
             # setTextCursor calls ensureCursorVisible, which follows the caret RIGHT when a
             # Show-mode wide glyph renders past the base-font cell width the grid advertised
             # to the child -- parking the view mid-grid and hiding column 0. A TUI grid is a
@@ -4720,9 +4737,20 @@ class SecureTerminal(QPlainTextEdit):
             # _feed_stream feeds only the pyte grid (self._stream), never self._raw, so the
             # banner must be put on _raw here; feeding it below shows it in the live grid now.
             self._start(None, keep_screen=True)
-            self._raw = self._grid_text() + _banner
+            base = self._grid_text()
+            # Rescue the exited program's FINAL full-screen frame into the COPYABLE scrollback
+            # ONLY when there is otherwise nothing to show -- a tab launched STRAIGHT INTO a
+            # TUI (its primary scrollback is empty), which rmcup would otherwise restart to a
+            # bare prompt with the last screen lost. The frame was already captured for Save
+            # Transcript (the last snapshot is this program's most recent frame; restart runs
+            # once per -- PROGRAM tab). When real primary scrollback exists it is shown as-is,
+            # and the alt frame stays in Save Transcript only, exactly as rmcup intends.
+            alt_dump = (self._alt_exit_snapshots[-1]
+                        if not base.strip() and self._alt_exit_snapshots else '')
+            self._raw = base + alt_dump + _banner
             self._cap_raw()
-            self._feed_stream(_banner.encode('utf-8', 'replace'))
+            # The grid needs CRLF to return to column 0; the snapshot is stored LF-only.
+            self._feed_stream((alt_dump.replace('\n', '\r\n') + _banner).encode('utf-8', 'replace'))
             self._render_tui()
         else:
             # CLI: the line document keeps the exited program's output as scrollback;
@@ -4884,7 +4912,7 @@ class SecureTerminal(QPlainTextEdit):
         cursor.setPosition(min(target, self.document().characterCount() - 1))
         self._out_cursor = cursor
         self._cursor_visible = True          # CLI always shows the cursor
-        self._cursor_on = True               # solid while output streams (blink resumes idle)
+        self._mark_cursor_moved(cursor.position())   # solid while the caret MOVES; blinks idle
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
         # A terminal does not auto-scroll horizontally: anchor the view at the left
@@ -5536,13 +5564,21 @@ class SecureTerminal(QPlainTextEdit):
         The target comes from _foreground_target, which SAMPLES the foreground pgrp (it
         can flip under an async-prompt shell) so a real job is not missed by a single read
         that happened to catch the shell -- while a genuine bare prompt still yields None."""
-        pgrp = self._foreground_target()
+        signalled, _ = self._terminate_pgrp(self._foreground_target())
+        return signalled
+
+    def _terminate_pgrp(self, pgrp):
+        """SIGTERM `pgrp` now, then SIGKILL any survivor after a grace period. The single
+        kill primitive shared by terminate_foreground AND terminate_debug, so the diagnostic
+        reports the outcome of the SAME attempt -- never a parallel recomputation that could
+        disagree. Returns (signalled, errno): (False, None) when pgrp is None (nothing to
+        terminate), (False, errno) if the SIGTERM raised, (True, None) on a delivered SIGTERM."""
         if pgrp is None:
-            return False
+            return (False, None)
         try:
             os.killpg(pgrp, signal.SIGTERM)
-        except OSError:
-            return False
+        except OSError as exc:
+            return (False, exc.errno)
 
         def _kill_survivor(target=pgrp):  # pragma: no cover - fires via QTimer 2s later; the grace-period SIGKILL is not observable in the offscreen test harness
             try:
@@ -5554,7 +5590,7 @@ class SecureTerminal(QPlainTextEdit):
             except OSError:
                 pass        # exited between the check and the kill -> fine
         QTimer.singleShot(2000, _kill_survivor)
-        return True
+        return (True, None)
 
     def terminate_debug(self):
         """A copyable diagnostic for the Terminate action that ALSO performs the real
@@ -5600,18 +5636,25 @@ class SecureTerminal(QPlainTextEdit):
         line('pid is current child', self._pid_is_current_child())
         line('child exec-replaced', self._child_execd())
         line('has_foreground_program', self.has_foreground_program())
-        # Distinct FOREGROUND-JOB pgrps seen: a real program in front sits in its own group,
-        # != our group and != the shell's. Any such value across the window is a program
-        # Terminate should be able to kill, even if other samples caught the bare shell.
+        # Distinct FOREGROUND-JOB pgrps seen across the window: OBSERVATIONAL only (a real
+        # program in front sits in its own group, != our group and != the shell's). Kept to
+        # make a FLIPPING foreground visible; the kill decision is _foreground_target below.
         jobs = sorted({s for s in samples if isinstance(s, int) and s != our and s != cpg})
         line('foreground job pgrps', jobs if jobs else '(none seen -- only shell/self)')
         if len({s for s in samples if s is not None}) > 1:
             line('FLIPPING', 'YES -- the foreground process group is not stable; a single '
                             'read (what a naive Terminate uses) will sometimes catch the '
-                            'shell and no-op. terminate_foreground now samples to avoid this.')
-        if jobs:
-            verdict = ('a real foreground job runs (pgrp %s) -- Terminate SHOULD signal it'
-                       % jobs[-1])
+                            'shell and no-op. _foreground_target samples to avoid this.')
+        # The AUTHORITATIVE target: computed ONCE by the SAME function terminate uses, then
+        # reported, probed, and killed below -- so the verdict can never disagree with the
+        # action (the whole reason the diagnostic performs the real Terminate).
+        target = self._foreground_target()
+        line('_foreground_target()',
+             ('pgrp %d (Terminate will signal this group)' % target) if target is not None
+             else 'None (no killable foreground -- Terminate is a no-op)')
+        if target is not None:
+            verdict = ('a real foreground job runs (pgrp %d) -- Terminate SHOULD signal it'
+                       % target)
         elif fpg is None:
             verdict = 'no foreground process group'
         elif fpg == our:
@@ -5619,20 +5662,19 @@ class SecureTerminal(QPlainTextEdit):
         else:
             verdict = 'only the bare login shell is in front -- nothing to terminate'
         line('would terminate', verdict)
-        probe = jobs[-1] if jobs else (fpg if isinstance(fpg, int) else None)
-        if probe is not None:                     # signal 0 sends NOTHING -- a pure probe
+        if target is not None:                    # signal 0 sends NOTHING -- a pure probe
             try:
-                os.killpg(probe, 0)
-                line('killpg(%d, 0) probe' % probe, 'ok -- group exists and is signalable')
+                os.killpg(target, 0)
+                line('killpg(%d, 0) probe' % target, 'ok -- group exists and is signalable')
             except OSError as exc:
-                line('killpg(%d, 0) probe' % probe, err(exc))
-        # Then ACTUALLY run the real Terminate and report its result RIGHT HERE, so the
-        # decision above and the outcome are the SAME attempt (no separate-moment guessing).
-        # A `would terminate ... SHOULD signal it` paired with `terminate_foreground() False`
-        # is the smoking gun that terminate_foreground and the decision disagree.
+                line('killpg(%d, 0) probe' % target, err(exc))
+        # Run the real Terminate against the SAME target and report it here, so the decision
+        # above and the outcome are ONE attempt -- no parallel recomputation that could differ.
+        signalled, errno_val = self._terminate_pgrp(target)
+        if errno_val is not None:
+            line('killpg(SIGTERM) errno', _errno.errorcode.get(errno_val, errno_val))
         line('terminate_foreground()',
-             '%s (True = a real SIGTERM was just sent to the foreground group)'
-             % self.terminate_foreground())
+             '%s (True = a real SIGTERM was just sent to the foreground group)' % signalled)
         return '\n'.join(out)
 
     # Pids of OUR pty shells. The app's SIGCHLD handler reaps ONLY these, never a
@@ -6228,6 +6270,19 @@ class SecureTerminal(QPlainTextEdit):
         self._cursor_on = not self._cursor_on
         self._update_cursor_region()
 
+    def _mark_cursor_moved(self, pos):
+        """Reset the cursor SOLID and (re)start its blink ONLY when the output cursor
+        actually MOVED (typing / the program repositioning the caret). A render that
+        redraws WITHOUT moving the cursor -- a spinner or streaming output elsewhere on
+        a continuously-repainting TUI (e.g. Claude Code) -- must NOT force solid: forcing
+        _cursor_on=True every frame out-paces the blink timer so the OFF half-cycle never
+        shows and the cursor looks permanently solid. Leaving it alone when the position
+        is unchanged lets the timer keep blinking. Also (re)starts the timer from the
+        output path, which the old code only did on focus-in."""
+        if pos != self._blink_pos:
+            self._blink_pos = pos
+            self._restart_blink()
+
     def _restart_blink(self):
         """Show the cursor at once and (re)start its blink -- called on every output-
         cursor placement, so a streaming/moving cursor stays solid and it blinks
@@ -6244,9 +6299,16 @@ class SecureTerminal(QPlainTextEdit):
     def hideEvent(self, event):
         # A hidden widget (a background tab, or one being closed) must not keep a
         # blink timer alive: its timeout would repaint a viewport that may be mid-
-        # teardown. Focus-in restarts it when the tab is shown again.
+        # teardown. showEvent restarts it when the tab is shown again.
         self._blink_timer.stop()
         super().hideEvent(event)
+
+    def showEvent(self, event):
+        # A re-shown tab must resume blinking even when Qt does NOT redeliver a
+        # focusInEvent (focus never actually left the widget, only the tab was
+        # hidden), which hideEvent's timer stop would otherwise leave dead.
+        super().showEvent(event)
+        self._restart_blink()
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -6566,8 +6628,8 @@ class SecureTerminal(QPlainTextEdit):
         if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
                 and not self._review_active):
             self._write(b'\x1b[I')          # DEC 1004 focus-in report
-        self._restart_blink()               # resume blinking, cursor visible at once
-        super().focusInEvent(event)
+        super().focusInEvent(event)         # FIRST, so hasFocus() is true when
+        self._restart_blink()               # _restart_blink gates its timer start on it
 
     def focusOutEvent(self, event):
         if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
