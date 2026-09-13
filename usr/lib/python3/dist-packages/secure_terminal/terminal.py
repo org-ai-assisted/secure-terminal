@@ -5984,7 +5984,14 @@ class SecureTerminal(QPlainTextEdit):
             # (80), that fill (and the clickable void it creates) lands in the
             # middle of a wider window instead of at the true right edge.
             old_cols = self._cols
-            self._set_winsize(*self._grid_size())
+            new_cols, new_rows = self._grid_size()
+            # Only push a new winsize on a real CHARACTER-grid change. A sub-character
+            # pixel resize (or the several resizeEvents one maximize/drag fires, all
+            # landing on the same grid) would otherwise re-ioctl the SAME size, SIGWINCHing
+            # the child for nothing -- zsh then reprints its prompt, which reads as a stray
+            # Enter. The TUI branch (_sync_tui_size) already guards this; keep line mode in step.
+            if (new_cols, new_rows) != (self._cols, self._rows):
+                self._set_winsize(new_cols, new_rows)
             # REFLOW retained line output to the new width: a long line emitted at the old
             # width otherwise horizontal-scrolls (Box/Show are NoWrap by design). _rerender
             # replays _raw through _feed_line, whose hard-wrap is self._cols, so it re-wraps
