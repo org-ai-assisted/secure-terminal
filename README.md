@@ -209,14 +209,23 @@ editing (mid-line cursor movement, history recall, completion menus) is
 intentionally basic there; compose or paste a line, read the exact bytes, then run
 it. Turn on TUI mode when you want those interactive features to render.
 
+## Review status
+
+The guarantees above are enforced by an extensive automated suite; independent human
+review is still pending. secure-terminal follows a three-stage review path: **(1)**
+written by AI and checked by that automated suite -- the current status; **(2)** human
+non-malicious review, confirming it works as intended with no backdoors; **(3)** a full
+human security audit of the whole design, the gold standard. See
+[the review status page](https://secure-terminal.github.io/human-review/).
+
 ## Run
 
 ```
 secure-terminal
 ```
 
-Built with Python and Qt6. AI-assisted; see
-[org-ai-assisted](https://github.com/org-ai-assisted).
+Built with Python and Qt6. AI-assisted (see
+[org-ai-assisted](https://github.com/org-ai-assisted) and the review status above).
 
 ## How to install `secure-terminal`
 
