@@ -436,7 +436,7 @@ from secure_terminal.sanitize import (
     feed_line_edits, cells_to_runs, cells_display_col, display_len,
     MARK_KEY, WRAP_NL, _NO_NEWLINE_KEY, BOX,
     SPACE_MARK,
-    WS_ANOMALY,
+    WS_ANOMALY, whitespace_anomaly_cols,
     render_output, render_cap_prefix,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
@@ -2811,6 +2811,18 @@ class SecureTerminal(QPlainTextEdit):
             return _cache_bounded(self._grid_mark_cache, key, fmt)
         return fmt
 
+    def _ws_dot_format(self):
+        """Shared grid format for a whitespace-anomaly cell: the _WS_DOT_PROP flag only -- the
+        cell keeps its real space (copy-safe) and paintEvent draws the faint dot. One cached
+        instance so a run of flagged spaces coalesces (run coalescing is by format identity).
+        Theme-independent (no colour), so it is never cleared with the colour caches."""
+        fmt = getattr(self, '_grid_ws_fmt', None)
+        if fmt is None:
+            fmt = QTextCharFormat()
+            fmt.setProperty(_WS_DOT_PROP, True)
+            self._grid_ws_fmt = fmt
+        return fmt
+
     def _grid_row_runs(self, row, columns):
         """The (text, format) runs one pyte row renders to, same-format cells
         coalesced. This IS both the row's render and its incremental signature:
@@ -2820,13 +2832,22 @@ class SecureTerminal(QPlainTextEdit):
         format objects and compare equal by identity (fast); a theme / mode /
         marking / colour change rebuilds the cached formats, so the runs differ
         and the row is correctly re-rendered."""
+        chars = [tui_cell(row[x].data, self._mode) for x in range(columns)]
+        # Whitespace anomalies in the grid: INTERIOR runs of >= 2 spaces only. Leading and
+        # trailing are suppressed (flag_leading/flag_trailing False) -- a grid pads every row
+        # out to the width with spaces (trailing = structural fill) and positions content with
+        # leading spaces (indentation), so dotting either would fill the screen; a run of >= 2
+        # spaces BETWEEN visible tokens is the real "hidden extra spacing" anomaly. Gated on the
+        # risk-marking toggle, like the CLI path. A flagged space keeps its real space (copy-safe)
+        # under the dot-flagged format; paintEvent draws the dot.
+        flagged = (whitespace_anomaly_cols(chars, flag_trailing=False, flag_leading=False)
+                   if self._markings else ())
         runs = []
         run_text = ''
         run_fmt = None
         for x in range(columns):
-            cell = row[x]
-            ch = tui_cell(cell.data, self._mode)
-            fmt = self._grid_cell_format(cell, ch)
+            ch = chars[x]
+            fmt = self._ws_dot_format() if x in flagged else self._grid_cell_format(row[x], ch)
             if run_text and fmt is run_fmt:
                 run_text += ch
             else:
@@ -6360,25 +6381,30 @@ class SecureTerminal(QPlainTextEdit):
         painter.end()
 
     def _ws_dot_runs(self, block):
-        """(start, end) document positions of each whitespace-anomaly run in `block`, from
-        the document fragments carrying the _WS_DOT_PROP flag. CLI line mode only (see
-        _ws_dot_rects): whitespace anomalies are a flowing-output concept, and a TUI grid
-        pads every row with structural spaces that are not anomalies."""
-        it = block.begin()
-        while not it.atEnd():
-            frag = it.fragment()
-            if frag.isValid() and frag.charFormat().property(_WS_DOT_PROP):
-                yield frag.position(), frag.position() + frag.length()
-            it += 1
+        """(start, end) document positions of each whitespace-anomaly run in `block`: from the
+        block's _GridRow runs in TUI grid mode (formats live in the layout, not the char
+        format), else from the document fragments in CLI line mode (the _WS_DOT_PROP flag on
+        the char format). Mirrors _doc_runs -- the seam both render paths share. TUI flags
+        INTERIOR runs only (see _grid_row_runs), so the grid padding is never dotted."""
+        data = block.userData()
+        base = block.position()
+        if isinstance(data, _GridRow):
+            for start, length, fmt, _cp in data.runs:
+                if fmt.property(_WS_DOT_PROP):
+                    yield base + start, base + start + length
+        else:
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid() and frag.charFormat().property(_WS_DOT_PROP):
+                    yield frag.position(), frag.position() + frag.length()
+                it += 1
 
     def _ws_dot_rects(self):
         """Viewport cell rectangles of every visible whitespace-anomaly cell, one per
         flagged column. cursorRect maps a document position to the viewport, so this is
-        correct under scroll and soft-wrap alike. CLI line mode only: a TUI grid space-pads
-        every row (structural, not an anomaly), so flagging there would dot the whole
-        screen."""
-        if self._grid_mode():
-            return
+        correct under scroll and soft-wrap alike. Both render paths: the CLI flowing document
+        and the TUI grid (interior-only there, so grid padding is never flagged)."""
         doc = self.document()
         cur = QTextCursor(doc)
         cell_w = max(2, self.fontMetrics().horizontalAdvance(' '))
