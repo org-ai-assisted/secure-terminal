@@ -977,6 +977,14 @@ class MainWindow(QMainWindow):
         # turned it on in a privileged directory (remote_control is privileged-
         # only, so a home config cannot enable it).
         self._remote_control = cfg.get('remote_control') == 'true'
+        # --terminate-verbose (or terminate_verbose=true in a config drop-in): on EVERY
+        # Terminate invocation, dump a MAXIMUM diagnostic -- which tab current() resolved,
+        # every tab's foreground state, and the per-terminal kill-decision inputs -- to a
+        # state-dir file AND a copyable box, so a Terminate that appears to do nothing can be
+        # diagnosed from a running instance without a rebuild.
+        self._terminate_verbose = (
+            bool(launch is not None and getattr(launch, 'terminate_verbose', False))
+            or cfg.get('terminate_verbose') == 'true')
         # single-instance group socket: None until this window claims the group's
         # primary socket (a server-less coexisting instance leaves it None).
         self._server = None
@@ -2547,8 +2555,62 @@ class MainWindow(QMainWindow):
 
     def terminate_foreground(self):
         term = self.current()
-        if term is not None:
+        if term is None:
+            return
+        if self._terminate_verbose:
+            self._terminate_verbose_report(term)   # dumps diagnostic AND performs Terminate
+        else:
             term.terminate_foreground()
+
+    def _terminate_verbose_report(self, term):
+        """--terminate-verbose: the MainWindow-side routing (which tab current() resolved,
+        every tab's foreground state) PLUS the per-terminal terminate_debug() -- which ALSO
+        performs the real Terminate, so diagnosis and action are one attempt. Written to a
+        state-dir file and shown copyable, so a Terminate that does nothing is diagnosable
+        (which tab it hit, whether that tab had a killable foreground, the killpg result)."""
+        lines = []
+
+        def line(key, val):
+            lines.append('%-26s %s' % (key, val))
+
+        line('current tab index', self.tabs.currentIndex())
+        line('tab count', self.tabs.count())
+        line('act_terminate enabled', self.act_terminate.isEnabled())
+        line('current() is this term', term is self.current())
+        for i in range(self.tabs.count()):
+            widget = self.tabs.widget(i)
+            mark = '  <== current' if widget is self.current() else ''
+            if isinstance(widget, SecureTerminal):
+                # has_foreground_program / _foreground_pgrp self-handle their OSErrors
+                # (return False / None), so no extra guard is needed here.
+                line('tab %d' % i, 'pid=%s cmd=%r fg=%s fpgrp=%s%s'
+                     % (widget._pid, widget._command, widget.has_foreground_program(),
+                        widget._foreground_pgrp(), mark))
+            else:
+                line('tab %d' % i, '%r (not a terminal)%s' % (widget, mark))
+        report = ('Terminate (verbose) -- MainWindow routing:\n' + '\n'.join(lines)
+                  + '\n\n' + term.terminate_debug())
+        # Persist to the state dir so the diagnostic survives the dialog and can be shared
+        # (0600 + O_NOFOLLOW, like every sibling capture writer).
+        try:
+            session.ensure_state_dir()
+            path = os.path.join(session._state_dir(), 'terminate-debug.txt')
+            fd = os.open(path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.write(report + '\n')
+        except OSError:
+            pass                                    # best-effort: never let it abort Terminate
+        box = QMessageBox(self)
+        box.setWindowTitle('Terminate (verbose diagnostic + result)')
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText('Terminate ran. Maximum diagnostic below (select all, copy, send it '
+                    'over); also saved to the state dir as terminate-debug.txt:')
+        box.setInformativeText(report)
+        box.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        box.exec()
 
     def _update_terminate_enabled(self):
         term = self.current()
@@ -6432,6 +6494,7 @@ class _Launch:
         self.tabs = []             # [{title, tui, mode, command}]
         self.test_canary = False   # --test-canary -> headless positive control, exit
         self.tray = False          # --tray -> start hidden-to-tray with the sanitizer armed
+        self.terminate_verbose = False  # --terminate-verbose -> dump a max Terminate diagnostic
 
 
 def _launch_parser(with_globals):
@@ -6446,7 +6509,9 @@ def _launch_parser(with_globals):
                "(list tabs, send text, dump a tab's rendered text or full grid state, "
                'zoom); requires remote_control=true set by an admin in '
                '/etc/secure-terminal.d. Environment: SECURE_TERMINAL_TRANSCRIPT_FILE=PATH '
-               "writes the tab's transcript to PATH on output-settle.")
+               "writes the tab's transcript to PATH on output-settle -- on a confined "
+               'install PATH must be under ~/.local/state/secure-terminal/ (the AppArmor '
+               'profile denies writes elsewhere; a denied write is silently skipped).')
     if with_globals:
         p.add_argument('--version', action='version',
                        version='secure-terminal ' + APP_VERSION)
@@ -6494,6 +6559,12 @@ def _launch_parser(with_globals):
                        help='start hidden to the system tray with the clipboard '
                             'sanitizer watching (no terminal window opens); used by '
                             'the login autostart entry')
+        p.add_argument('--terminate-verbose', dest='terminate_verbose',
+                       action='store_true',
+                       help='on every Terminate, dump a maximum diagnostic (which tab '
+                            'current() resolved, each tab foreground state, the kill '
+                            'decision + result) to a copyable box and the state-dir file '
+                            'terminate-debug.txt, to debug a Terminate that does nothing')
     p.add_argument('--title', help='initial tab title')
     p.add_argument('--tui', action='store_true', default=None,
                    help='start this tab in TUI mode')
@@ -6562,6 +6633,7 @@ def _parse_launch_args(argv):
             # does); dispatched from main() before Qt.
             launch.test_canary = namespace.test_canary
             launch.tray = namespace.tray
+            launch.terminate_verbose = namespace.terminate_verbose
         else:
             namespace = parser.parse_args(group)
         launch.tabs.append({
