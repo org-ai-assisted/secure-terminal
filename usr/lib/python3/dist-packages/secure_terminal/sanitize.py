@@ -1431,26 +1431,35 @@ WRAP_NL = '\x00wrap'
 WS_ANOMALY = 'whitespace'
 
 
-def whitespace_anomaly_cols(chars, flag_trailing=True):
+def whitespace_anomaly_cols(chars, flag_trailing=True, flag_leading=True):
     """Indices of the whitespace anomalies in `chars`, a per-column sequence of the single
-    rendered characters of one line: every LEADING U+0020, every TRAILING U+0020 (unless
-    flag_trailing is False), plus any INTERIOR run of >= 2 U+0020. A lone interior space is
-    not flagged. Only the plain ASCII space counts -- a non-ASCII space is already its own
-    'invisible' marking. Pure over the sequence, so the classification is directly testable.
+    rendered characters of one line: every LEADING U+0020 (unless flag_leading is False),
+    every TRAILING U+0020 (unless flag_trailing is False), plus any INTERIOR run of >= 2
+    U+0020. A lone interior space is not flagged. Only the plain ASCII space counts -- a
+    non-ASCII space is already its own 'invisible' marking. Pure over the sequence, so the
+    classification is directly testable.
 
     flag_trailing is False for the EDITABLE current line: its end is where the cursor sits
     and typing happens (the shell prompt's separator space, a half-typed line), so its
     trailing space is not an end-of-output anomaly. Leading + interior are still flagged
     there -- so leading command spaces (an indent that hides a command from shell history)
-    show up live, as an interior run after the prompt's own separator space."""
+    show up live, as an interior run after the prompt's own separator space.
+
+    flag_leading AND flag_trailing are both False for the TUI GRID (terminal._grid_row_runs),
+    which leaves INTERIOR runs only: a grid pads every row out to the full width with spaces
+    (trailing = structural fill, not content) and positions content with leading spaces
+    (indentation / layout), so flagging either would dot the whole screen; a run of >= 2
+    spaces BETWEEN visible tokens is still the real anomaly (hidden extra spacing) and is
+    flagged."""
     n = len(chars)
     is_sp = [c == ' ' for c in chars]
     flagged = set()
     i = 0
-    while i < n and is_sp[i]:                 # every leading space
-        flagged.add(i)
+    while i < n and is_sp[i]:                 # scan the leading run
         i += 1
     lead_end = i
+    if flag_leading:
+        flagged.update(range(0, lead_end))    # every leading space
     j = n - 1
     while j >= 0 and is_sp[j]:                 # scan back over the trailing run
         j -= 1
