@@ -3398,6 +3398,7 @@ class SecureTerminal(QPlainTextEdit):
             'confusable': {'fg': '#a4113f', 'bg': '#ffb3ca'},   # rose   -- a homoglyph posing as ASCII
             'combining':  {'fg': '#5b21b6', 'bg': '#cdb0ff'},   # violet -- a stacked combining mark (Zalgo)
             'nonascii':   {'fg': '#6d28d9', 'bg': None},        # purple -- honest foreign: subtle, no band
+            'whitespace': {'fg': '#9aa0a6', 'bg': None},        # faint grey -- an anomalous space (invisible fg; the WIDGET paints a dot, this entry serves the colour-only paths: revealed editor / review table)
         },
         'dark': {
             'bidi':       {'fg': '#ff5a60', 'bg': '#5c1820'},   # red    -- reorders text (worst)
@@ -3406,6 +3407,7 @@ class SecureTerminal(QPlainTextEdit):
             'confusable': {'fg': '#ff6f9d', 'bg': '#551d35'},   # rose   -- a homoglyph posing as ASCII
             'combining':  {'fg': '#c9a3ff', 'bg': '#46306b'},   # violet -- a stacked combining mark (Zalgo)
             'nonascii':   {'fg': '#a06cff', 'bg': None},        # purple -- honest foreign: subtle, no band
+            'whitespace': {'fg': '#7a7f86', 'bg': None},        # faint grey -- an anomalous space (invisible fg; the WIDGET paints a dot, this entry serves the colour-only paths: revealed editor / review table)
         },
     }
 
