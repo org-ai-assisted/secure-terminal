@@ -2198,6 +2198,21 @@ class MainWindow(QMainWindow):
         return os.path.join(session._state_dir(), 'transcript.txt')
 
     @staticmethod
+    def _default_screen_path():
+        """The on-save current-screen file path -- the file Open Current Screen writes
+        and Copy Current Screen File Path names. Same state dir as the transcript."""
+        return os.path.join(session._state_dir(), 'screen.txt')
+
+    @staticmethod
+    def _default_state_dump_path():
+        """The on-save STATE DUMP file path. Unlike the plain screen/transcript (lossless
+        text, NO cell attributes), this file carries the full grid WITH per-cell SGR
+        attributes (bold/colour/reverse), cursor, modes and alt-screen -- so a render bug
+        (a leaked bold, a dropped row) is reportable at full fidelity in one file. Named
+        here so the writer (copy/open) and the tab tooltip agree on one path."""
+        return os.path.join(session._state_dir(), 'state-dump.txt')
+
+    @staticmethod
     def _tab_pts(term):
         """The child's controlling pts (e.g. /dev/pts/24), read from the child's own
         stdin symlink -- cheap, and NOT parsed out of the attacker-set OSC title. None
@@ -2237,6 +2252,10 @@ class MainWindow(QMainWindow):
             add('transcript', live)
         else:
             add('transcript (on save)', self._default_transcript_path())
+        # The full-fidelity grid dump path: hand this file to a reviewer for a render bug
+        # (it records per-cell bold/colour the plain transcript cannot). Written on demand
+        # by Save/Open/Copy-path State Dump or the /dump-state command.
+        add('state dump (on save)', self._default_state_dump_path())
         return '<br>'.join(rows)
 
     def _refresh_tab_label(self, term):
@@ -3910,40 +3929,67 @@ class MainWindow(QMainWindow):
         self._save_capture('Save Current Screen', 'secure-terminal-screen.txt',
                            SecureTerminal.transcript_text)
 
+    def save_state_dump(self):
+        self._save_capture('Save Screen State Dump', 'secure-terminal-state-dump.txt',
+                           SecureTerminal.dump_state)
+
     def open_transcript(self):
         self._open_capture('transcript.txt', SecureTerminal.scrollback_text)
 
     def open_current_screen(self):
         self._open_capture('screen.txt', SecureTerminal.transcript_text)
 
+    def open_state_dump(self):
+        self._open_capture('state-dump.txt', SecureTerminal.dump_state)
+
     def copy_transcript_path(self):
-        """Write this tab's scrollback to the app's default transcript file and show
-        its path with a one-click copy, so it can be found or shared without hunting.
-        Independent of any env var: it uses the SAME default state-dir file Open
-        Transcript writes (the one place AppArmor permits writes), refreshed NOW so
-        the shown path always names a real, current file."""
+        """Write this tab's scrollback to the app's default transcript file and show its
+        path with a one-click copy, so it can be found or shared without hunting."""
+        self._copy_capture_path(
+            'Transcript file path', "This tab's transcript file:",
+            self._default_transcript_path(), SecureTerminal.scrollback_text)
+
+    def copy_current_screen_path(self):
+        """Write this tab's CURRENT SCREEN to the app's default screen file and show its
+        path with one-click copy -- the screen counterpart of copy_transcript_path."""
+        self._copy_capture_path(
+            'Screen file path', "This tab's current-screen file:",
+            self._default_screen_path(), SecureTerminal.transcript_text)
+
+    def copy_state_dump_path(self):
+        """Write this tab's full-fidelity STATE DUMP (grid + per-cell attributes) to the
+        app's default state-dump file and show its path with one-click copy -- the file to
+        hand a reviewer for a render bug the plain screen/transcript cannot show."""
+        self._copy_capture_path(
+            'State dump file path', "This tab's state dump file:",
+            self._default_state_dump_path(), SecureTerminal.dump_state)
+
+    def _copy_capture_path(self, title, heading, path, getter):
+        """Write getter(current tab) to the fixed state-dir `path` (refreshed NOW so the
+        shown path always names a real, current file), then show that path with a
+        one-click copy. Independent of any env var; uses the SAME default state-dir file
+        the matching Open action writes (the one place AppArmor permits writes). Single
+        builder shared by the transcript / screen / state-dump copy-path actions."""
         term = self.current()
         if term is None or not self._tab_is_live(term):
             return
-        path = self._default_transcript_path()
         try:
             session.ensure_state_dir()
-            # 0600 + O_NOFOLLOW, exactly as Open Transcript writes it: owner-only, and
-            # a planted symlink at the target fails the open rather than redirecting.
+            # 0600 + O_NOFOLLOW, exactly as the matching Open action writes it: owner-only,
+            # and a planted symlink at the target fails the open rather than redirecting.
             fd = os.open(path,
                          os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                handle.write(term.scrollback_text())
+                handle.write(getter(term))
         except OSError as exc:
             QMessageBox.warning(
-                self, 'Transcript file path',
-                'Could not write the transcript file:\n%s\n\n%s'
-                % (path, exc.strerror or exc))
+                self, title,
+                'Could not write the file:\n%s\n\n%s' % (path, exc.strerror or exc))
             return
         dlg = QDialog(self)
-        dlg.setWindowTitle('Transcript file path')
+        dlg.setWindowTitle(title)
         lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel("This tab's transcript file:", dlg))
+        lay.addWidget(QLabel(heading, dlg))
         field = QLineEdit(path, dlg)     # read-only + selectable: copy by hand too
         field.setReadOnly(True)
         field.setCursorPosition(0)
@@ -4272,6 +4318,45 @@ class MainWindow(QMainWindow):
             'one click.')
         self.act_transcript_path.triggered.connect(self.copy_transcript_path)
         file_menu.addAction(self.act_transcript_path)
+
+        # No mnemonic (File menu letters are saturated -- the no-dup-mnemonic gate). Screen
+        # copy-path completes the pair with Save/Open Current Screen.
+        self.act_screen_path = QAction('Copy Current Screen File Path...', self)
+        self._bind(self.act_screen_path, 'copy_current_screen_path', '')
+        self.act_screen_path.setToolTip(
+            "Write what is on screen right NOW to the app's default screen file, then "
+            'show and copy its path in one click. Sanitized plain ASCII, safe anywhere.')
+        self.act_screen_path.triggered.connect(self.copy_current_screen_path)
+        file_menu.addAction(self.act_screen_path)
+
+        # The full-fidelity state dump (grid + per-cell bold/colour/cursor/modes): the file
+        # to hand a reviewer for a render bug the plain screen/transcript cannot show.
+        self.act_save_state = QAction(QIcon.fromTheme('document-save'),
+                                      'Save Screen State Dump...', self)
+        self._bind(self.act_save_state, 'save_state_dump', '')
+        self.act_save_state.setToolTip(
+            'Save the FULL terminal state -- every grid cell WITH its bold/colour '
+            'attributes, cursor, modes and alt-screen. The file to attach to a render-bug '
+            'report; the plain screen/transcript carries no attributes.')
+        self.act_save_state.triggered.connect(self.save_state_dump)
+        file_menu.addAction(self.act_save_state)
+
+        self.act_open_state = QAction(QIcon.fromTheme('document-open'),
+                                      'Open Screen State Dump...', self)
+        self._bind(self.act_open_state, 'open_state_dump', '')
+        self.act_open_state.setToolTip(
+            'Open the FULL terminal state dump (grid + attributes) in your system default '
+            'text editor.')
+        self.act_open_state.triggered.connect(self.open_state_dump)
+        file_menu.addAction(self.act_open_state)
+
+        self.act_state_path = QAction('Copy State Dump File Path...', self)
+        self._bind(self.act_state_path, 'copy_state_dump_path', '')
+        self.act_state_path.setToolTip(
+            "Write this tab's full state dump to the app's default file, then show and "
+            'copy its path in one click.')
+        self.act_state_path.triggered.connect(self.copy_state_dump_path)
+        file_menu.addAction(self.act_state_path)
 
         file_menu.addSeparator()
         self.act_terminate = QAction(
@@ -5095,6 +5180,7 @@ class MainWindow(QMainWindow):
         '  /escape-limit <chars suppressed before a notice, 0 = never>\n'
         '  /terminate            (terminate the foreground program, like the button)\n'
         '  /terminate-debug      (why Terminate did or did not act -- copyable)\n'
+        '  /dump-state           (write the full grid+attributes state dump, show path)\n'
         '  /help')
 
     def show_command_palette(self):
@@ -5150,6 +5236,10 @@ class MainWindow(QMainWindow):
                 Qt.TextInteractionFlag.TextSelectableByMouse
                 | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             box.exec()
+        elif cmd == 'dump-state':
+            # Write the full grid+attributes state dump and show its path (parity with the
+            # menu action) -- the file to hand a reviewer for a render bug.
+            self.copy_state_dump_path()
         # All-ASCII digits AND a bounded length: str.isdigit() also accepts non-ASCII
         # digit-likes (superscripts) that int() rejects, and an all-ASCII-digit string
         # over CPython's int_max_str_digits (~4300) makes int() ITSELF raise ValueError
@@ -6351,7 +6441,12 @@ def _launch_parser(with_globals):
         prog='secure-terminal', add_help=with_globals,
         description='A terminal that shows untrusted output safely.',
         epilog="Run a command with '-- PROGRAM ARGS' (a real argv, no shell "
-               'reparse). Open several tabs by repeating --tab.')
+               'reparse). Open several tabs by repeating --tab. '
+               "Remote-control a running instance with 'secure-terminal ctl --help' "
+               "(list tabs, send text, dump a tab's rendered text or full grid state, "
+               'zoom); requires remote_control=true set by an admin in '
+               '/etc/secure-terminal.d. Environment: SECURE_TERMINAL_TRANSCRIPT_FILE=PATH '
+               "writes the tab's transcript to PATH on output-settle.")
     if with_globals:
         p.add_argument('--version', action='version',
                        version='secure-terminal ' + APP_VERSION)
