@@ -1420,6 +1420,76 @@ MARK_KEY = '\x00mark'
 # reaching `wrap` cells wraps before any later \n.
 WRAP_NL = '\x00wrap'
 
+# Whitespace-anomaly marking colour class. An ASCII space (U+0020) is benign per code
+# point, so it is NOT a marking_class entry; it is risky only by POSITION / run length --
+# LEADING spaces (a command indented to read as output, or hidden from shell history under
+# HISTCONTROL=ignorespace), TRAILING spaces (invisible end-of-line padding), and INTERIOR
+# runs of >= 2 spaces (a run reads as one gap, hiding an extra argument or faking column
+# alignment). A lone interior space is ordinary word spacing and is never flagged. The cell
+# keeps its real U+0020 (so copy / transcript / toPlainText all yield a plain space); the
+# widget paints a faint dot over each flagged column (display-only, all display modes).
+WS_ANOMALY = 'whitespace'
+
+
+def whitespace_anomaly_cols(chars, flag_trailing=True):
+    """Indices of the whitespace anomalies in `chars`, a per-column sequence of the single
+    rendered characters of one line: every LEADING U+0020, every TRAILING U+0020 (unless
+    flag_trailing is False), plus any INTERIOR run of >= 2 U+0020. A lone interior space is
+    not flagged. Only the plain ASCII space counts -- a non-ASCII space is already its own
+    'invisible' marking. Pure over the sequence, so the classification is directly testable.
+
+    flag_trailing is False for the EDITABLE current line: its end is where the cursor sits
+    and typing happens (the shell prompt's separator space, a half-typed line), so its
+    trailing space is not an end-of-output anomaly. Leading + interior are still flagged
+    there -- so leading command spaces (an indent that hides a command from shell history)
+    show up live, as an interior run after the prompt's own separator space."""
+    n = len(chars)
+    is_sp = [c == ' ' for c in chars]
+    flagged = set()
+    i = 0
+    while i < n and is_sp[i]:                 # every leading space
+        flagged.add(i)
+        i += 1
+    lead_end = i
+    j = n - 1
+    while j >= 0 and is_sp[j]:                 # scan back over the trailing run
+        j -= 1
+    trail_start = j + 1
+    if flag_trailing:
+        flagged.update(range(trail_start, n))  # every trailing space
+    k = lead_end
+    while k < trail_start:                     # interior runs of >= 2, between lead and trail
+        if is_sp[k]:
+            r = k
+            while r < trail_start and is_sp[r]:
+                r += 1
+            if r - k >= 2:
+                flagged.update(range(k, r))
+            k = r
+        else:
+            k += 1
+    return flagged
+
+
+def _space_is_visible(key):
+    """A space carrying a BACKGROUND colour is a program-painted block (colour art, a
+    status bar, a gradient row), not invisible padding -- you can SEE it -- so it is never a
+    whitespace anomaly and must keep its own SGR (no dot, no format override). The CLI SGR
+    state models fg/bg/bold, so a non-None bg is the whole test."""
+    return bool(key) and dict(key).get('bg') is not None
+
+
+def _ws_anomaly_cols_for_cells(cellline, flag_trailing=True):
+    """whitespace_anomaly_cols over a CLI cell-line (a list of (char, key) cells). A cell
+    counts as a space iff its source char is a lone U+0020; the no-trailing-newline marker
+    (_NO_NEWLINE_MARK, a synthetic ' ' cell) is treated as a space so a REAL trailing space
+    just before it is still caught -- its own column never paints a dot (cells_to_runs
+    handles the marker cell first)."""
+    chars = [' ' if key == _NO_NEWLINE_STATE else (c if c == ' ' else '\x00')
+             for c, key in cellline]
+    return whitespace_anomaly_cols(chars, flag_trailing)
+
+
 # sentinel key for the no-trailing-newline marker cell (_NO_NEWLINE_MARK). cells_to_runs
 # emits it as a run carrying NO display text, so the marker never enters the document
 # (unforgeable + copy-safe); the widget keys on it to paint the left-gutter glyph on that
@@ -1504,22 +1574,38 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
         else:
             add(disp, key if colors else None)
 
-    for idx, cellline in enumerate(lines):
-        for ch, key in (_collapse_zalgo_runs(cellline) if mode == 'show' else cellline):
+    def emit_line(seq, flag_trailing=True):
+        # A whitespace anomaly keeps its real U+0020 as the run TEXT (so copy /
+        # transcript / toPlainText all get a plain space) under an unforgeable WS_ANOMALY
+        # marking key; the widget paints a faint dot over the run. Gated on `markings`
+        # (the risk-marking toggle). No flood cap is needed: flagged spaces are always
+        # contiguous (leading / trailing / >= 2 interior), so they coalesce into a bounded
+        # number of runs -- they cannot alternate per-character the way emit's cap guards.
+        flagged = _ws_anomaly_cols_for_cells(seq, flag_trailing) if markings else ()
+        for col, (ch, key) in enumerate(seq):
             if key == _NO_NEWLINE_STATE:
                 # Internal no-trailing-newline marker: emit a run with NO display text
                 # (so it is neither shown nor copyable) whose key the widget recognizes
                 # to paint the left-gutter glyph. Program SGR can never produce this key.
                 add('', _NO_NEWLINE_KEY)
+            elif col in flagged and not _space_is_visible(key):
+                # invisible padding: keep the real space, paint the dot.
+                add(ch, (MARK_KEY, WS_ANOMALY, 0x20))
             else:
+                # not flagged, OR a bg-coloured (visible) space that keeps its own SGR.
                 emit(ch, key)
+
+    for idx, cellline in enumerate(lines):
+        emit_line(_collapse_zalgo_runs(cellline) if mode == 'show' else cellline)
         # a newline that ended a soft autowrap is tagged so the widget can join
         # the wrapped rows on copy (see WRAP_NL); a real line break stays None.
         soft = wraps is not None and idx < len(wraps) and wraps[idx]
         add('\n', WRAP_NL if soft else None)
     prefix_len = sum(display_len(p) for parts, _ in runs for p in parts)
-    for ch, key in (_collapse_zalgo_runs(current) if mode == 'show' else current):
-        emit(ch, key)
+    # The current (editable) line: do NOT flag its trailing space -- that is where the
+    # cursor sits (the prompt separator, a half-typed line), not end-of-output padding.
+    emit_line(_collapse_zalgo_runs(current) if mode == 'show' else current,
+              flag_trailing=False)
     return [(''.join(parts), key) for parts, key in runs], prefix_len
 
 

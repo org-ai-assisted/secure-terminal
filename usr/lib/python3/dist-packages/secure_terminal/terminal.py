@@ -436,6 +436,7 @@ from secure_terminal.sanitize import (
     feed_line_edits, cells_to_runs, cells_display_col, display_len,
     MARK_KEY, WRAP_NL, _NO_NEWLINE_KEY, BOX,
     SPACE_MARK,
+    WS_ANOMALY,
     render_output, render_cap_prefix,
     wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
     wants_line_clears,
@@ -502,6 +503,16 @@ _WORD_PUNCT = '@-./_~?&=%+#'
 _LINE_TRIM_CHARS = ' \t\u00a0\u2028\u2029'
 
 _CP_PROP = QTextFormat.Property.UserProperty + 1
+
+# Char-format flag on a whitespace-anomaly run (WS_ANOMALY): the run's text stays real
+# U+0020 spaces (copy-safe), and paintEvent draws a faint dot over each of its cells. A
+# non-SGR property a program's output can never set, in both render paths (CLI fragment
+# char format, TUI grid _GridRow run format).
+_WS_DOT_PROP = QTextFormat.Property.UserProperty + 2
+
+# The glyph paintEvent overlays on a whitespace-anomaly cell: U+00B7 MIDDLE DOT, faint.
+# Overlaid, never inserted into the document, so it does not affect copy/transcript.
+_WS_DOT_GLYPH = chr(0x00B7)   # MIDDLE DOT
 
 # Per-block annotation bits kept in QTextBlock.userState() -- a small bitfield, and a
 # general per-line channel (future: neutralized-escape, OSC-activity). Qt's unset default
@@ -3387,6 +3398,7 @@ class SecureTerminal(QPlainTextEdit):
             'confusable': {'fg': '#a4113f', 'bg': '#ffb3ca'},   # rose   -- a homoglyph posing as ASCII
             'combining':  {'fg': '#5b21b6', 'bg': '#cdb0ff'},   # violet -- a stacked combining mark (Zalgo)
             'nonascii':   {'fg': '#6d28d9', 'bg': None},        # purple -- honest foreign: subtle, no band
+            'whitespace': {'fg': '#9aa0a6', 'bg': None},        # faint grey -- an anomalous space (invisible fg; the WIDGET paints a dot, this entry serves the colour-only paths: revealed editor / review table)
         },
         'dark': {
             'bidi':       {'fg': '#ff5a60', 'bg': '#5c1820'},   # red    -- reorders text (worst)
@@ -3395,6 +3407,7 @@ class SecureTerminal(QPlainTextEdit):
             'confusable': {'fg': '#ff6f9d', 'bg': '#551d35'},   # rose   -- a homoglyph posing as ASCII
             'combining':  {'fg': '#c9a3ff', 'bg': '#46306b'},   # violet -- a stacked combining mark (Zalgo)
             'nonascii':   {'fg': '#a06cff', 'bg': None},        # purple -- honest foreign: subtle, no band
+            'whitespace': {'fg': '#7a7f86', 'bg': None},        # faint grey -- an anomalous space (invisible fg; the WIDGET paints a dot, this entry serves the colour-only paths: revealed editor / review table)
         },
     }
 
@@ -3414,6 +3427,13 @@ class SecureTerminal(QPlainTextEdit):
             fmt = self._line_fmt_cache.get(key)
             if fmt is None:
                 color = key[1]
+                if color == WS_ANOMALY:
+                    # A whitespace anomaly carries NO glyph colour (the cell is a real
+                    # space) and NO _CP_PROP (copy/hover treat it as an ordinary space):
+                    # only the dot flag, which paintEvent reads to draw the faint dot.
+                    fmt = QTextCharFormat()
+                    fmt.setProperty(_WS_DOT_PROP, True)
+                    return _cache_bounded(self._line_fmt_cache, key, fmt)
                 if isinstance(color, str):
                     fmt = QTextCharFormat()
                     spec = self.MARKING_COLORS[self._theme][color]
@@ -6319,6 +6339,12 @@ class SecureTerminal(QPlainTextEdit):
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        # Faint dots over whitespace-anomaly cells, BEFORE the caret's shot/blink guards:
+        # unlike the blinking caret, the dots are a rendering feature and must appear in a
+        # deterministic screenshot too. The document holds real spaces, so the dots never
+        # reach copy/transcript.
+        if self.isVisible():
+            self._paint_ws_dots()
         # Our own terminal cursor, drawn over the text. It blinks independent of any
         # selection (the native caret, which we hid, does not). Suppressed for a
         # deterministic screenshot (shot mode), on a non-interactive preview surface,
@@ -6331,6 +6357,56 @@ class SecureTerminal(QPlainTextEdit):
             return                          # blink OFF half-cycle
         painter = QPainter(self.viewport())
         painter.fillRect(self._cursor_rect(), self._cursor_color())
+        painter.end()
+
+    def _ws_dot_runs(self, block):
+        """(start, end) document positions of each whitespace-anomaly run in `block`, from
+        the document fragments carrying the _WS_DOT_PROP flag. CLI line mode only (see
+        _ws_dot_rects): whitespace anomalies are a flowing-output concept, and a TUI grid
+        pads every row with structural spaces that are not anomalies."""
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid() and frag.charFormat().property(_WS_DOT_PROP):
+                yield frag.position(), frag.position() + frag.length()
+            it += 1
+
+    def _ws_dot_rects(self):
+        """Viewport cell rectangles of every visible whitespace-anomaly cell, one per
+        flagged column. cursorRect maps a document position to the viewport, so this is
+        correct under scroll and soft-wrap alike. CLI line mode only: a TUI grid space-pads
+        every row (structural, not an anomaly), so flagging there would dot the whole
+        screen."""
+        if self._grid_mode():
+            return
+        doc = self.document()
+        cur = QTextCursor(doc)
+        cell_w = max(2, self.fontMetrics().horizontalAdvance(' '))
+        # _gutter_blocks yields only visible blocks, and the QPainter clips to the
+        # viewport, so an off-edge dot needs no explicit bounds check here.
+        for block, _top, _bottom in self._gutter_blocks():
+            for a, b in self._ws_dot_runs(block):
+                for pos in range(a, b):
+                    cur.setPosition(pos)
+                    r = self.cursorRect(cur)
+                    yield QRect(r.x(), r.y(), cell_w, r.height())
+
+    def _paint_ws_dots(self):
+        """Draw a faint centred dot over each whitespace-anomaly cell. Display-only: the
+        cells are real spaces in the document, so the marker never enters copy / transcript
+        / toPlainText -- only the on-screen look changes, in every display mode."""
+        rects = list(self._ws_dot_rects())
+        if not rects:
+            return
+        color = self.palette().color(QPalette.ColorRole.Text)
+        color.setAlpha(90)                        # faint: a hint, not program ink
+        painter = QPainter(self.viewport())
+        painter.setPen(color)
+        painter.setFont(self.font())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        align = int(Qt.AlignmentFlag.AlignCenter)
+        for rect in rects:
+            painter.drawText(rect, align, _WS_DOT_GLYPH)
         painter.end()
 
     def reset_caret(self, keep_view=False):

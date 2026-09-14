@@ -26,11 +26,42 @@ a deliberate follow-up, not shipped here.
 """
 
 import json
+import unicodedata
 
 import pyte.modes
 import pyte.charsets as _charsets
 
 FORMAT_VERSION = 2
+
+# Unicode categories that must be BADGED in the human-readable text dump: a grid cell's
+# raw codepoint is opened in an editor / cat, where a bidi override (Cf) reverses the
+# rest of the line (spoofing the "full-fidelity" dump the reader is told to trust) and a
+# line/paragraph separator (Zl/Zp) or control (Cc) splits one grid row across lines
+# (detaching its @col annotations). Controls (Cc), format incl. bidi + zero-width (Cf),
+# surrogates (Cs), private-use (Co) and the two Unicode line breaks are named instead.
+# Ordinary printable glyphs (letters, digits, punctuation, CJK, box-drawing, emoji) stay
+# raw so the dump reads naturally. The JSON dump escapes all of these via ensure_ascii,
+# and the CLI document / title go through sanitize / %r, so only this grid text needs it.
+_UNSAFE_DUMP_CATS = frozenset({'Cc', 'Cf', 'Zl', 'Zp', 'Cs', 'Co'})
+
+
+def _safe_grid_text(text):
+    """Return `text` with every _UNSAFE_DUMP_CATS codepoint replaced by a printable
+    <U+XXXX NAME> badge -- full fidelity (the codepoint is identified, not dropped) yet
+    safe to open. Fast path returns the input unchanged when nothing needs badging."""
+    if not any(unicodedata.category(ch) in _UNSAFE_DUMP_CATS for ch in text):
+        return text
+    out = []
+    for ch in text:
+        if unicodedata.category(ch) in _UNSAFE_DUMP_CATS:
+            try:
+                name = unicodedata.name(ch)
+            except ValueError:
+                name = 'UNNAMED'
+            out.append('<U+%04X %s>' % (ord(ch), name))
+        else:
+            out.append(ch)
+    return ''.join(out)
 
 # pyte private modes are stored in Screen.mode shifted left 5 (see pyte.modes); the
 # widget stores bracketed paste (DEC private 2004) the same way but pyte has no name
@@ -388,7 +419,7 @@ def dump_text(snap):
     out.append('--- grid ---  (blank cells and fully-blank rows elided; '
                'row index shows gaps)')
     for row in snap['rows']:
-        line = '%4d: %s' % (row['y'], row['text'])
+        line = '%4d: %s' % (row['y'], _safe_grid_text(row['text']))
         ann = '  '.join('@%d-%d %s' % (r['start'], r['end'] - 1, _fmt_attrs(r['attrs']))
                         for r in row['runs'])
         if ann:

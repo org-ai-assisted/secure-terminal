@@ -268,6 +268,19 @@ second command can never ride an explicit submit.
   * `/etc/apparmor.d/secure-terminal`:
     AppArmor confinement profile.
 
+## ENVIRONMENT
+
+  * `SECURE_TERMINAL_TRANSCRIPT_FILE`:
+    When set to a path, secure-terminal writes the tab's transcript (the current
+    rendered frame, lossless plain ASCII) to that file, refreshed on output-settle.
+    On a confined install the path must be under `~/.local/state/secure-terminal/`:
+    the shipped AppArmor profile denies writes elsewhere, and a denied write is
+    silently skipped (the file is simply never created).
+    The same content is available on demand via `File > Save/Open/Copy Current
+    Screen`. For a render bug, prefer the richer state dump (`File > Save/Open/Copy
+    Screen State Dump`, or the `/dump-state` command): it records the full grid WITH
+    per-cell attributes (bold, colour, cursor, modes) that the plain transcript omits.
+
 ## SECURITY
 
 secure-terminal does not sandbox the programs you run; if you choose to run
