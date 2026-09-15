@@ -6391,10 +6391,13 @@ class MainWindow(QMainWindow):
         # is running in the background, a window close HIDES to tray and keeps the process
         # (and the sanitizer) alive rather than quitting -- the "background" in "run in the
         # background" means it outlives the window. An explicit Quit (tray menu -> sets
-        # _really_quit) tears down instead. Guarded on a live tray, so there is always
-        # somewhere to hide from -- never a stranded invisible window.
+        # _really_quit) tears down instead. A signal-driven quit (SIGTERM/SIGINT/SIGHUP,
+        # e.g. logout/shutdown) sets _force_close and must ALSO tear down and save, never
+        # hide -- else the process lingers through shutdown with the session unsaved.
+        # Guarded on a live tray, so there is always somewhere to hide from.
         if (self._systray and self._tray is not None
-                and self._clip_bg_watcher is not None and not self._really_quit):
+                and self._clip_bg_watcher is not None
+                and not self._really_quit and not self._force_close):
             event.ignore()
             self.hide()
             return
