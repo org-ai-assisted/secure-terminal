@@ -203,7 +203,6 @@ def _run(argv, mode):
         # coverage tracer in the parent never receives the child's line data;
         # the behaviour is exercised end-to-end by the CLI tests instead.)
         os.environ['TERM'] = 'dumb'
-        os.environ.setdefault('PAGER', 'cat')
         # The decode side assumes UTF-8; make the child emit UTF-8. No-op when the
         # ambient locale is already UTF-8.
         ensure_utf8_ctype()

@@ -117,22 +117,25 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
     def select_graphic_rendition(self, *attrs, private=False, **kwargs):
         if private:
             return
-        # pyte encodes AIXTERM bright BACKGROUND (SGR 100-107) as a base-name bg PLUS
-        # bold=True, conflating a bright bg with bold: the bg then renders DIM (the base
-        # palette index, not the +8 bright entry) and the phantom bold both brightens the
-        # fg (see _pyte_format's bright=cell.bold) and bolds the font. Handle bright-bg
-        # here: strip it from what pyte parses (so no phantom bold is set) and point the
-        # bg at the matching BRIGHT palette name, which _pyte_qcolor renders from
-        # ANSI_PALETTE[8..15] -- OSC-palette aware, exactly like bright fg. Scan in order
-        # so a later reset / normal-bg / 256-bg still wins over an earlier bright-bg.
+        # pyte encodes AIXTERM bright FOREGROUND (SGR 90-97) and bright BACKGROUND
+        # (SGR 100-107) as a base-name colour PLUS bold=True, conflating "bright" with
+        # "bold": the colour then renders DIM (the base palette index, not the +8 bright
+        # entry) and the phantom bold bolds the font (and brightens the fg via
+        # _pyte_format's bright=cell.bold). Real terminals show bright, NOT bold (DECRQSS:
+        # xterm reports 0;91m, not 0;1m). Handle both here: strip the bright code from what
+        # pyte parses (so no phantom bold is set) and point the fg/bg at the matching BRIGHT
+        # palette name, which _pyte_qcolor renders from ANSI_PALETTE[8..15] (OSC-palette
+        # aware). Scan in order so a later reset / normal / 256 colour still wins over an
+        # earlier bright one.
         passthrough = []
         bright_bg = None
+        bright_fg = None
         it = iter(attrs)
         for attr in it:
             if attr in (38, 48):
                 # 38/48 introduce an EXTENDED colour (5;<idx> or 2;<r>;<g>;<b>); the params
                 # that follow are colour DATA, not opcodes, so CONSUME them -- else a component
-                # in 100-107 (e.g. the index in 38;5;101) is misread as a bright-bg code and
+                # in 90-107 (e.g. the index in 38;5;91) is misread as a bright code and
                 # corrupts the 256/truecolour sequence.
                 passthrough.append(attr)
                 mode = next(it, None)
@@ -148,23 +151,32 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                         passthrough.append(comp)
                         got += 1
                     complete = need > 0 and got == need
-                if attr == 48 and complete:
-                    # a COMPLETE 256/truecolour bg (48;5;N or 48;2;R;G;B) overrides an earlier
-                    # bright-bg. An INCOMPLETE/malformed 48 (bare, bad mode, or missing
-                    # components) is ignored and must NOT clear a preceding valid bright-bg --
-                    # e.g. `101;48` keeps the bright-red bg.
-                    bright_bg = None
+                if complete:
+                    # a COMPLETE 256/truecolour fg (38) / bg (48) overrides an earlier bright
+                    # fg / bg. An INCOMPLETE/malformed selector (bare, bad mode, or missing
+                    # components) is ignored and must NOT clear a preceding valid bright colour
+                    # -- e.g. `91;38` keeps the bright-red fg.
+                    if attr == 38:
+                        bright_fg = None
+                    elif attr == 48:
+                        bright_bg = None
                 continue
-            if attr in _BG_AIXTERM_BRIGHT:
+            if attr in _FG_AIXTERM_BRIGHT:
+                bright_fg = _FG_AIXTERM_BRIGHT[attr]
+            elif attr in _BG_AIXTERM_BRIGHT:
                 bright_bg = _BG_AIXTERM_BRIGHT[attr]
             else:
                 passthrough.append(attr)
+                if attr in _FG_OVERRIDE_CODES:
+                    bright_fg = None
                 if attr in _BG_OVERRIDE_CODES:
                     bright_bg = None
-        # Skip super when the ONLY codes were bright-bg: an empty *passthrough would hit
+        # Skip super when the ONLY codes were bright colours: an empty *passthrough would hit
         # pyte's reset-all fast path. A genuine ESC[m (no attrs) must still reach it.
         if passthrough or not attrs:
             super().select_graphic_rendition(*passthrough)
+        if bright_fg is not None:
+            self.cursor.attrs = self.cursor.attrs._replace(fg=bright_fg)
         if bright_bg is not None:
             self.cursor.attrs = self.cursor.attrs._replace(bg=bright_bg)
 
@@ -942,10 +954,19 @@ _PYTE_COLOR = {
 # AIXTERM bright-background SGR code (100-107) -> the bright palette name above.
 _BG_AIXTERM_BRIGHT = {code: 'bright' + name
                       for code, name in pyte.graphics.BG_AIXTERM.items()}
+# AIXTERM bright-FOREGROUND SGR code (90-97) -> the bright palette name above. pyte
+# stores 90-97 as a BASE name plus bold=True, so a bright fg would render BOLD (real
+# terminals show bright, not bold: verified via DECRQSS, xterm reports 0;91m not 0;1m).
+# Rewrite it exactly like the bright bg so pyte sets no phantom bold.
+_FG_AIXTERM_BRIGHT = {code: 'bright' + name
+                      for code, name in pyte.graphics.FG_AIXTERM.items()}
 # Codes that re-select or reset the background; any AFTER a bright-bg code overrides it:
 # normal/default bg (40-47/49) and reset-all (0). The 256/truecolor bg selector (48) is
 # handled in select_graphic_rendition (it consumes its own colour params there).
 _BG_OVERRIDE_CODES = frozenset(pyte.graphics.BG) | {0}
+# Foreground analog: normal/default fg (30-37/39) and reset-all (0) override a bright fg.
+# The 256/truecolor fg selector (38) is handled in select_graphic_rendition.
+_FG_OVERRIDE_CODES = frozenset(pyte.graphics.FG) | {0}
 
 
 def _build_tui_keys():
@@ -3720,7 +3741,6 @@ class SecureTerminal(QPlainTextEdit):
             # modes, so advertise it -- a fixed value, not inherited, so it is not a
             # fingerprint. Programs then emit truecolor instead of down-mapping.
             os.environ['COLORTERM'] = 'truecolor'
-            os.environ.setdefault('PAGER', 'cat')
             # The decode side assumes UTF-8; make the child emit UTF-8 (else a wide-char
             # program renders each byte as <ffffffff>). No-op when the ambient locale is
             # already UTF-8.
