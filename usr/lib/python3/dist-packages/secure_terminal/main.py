@@ -681,17 +681,27 @@ class _ToolTipFilter(QObject):
             if isinstance(obj, QMenu):
                 return super().eventFilter(obj, event)
             text = obj.toolTip()
+            at_rect = None
             if isinstance(obj, QTabBar):
                 # A tab's own tooltip (name / program / cwd, set per index) is what Qt
                 # would otherwise show via the native, dark-on-dark tab tooltip. Prefer
                 # the tab under the pointer, else the bar-level hint -- both via InfoTip.
                 idx = obj.tabAt(event.pos())
-                if idx >= 0 and obj.tabToolTip(idx):
-                    text = obj.tabToolTip(idx)
+                if idx >= 0:
+                    if obj.tabToolTip(idx):
+                        text = obj.tabToolTip(idx)
+                    # Anchor to the HOVERED tab's global rect, not the whole bar: else
+                    # _place uses the bar's left edge (far left of the window), the tip
+                    # lands away from the pointer, and moving toward it leaves the tab so
+                    # the leave-poll dismisses it before it is reachable. at_rect also
+                    # scopes that poll to the tab.
+                    tr = obj.tabRect(idx)
+                    at_rect = QRect(obj.mapToGlobal(tr.topLeft()), tr.size())
             if text:
                 self._tip.show_for(obj, text,
                                    self._window.current_zoom_percent(),
-                                   self._window.current_theme_key())
+                                   self._window.current_theme_key(),
+                                   at_rect=at_rect)
                 return True                            # suppress the plain tooltip
         return super().eventFilter(obj, event)
 
