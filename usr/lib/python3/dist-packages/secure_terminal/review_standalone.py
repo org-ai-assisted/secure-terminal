@@ -51,14 +51,17 @@ class _StandaloneReview:
         self._theme = theme
 
     def _report(self, action, text):
-        # 'reject' carries no text; 'unicode' (Deliver) carries the exact delivered
-        # string (the box plus the neutralized tail). Print it verbatim so a caller can
-        # capture what would have crossed, then end the single-shot review.
+        # stdout carries ONLY the delivered payload -- EXACTLY the bytes that would
+        # cross, no added newline -- so a caller can capture it unambiguously. A Reject
+        # writes nothing to stdout (a note to stderr instead), so delivering the literal
+        # text "rejected" is never confused with a rejection. 'unicode' (Deliver)
+        # carries the box plus the neutralized tail; 'reject' carries no text.
         if action == 'reject':
-            sys.stdout.write('rejected\n')
+            sys.stderr.write('rejected\n')
+            sys.stderr.flush()
         else:
-            sys.stdout.write((text or '') + '\n')
-        sys.stdout.flush()
+            sys.stdout.write(text or '')
+            sys.stdout.flush()
         app = QApplication.instance()
         if app is not None:
             app.quit()
@@ -92,12 +95,16 @@ class _ReviewWindow(QWidget):
 
 
 def _resolve_payload(args):
-    """The text to review: --text if given; else piped stdin when it carries content;
-    else the built-in sample (so a bare headless launch still shows something)."""
+    """The text to review, EXACTLY as supplied: --text verbatim if given; else piped
+    stdin verbatim when it carries any content; else the built-in sample (so a bare
+    launch still shows something). Trailing newlines and whitespace are significant to
+    a terminal paste, so the payload is never stripped."""
     if args.text is not None:
-        return args.text.rstrip('\n')
-    piped = '' if sys.stdin.isatty() else sys.stdin.read()
-    return (piped if piped.strip() else _SAMPLE).rstrip('\n')
+        return args.text
+    if sys.stdin.isatty():
+        return _SAMPLE
+    piped = sys.stdin.read()
+    return piped if piped else _SAMPLE
 
 
 def main(argv=None):
