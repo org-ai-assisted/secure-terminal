@@ -33,12 +33,21 @@ def socket_dir():
     return os.path.join(base, _APP)
 
 
-def socket_path(group='default'):
-    """The socket file for an instance group. The group name is reduced to a safe
-    filename so it can never escape the socket directory."""
-    safe = ''.join(c for c in (group or 'default')
+def safe_group(group):
+    """A group name reduced to one safe filename component, so it can never escape a
+    directory. Single source of truth for group identity: the session state subtree
+    keys off THIS too (session._state_dir), so the socket and the on-disk state agree
+    on what one instance is -- two names that map here to the same string ARE the same
+    instance, and two that differ are different (no socket/state divergence). Strips
+    every character outside [alnum . _ -]; an empty result becomes 'default'."""
+    return ''.join(c for c in (group or 'default')
                    if c.isalnum() or c in '-_.') or 'default'
-    return os.path.join(socket_dir(), safe + '.sock')
+
+
+def socket_path(group='default'):
+    """The socket file for an instance group (its name via safe_group so it can never
+    escape the socket directory)."""
+    return os.path.join(socket_dir(), safe_group(group) + '.sock')
 
 
 def _makedirs_private(path):

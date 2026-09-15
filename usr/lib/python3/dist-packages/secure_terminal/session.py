@@ -32,7 +32,7 @@ import time
 import shutil
 from typing import TypeGuard
 
-from secure_terminal.ipc import _makedirs_private   # 0o700 private-dir creator (reused)
+from secure_terminal.ipc import _makedirs_private, safe_group   # reused ipc helpers
 
 # A hard cap on the persisted scrollback of an "unlimited" tab, so a log file
 # cannot grow without bound on disk even when no line limit is set.
@@ -60,35 +60,54 @@ def _valid_uid(value) -> TypeGuard[int]:
 
 
 # The per-instance state namespace: each independent instance owns a SUBTREE of the
-# state dir keyed by its group, so two instances (a primary + a --new-instance, or two
+# state dir keyed by its group, so two instances (a primary + a secondary, or two
 # --instance-group launches) never share tab-<n>.log / transcript-<n>.txt and can never
 # delete each other's files -- the tab ordinal is unique only WITHIN one instance, so it
 # must be namespaced by the instance to be a valid on-disk key across processes (the
 # idiom used by iTerm2 / VTE / tmux-resurrect). Set once at window startup.
 _INSTANCE_GROUP = 'default'
-# The unnamed-throwaway group prefix (a bare --new-instance): isolated, not restored
-# across restart, and self-removed on close. A named --instance-group persists.
-_THROWAWAY_PREFIX = 'new-'
-_GROUP_SAFE_RE = re.compile(r'[^A-Za-z0-9._-]')
+# A throwaway instance (a secondary window that is NOT the group's primary, a
+# --new-instance, or a degenerate group name) writes this marker file into its subtree.
+# It identifies a crashed throwaway for gc_instances by CONTENT, not by the subtree name
+# -- so a user's --instance-group can be named anything (even a UUID) without being
+# mistaken for a throwaway and swept.
+_THROWAWAY_MARKER = '.throwaway'
 
 
-def _safe_group(name):
-    """A filesystem-safe single path component for the instance subtree. Rejects path
-    separators / traversal (a crafted --instance-group must never escape the state dir)
-    by mapping unsafe characters to '_'; '', '.' and '..' fall back to 'default'."""
-    safe = _GROUP_SAFE_RE.sub('_', name) if isinstance(name, str) else ''
-    return safe if safe and safe not in ('.', '..') else 'default'
+def _dir_safe(name):
+    """A single filesystem-safe path component for the instance subtree, matching the
+    socket identity (ipc.safe_group) so the state dir and the socket agree on what one
+    instance is. '.'/'..'/'' (dir-traversal / empty) fall back to 'default'; the caller
+    routes such degenerate names to a throwaway instead of ever writing them."""
+    safe = safe_group(name)
+    return safe if safe not in ('.', '..', '') else 'default'
 
 
 def set_instance_group(name):
-    """Point every session read/write at this instance's own subtree. Called once at
-    window startup, before any restore/save, so the whole module namespaces to it."""
+    """Point every session read/write at this instance's own NAMED subtree (a primary of
+    its group). Called once at window startup, before any restore/save."""
     global _INSTANCE_GROUP
-    _INSTANCE_GROUP = _safe_group(name)
+    _INSTANCE_GROUP = _dir_safe(name)
+
+
+def set_instance_throwaway():
+    """Point this instance at a fresh ISOLATED throwaway subtree (a secondary window or a
+    --new-instance): a random id no other instance can pick, marked so a crash leaves a
+    GC-able orphan. Not restored across restart; self-removed on close. Returns the id."""
+    global _INSTANCE_GROUP
+    _INSTANCE_GROUP = os.urandom(8).hex()
+    try:
+        ensure_state_dir()
+        with open(os.path.join(_state_dir(), _THROWAWAY_MARKER), 'w',
+                  encoding='utf-8'):
+            pass
+    except OSError:
+        pass                    # best-effort marker; gc still bounded by self-removal
+    return _INSTANCE_GROUP
 
 
 def instance_group():
-    """The sanitized instance group currently in effect (the state subtree name)."""
+    """The instance group / subtree name currently in effect."""
     return _INSTANCE_GROUP
 
 
@@ -297,21 +316,21 @@ def remove_instance():
 
 
 def gc_instances(max_age_days=30):
-    """Backstop for CRASHED unnamed instances: remove throwaway (`new-<id>`) subtrees
-    left behind (a clean close self-removes via remove_instance). Age-gated well beyond
-    any plausible session so a still-running instance is never swept; named/default
-    groups are NEVER touched. Best-effort; never raises."""
+    """Backstop for CRASHED throwaway instances: remove subtrees carrying the throwaway
+    MARKER (a clean close self-removes via remove_instance). Identified by the marker's
+    presence, not by the subtree NAME -- so a user's --instance-group (any name) is never
+    swept. Age-gated well beyond any plausible session so a still-running throwaway is
+    never touched; named/default groups have no marker. Best-effort; never raises."""
     cutoff = time.time() - max_age_days * 86400
     try:
         names = os.listdir(_instances_root())
     except OSError:
         return
     for name in names:
-        if not name.startswith(_THROWAWAY_PREFIX):
-            continue
         path = os.path.join(_instances_root(), name)
+        marker = os.path.join(path, _THROWAWAY_MARKER)
         try:
-            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+            if os.path.isfile(marker) and os.path.getmtime(path) < cutoff:
                 shutil.rmtree(path, ignore_errors=True)
         except OSError:  # pragma: no cover - a TOCTOU race (dir vanished under us)
             pass

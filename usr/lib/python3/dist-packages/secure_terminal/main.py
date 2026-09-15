@@ -796,7 +796,7 @@ def _valid_uid(value) -> TypeGuard[int]:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, launch=None, cg_base=None):
+    def __init__(self, launch=None, cg_base=None, is_primary=True):
         super().__init__()
         self.setWindowTitle('secure-terminal')
         # Per-tab resource-isolation base (from resource_isolation.base_setup(),
@@ -999,19 +999,26 @@ class MainWindow(QMainWindow):
         self._instance_group = 'default'
         # Namespace this instance's on-disk state (session.json + tab-<n>.log +
         # transcript-<n>.txt) under its OWN subtree, so a coexisting instance can never
-        # share or delete these files -- a tab ordinal is unique only WITHIN one
-        # instance, so it must be namespaced by the instance to be a valid on-disk key
-        # across processes (the iTerm2 / VTE / tmux-resurrect idiom). A named group
-        # (default, or --instance-group NAME) persists + restores that subtree; a bare
-        # --new-instance gets an isolated THROWAWAY subtree (a fresh id each launch, so
-        # not restorable) that is self-removed on close.
-        _group = getattr(launch, 'instance_group', 'default') if launch is not None \
+        # share or delete these files -- a tab ordinal is unique only WITHIN one instance,
+        # so it must be namespaced by the instance to be a valid on-disk key across
+        # processes (the iTerm2 / VTE / tmux-resurrect idiom). Only the PRIMARY (the
+        # window that OWNS its group's single-instance socket, is_primary) persists +
+        # restores the group's named subtree. A THROWAWAY -- a secondary window that lost
+        # the socket bind, a --new-instance, or a degenerate group name -- gets an
+        # isolated random subtree (not restorable, self-removed on close) so it never
+        # touches the primary's files. The socket group keys the subtree via the SAME
+        # ipc.safe_group, so socket identity and state subtree agree.
+        _named = getattr(launch, 'instance_group', 'default') if launch is not None \
             else 'default'
-        if self._ephemeral and _group == 'default':
-            _group = session._THROWAWAY_PREFIX + os.urandom(6).hex()
-        session.set_instance_group(_group)
-        self._state_group = session.instance_group()   # the sanitized group actually used
-        self._throwaway = self._state_group.startswith(session._THROWAWAY_PREFIX)
+        _safe = ipc.safe_group(_named)
+        self._throwaway = (
+            (launch is not None and getattr(launch, 'new_instance', False))
+            or not is_primary or _safe in ('.', '..', ''))
+        if self._throwaway:
+            session.set_instance_throwaway()
+        else:
+            session.set_instance_group(_named)
+        self._state_group = session.instance_group()
         session.gc_instances()      # backstop-clean crashed throwaway subtrees
         # term -> durable tab id, stable across a restart (persisted in the session,
         # restored in _restore_tab). Names `ctl id:N` AND every per-tab save file, so
@@ -1159,14 +1166,14 @@ class MainWindow(QMainWindow):
                     saved_uids.add(_u)
             if saved_uids:
                 self._next_tab_id = max(self._next_tab_id, max(saved_uids) + 1)
-            # Drop any per-tab state file with no live owner (a crash between a tab
-            # close and its unlink, or a previous session's leftovers), so nothing
-            # sensitive lingers; restored tabs' files are kept. SKIP the sweep for a
-            # PRE-DURABLE-ID session (tabs present but none carries a valid id): those
-            # old tab-<n>.log files are the user's real scrollback, and while the clean
-            # cut means they are not RESTORED, the sweep must not DELETE them -- that
-            # would be silent data loss on the one upgrade launch.
-            if _restore_ok and not (restored and not saved_uids):
+            # Drop per-tab files with no live owner (a crash between a tab close and its
+            # unlink) -- but ONLY when we actually restored real tabs (a valid uid anchor).
+            # A restore that yields NO valid uid must NOT sweep: that covers both a
+            # pre-durable-id upgrade (old tab-<n>.log are the user's real scrollback) AND a
+            # missing/corrupt session.json (session.load returns [] on a parse failure,
+            # which the code treats as recoverable) -- sweeping either would silently
+            # DELETE intact scrollback the index just failed to reference.
+            if _restore_ok and saved_uids:
                 session.purge_orphans(saved_uids)
             # The tab focused last time is restored FIRST (real content), so it -- not
             # tab 0 -- is what shows the instant the window opens (no first-tab flash);
@@ -2127,13 +2134,17 @@ class MainWindow(QMainWindow):
             info = self._pending_restore.pop(term, None)
             # Closing a not-yet-swapped restored tab discards it for good -> remove its
             # app-managed files (scratch exports + restore log), like the real path.
-            # Guard on the id NOT being owned by a live tab: a duplicate saved id (a
+            # Guard on the id NOT being owned by ANOTHER tab: a duplicate saved id (a
             # crafted/corrupt session.json) can leave this placeholder carrying an id a
-            # real restored tab already holds -- purging it then would delete the LIVE
-            # tab's files. A placeholder never went through _add_tab's dedup, so check.
-            if (isinstance(info, dict) and _valid_uid(info.get('uid'))
-                    and info['uid'] not in self._tab_ids.values()):
-                session.purge_tab_files(info['uid'])
+            # live tab OR another still-pending placeholder also holds -- purging it then
+            # would delete that other tab's files. A placeholder never went through
+            # _add_tab's dedup, so check both the live ids and the remaining placeholders.
+            if isinstance(info, dict) and _valid_uid(info.get('uid')):
+                _other_uids = {i.get('uid') for i in self._pending_restore.values()
+                               if isinstance(i, dict)}
+                if (info['uid'] not in self._tab_ids.values()
+                        and info['uid'] not in _other_uids):
+                    session.purge_tab_files(info['uid'])
             if term in self._deferred_restore:
                 self._deferred_restore.remove(term)
             self._user_titles.pop(term, None)
@@ -7208,7 +7219,12 @@ def main(cg_base=None):
                              '--tray has nothing to do.\n')
             return 0
 
-    window = MainWindow(launch=launch, cg_base=cg_base)
+    # is_primary: this window OWNS its group's single-instance socket (claimed above).
+    # A secondary window (peer_owns / bind failed) and a --new-instance are NOT primary,
+    # so they get an isolated throwaway state subtree rather than the group's persistent
+    # one -- they can never restore or clobber the primary's session (konsole model:
+    # every launch is its own window+process).
+    window = MainWindow(launch=launch, cg_base=cg_base, is_primary=server is not None)
     # Install the terminate-on-signal handler only now, after the window exists:
     # its handler queues a normal close of every top-level window (see
     # _install_signal_quit), so the window must already be built and shown for a
