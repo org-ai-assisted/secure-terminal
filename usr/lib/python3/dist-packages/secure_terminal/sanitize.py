@@ -2054,6 +2054,10 @@ def parse_sgr(param_str, state):
             state['bold'] = False
         elif n == 1:
             state['bold'] = True
+        elif n == 2:
+            # SGR 2 (faint) = decreased intensity, NOT bold. Every real terminal
+            # drops bold here; clear it so a program's faint never renders bold.
+            state['bold'] = False
         elif n == 22:
             state['bold'] = False
         elif 30 <= n <= 37:
