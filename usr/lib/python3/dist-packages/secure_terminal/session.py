@@ -28,6 +28,9 @@ starts under the restored history.
 import os
 import re
 import json
+import time
+import shutil
+from typing import TypeGuard
 
 from secure_terminal.ipc import _makedirs_private   # 0o700 private-dir creator (reused)
 
@@ -47,10 +50,56 @@ _TAB_SCRATCH_STEMS = ('transcript', 'screen', 'state-dump')
 _SCRATCH_RE = re.compile(r'^(?:transcript|screen|state-dump)-(\d+)\.txt$')
 
 
-def _state_dir():
+def _valid_uid(value) -> TypeGuard[int]:
+    """A durable tab id is a non-negative int. Reject bool (a JSON true/false is an
+    int subclass) and any non-int a hand-edited/corrupt session.json could carry, so
+    such a value is never used to KEY a log file (which would alias another tab's
+    scrollback, or crash). Mirrors main._valid_uid; kept here so session stands
+    alone (the GUI is not imported to load a session)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+# The per-instance state namespace: each independent instance owns a SUBTREE of the
+# state dir keyed by its group, so two instances (a primary + a --new-instance, or two
+# --instance-group launches) never share tab-<n>.log / transcript-<n>.txt and can never
+# delete each other's files -- the tab ordinal is unique only WITHIN one instance, so it
+# must be namespaced by the instance to be a valid on-disk key across processes (the
+# idiom used by iTerm2 / VTE / tmux-resurrect). Set once at window startup.
+_INSTANCE_GROUP = 'default'
+# The unnamed-throwaway group prefix (a bare --new-instance): isolated, not restored
+# across restart, and self-removed on close. A named --instance-group persists.
+_THROWAWAY_PREFIX = 'new-'
+_GROUP_SAFE_RE = re.compile(r'[^A-Za-z0-9._-]')
+
+
+def _safe_group(name):
+    """A filesystem-safe single path component for the instance subtree. Rejects path
+    separators / traversal (a crafted --instance-group must never escape the state dir)
+    by mapping unsafe characters to '_'; '', '.' and '..' fall back to 'default'."""
+    safe = _GROUP_SAFE_RE.sub('_', name) if isinstance(name, str) else ''
+    return safe if safe and safe not in ('.', '..') else 'default'
+
+
+def set_instance_group(name):
+    """Point every session read/write at this instance's own subtree. Called once at
+    window startup, before any restore/save, so the whole module namespaces to it."""
+    global _INSTANCE_GROUP
+    _INSTANCE_GROUP = _safe_group(name)
+
+
+def instance_group():
+    """The sanitized instance group currently in effect (the state subtree name)."""
+    return _INSTANCE_GROUP
+
+
+def _instances_root():
     base = os.environ.get('XDG_STATE_HOME') or os.path.join(
         os.path.expanduser('~'), '.local', 'state')
     return os.path.join(base, 'secure-terminal')
+
+
+def _state_dir():
+    return os.path.join(_instances_root(), _INSTANCE_GROUP)
 
 
 def ensure_state_dir():
@@ -130,9 +179,13 @@ def save(tabs, window=None, active=None):
         ensure_state_dir()
         index = []
         current = set()
-        for tab in tabs:
+        for position, tab in enumerate(tabs):
             entry = {key: value for key, value in tab.items() if key != 'text'}
-            uid = tab['uid']
+            # The app always supplies a valid uid (_session_tabs); fall back to the
+            # list position for any other caller so save() keeps its "Never raises"
+            # contract (a bare tab dict must not KeyError on quit).
+            uid = tab.get('uid')
+            uid = uid if _valid_uid(uid) else position
             current.add(uid)
             _write_atomic(_log_path(uid), tab.get('text', ''))
             index.append(entry)
@@ -189,11 +242,18 @@ def load():
     if not isinstance(index, list):
         return []
     tabs = []
+    seen: set[int] = set()
     for entry in index:
         if not isinstance(entry, dict):
             continue
         uid = entry.get('uid')
-        if isinstance(uid, int) and uid >= 0:
+        # A VALID, not-yet-seen id keys this tab's log. Reject a bool (True==1 would
+        # read tab-1.log) and a DUPLICATE id (two entries claiming one log would both
+        # restore that one tab's scrollback -- a history-aliasing leak from a crafted
+        # or corrupt session.json); such an entry restores empty and _restore_tab
+        # assigns it a fresh id.
+        if _valid_uid(uid) and uid not in seen:
+            seen.add(uid)
             try:
                 # errors='replace': a log truncated mid-UTF-8, or corrupted on disk,
                 # must not break startup. Strict decoding raises UnicodeDecodeError
@@ -206,8 +266,8 @@ def load():
             except OSError:
                 entry['text'] = ''  # a missing log just restores an empty tab
         else:
-            # No/invalid id (e.g. a session.json written before the durable-id
-            # migration): restore an empty tab; _restore_tab assigns a fresh id.
+            # No/invalid/bool/duplicate id (a pre-durable-id session.json, or a
+            # crafted one): restore an empty tab; _restore_tab assigns a fresh id.
             entry['text'] = ''
         tabs.append(entry)
     return tabs
@@ -227,6 +287,36 @@ def clear():
         _remove(_log_path(uid))
 
 
+def remove_instance():
+    """Remove this instance's whole state subtree (its session.json + every per-tab
+    log/scratch file + the group dir). Used when an unnamed --new-instance closes: it
+    is not restorable across a restart (a fresh id each launch), so leaving its subtree
+    behind is pure orphan. Best-effort (ignore_errors swallows a partial tree); confined
+    to this instance's own dir, so it can never touch another instance's files."""
+    shutil.rmtree(_state_dir(), ignore_errors=True)
+
+
+def gc_instances(max_age_days=30):
+    """Backstop for CRASHED unnamed instances: remove throwaway (`new-<id>`) subtrees
+    left behind (a clean close self-removes via remove_instance). Age-gated well beyond
+    any plausible session so a still-running instance is never swept; named/default
+    groups are NEVER touched. Best-effort; never raises."""
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        names = os.listdir(_instances_root())
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(_THROWAWAY_PREFIX):
+            continue
+        path = os.path.join(_instances_root(), name)
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:  # pragma: no cover - a TOCTOU race (dir vanished under us)
+            pass
+
+
 def purge_tab_files(uid):
     """Best-effort remove a closed tab's app-managed files: its on-demand scratch
     exports (transcript/screen/state-dump-<id>.txt) and its scrollback log
@@ -241,7 +331,7 @@ def purge_tab_files(uid):
 
 def _state_uids_on_disk():
     """Every tab id that has any per-tab file (log or scratch) in the state dir."""
-    uids = set()
+    uids: set[int] = set()
     try:
         names = os.listdir(_state_dir())
     except OSError:

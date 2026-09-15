@@ -17,6 +17,7 @@ import fcntl
 import argparse
 import json
 import tempfile
+from typing import TypeGuard
 
 from PyQt6.QtCore import (
     QTimer, Qt, QUrl, QRect, QRectF, QPoint, QSize, QByteArray, QObject, QEvent,
@@ -787,7 +788,7 @@ class FindBar(QWidget):
         super().keyPressEvent(event)
 
 
-def _valid_uid(value):
+def _valid_uid(value) -> TypeGuard[int]:
     """A durable tab id is a non-negative int. Reject bool (a JSON true/false is an
     int subclass) and any non-int a hand-edited/corrupt session.json could carry, so
     a bad value falls back to a freshly minted id rather than aliasing a real tab."""
@@ -973,10 +974,10 @@ class MainWindow(QMainWindow):
         self._shortcuts = {}          # ident -> (action, default_seq_str, label)
         # session persistence is on unless explicitly disabled
         self._persist_session = cfg.get('persist_session') != 'false'
-        # A coexisting standalone window (--new-instance) is EPHEMERAL: it must not restore
-        # the shared session (that clones the primary's tabs -- the "opens the same tabs"
-        # bug) nor save/geometry over it. Distinct from the persist_session SETTING, which
-        # this window leaves untouched (so it cannot clobber the config for the primary).
+        # --new-instance is a coexisting STANDALONE window (never the primary of its
+        # group's socket). _ephemeral marks that standalone role for the tray menu;
+        # its on-disk STATE is isolated per instance group (see _state_group below), so
+        # it no longer needs the old "don't save over the shared session" hack.
         self._ephemeral = launch is not None and getattr(launch, 'new_instance', False)
         # confirm before closing a tab/window that still runs a foreground program
         self._confirm_close = cfg.get('confirm_close') != 'false'
@@ -996,6 +997,22 @@ class MainWindow(QMainWindow):
         # primary socket (a server-less coexisting instance leaves it None).
         self._server = None
         self._instance_group = 'default'
+        # Namespace this instance's on-disk state (session.json + tab-<n>.log +
+        # transcript-<n>.txt) under its OWN subtree, so a coexisting instance can never
+        # share or delete these files -- a tab ordinal is unique only WITHIN one
+        # instance, so it must be namespaced by the instance to be a valid on-disk key
+        # across processes (the iTerm2 / VTE / tmux-resurrect idiom). A named group
+        # (default, or --instance-group NAME) persists + restores that subtree; a bare
+        # --new-instance gets an isolated THROWAWAY subtree (a fresh id each launch, so
+        # not restorable) that is self-removed on close.
+        _group = getattr(launch, 'instance_group', 'default') if launch is not None \
+            else 'default'
+        if self._ephemeral and _group == 'default':
+            _group = session._THROWAWAY_PREFIX + os.urandom(6).hex()
+        session.set_instance_group(_group)
+        self._state_group = session.instance_group()   # the sanitized group actually used
+        self._throwaway = self._state_group.startswith(session._THROWAWAY_PREFIX)
+        session.gc_instances()      # backstop-clean crashed throwaway subtrees
         # term -> durable tab id, stable across a restart (persisted in the session,
         # restored in _restore_tab). Names `ctl id:N` AND every per-tab save file, so
         # two tabs never clobber each other and a tab keeps its files across a restart.
@@ -1129,20 +1146,27 @@ class MainWindow(QMainWindow):
             # + scrollback now (the window opens usable), the rest one per event-loop
             # turn AFTER the window is shown. The bar no longer grows one tab at a
             # time and the first paint is never blocked by a big multi-tab session.
-            _restore_ok = self._persist_session and not self._ephemeral
+            _restore_ok = self._persist_session and not self._throwaway
             restored = [i for i in (session.load() if _restore_ok else [])
                         if isinstance(i, dict)]
             # Seed the durable-id counter ABOVE every restored id BEFORE building any
             # tab, so a user-opened new tab cannot grab an id a not-yet-swapped
             # placeholder will later reclaim (placeholders restore lazily).
-            saved_uids = {i.get('uid') for i in restored if _valid_uid(i.get('uid'))}
+            saved_uids: set[int] = set()
+            for _info in restored:
+                _u = _info.get('uid')
+                if _valid_uid(_u):
+                    saved_uids.add(_u)
             if saved_uids:
                 self._next_tab_id = max(self._next_tab_id, max(saved_uids) + 1)
-            if _restore_ok:
-                # Drop any per-tab state file with no live owner -- a crash between a
-                # tab close and its unlink, or a previous session's leftovers on a
-                # fresh start -- so nothing sensitive lingers. Restored tabs' files are
-                # kept (their scrollback was already read into memory by session.load).
+            # Drop any per-tab state file with no live owner (a crash between a tab
+            # close and its unlink, or a previous session's leftovers), so nothing
+            # sensitive lingers; restored tabs' files are kept. SKIP the sweep for a
+            # PRE-DURABLE-ID session (tabs present but none carries a valid id): those
+            # old tab-<n>.log files are the user's real scrollback, and while the clean
+            # cut means they are not RESTORED, the sweep must not DELETE them -- that
+            # would be silent data loss on the one upgrade launch.
+            if _restore_ok and not (restored and not saved_uids):
                 session.purge_orphans(saved_uids)
             # The tab focused last time is restored FIRST (real content), so it -- not
             # tab 0 -- is what shows the instant the window opens (no first-tab flash);
@@ -2103,7 +2127,12 @@ class MainWindow(QMainWindow):
             info = self._pending_restore.pop(term, None)
             # Closing a not-yet-swapped restored tab discards it for good -> remove its
             # app-managed files (scratch exports + restore log), like the real path.
-            if isinstance(info, dict) and _valid_uid(info.get('uid')):
+            # Guard on the id NOT being owned by a live tab: a duplicate saved id (a
+            # crafted/corrupt session.json) can leave this placeholder carrying an id a
+            # real restored tab already holds -- purging it then would delete the LIVE
+            # tab's files. A placeholder never went through _add_tab's dedup, so check.
+            if (isinstance(info, dict) and _valid_uid(info.get('uid'))
+                    and info['uid'] not in self._tab_ids.values()):
                 session.purge_tab_files(info['uid'])
             if term in self._deferred_restore:
                 self._deferred_restore.remove(term)
@@ -3657,9 +3686,9 @@ class MainWindow(QMainWindow):
 
     def _restore_window_geometry(self):
         """Reopen at the last session's window size + maximized state. A no-op when
-        session persistence is off, nothing was saved, or this is an ephemeral
-        (--new-instance) window (keeps the default size)."""
-        if not self._persist_session or self._ephemeral:
+        session persistence is off, nothing was saved, or this is an unnamed throwaway
+        (--new-instance) window (keeps the default size; nothing to restore)."""
+        if not self._persist_session or self._throwaway:
             return
         blob = session.load_window()
         if isinstance(blob, str) and blob:
@@ -6374,7 +6403,11 @@ class MainWindow(QMainWindow):
                 terms):
             event.ignore()
             return
-        if self._persist_session and not self._ephemeral:   # ephemeral window: never clobber
+        if self._throwaway:
+            # An unnamed --new-instance is not restorable (a fresh id each launch), so
+            # leaving its isolated subtree behind is pure orphan -- remove it whole.
+            session.remove_instance()
+        elif self._persist_session:
             session.save(self._session_tabs(), self._window_state(),
                          self.tabs.currentIndex())
         else:
