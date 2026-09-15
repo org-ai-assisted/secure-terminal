@@ -224,7 +224,11 @@ def save(tabs, window=None, active=None):
 
 
 def load_active():
-    """Return the saved focused-tab index, or None. Never raises."""
+    """Return the saved focused-tab index, REMAPPED to its position in the dict-only tab
+    list that load() returns. A corrupt/hand-edited session.json can carry non-dict tab
+    entries, which load() drops -- so the RAW `active` index would then point PAST the
+    intended tab in the filtered list (the wrong tab restored as focused). None when
+    unset/invalid, out of range, or the active entry is itself not a dict. Never raises."""
     try:
         with open(session_path(), encoding='utf-8') as handle:
             data = json.load(handle)
@@ -233,7 +237,13 @@ def load_active():
     if not isinstance(data, dict):
         return None
     active = data.get('active')
-    return active if isinstance(active, int) and active >= 0 else None
+    tabs = data.get('tabs')
+    if not (isinstance(active, int) and active >= 0 and isinstance(tabs, list)
+            and active < len(tabs) and isinstance(tabs[active], dict)):
+        return None
+    # The active tab's index AMONG the dict entries load() keeps: non-dict entries before
+    # it shift it left. For a well-formed file (every entry a dict) this equals `active`.
+    return sum(1 for entry in tabs[:active] if isinstance(entry, dict))
 
 
 def load_window():
