@@ -155,13 +155,6 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                     # e.g. `101;48` keeps the bright-red bg.
                     bright_bg = None
                 continue
-            if attr == 2:
-                # SGR 2 (faint) = decreased intensity, NOT bold. pyte has no faint
-                # attr and drops 2, leaving bold set -- konsole/xterm/vte clear it.
-                # Map to 22 (normal intensity) so a program's faint never renders
-                # bold. (Dim rendering is unmodelled: pyte's Char has no faint field.)
-                passthrough.append(22)
-                continue
             if attr in _BG_AIXTERM_BRIGHT:
                 bright_bg = _BG_AIXTERM_BRIGHT[attr]
             else:
