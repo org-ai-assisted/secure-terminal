@@ -787,6 +787,13 @@ class FindBar(QWidget):
         super().keyPressEvent(event)
 
 
+def _valid_uid(value):
+    """A durable tab id is a non-negative int. Reject bool (a JSON true/false is an
+    int subclass) and any non-int a hand-edited/corrupt session.json could carry, so
+    a bad value falls back to a freshly minted id rather than aliasing a real tab."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 class MainWindow(QMainWindow):
     def __init__(self, launch=None, cg_base=None):
         super().__init__()
@@ -989,7 +996,10 @@ class MainWindow(QMainWindow):
         # primary socket (a server-less coexisting instance leaves it None).
         self._server = None
         self._instance_group = 'default'
-        self._tab_ids = {}            # term -> stable id (for `ctl --tab id:N`)
+        # term -> durable tab id, stable across a restart (persisted in the session,
+        # restored in _restore_tab). Names `ctl id:N` AND every per-tab save file, so
+        # two tabs never clobber each other and a tab keeps its files across a restart.
+        self._tab_ids = {}
         self._next_tab_id = 0
 
         self.tabs = QTabWidget(self)
@@ -1122,6 +1132,18 @@ class MainWindow(QMainWindow):
             _restore_ok = self._persist_session and not self._ephemeral
             restored = [i for i in (session.load() if _restore_ok else [])
                         if isinstance(i, dict)]
+            # Seed the durable-id counter ABOVE every restored id BEFORE building any
+            # tab, so a user-opened new tab cannot grab an id a not-yet-swapped
+            # placeholder will later reclaim (placeholders restore lazily).
+            saved_uids = {i.get('uid') for i in restored if _valid_uid(i.get('uid'))}
+            if saved_uids:
+                self._next_tab_id = max(self._next_tab_id, max(saved_uids) + 1)
+            if _restore_ok:
+                # Drop any per-tab state file with no live owner -- a crash between a
+                # tab close and its unlink, or a previous session's leftovers on a
+                # fresh start -- so nothing sensitive lingers. Restored tabs' files are
+                # kept (their scrollback was already read into memory by session.load).
+                session.purge_orphans(saved_uids)
             # The tab focused last time is restored FIRST (real content), so it -- not
             # tab 0 -- is what shows the instant the window opens (no first-tab flash);
             # it stays current as the placeholders around it swap in their real shells.
@@ -1153,9 +1175,15 @@ class MainWindow(QMainWindow):
         self._update_terminate_enabled()
 
     # -- tabs, each its own shell over its own pseudo-terminal -----------------
-    def _add_tab(self, term, activate=True, at=None):
-        self._tab_ids[term] = self._next_tab_id       # stable id for ctl matching
-        self._next_tab_id += 1
+    def _add_tab(self, term, activate=True, at=None, uid=None):
+        # Durable tab id: reuse the caller-supplied uid on restore (kept stable across
+        # the restart); otherwise mint the next one. A supplied uid already in use (a
+        # corrupt/duplicate session.json) falls back to a fresh id, so two live tabs
+        # can never share an id or a save file.
+        if not _valid_uid(uid) or uid in self._tab_ids.values():
+            uid = self._next_tab_id
+        self._tab_ids[term] = uid
+        self._next_tab_id = max(self._next_tab_id, uid + 1)
         term.zoom_step.connect(self._on_zoom_step)
         term.tab_step.connect(self._on_tab_step)
         term.tab_move.connect(self._on_tab_move)
@@ -2049,7 +2077,7 @@ class MainWindow(QMainWindow):
         # but a session from older code could carry Reveal/Detail; box it so the
         # restored chip never disagrees with the grid. Silent on restore.
         self._enforce_tui_autobox(term, notify=False)
-        index = self._add_tab(term, activate=activate, at=at)
+        index = self._add_tab(term, activate=activate, at=at, uid=info.get('uid'))
         name = info.get('name')
         if isinstance(name, str) and name:
             self._user_titles[term] = sanitize_title(name)   # restored session: untrusted file
@@ -2072,7 +2100,11 @@ class MainWindow(QMainWindow):
             # a restore placeholder: no shell to confirm or shut down -- drop it from
             # both pending collections and any name/colour keyed to it, remove the bar
             # entry, and close the window if it was the last tab (as the real path does).
-            self._pending_restore.pop(term, None)
+            info = self._pending_restore.pop(term, None)
+            # Closing a not-yet-swapped restored tab discards it for good -> remove its
+            # app-managed files (scratch exports + restore log), like the real path.
+            if isinstance(info, dict) and _valid_uid(info.get('uid')):
+                session.purge_tab_files(info['uid'])
             if term in self._deferred_restore:
                 self._deferred_restore.remove(term)
             self._user_titles.pop(term, None)
@@ -2125,7 +2157,12 @@ class MainWindow(QMainWindow):
             self._pre_tui_mode.pop(term, None)   # else a closed auto-boxed tab lingers
             self._osc_notified = {p for p in self._osc_notified if p[0] is not term}
             self._esc_notified.discard(term)
-            self._tab_ids.pop(term, None)
+            uid = self._tab_ids.pop(term, None)
+            # A user-initiated single-tab close discards this tab for good -> remove its
+            # app-managed files (scratch exports + restore log). NOT reached on app quit,
+            # which saves the logs for restore (that path is closeEvent, not close_tab).
+            if _valid_uid(uid):
+                session.purge_tab_files(uid)
             # Re-resolve the index: closing ANOTHER tab during the modal shifts indices,
             # so the `index` captured at entry may now point at a different tab.
             index = self.tabs.indexOf(term)
@@ -2198,27 +2235,20 @@ class MainWindow(QMainWindow):
             self._user_titles[term] = sanitize_title(name.strip())   # ASCII-only, like every title
             self._refresh_tab_label(term)
 
-    @staticmethod
-    def _default_transcript_path():
-        """The on-save transcript file path (the one place AppArmor permits writes).
-        Shared by copy_transcript_path (which writes it) and the tab tooltip (which
-        shows it), so both name the same file rather than duplicating the join."""
-        return os.path.join(session._state_dir(), 'transcript.txt')
+    def _default_transcript_path(self, term):
+        """This TAB's on-save transcript file path (the state dir is the one place
+        AppArmor permits writes). Keyed by the tab's durable id so tabs never clobber
+        each other; the same path is named by copy_transcript_path (which writes it)
+        and the tab tooltip (which shows it)."""
+        return session.tab_file('transcript', self._tab_ids[term])
 
-    @staticmethod
-    def _default_screen_path():
-        """The on-save current-screen file path -- the file Open Current Screen writes
-        and Copy Current Screen File Path names. Same state dir as the transcript."""
-        return os.path.join(session._state_dir(), 'screen.txt')
-
-    @staticmethod
-    def _default_state_dump_path():
-        """The on-save STATE DUMP file path. Unlike the plain screen/transcript (lossless
-        text, NO cell attributes), this file carries the full grid WITH per-cell SGR
-        attributes (bold/colour/reverse), cursor, modes and alt-screen -- so a render bug
-        (a leaked bold, a dropped row) is reportable at full fidelity in one file. Named
-        here so the writer (copy/open) and the tab tooltip agree on one path."""
-        return os.path.join(session._state_dir(), 'state-dump.txt')
+    def _default_state_dump_path(self, term):
+        """This tab's on-save STATE DUMP file path. Unlike the plain screen/transcript
+        (lossless text, NO cell attributes), this file carries the full grid WITH
+        per-cell SGR attributes (bold/colour/reverse), cursor, modes and alt-screen --
+        so a render bug (a leaked bold, a dropped row) is reportable at full fidelity in
+        one file. Keyed by the tab's durable id, like its siblings."""
+        return session.tab_file('state-dump', self._tab_ids[term])
 
     @staticmethod
     def _tab_pts(term):
@@ -2248,6 +2278,9 @@ class MainWindow(QMainWindow):
             if value:
                 rows.append('%s: %s' % (field, html.escape(str(value))))
 
+        tid = self._tab_ids.get(term)
+        if tid is not None:      # show id 0 too (add() would skip a falsy value)
+            rows.append('tab id: %s' % html.escape(str(tid)))
         add('name', self._user_titles.get(term))
         add('program', self._prog_titles.get(term))
         add('command', _command_display(term._command) or '(login shell)')
@@ -2259,11 +2292,11 @@ class MainWindow(QMainWindow):
         if live:
             add('transcript', live)
         else:
-            add('transcript (on save)', self._default_transcript_path())
+            add('transcript (on save)', self._default_transcript_path(term))
         # The full-fidelity grid dump path: hand this file to a reviewer for a render bug
         # (it records per-cell bold/colour the plain transcript cannot). Written on demand
         # by Save/Open/Copy-path State Dump or the /dump-state command.
-        add('state dump (on save)', self._default_state_dump_path())
+        add('state dump (on save)', self._default_state_dump_path(term))
         return '<br>'.join(rows)
 
     def _refresh_tab_label(self, term):
@@ -3984,39 +4017,39 @@ class MainWindow(QMainWindow):
     # <U+XXXX NAME> rather than collapsing to '_'), so a saved file is safe to open
     # anywhere, unlike a normal terminal's raw log.
     def save_transcript(self):
-        self._save_capture('Save Transcript', 'secure-terminal-transcript.txt',
+        self._save_capture('Save Transcript', 'secure-terminal-transcript',
                            SecureTerminal.scrollback_text)
 
     def save_current_screen(self):
-        self._save_capture('Save Current Screen', 'secure-terminal-screen.txt',
+        self._save_capture('Save Current Screen', 'secure-terminal-screen',
                            SecureTerminal.transcript_text)
 
     def save_state_dump(self):
-        self._save_capture('Save Screen State Dump', 'secure-terminal-state-dump.txt',
+        self._save_capture('Save Screen State Dump', 'secure-terminal-state-dump',
                            SecureTerminal.dump_state)
 
     def open_transcript(self):
-        self._open_capture('transcript.txt', SecureTerminal.scrollback_text)
+        self._open_capture('transcript', SecureTerminal.scrollback_text)
 
     def open_current_screen(self):
-        self._open_capture('screen.txt', SecureTerminal.transcript_text)
+        self._open_capture('screen', SecureTerminal.transcript_text)
 
     def open_state_dump(self):
-        self._open_capture('state-dump.txt', SecureTerminal.dump_state)
+        self._open_capture('state-dump', SecureTerminal.dump_state)
 
     def copy_transcript_path(self):
         """Write this tab's scrollback to the app's default transcript file and show its
         path with a one-click copy, so it can be found or shared without hunting."""
         self._copy_capture_path(
             'Transcript file path', "This tab's transcript file:",
-            self._default_transcript_path(), SecureTerminal.scrollback_text)
+            'transcript', SecureTerminal.scrollback_text)
 
     def copy_current_screen_path(self):
         """Write this tab's CURRENT SCREEN to the app's default screen file and show its
         path with one-click copy -- the screen counterpart of copy_transcript_path."""
         self._copy_capture_path(
             'Screen file path', "This tab's current-screen file:",
-            self._default_screen_path(), SecureTerminal.transcript_text)
+            'screen', SecureTerminal.transcript_text)
 
     def copy_state_dump_path(self):
         """Write this tab's full-fidelity STATE DUMP (grid + per-cell attributes) to the
@@ -4024,17 +4057,18 @@ class MainWindow(QMainWindow):
         hand a reviewer for a render bug the plain screen/transcript cannot show."""
         self._copy_capture_path(
             'State dump file path', "This tab's state dump file:",
-            self._default_state_dump_path(), SecureTerminal.dump_state)
+            'state-dump', SecureTerminal.dump_state)
 
-    def _copy_capture_path(self, title, heading, path, getter):
-        """Write getter(current tab) to the fixed state-dir `path` (refreshed NOW so the
-        shown path always names a real, current file), then show that path with a
-        one-click copy. Independent of any env var; uses the SAME default state-dir file
-        the matching Open action writes (the one place AppArmor permits writes). Single
-        builder shared by the transcript / screen / state-dump copy-path actions."""
+    def _copy_capture_path(self, title, heading, stem, getter):
+        """Write getter(current tab) to that tab's per-id state-dir file `stem`-<id>.txt
+        (refreshed NOW so the shown path always names a real, current file), then show
+        that path with a one-click copy. Independent of any env var; names the SAME
+        per-tab file the matching Open action writes (the one place AppArmor permits
+        writes). Single builder shared by the transcript / screen / state-dump actions."""
         term = self.current()
         if term is None or not self._tab_is_live(term):
             return
+        path = session.tab_file(stem, self._tab_ids[term])
         try:
             session.ensure_state_dir()
             # 0600 + O_NOFOLLOW, exactly as the matching Open action writes it: owner-only,
@@ -4072,10 +4106,14 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
         dlg.exec()
 
-    def _save_capture(self, title, default_name, getter):
+    def _save_capture(self, title, stem, getter):
         term = self.current()
         if term is None:
             return
+        # Per-tab default name so the pre-filled Save target does not collide between
+        # tabs; the user still picks the final path (this is a user document, not
+        # app-managed state -- it is NOT auto-purged on tab close).
+        default_name = '%s-%d.txt' % (stem, self._tab_ids[term])
         # Open the dialog IN a folder the AppArmor profile permits writes to (the
         # app's state dir): the home directory is confined read-only, so defaulting
         # there (Qt's default) offers only locations the save would then be denied.
@@ -4113,17 +4151,18 @@ class MainWindow(QMainWindow):
                 'choose a location there.'
                 % (path, exc.strerror or exc, session._state_dir()))
 
-    def _open_capture(self, filename, getter):
+    def _open_capture(self, stem, getter):
         term = self.current()
         if term is None or not self._tab_is_live(term):
             return
         # Hand the text to the system default viewer/editor (xdg-open via Qt), no dialog.
-        # Written to a FIXED file under the app's XDG state dir: the shipped AppArmor
-        # profile allows ~/.local/state/secure-terminal/** but NOT /tmp, and reusing one
-        # file (rather than a fresh temp each time) keeps sensitive history from
-        # accumulating. ensure_state_dir + 0o600 keep it owner-only; an OSError must NOT
-        # propagate out of this Qt slot and take the whole window (all tabs) down with it.
-        path = os.path.join(session._state_dir(), filename)
+        # Written to this tab's per-id file under the app's XDG state dir: the shipped
+        # AppArmor profile allows ~/.local/state/secure-terminal/** but NOT /tmp, and
+        # reusing one file per tab (rather than a fresh temp each time) keeps sensitive
+        # history from accumulating. ensure_state_dir + 0o600 keep it owner-only; an
+        # OSError must NOT propagate out of this Qt slot and take the whole window (all
+        # tabs) down with it. The file is unlinked when the tab closes (purge_tab_files).
+        path = session.tab_file(stem, self._tab_ids[term])
         try:
             session.ensure_state_dir()
             # O_NOFOLLOW: refuse to follow a symlink at the target (defence in depth; the
@@ -6183,6 +6222,7 @@ class MainWindow(QMainWindow):
         for term in self._real_terms():
             text = session.cap_text(term.toPlainText(), term.current_scrollback())
             tabs.append({
+                'uid': self._tab_ids[term],   # durable id: keys the log + save files
                 'name': self._user_titles.get(term, ''),
                 'color': self._tab_colors.get(term, ''),
                 'theme': term.current_theme(),
