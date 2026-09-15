@@ -115,6 +115,16 @@ profile secure-terminal /usr/bin/secure-terminal {
   /usr/local/bin/*  Ux,
   /usr/local/sbin/* Ux,
 
+  # Terminate + tab-close must be able to SIGNAL those unconfined children. AppArmor
+  # mediates signal SENDING by profile, and the children run at the 'unconfined' label
+  # (the Ux transitions above), so WITHOUT this rule killpg(SIGTERM)/kill(SIGHUP) return
+  # EACCES and the Terminate button -- plus a tab close's hangup -- silently do nothing
+  # under the enforced profile. Scoped to exactly the terminate/close set the app sends
+  # (SIGTERM then SIGKILL for Terminate, SIGHUP for close) and to unconfined peers: the
+  # base abstraction already permits the signal-0 existence probe, and the resize SIGWINCH
+  # is kernel-generated via the TIOCSWINSZ ioctl, not a mediated kill() send.
+  signal (send) set=(term, kill, hup) peer=unconfined,
+
   # site additions (an extra shell) go here without editing this file
   include if exists <local/secure-terminal>
 }
