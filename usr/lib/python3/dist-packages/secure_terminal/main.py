@@ -2279,16 +2279,22 @@ class MainWindow(QMainWindow):
         """This TAB's on-save transcript file path (the state dir is the one place
         AppArmor permits writes). Keyed by the tab's durable id so tabs never clobber
         each other; the same path is named by copy_transcript_path (which writes it)
-        and the tab tooltip (which shows it)."""
-        return session.tab_file('transcript', self._tab_ids[term])
+        and the tab tooltip (which shows it). None when the term has no id yet
+        (unregistered, or transiently mid-close/-swap): the tooltip builds this in a Qt
+        slot, where an uncaught KeyError would abort() the whole process, so it must NOT
+        raise -- the caller's add() drops a None line."""
+        uid = self._tab_ids.get(term)
+        return session.tab_file('transcript', uid) if uid is not None else None
 
     def _default_state_dump_path(self, term):
         """This tab's on-save STATE DUMP file path. Unlike the plain screen/transcript
         (lossless text, NO cell attributes), this file carries the full grid WITH
         per-cell SGR attributes (bold/colour/reverse), cursor, modes and alt-screen --
         so a render bug (a leaked bold, a dropped row) is reportable at full fidelity in
-        one file. Keyed by the tab's durable id, like its siblings."""
-        return session.tab_file('state-dump', self._tab_ids[term])
+        one file. Keyed by the tab's durable id, like its siblings. None (never a raise)
+        when the term has no id yet -- same tooltip-Qt-slot safety as the transcript."""
+        uid = self._tab_ids.get(term)
+        return session.tab_file('state-dump', uid) if uid is not None else None
 
     @staticmethod
     def _tab_pts(term):
