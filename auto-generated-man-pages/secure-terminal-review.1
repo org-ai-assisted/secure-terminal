@@ -1,0 +1,32 @@
+.\" generated with Ronn-NG/v0.10.1
+.\" http://github.com/apjanke/ronn-ng/tree/0.10.1
+.TH "SECURE\-TERMINAL\-REVIEW" "1" "January 2020" "secure-terminal" "secure-terminal Manual"
+.SH "NAME"
+\fBsecure\-terminal\-review\fR \- show the review popup by itself
+.SH "SYNOPSIS"
+\fBsecure\-terminal\-review\fR [\fB\-\-kind\fR paste|copy|clipboard] [\fB\-\-text\fR TEXT] [\fB\-\-theme\fR THEME] [\fB\-\-delay\fR SECONDS]
+.SH "DESCRIPTION"
+secure\-terminal\-review shows the secure\-terminal review popup on its own, with no terminal, tab or pseudo\-terminal behind it\. It hosts the SAME review widget the docked review bar (in the terminal window) and the clipboard sanitizer use, so the transforms, the fully\-revealed per\-character view, the content\-driven Deliver gate and the direction wording are all identical \-\- this is only a separate frame for that one widget\.
+.P
+The payload to review is \fB\-\-text\fR if given, otherwise text piped on standard input, otherwise a small built\-in sample that contains hidden characters so the bar has something to reveal\. The payload is reviewed exactly as supplied; nothing is stripped\.
+.P
+On Deliver, the exact delivered text (the box contents plus the neutralized tail) is written to standard output with no added newline \-\- the bytes that would cross\. On Reject, nothing is written to standard output and a \fBrejected\fR notice is written to standard error, so delivering the literal text \fBrejected\fR is never confused with a rejection\.
+.P
+It needs a running graphical session (a Wayland or X display), like the terminal itself\.
+.SH "OPTIONS"
+.TP
+\fB\-\-kind\fR paste|copy|clipboard
+The review direction, which sets the button wording and the accept note\. Default: paste\.
+.TP
+\fB\-\-text\fR TEXT
+The text to review\. Overrides standard input and the built\-in sample\.
+.TP
+\fB\-\-theme\fR THEME
+The colour theme of the preview panes\. Default: the configured theme\.
+.TP
+\fB\-\-delay\fR SECONDS
+The anti\-fat\-finger countdown that gates Deliver, in seconds\. Default: 0\.
+.SH "EXIT STATUS"
+Exits with the Qt application's exit code (0 on a normal close)\.
+.SH "SEE ALSO"
+\fBsecure\-terminal\fR(1)

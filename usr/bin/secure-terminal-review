@@ -1,0 +1,48 @@
+#!/usr/bin/python3 -Bsu
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## Launch the review popup standalone -- the shared ReviewBar in its own window, with
+## no terminal, tab or pty. A way to see and drive the review UI by itself.
+
+## Shell-invocation guard: under bash/sh the shebang is ignored and the `import`
+## lines below would run as shell commands (`import` is ImageMagick -> XGrabServer,
+## which freezes X). Re-exec under python3; inert as a string literal in python3.
+"exec" "python3" "-Bsu" "$0" "$@"
+
+import os
+import sys
+
+## Run straight from a source checkout, not only when installed (mirrors the
+## secure-terminal launcher): from a checkout the package is under
+## <repo>/usr/lib/python3/dist-packages, so add that when present.
+_dev = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+    'lib', 'python3', 'dist-packages')
+if os.path.isdir(os.path.join(_dev, 'secure_terminal')):
+    sys.path.insert(0, _dev)
+
+## Fail loud on a missing runtime dependency (clear stderr + non-zero exit) before the
+## heavy import below would traceback. Only what the review path needs: Qt widgets, plus
+## the sanitize classifiers (the review preview bands confusables / invisibles).
+from secure_terminal.preflight import require
+require(
+    ('PyQt6.QtWidgets', 'python3-pyqt6'),
+    # Without it _ASCII_CONFUSABLES is empty and every homoglyph silently drops from
+    # the `confusable` risk class to generic `nonascii` -- the review preview would
+    # then under-warn with no signal. A partial install must fail here instead.
+    ('confusable_homoglyphs', 'python3-confusable-homoglyphs'),
+    # \X (UAX #29 grapheme clusters): the flood cap in sanitize depends on it; the
+    # stdlib re has no equivalent. Absent module must not mean absent cap.
+    ('regex', 'python3-regex'),
+    # East-Asian / emoji display width used by the sanitize width logic.
+    ('wcwidth', 'python3-wcwidth'),
+)
+
+from secure_terminal.review_standalone import main
+
+if __name__ == '__main__':
+    sys.exit(main())

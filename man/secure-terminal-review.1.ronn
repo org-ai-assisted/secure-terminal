@@ -1,0 +1,58 @@
+secure-terminal-review(1) -- show the review popup by itself
+============================================================
+
+<!--
+# Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+# See the file COPYING for copying conditions.
+-->
+
+## SYNOPSIS
+
+`secure-terminal-review` [`--kind` paste|copy|clipboard] [`--text` TEXT]
+[`--theme` THEME] [`--delay` SECONDS]
+
+## DESCRIPTION
+
+secure-terminal-review shows the secure-terminal review popup on its own, with
+no terminal, tab or pseudo-terminal behind it. It hosts the SAME review widget
+the docked review bar (in the terminal window) and the clipboard sanitizer use,
+so the transforms, the fully-revealed per-character view, the content-driven
+Deliver gate and the direction wording are all identical -- this is only a
+separate frame for that one widget.
+
+The payload to review is `--text` if given, otherwise text piped on standard
+input, otherwise a small built-in sample that contains hidden characters so the
+bar has something to reveal. The payload is reviewed exactly as supplied; nothing
+is stripped.
+
+On Deliver, the exact delivered text (the box contents plus the neutralized tail)
+is written to standard output with no added newline -- the bytes that would cross.
+On Reject, nothing is written to standard output and a `rejected` notice is
+written to standard error, so delivering the literal text `rejected` is never
+confused with a rejection.
+
+It needs a running graphical session (a Wayland or X display), like the terminal
+itself.
+
+## OPTIONS
+
+  * `--kind` paste|copy|clipboard:
+    The review direction, which sets the button wording and the accept note.
+    Default: paste.
+
+  * `--text` TEXT:
+    The text to review. Overrides standard input and the built-in sample.
+
+  * `--theme` THEME:
+    The colour theme of the preview panes. Default: the configured theme.
+
+  * `--delay` SECONDS:
+    The anti-fat-finger countdown that gates Deliver, in seconds. Default: 0.
+
+## EXIT STATUS
+
+Exits with the Qt application's exit code (0 on a normal close).
+
+## SEE ALSO
+
+`secure-terminal`(1)

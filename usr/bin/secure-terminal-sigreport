@@ -42,6 +42,13 @@ def _report(signum, _frame):
 
 
 def main():
+    # `--screenshot-deterministic` (also auto-enabled under the terminal's own
+    # SECURE_TERMINAL_SHOT screenshot mode) replaces the volatile PID in the ready
+    # line with a fixed placeholder, so a regenerated screenshot is byte-reproducible
+    # while still honestly showing that a PID is reported. The real PID is used
+    # otherwise -- it is what a diagnostic run wants.
+    deterministic = ('--screenshot-deterministic' in sys.argv[1:]
+                     or bool(os.environ.get('SECURE_TERMINAL_SHOT')))
     # Trap every signal the kernel allows a handler for. SIGKILL/SIGSTOP are
     # uncatchable by design; skip them (and the invalid 0) rather than crash.
     for sig in signal.Signals:
@@ -51,9 +58,10 @@ def main():
             signal.signal(sig, _report)
         except (OSError, ValueError, RuntimeError):
             continue                      # real-time / reserved signals: not trappable here
-    sys.stdout.write('sigreport: PID %d ready -- waiting for signals '
+    pid_text = '[redacted]' if deterministic else str(os.getpid())
+    sys.stdout.write('sigreport: PID %s ready -- waiting for signals '
                      '(Terminate sends SIGTERM then SIGKILL; SIGQUIT/Ctrl-\\ quits)\n'
-                     % os.getpid())
+                     % pid_text)
     sys.stdout.flush()
     while True:
         time.sleep(3600)                  # woken by any delivered signal; loops and waits again
