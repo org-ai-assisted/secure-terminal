@@ -1438,6 +1438,12 @@ class SecureTerminal(QPlainTextEdit):
         self._last_click_pos = None
         self._select_mode = 'char'    # 'char' | 'word' | 'line'
         self._sel_anchor = None       # (start, end) doc positions the drag extends from
+        # Doc position of the last plain (no-shift) left click. A later Shift+click extends
+        # the selection FROM here (konsole parity), not from the text cursor -- which the
+        # render pins to the output cursor at the document bottom, so Qt's default extend
+        # ran to the bottom (the "shift+click selects to the bottom" bug). None until the
+        # first plain click; the caret itself still snaps back to the output cursor.
+        self._shift_click_anchor = None
         self._grid_shown = False      # is the fixed pyte grid currently on screen
         # Local caret echoes (^C, ^\) awaiting possible de-duplication against the
         # shell's own echo: [(text, deadline_monotonic), ...]. See _echo_caret.
@@ -6648,14 +6654,30 @@ class SecureTerminal(QPlainTextEdit):
         # the user selects (a left-button press begins a possible drag).
         if event.button() == Qt.MouseButton.LeftButton:
             self._mouse_selecting = True
-            if self._mouse_reporting() and self._shift(event):
-                # Shift is MANDATORY to bypass the child's mouse grab, but Qt reads a
-                # Shift+press as "EXTEND the selection from the current cursor" -- which the
-                # grid render loop pins to the child's cursor (_place_grid_cursor). Left
-                # alone every selection anchored there and a single line was unselectable.
-                # Collapse the cursor to the click first, so the shift-press starts a FRESH
-                # selection at the click instead of extending from the pinned cursor.
-                self.setTextCursor(self.cursorForPosition(event.position().toPoint()))
+            if self._shift(event):
+                # Qt reads a Shift+press as "EXTEND the selection from the text cursor",
+                # which the render pins to the output cursor at the document bottom
+                # (_place_grid_cursor / reset_caret) -- so a Shift+click selected everything
+                # from the click DOWN TO THE BOTTOM, in every non-report mode (the reported
+                # bug), and under a mouse-grabbing child a single line was unselectable.
+                # Anchor the extend explicitly instead: from the last plain-click position
+                # (konsole parity -- click, then Shift+click to extend to there). With no
+                # recorded click -- or under a mouse-reporting child, where plain clicks are
+                # reported to the child and never recorded here -- start a FRESH selection at
+                # the click. Never the bottom. super() (below) extends this anchor to the click.
+                tc = self.textCursor()
+                if self._shift_click_anchor is not None and not self._mouse_reporting():
+                    tc.setPosition(min(self._shift_click_anchor,
+                                       self.document().characterCount() - 1))
+                else:
+                    tc.setPosition(self.cursorForPosition(event.position().toPoint()).position())
+                self.setTextCursor(tc)
+            else:
+                # Remember where a plain click landed so a later Shift+click can extend from
+                # it. The caret still snaps back to the output cursor on release; this is a
+                # separate selection anchor, not a movable caret.
+                self._shift_click_anchor = \
+                    self.cursorForPosition(event.position().toPoint()).position()
             point = event.position().toPoint()
             # A triple-click (3rd rapid press; Qt sends the 2nd as a dblclick) selects the
             # whole logical line.
