@@ -1562,7 +1562,13 @@ class SecureTerminal(QPlainTextEdit):
             # cut at an escape boundary: a raw slice can start mid-sequence, and
             # the headless remainder then renders as literal escape garbage.
             self._raw = tail_from_escape_boundary(restored, self._RAW_MAX)
-            self._append(restored)
+            # Seed the document from the CAPPED _raw, not the full restored text: the
+            # save side caps by line COUNT only (session.cap_text), so a heavy tab can
+            # persist more than _RAW_MAX chars. Appending the full restored would show
+            # more than _raw can reproduce, and the first _rerender / width reflow
+            # (which rebuilds from _raw) would then silently drop the excess. For the
+            # common case (restored <= _RAW_MAX) _raw == restored, so this is identical.
+            self._append(self._raw)
 
         self._notifier = None
         self._fd = None
