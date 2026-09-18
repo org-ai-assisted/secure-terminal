@@ -132,23 +132,31 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         bright_fg = None
         it = iter(attrs)
         for attr in it:
-            if attr in (38, 48):
-                # 38/48 introduce an EXTENDED colour (5;<idx> or 2;<r>;<g>;<b>); the params
+            if attr in (38, 48, 58):
+                # 38/48/58 introduce an EXTENDED colour (5;<idx> or 2;<r>;<g>;<b>); the params
                 # that follow are colour DATA, not opcodes, so CONSUME them -- else a component
                 # in 90-107 (e.g. the index in 38;5;91) is misread as a bright code and
-                # corrupts the 256/truecolour sequence.
-                passthrough.append(attr)
+                # corrupts the 256/truecolour sequence. 38 (fg) / 48 (bg) pass through to pyte,
+                # which renders them; 58 (set underline colour) is NOT rendered by pyte, so its
+                # payload is consumed but DROPPED -- appending it would leak the sub-parameters
+                # as standalone SGR at the pyte layer (the same 58;2;r;g;b corruption a zero
+                # channel causes by hitting pyte's SGR-0 full reset).
+                emit = attr in (38, 48)
+                if emit:
+                    passthrough.append(attr)
                 mode = next(it, None)
                 complete = False
                 if mode is not None:
-                    passthrough.append(mode)
+                    if emit:
+                        passthrough.append(mode)
                     need = 3 if mode == 2 else 1 if mode == 5 else 0
                     got = 0
                     for _ in range(need):
                         comp = next(it, None)
                         if comp is None:
                             break
-                        passthrough.append(comp)
+                        if emit:
+                            passthrough.append(comp)
                         got += 1
                     complete = need > 0 and got == need
                 if complete:
