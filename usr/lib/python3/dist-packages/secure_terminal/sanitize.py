@@ -128,18 +128,23 @@ def _detail_badge(cp):
 # CSI (ESC [ ...), OSC (ESC ] ... BEL/ST), the DCS/SOS/PM/APC string sequences
 # (ESC P/X/^/_ ... ST) and other two-byte escapes.
 ANSI_RE = re.compile(
-    # CSI: ESC [ , parameter bytes 0x30-0x3F (0-9 : ; < = > ?), intermediate
-    # bytes 0x20-0x2F, a final byte 0x40-0x7E. The parameter class must span the
-    # whole 0x30-0x3F range, or a private-prefix sequence a capable-TERM program
-    # emits (e.g. modifyOtherKeys "\x1b[>4;2m", "\x1b[?25l") is left unstripped.
-    r'\x1b\[[0-?]*[ -/]*[@-~]'
-    # An INTERRUPTED CSI -- ESC [ params (+ intermediates) with NO final byte, cut short by
+    # CSI: ESC [ , then a run of parameter (0x30-0x3F: 0-9 : ; < = > ?) and
+    # intermediate (0x20-0x2F) bytes in ANY order, a final byte 0x40-0x7E. The
+    # class must span the whole 0x30-0x3F range, or a private-prefix sequence a
+    # capable-TERM program emits (e.g. modifyOtherKeys "\x1b[>4;2m", "\x1b[?25l")
+    # is left unstripped. The param+intermediate class is the single 0x20-0x3F run
+    # a VT state machine stays in (csi_param / csi_intermediate / csi_ignore) until
+    # the final dispatches: a malformed OUT-OF-ORDER CSI (an intermediate before a
+    # param, "\x1b[ 1m") is consumed whole and shows nothing, as a real terminal
+    # does -- an ordered [0-?]*[ -/]* left the "1m" tail to leak as literal text.
+    r'\x1b\[[ -?]*[@-~]'
+    # An INTERRUPTED CSI -- ESC [ param/intermediate bytes with NO final byte, cut short by
     # a non-final byte (e.g. "\x1b[38;5;123\n") -- must still be consumed, or its param
     # bytes ("38;5;123") leak as literal text (the generic arm below strips only "\x1b[",
     # leaving the params). Ordered AFTER the complete-CSI arm, so a well-formed CSI is
-    # consumed whole first; only params-without-a-final reach here. (A CSI genuinely split
+    # consumed whole first; only a run-without-a-final reaches here. (A CSI genuinely split
     # across reads is held by feed_chunk_carry, not leaked.)
-    r'|\x1b\[[0-?]*[ -/]*'
+    r'|\x1b\[[ -?]*'
     r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?'
     # DCS (ESC P), SOS (ESC X), PM (ESC ^), APC (ESC _): a string sequence whose
     # BODY runs to an ST (ESC \) terminator. Unlike OSC, BEL does NOT terminate
@@ -184,7 +189,7 @@ _TRAILING_ESCAPE = re.compile(
     r'\x1b(?:'
     r'\][^\x07\x1b]*'        # OSC: ESC ] ... still awaiting its BEL or ST
     r'|[PX^_][^\x1b]*'       # DCS/SOS/PM/APC: ESC P/X/^/_ ... awaiting ST (BEL is body)
-    r'|\[[0-?]*[ -/]*'       # CSI: ESC [ params/intermediates, no final byte yet
+    r'|\[[ -?]*'             # CSI: ESC [ param/intermediate bytes (any order), no final yet
     r'|[NO]'                 # SS2/SS3: ESC N/O awaiting the ONE byte it shifts.
                              # ANSI_RE consumes that byte, so without this arm a
                              # read boundary between introducer and byte leaves the
@@ -843,6 +848,27 @@ def cap_zalgo_show(text, carry=0):
     return ''.join(out), run
 
 
+def _zalgo_runs(cellline):
+    """Yield (start, end, collapsed) spans of `cellline`: a base cell at `start` plus its
+    run of combining-mark cells up to `end` (exclusive). `collapsed` is True when SHOW mode
+    merges the span into ONE box cell -- a run of MORE than _ZALGO_MARK_MAX marks on a
+    non-wide base. A wide (East-Asian W/F) base occupies two columns; collapsing base+marks
+    to a one-column box would shrink the line and desync the caret, so it is left
+    un-collapsed (Zalgo on a wide base is exotic). Single source of the run boundaries for
+    both the renderer (_collapse_zalgo_runs) and the caret offset (cells_display_col), so the
+    two can never disagree on where a run starts, ends, or collapses."""
+    i, n = 0, len(cellline)
+    while i < n:
+        j = i + 1
+        while (j < n and len(cellline[j][0]) == 1
+               and ord(cellline[j][0]) >= 0x0300 and _is_mark(cellline[j][0])):
+            j += 1
+        base = cellline[i][0]
+        wide = len(base) == 1 and unicodedata.east_asian_width(base) in ('W', 'F')
+        yield i, j, (not wide and j - (i + 1) > _ZALGO_MARK_MAX)
+        i = j
+
+
 def _collapse_zalgo_runs(cellline):
     """Merge a base cell plus a run of MORE than _ZALGO_MARK_MAX combining-mark cells into ONE
     multi-cp cell, so the SHOW-mode line renderer boxes it (its risk band then fills the whole
@@ -850,25 +876,13 @@ def _collapse_zalgo_runs(cellline):
     without this the band lands on each thin mark and overflows. A run <= the cap is left as
     separate cells, so legitimate decomposed text is unchanged. Display-width-neutral: the
     base is one column and the marks are zero-width, so the boxed cell (one column) leaves the
-    caret offsets intact."""
+    caret offsets intact (cells_display_col collapses the SAME runs, so the caret agrees)."""
     out = []
-    i = 0
-    n = len(cellline)
-    while i < n:
-        j = i + 1
-        while (j < n and len(cellline[j][0]) == 1
-               and ord(cellline[j][0]) >= 0x0300 and _is_mark(cellline[j][0])):
-            j += 1
-        base = cellline[i][0]
-        # A wide (East-Asian W/F) base occupies two columns; collapsing base+marks to a
-        # one-column box would shrink the line and desync the caret. Such a base is left
-        # un-collapsed (Zalgo on a wide base is exotic); every ordinary base is collapsed.
-        wide = len(base) == 1 and unicodedata.east_asian_width(base) in ('W', 'F')
-        if not wide and j - (i + 1) > _ZALGO_MARK_MAX:
+    for i, j, collapsed in _zalgo_runs(cellline):
+        if collapsed:
             out.append((''.join(cellline[k][0] for k in range(i, j)), cellline[i][1]))
         else:
             out.extend(cellline[i:j])
-        i = j
     return out
 
 
@@ -1624,12 +1638,26 @@ def cells_display_col(cells, col, mode):
     caret, since a reveal badge is many columns wide. Counted in the UTF-16 units
     a document position uses (see display_len), so an astral character does not
     shift the caret."""
-    prefix = cells[:col]
-    # match cells_to_runs: a Zalgo run collapses to ONE box, so its marks do not each add a
-    # document offset -- without this the caret drifts past text after a Zalgo cluster.
-    if mode == 'show':
-        prefix = _collapse_zalgo_runs(prefix)
-    return sum(display_len(_cell_display(c, mode)) for c, _ in prefix)
+    if mode != 'show':
+        return sum(display_len(_cell_display(c, mode)) for c, _ in cells[:col])
+    # match cells_to_runs: a Zalgo run (> _ZALGO_MARK_MAX marks) collapses to ONE box, so its
+    # marks do not each add a document offset. Identify runs from the FULL cells, not the
+    # cells[:col] slice: a run that `col` cuts mid-way still collapses (its full length
+    # exceeds the cap), so collapsing only the truncated prefix would leave it uncollapsed and
+    # the caret would drift past the box by one offset per un-collapsed mark. A col landing
+    # inside a collapsed run resolves to the box's trailing edge.
+    off = 0
+    for i, j, collapsed in _zalgo_runs(cells):
+        if col <= i:
+            break
+        if collapsed:
+            off += display_len(BOX)           # the whole run is ONE box, marks add no offset
+        else:
+            for k in range(i, min(j, col)):
+                off += display_len(_cell_display(cells[k][0], mode))
+        if col < j:                           # the cursor sits inside this run -> stop here
+            break
+    return off
 
 
 # Unicode Default_Ignorable_Code_Point ranges that str.isprintable() does NOT
