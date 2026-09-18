@@ -1828,6 +1828,11 @@ class SecureTerminal(QPlainTextEdit):
             self._render_tui()
             return
         self.clear()
+        # The document was just cleared and is about to be replayed from _raw, so a shift-click
+        # anchor into the OLD content now points at unrelated text (a QTextCursor left by clear()
+        # drifts to the end during the replay) -- drop it, exactly as _reset_grid_view does for
+        # the grid path, so a Shift+click after a mode toggle / reflow starts fresh not at the bottom.
+        self._shift_click_anchor = None
         self._out_cursor = None
         self._line_cells = []
         self._line_col = 0
