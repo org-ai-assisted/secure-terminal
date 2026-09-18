@@ -1438,11 +1438,14 @@ class SecureTerminal(QPlainTextEdit):
         self._last_click_pos = None
         self._select_mode = 'char'    # 'char' | 'word' | 'line'
         self._sel_anchor = None       # (start, end) doc positions the drag extends from
-        # Doc position of the last plain (no-shift) left click. A later Shift+click extends
+        # QTextCursor at the last plain (no-shift) left click. A later Shift+click extends
         # the selection FROM here (konsole parity), not from the text cursor -- which the
         # render pins to the output cursor at the document bottom, so Qt's default extend
-        # ran to the bottom (the "shift+click selects to the bottom" bug). None until the
-        # first plain click; the caret itself still snaps back to the output cursor.
+        # ran to the bottom (the "shift+click selects to the bottom" bug). A QTextCursor
+        # (not a bare int position) so the document auto-tracks it as scrollback trims/inserts
+        # move the content; a FULL rebuild (_reset_grid_view clears the document) drops it back
+        # to None so a Shift+click there starts fresh rather than from a stale offset. None
+        # until the first plain click; the caret itself still snaps back to the output cursor.
         self._shift_click_anchor = None
         self._grid_shown = False      # is the fixed pyte grid currently on screen
         # Local caret echoes (^C, ^\) awaiting possible de-duplication against the
@@ -2552,6 +2555,9 @@ class SecureTerminal(QPlainTextEdit):
         self._grid_row_ids = []
         self._grid_row_sig = []
         self._row_sig_cache = {}      # buffer swap (alt enter/leave), seed, resize-rebuild
+        # The document was just cleared, so a shift-click anchor into the OLD content now points
+        # at unrelated text -- drop it, so a Shift+click after a rebuild starts fresh at the click.
+        self._shift_click_anchor = None
         self._tui_follow = True       # a fresh grid view follows the tail until the user scrolls
 
     def _on_scroll_value(self, value):
@@ -6667,17 +6673,18 @@ class SecureTerminal(QPlainTextEdit):
                 # the click. Never the bottom. super() (below) extends this anchor to the click.
                 tc = self.textCursor()
                 if self._shift_click_anchor is not None and not self._mouse_reporting():
-                    tc.setPosition(min(self._shift_click_anchor,
-                                       self.document().characterCount() - 1))
+                    # A live QTextCursor -- the document has kept its position valid across
+                    # any scrollback trim/insert since the click, so no clamp is needed.
+                    tc.setPosition(self._shift_click_anchor.position())
                 else:
                     tc.setPosition(self.cursorForPosition(event.position().toPoint()).position())
                 self.setTextCursor(tc)
             else:
                 # Remember where a plain click landed so a later Shift+click can extend from
-                # it. The caret still snaps back to the output cursor on release; this is a
+                # it. Stored as a QTextCursor so the document auto-tracks it as output scrolls;
+                # the caret still snaps back to the output cursor on release -- this is a
                 # separate selection anchor, not a movable caret.
-                self._shift_click_anchor = \
-                    self.cursorForPosition(event.position().toPoint()).position()
+                self._shift_click_anchor = self.cursorForPosition(event.position().toPoint())
             point = event.position().toPoint()
             # A triple-click (3rd rapid press; Qt sends the 2nd as a dblclick) selects the
             # whole logical line.
