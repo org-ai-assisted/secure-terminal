@@ -2068,10 +2068,15 @@ def parse_sgr(param_str, state):
             state['bg'] = n - 100 + 8
         elif n == 49:
             state['bg'] = None
-        elif n in (38, 48):
-            # 8-bit (5;n) and 24-bit (2;r;g;b) colour: resolve to a stored value.
-            # Colour is passive (a contrast guard keeps text readable), so it is
-            # safe to honour the full range rather than dropping it.
+        elif n in (38, 48, 58):
+            # 8-bit (5;n) and 24-bit (2;r;g;b) extended colour: resolve to a
+            # stored value. Colour is passive (a contrast guard keeps text
+            # readable), so it is safe to honour the full range rather than
+            # dropping it. 58 (set underline colour) shares the SAME
+            # sub-parameter grammar but has no slot in this state (fg/bg/bold
+            # only): CONSUME its payload but store nothing -- else 58;2;r;g;b
+            # leaks its channels as standalone SGR codes, and a zero channel
+            # hits the SGR-0 full-reset arm and silently clears bold.
             colour = None
             if i + 1 < len(nums) and nums[i + 1] == 5:
                 if i + 2 < len(nums):
@@ -2083,7 +2088,7 @@ def parse_sgr(param_str, state):
                                                 nums[i + 3] & 0xff,
                                                 nums[i + 4] & 0xff)
                 i += 4
-            if colour is not None:
+            if colour is not None and n in (38, 48):
                 state['fg' if n == 38 else 'bg'] = colour
         i += 1
     return state
