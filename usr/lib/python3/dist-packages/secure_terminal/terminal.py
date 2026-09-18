@@ -141,32 +141,28 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                 # payload is consumed but DROPPED -- appending it would leak the sub-parameters
                 # as standalone SGR at the pyte layer (the same 58;2;r;g;b corruption a zero
                 # channel causes by hitting pyte's SGR-0 full reset).
-                emit = attr in (38, 48)
-                if emit:
-                    passthrough.append(attr)
                 mode = next(it, None)
-                complete = False
-                if mode is not None:
-                    if emit:
-                        passthrough.append(mode)
-                    need = 3 if mode == 2 else 1 if mode == 5 else 0
-                    got = 0
-                    for _ in range(need):
-                        comp = next(it, None)
-                        if comp is None:
-                            break
-                        if emit:
-                            passthrough.append(comp)
-                        got += 1
-                    complete = need > 0 and got == need
-                if complete:
-                    # a COMPLETE 256/truecolour fg (38) / bg (48) overrides an earlier bright
-                    # fg / bg. An INCOMPLETE/malformed selector (bare, bad mode, or missing
-                    # components) is ignored and must NOT clear a preceding valid bright colour
-                    # -- e.g. `91;38` keeps the bright-red fg.
+                # Consume the colour DATA per the ITU T.416 colour-space id, so a data
+                # component (e.g. the 90 in 38;3;90) can never fall through to the outer loop
+                # and be misread as a top-level bright SGR: 0/1 carry no data, 2 (RGB) and
+                # 3 (CMY) three, 4 (CMYK) four, 5 (indexed) one. An unknown id carries none.
+                need = {0: 0, 1: 0, 2: 3, 3: 3, 4: 4, 5: 1}.get(mode, 0)
+                comps = []
+                for _ in range(need):
+                    comp = next(it, None)
+                    if comp is None:
+                        break
+                    comps.append(comp)
+                # Only 38;2/38;5 (fg) and 48;2/48;5 (bg) are rendered by pyte -- emit a COMPLETE
+                # one intact so it overrides an earlier bright fg/bg. 58 (underline colour) and
+                # every other/unknown colour space are consumed and DROPPED so their sub-params
+                # never leak as standalone SGR; an incomplete/bare/bad-mode selector likewise
+                # emits nothing and leaves a preceding bright colour untouched (e.g. 91;38).
+                if mode in (2, 5) and len(comps) == need and attr in (38, 48):
+                    passthrough.extend((attr, mode, *comps))
                     if attr == 38:
                         bright_fg = None
-                    elif attr == 48:
+                    else:
                         bright_bg = None
                 continue
             if attr in _FG_AIXTERM_BRIGHT:
@@ -337,6 +333,14 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         self.dirty.add(row)
 
     def erase_in_line(self, how=0, *args, **kwargs):
+        # Ignore an out-of-spec selector. Stock pyte.Screen.erase_in_line handles only
+        # how in (0, 1, 2); any other value leaves its local `interval` unbound and raises
+        # UnboundLocalError, which propagates out of feed() and drops the rest of the PTY
+        # chunk (the exact "one malformed CSI must not drop the chunk" failure this class
+        # guards against). A real terminal ignores an unknown EL parameter -- no-op here
+        # (nothing erased, so no gutter flag change either).
+        if how not in (0, 1, 2):
+            return
         # Erasing the cursor row's content clears its no-trailing-newline flag (the
         # gutter must not mark a row whose old content is gone).
         row = self.buffer.get(self.cursor.y)
@@ -345,6 +349,12 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         super().erase_in_line(how, *args, **kwargs)
 
     def erase_in_display(self, how=0, *args, private=False, **kwargs):
+        # Ignore an out-of-spec selector, same as erase_in_line: stock
+        # pyte.Screen.erase_in_display handles only how in (0, 1, 2, 3) and raises
+        # UnboundLocalError otherwise, crashing the parser and dropping the rest of the
+        # chunk. A real terminal ignores an unknown ED parameter (private ESC[?9J included).
+        if how not in (0, 1, 2, 3):
+            return
         # Clear the flag on exactly the rows this erase blanks (whole screen for how
         # 2/3, cursor->end for 0, start->cursor for 1) so no stale gutter marker rides
         # a cleared region -- e.g. `clear` (ESC[H ESC[2J) after un-terminated output.
@@ -911,6 +921,27 @@ def cli_terminfo_dir():
             # as-is (exist_ok), so _owned_regular -- not this mode -- is the real
             # guard against a poisoned entry handed to the child via TERMINFO_DIRS.
             os.makedirs(cache, mode=0o700, exist_ok=True)
+            # tic -o opens its output path with NO O_NOFOLLOW, so a symlink planted at the
+            # compiled-entry path (or the 's/' subdir) by anyone who can write a poisoned
+            # cache dir would be FOLLOWED and the target file clobbered with terminfo bytes
+            # on EVERY launch. _fresh() already refused to TRUST such an entry; remove a
+            # symlinked / foreign-owned entry here so tic writes a fresh regular file instead
+            # of writing through the link.
+            tdir = os.path.join(cache, 's')
+            if os.path.islink(tdir):
+                try:
+                    os.unlink(tdir)
+                except OSError:  # pragma: no cover - defensive
+                    pass
+            for _name in ('secure-terminal', 'secure-terminal-noedit'):
+                _entry = os.path.join(tdir, _name)
+                try:
+                    if os.path.islink(_entry) or (
+                            os.path.exists(_entry)
+                            and os.lstat(_entry).st_uid not in (0, os.getuid())):
+                        os.unlink(_entry)
+                except OSError:  # pragma: no cover - defensive
+                    pass
             subprocess.run(['tic', '-x', '-o', cache, src],
                            check=True, capture_output=True, timeout=15)
             # the same both-entries test: a tic that produced only one of them is
@@ -3367,6 +3398,13 @@ class SecureTerminal(QPlainTextEdit):
                 # wider than the pty. Restore the pre-DECCOLM width (buffer preserved) BEFORE
                 # the tab stops, so they are spaced for the final width, not the stale 132.
                 screen.resize(screen.lines, screen.saved_columns)
+                # pyte.Screen.resize() does NOT clamp the cursor on a shrink (see the same
+                # clamp in _sync_tui_size), so a cursor left past the restored width stays
+                # out of range and _place_grid_cursor pins the caret to the last column of
+                # the returning prompt -- a residual VT-state leak. Clamp it into the grid.
+                screen.cursor.y = min(screen.cursor.y, screen.lines - 1)
+                if screen.cursor.x > screen.columns:
+                    screen.cursor.x = screen.columns - 1
                 screen.saved_columns = None
             screen.tabstops = set(range(8, screen.columns, 8))   # pyte's power-up default
         self._mouse_modes = set()
@@ -4607,7 +4645,11 @@ class SecureTerminal(QPlainTextEdit):
         # would raise AttributeError -- inside the handler -- if that ever changed.
         except ValueError:
             return
-        QGuiApplication.clipboard().setText(sanitize_clipboard(text))
+        board = QGuiApplication.clipboard()
+        if board is None:  # pragma: no cover - clipboard() is non-None under a running QApplication
+            return         # guard as _reply_clipboard does: an AttributeError here would
+                           # propagate out of _handle_osc and drop the rest of the PTY chunk
+        board.setText(sanitize_clipboard(text))
         # The write always applies (a throttle would drop legitimate rapid distinct writes);
         # instead REPORT a program flooding the clipboard, ONCE per tab, so a runaway is visible
         # without breaking a real program's rapid writes.
@@ -4672,20 +4714,30 @@ class SecureTerminal(QPlainTextEdit):
                 pass        # already closed -> nothing to do
             self._fd = None
         if self._pid:
-            if hangup and self._pid_is_current_child():
-                # Only SIGHUP a pid that is still OUR child: reap_pty_children may have freed
-                # it for OS reuse (see #30), and hanging up a reused pid would signal an
-                # unrelated process. A gone / reused pid has nothing of ours to hang up.
+            # reap_pty_children (the shared SIGCHLD reaper) may have freed this pid for OS
+            # reuse (see #30) before _release_pty runs, so distinguish THREE cases by identity:
+            if self._pid_is_current_child():
+                # Still OUR child (start-time matches a live child or our own not-yet-reaped
+                # zombie): safe to hang up, reap and evict.
+                if hangup:
+                    try:
+                        os.kill(self._pid, signal.SIGHUP)
+                    except OSError:
+                        pass    # child already gone -> nothing to hang up
                 try:
-                    os.kill(self._pid, signal.SIGHUP)
-                except OSError:
-                    pass    # child already gone -> nothing to hang up
-            try:
-                reaped = os.waitpid(self._pid, os.WNOHANG)[0]
-            except (OSError, ChildProcessError):
-                reaped = self._pid   # already reaped -> drop it from the registry
-            if reaped:
+                    reaped = os.waitpid(self._pid, os.WNOHANG)[0]
+                except (OSError, ChildProcessError):
+                    reaped = self._pid   # reaped between the check and here -> drop it
+                if reaped:
+                    SecureTerminal._LIVE_PTY_PIDS.discard(self._pid)
+            elif self._pid_start_time(self._pid) is None:
+                # The pid is GONE (our child exited and was reaped elsewhere -- the shared
+                # reaper, or externally): no live process holds it, so evict our stale
+                # registry entry, but never waitpid (nothing of ours to reap; ECHILD).
                 SecureTerminal._LIVE_PTY_PIDS.discard(self._pid)
+            # else: a DIFFERENT live process reused the pid after our child was reaped --
+            # touch nothing (#7): a waitpid would steal another tab's child's exit status and
+            # a discard would evict that tab's live registry entry.
             self._pid = None
 
     def shutdown(self):
@@ -5671,18 +5723,30 @@ class SecureTerminal(QPlainTextEdit):
             os.killpg(pgrp, signal.SIGTERM)
         except OSError as exc:
             return (False, exc.errno)
-
-        def _kill_survivor(target=pgrp):  # pragma: no cover - fires via QTimer 2s later; the grace-period SIGKILL is not observable in the offscreen test harness
-            try:
-                os.killpg(target, 0)      # still alive?
-            except OSError:
-                return                    # already gone
-            try:
-                os.killpg(target, signal.SIGKILL)
-            except OSError:
-                pass        # exited between the check and the kill -> fine
-        QTimer.singleShot(2000, _kill_survivor)
+        # Capture the group LEADER's start-time NOW (the leader's pid == the pgid), so the
+        # deferred SIGKILL can confirm the SAME group is still there. os.killpg(pgrp, 0) alone
+        # checks only that SOMETHING is in the group -- after the SIGTERM'd job exits inside the
+        # grace window its pgid can be reused by an unrelated process (a real race, amplified by
+        # our own pty.fork() cadence when a tab is closed and another opened), and a blind
+        # SIGKILL would then kill that stranger. The recheck at fire time gates on identity.
+        leader_start = self._pid_start_time(pgrp)
+        QTimer.singleShot(
+            2000, lambda: self._kill_pgrp_survivor(pgrp, leader_start))
         return (True, None)
+
+    def _kill_pgrp_survivor(self, pgrp, leader_start):
+        """Deferred SIGKILL of a SIGTERM'd foreground group's survivors -- but ONLY when the
+        group leader's start-time still matches the one captured at SIGTERM. This gates on
+        IDENTITY, not mere liveness: a pgid reused by an unrelated process after the original
+        job exited in the grace window must never be killed. If the leader is already gone
+        (start-time unreadable now, or was unreadable at SIGTERM) we skip the SIGKILL -- the
+        safe direction (a stuck job's leader is normally still alive), never a wrong kill."""
+        if leader_start is None or self._pid_start_time(pgrp) != leader_start:
+            return
+        try:
+            os.killpg(pgrp, signal.SIGKILL)
+        except OSError:
+            pass            # exited between the recheck and the kill -> fine
 
     def terminate_debug(self):
         """A copyable diagnostic for the Terminate action that ALSO performs the real
