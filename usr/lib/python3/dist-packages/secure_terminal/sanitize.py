@@ -587,20 +587,33 @@ def render_cap_prefix(text, budget):
 # switches to the alternate screen buffer is a full-screen (TUI) app -- htop,
 # vim, less -- which line mode, having no escape parser, cannot draw. Detecting
 # this lets the widget hint that TUI mode is needed, rather than showing garbage.
-_ALT_SCREEN = ('\x1b[?1049h', '\x1b[?1047h', '\x1b[?47h')
-_ALT_SCREEN_OFF = ('\x1b[?1049l', '\x1b[?1047l', '\x1b[?47l')
+_ALT_MODES = frozenset(('47', '1047', '1049'))
+# A private-mode CSI: ESC[? <;-separated numbers> h|l. Matched (not exact-substring) so a
+# COMBINED sequence -- ESC[?1047;1049h, or leaving via ESC[?1049;1047l -- is still recognised;
+# the old literal markers required the mode digits to be immediately followed by h/l and so
+# silently missed the combined form, letting a full-screen program bypass alt-screen detection.
+_ALT_CSI_RE = re.compile(r'\x1b\[\?([0-9;]+)([hl])')
+
+
+def alt_screen_transitions(text):
+    """Yield (start, end, 'enter'|'leave') for each private-mode CSI in `text` that sets ('h',
+    enter) or resets ('l', leave) an alternate-screen mode (47/1047/1049), combined forms
+    included. Exact token match on the ;-split params, so ESC[?147h (mode 147) is NOT alt."""
+    for m in _ALT_CSI_RE.finditer(text):
+        if _ALT_MODES & set(m.group(1).split(';')):
+            yield (m.start(), m.end(), 'enter' if m.group(2) == 'h' else 'leave')
 
 
 def wants_full_screen(text):
     """True when the output tries to switch to the alternate screen buffer, the
     tell of a full-screen (TUI) program that cannot render in line mode."""
-    return any(seq in text for seq in _ALT_SCREEN)
+    return any(kind == 'enter' for _s, _e, kind in alt_screen_transitions(text))
 
 
 def leaves_full_screen(text):
     """True when the output leaves the alternate screen buffer -- the full-screen
     program (htop, vim) has exited and the shell's primary screen is back."""
-    return any(seq in text for seq in _ALT_SCREEN_OFF)
+    return any(kind == 'leave' for _s, _e, kind in alt_screen_transitions(text))
 
 
 # Mouse DEC private modes a program enables to have the terminal REPORT input to

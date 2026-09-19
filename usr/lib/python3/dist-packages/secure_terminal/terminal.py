@@ -377,9 +377,24 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
 
 
 def _make_private_tolerant(base):
-    """A private-CSI-tolerant wrapper: run pyte's base handler with its positional
-    params and drop the meaningless private= marker (and any stray kwargs)."""
+    """A private-CSI-tolerant wrapper: run pyte's base handler with its positional params,
+    drop the meaningless private= marker (and any stray kwargs), AND truncate excess params to
+    the handler's arity. A CSI carrying more numeric params than the handler accepts (a
+    non-private ESC[1;2A -> cursor_up, which takes one; ESC[1;2;3H -> cursor_position, two;
+    ESC[1;2@; ESC[1;2;3r) would else raise TypeError out of feed() and drop the rest of the PTY
+    chunk -- the same 'malformed CSI must not drop the chunk' failure the shim exists to close.
+    A real terminal ignores the extra params, so keep the leading ones the handler accepts."""
+    sig = inspect.signature(base)
+    if any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values()):
+        maxpos = None                          # *args handler -> no cap
+    else:
+        pos = [p for p in sig.parameters.values()
+               if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        maxpos = max(0, len(pos) - 1)          # minus `self`
+
     def _wrapped(self, *params, private=False, **_ignored):
+        if maxpos is not None and len(params) > maxpos:
+            params = params[:maxpos]
         return base(self, *params)
     return _wrapped
 
@@ -468,8 +483,8 @@ from secure_terminal.sanitize import (
     SPACE_MARK,
     WS_ANOMALY, whitespace_anomaly_cols,
     render_output, render_cap_prefix,
-    wants_full_screen, leaves_full_screen, wants_screen_repaint, wants_clear,
-    wants_line_clears,
+    wants_full_screen, leaves_full_screen, alt_screen_transitions,
+    wants_screen_repaint, wants_clear, wants_line_clears,
     describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
     PROMPT_START, _printable_follows,
     feed_chunk_carry, has_bell, OSC_FEATURES,
@@ -477,7 +492,6 @@ from secure_terminal.sanitize import (
     sgr_mouse_report,
     _MOUSE_BUTTON_MODES, _MOUSE_DRAG_MODE, _MOUSE_MOTION_MODE,
     _MOUSE_FOCUS_MODE, _MOUSE_SGR_MODE,
-    _ALT_SCREEN as _ALT_ENTER, _ALT_SCREEN_OFF as _ALT_LEAVE,
 )
 from secure_terminal import resource_isolation
 from secure_terminal import state_dump
@@ -746,10 +760,26 @@ def _trim_blank_wrap_fill(completed, wraps):
 # acts on these to snapshot/restore the primary screen at the exact boundary.
 _ALT_ENTER_BYTES = (b'\x1b[?1049h', b'\x1b[?1047h', b'\x1b[?47h')
 _ALT_LEAVE_BYTES = (b'\x1b[?1049l', b'\x1b[?1047l', b'\x1b[?47l')
+# Bytes twin of sanitize.alt_screen_transitions: a private-mode CSI that sets/resets an
+# alt-screen mode, COMBINED forms included (ESC[?1047;1049h). Exact-substring markers missed
+# those, so _feed_stream never snapshotted the primary screen and full-screen frames polluted
+# scrollback -- the unbounded-growth condition the snapshot machinery exists to prevent.
+_ALT_MODES_BYTES = frozenset((b'47', b'1047', b'1049'))
+_ALT_CSI_RE_BYTES = re.compile(rb'\x1b\[\?([0-9;]+)([hl])')
+
+
+def _alt_transitions_bytes(data):
+    """Yield (end, 'enter'|'leave') for each alt-screen private-mode CSI in `data`, in order."""
+    for m in _ALT_CSI_RE_BYTES.finditer(data):
+        if _ALT_MODES_BYTES & set(m.group(1).split(b';')):
+            yield (m.end(), 'enter' if m.group(2) == b'h' else 'leave')
 # longest alt-screen marker, so a tail of (len-1) carried between reads reunites a
 # marker split across an os.read() boundary (F6).
-_ALT_MARKER_MAX = max(len(m) for m in _ALT_ENTER + _ALT_LEAVE)
 _ALT_MARKER_MAX_BYTES = max(len(m) for m in _ALT_ENTER_BYTES + _ALT_LEAVE_BYTES)
+# The single-marker length also bounds the str carry tail (the markers are ASCII, so char
+# length == byte length); a marker split across an os.read() boundary is reunited by carrying
+# the last (_ALT_MARKER_MAX - 1) chars of the joined probe.
+_ALT_MARKER_MAX = _ALT_MARKER_MAX_BYTES
 
 
 def _alt_partial_tail(data):
@@ -822,8 +852,8 @@ def _argv_for_command(command):
     # word is empty ('""') names no program: a command WAS given but is unrunnable, so
     # fail closed rather than fall through to the shell. A NUL in any word is unrunnable
     # too (execvp ValueError), so fail closed on it as well.
-    if not (parsed and parsed[0]):
-        return None
+    if not (parsed and parsed[0].strip()):   # .strip(): a whitespace-only first word ('"   "'
+        return None                          # -> ['   ']) names no program, like the list path
     return None if any('\x00' in w for w in parsed) else parsed
 
 
@@ -886,16 +916,26 @@ def cli_terminfo_dir():
         compilation, so the terminal kept advertising what the renderer no longer
         matched -- the source-vs-artifact drift these entries exist to prevent."""
         def _owned_regular(path):
-            # Trust a compiled entry only if it is a REGULAR file (not a symlink to
-            # an attacker-chosen target) owned by root (the packaged /usr copy) or
-            # us (our own cache) -- never a foreign-owned or symlinked entry planted
-            # in a shared or poisoned cache dir, which the child would then load via
-            # TERMINFO_DIRS.
+            # Trust a compiled entry only if it is a REGULAR file (not a symlink to an
+            # attacker-chosen target) owned by root (the packaged /usr copy) or us (our own
+            # cache) -- never a foreign-owned or symlinked entry planted in a shared or poisoned
+            # cache dir, which the child would then load via TERMINFO_DIRS. Open with O_NOFOLLOW
+            # and fstat the FD -- one atomic check, so a co-located attacker cannot swap the
+            # regular file for a symlink between an islink() test and a later stat() (the TOCTOU
+            # a separate-syscall check left open); O_NOFOLLOW makes the open itself fail on a
+            # symlinked final component.
             try:
-                return (not os.path.islink(path) and os.path.isfile(path)
-                        and os.stat(path).st_uid in (0, os.getuid()))
-            except OSError:  # pragma: no cover - race (stat after isfile) is defensive
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError:                       # ELOOP (symlink), ENOENT, EACCES -> not trusted
                 return False
+            try:
+                st = os.fstat(fd)
+            except OSError:  # pragma: no cover - defensive
+                return False
+            finally:
+                os.close(fd)
+            return ((st.st_mode & 0o170000) == 0o100000     # S_IFREG: a regular file
+                    and st.st_uid in (0, os.getuid()))
         compiled = [os.path.join(directory, 's', name)
                     for name in ('secure-terminal', 'secure-terminal-noedit')]
         if not all(_owned_regular(path) for path in compiled):
@@ -2087,7 +2127,13 @@ class SecureTerminal(QPlainTextEdit):
         - TUI grid: sized to fit and its Detail/Reveal cells fall back to the box, so
           it never overflows; NoWrap.
         """
-        wrap = (not self._grid_mode()
+        # A preview instance renders via the CLI line path even when tui=True, so it is NOT a
+        # real pyte grid: treat it as non-grid here so detail/reveal overflow wraps to the
+        # viewport / keeps a scrollbar instead of being clipped away unreachably. Key on the
+        # preview FLAG, not screen==None -- a real TUI terminal creates its screen lazily
+        # (apply_tui before _make_screen), and it IS still a grid.
+        is_grid = self._grid_mode() and not getattr(self, '_preview', False)
+        wrap = (not is_grid
                 and self._mode in ('detail', 'reveal'))
         self.setLineWrapMode(
             QPlainTextEdit.LineWrapMode.WidgetWidth if wrap
@@ -2100,7 +2146,7 @@ class SecureTerminal(QPlainTextEdit):
         # at the right edge, exactly as a real terminal does. CLI keeps AsNeeded: a
         # genuinely long NoWrap Box/Show line there is reachable by a real scroll.
         self.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if self._grid_mode()
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if is_grid
             else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
     def _apply_vscroll_policy(self):
@@ -2491,9 +2537,12 @@ class SecureTerminal(QPlainTextEdit):
         painter.drawLine(cx - a, mid + a, cx, mid + 2 * a)
 
     def _block_at_gutter_y(self, y):
-        """The visible block whose row contains gutter-local y, or None."""
+        """The visible block whose row contains gutter-local y, or None. Half-open [top, bottom)
+        so the shared boundary pixel (block N's int(bottom) == block N+1's int(top) when the line
+        height is fractional) belongs to the LOWER block, not both -- an inclusive test returned
+        the upper block for that row, mis-annotating the gutter by one pixel at every boundary."""
         for block, top, bottom in self._gutter_blocks():
-            if top <= y <= bottom:
+            if top <= y < bottom:
                 return block
         return None
 
@@ -2546,6 +2595,12 @@ class SecureTerminal(QPlainTextEdit):
         return cols, rows
 
     def _set_winsize(self, cols, rows):
+        # The winsize fields are unsigned short: clamp to 0xFFFF FIRST and store the CLAMPED
+        # value, so self._cols/_rows never exceed what the kernel/child actually got at an
+        # extreme viewport (a mouse report clamps its cell against these, and dump_state
+        # reports them). Also stops an UNCAUGHT struct.error crashing the resize.
+        cols = min(cols, 0xFFFF)
+        rows = min(rows, 0xFFFF)
         # Remember the size we tell the child: the width so line-mode output wraps
         # at the same column the shell formats to (see self._cols / _feed_line), and
         # the height so a mouse report clamps its row to the child's screen.
@@ -2553,13 +2608,10 @@ class SecureTerminal(QPlainTextEdit):
         self._rows = rows
         if self._fd is None:
             return
-        # The winsize fields are unsigned short: clamp so an extreme viewport (rows
-        # or cols > 65535, from a huge/hostile window geometry) cannot raise an
-        # UNCAUGHT struct.error and crash the resize. struct.error is caught too, as
-        # belt-and-suspenders for any other pack failure.
+        # struct.error is caught too, as belt-and-suspenders for any other pack failure.
         try:
             fcntl.ioctl(self._fd, termios.TIOCSWINSZ,
-                        struct.pack('HHHH', min(rows, 0xFFFF), min(cols, 0xFFFF), 0, 0))
+                        struct.pack('HHHH', rows, cols, 0, 0))
         except (OSError, struct.error):
             pass            # a closed/invalid pty or bad size just misses this resize
 
@@ -3992,8 +4044,14 @@ class SecureTerminal(QPlainTextEdit):
         entered = wants_full_screen(alt_probe)
         left = leaves_full_screen(alt_probe)
         if entered or left:
-            last_enter = max((alt_probe.rfind(s) for s in _ALT_ENTER), default=-1)
-            last_leave = max((alt_probe.rfind(s) for s in _ALT_LEAVE), default=-1)
+            # LAST occurrence wins (a chunk carrying both: one program quits, another starts).
+            # Use the combined-CSI-aware scan, not exact-marker rfind, so ESC[?1047;1049h counts.
+            last_enter = last_leave = -1
+            for _s, _e, _kind in alt_screen_transitions(alt_probe):
+                if _kind == 'enter':
+                    last_enter = _s
+                else:
+                    last_leave = _s
             self._alt_screen = last_enter > last_leave
             # Drop any stale wheel-scroll remainder at an alt-screen transition:
             # a leftover sub-line delta must not carry into the next full-screen
@@ -4237,37 +4295,24 @@ class SecureTerminal(QPlainTextEdit):
         buffer."""
         if self._stream is None:
             return
-        pos, n = 0, len(data)
+        pos = 0
         transitions = 0
-        while pos < n:
-            nxt, kind, mlen = n, None, 0
-            for marker in _ALT_ENTER_BYTES:
-                i = data.find(marker, pos)
-                if 0 <= i < nxt:
-                    nxt, kind, mlen = i, 'enter', len(marker)
-            for marker in _ALT_LEAVE_BYTES:
-                i = data.find(marker, pos)
-                if 0 <= i < nxt:
-                    nxt, kind, mlen = i, 'leave', len(marker)
-            # Each enter/leave snapshots or clears the whole screen (pyte has no alt
-            # buffer). A process flooding alternating ?1049h/?1049l in one read could
-            # otherwise force thousands of full-screen deepcopies and freeze the GUI,
-            # so bound the snapshot/restore work per read: past the cap, feed the
-            # remainder as ordinary bytes (a real program redraws its own frame). This
-            # SAME cap bounds the per-marker find() scans below to at most
-            # _ALT_TRANSITIONS_MAX linear passes -- total O(cap*n) = O(n), NOT the O(n^2)
-            # an unbounded per-marker rescan would be; the loop is not a scan-DoS.
+        # Each enter/leave snapshots or clears the whole screen (pyte has no alt buffer). A
+        # process flooding alternating ?1049h/?1049l in one read could otherwise force thousands
+        # of full-screen deepcopies and freeze the GUI, so bound the snapshot/restore work per
+        # read: past the cap, feed the remainder as ordinary bytes (a real program redraws its
+        # own frame). _alt_transitions_bytes is a SINGLE regex pass -> O(n), not a scan-DoS.
+        for (end, kind) in _alt_transitions_bytes(data):
             if transitions >= self._ALT_TRANSITIONS_MAX:
-                self._feed_bytes(data[pos:])
                 break
-            self._feed_bytes(data[pos:nxt + mlen])   # up to and incl. the marker
+            self._feed_bytes(data[pos:end])          # up to and incl. the alt-screen CSI
             if kind == 'enter':
                 self._alt_enter()
-                transitions += 1
-            elif kind == 'leave':
+            else:
                 self._alt_leave()
-                transitions += 1
-            pos = nxt + mlen if kind else n
+            transitions += 1
+            pos = end
+        self._feed_bytes(data[pos:])                 # the remainder (or the whole chunk)
 
     def _feed_bytes(self, chunk):
         """Feed one segment to the pyte parser, containing any error -- pyte parses
@@ -5594,8 +5639,15 @@ class SecureTerminal(QPlainTextEdit):
         # was captured BEFORE that, so a raw compare would see the suffix only on the
         # LIVE read and mis-ID an idle, never-exec'd shell as a foreground program --
         # which the panic Terminate would then kill. Strip it so both reads normalize.
+        # Strip ONLY when the suffix is the kernel's synthetic marker, not part of a real
+        # filename: the kernel appends it to an UNLINKED path, so the "<name> (deleted)" path
+        # does not exist on disk. A file literally named "<name> (deleted)" (exec'd to spoof
+        # the strip into matching the baseline) DOES exist, so keep its real path -- else a
+        # replaced child would read as "still the original", defeating _child_execd.
         deleted = ' (deleted)'
-        return target[:-len(deleted)] if target.endswith(deleted) else target
+        if target.endswith(deleted) and not os.path.exists(target):
+            return target[:-len(deleted)]
+        return target
 
     @staticmethod
     def _pid_start_time(pid):
@@ -6257,8 +6309,16 @@ class SecureTerminal(QPlainTextEdit):
         ca.setPosition(a)
         cb.setPosition(b)
         ra, rb = self.cursorRect(ca), self.cursorRect(cb)
-        if not (min(ra.x(), rb.x()) <= pos.x() <= max(ra.x(), rb.x())
-                and min(ra.top(), rb.top()) <= pos.y() <= max(ra.bottom(), rb.bottom())):
+        if rb.top() != ra.top():
+            # The trailing caret wrapped to the next visual line (soft wrap in detail/reveal),
+            # so Qt collapsed rb.x() to the left margin -- the min/max box would then miss the
+            # char's real glyph, exactly at the attacker-steerable wrap boundary. The character
+            # actually spans from ra.x() to the RIGHT EDGE of ra's line; test that box instead.
+            if not (ra.x() <= pos.x() <= self.viewport().width()
+                    and ra.top() <= pos.y() <= ra.bottom()):
+                return None
+        elif not (min(ra.x(), rb.x()) <= pos.x() <= max(ra.x(), rb.x())
+                  and min(ra.top(), rb.top()) <= pos.y() <= max(ra.bottom(), rb.bottom())):
             return None
         cp = self._run_cp_at(a)
         if cp is not None:
@@ -7044,6 +7104,15 @@ class SecureTerminal(QPlainTextEdit):
             # the review resolves.
             return ('a paste/copy review is in progress; input to the child is '
                     'suspended -- retry after it resolves')
+        if self._staged_paste:
+            # A reviewed multi-line paste is mid-delivery (approved, held lines awaiting the
+            # user's next paste gesture). _dispatch_paste would clear _staged_paste and write
+            # this payload onto the same unsent prompt line, silently destroying reviewed-and-
+            # approved content -- the GUI path (insertFromMimeData) guards this by routing a
+            # second gesture into _insert_next_staged instead. Headless ctl has no such gesture,
+            # so REFUSE rather than clobber; the caller retries once the held paste is delivered.
+            return ('a reviewed multi-line paste is still being delivered; '
+                    'finish it in the GUI (or wait) before sending more text')
         # submit forces the multiline refusal even when bracketed paste is active: that
         # exemption exists only so a TUI child can BUFFER a multiline paste inert, but an
         # explicit submit appends a real CR after the 200~/201~ framing, which submits the
@@ -7178,8 +7247,13 @@ class SecureTerminal(QPlainTextEdit):
         if self.tui_active() or self.has_foreground_program():
             self._staged_paste = []
             return
-        line = self._staged_paste.pop(0)
+        line = self._staged_paste[0]              # peek: consume only once actually delivered
         if line:
             # the inserted line sits at the shell prompt unmirrored, like any paste
             self._line_dirty = True
-            self._write(line.encode('utf-8'))
+            if self._write(line.encode('utf-8')) is False:
+                # a partial / timed-out pty write (a wedged or slow child): leave the reviewed
+                # line staged so the next paste gesture retries it, rather than silently drop it
+                # (matches _write's False contract that ctl_send_text also honours).
+                return
+        self._staged_paste.pop(0)                 # delivered (or an empty held line) -> consume
