@@ -172,6 +172,13 @@ ANSI_RE = re.compile(
     # is rendered on the EOF flush so a program's final output is not lost (silent-final-
     # output-loss regression). The dangerous case -- CSI params like "31m" -- is caught by the
     # interrupted-CSI arm above; a generic remnant is left for the per-code-point classifier.
+    #
+    # An ESC + intermediate(s) ABORTED by a following ESC leaves its intermediates (printable
+    # 0x20-0x2F) as literal text here. That is INTENTIONALLY not stripped: stripping it in this
+    # one-shot regex (a lookahead on the next ESC) would DIVERGE from the streaming path, where
+    # the aborting ESC is often carried/dropped into a separate chunk and so cannot be seen --
+    # breaking T8 split-invariance to remove an INERT printable byte (T1 output-inertness is
+    # unaffected: the leaked byte is safe ASCII). Split-invariance is the stronger guarantee.
     r'|\x1b[ -/]*[0-~]'
 )
 
@@ -283,6 +290,19 @@ _STRING_TERMINATOR = {
     '^': re.compile(r'\x1b\\'),         # PM
     '_': re.compile(r'\x1b\\'),         # APC
 }
+# Where a string-sequence BODY ends while discarding, matching ANSI_RE's body class
+# (OSC: [^\x07\x1b]*, DCS/SOS/PM/APC: [^\x1b]*): the first BEL (OSC only) or ESC. An
+# ESC forming ST (ESC \) terminates the sequence; any OTHER ESC INTERRUPTS it (the
+# sequence ends before it, that ESC re-parses as a new introducer). Discarding only up
+# to this type's own terminator would sail past a nested introducer and misread the
+# nested body's BEL/ST as this sequence's terminator, leaking the tail as text.
+_STRING_DISCARD_END = {
+    ']': re.compile(r'\x07|\x1b'),      # OSC: BEL terminates; any ESC ends the body
+    'P': re.compile(r'\x1b'),           # DCS/SOS/PM/APC: any ESC ends the body (BEL is body)
+    'X': re.compile(r'\x1b'),
+    '^': re.compile(r'\x1b'),
+    '_': re.compile(r'\x1b'),
+}
 
 # An over-cap INCOMPLETE non-string escape -- a CSI (ESC [ ...) or a generic ESC
 # (ESC + intermediates) -- also switches to the discard state, or its continuation
@@ -290,13 +310,14 @@ _STRING_TERMINATOR = {
 # but untrusted output can -- exactly the threat this sanitizer holds). The body is
 # consumed to the sequence's final byte, matching ANSI_RE: a byte outside the
 # body-and-final grammar INTERRUPTS the sequence (the run ends and that byte resumes
-# as text, as ANSI_RE's interrupted-CSI arm does). The body pattern restarts in the
-# params sub-state on each continuation chunk (no cross-chunk params-vs-intermediates
-# memory), so a >cap CSI split with a param byte AFTER an intermediate over-swallows
-# the rest of the run where whole-stream ANSI_RE would interrupt -- accepted: it only
-# over-DROPS untrusted bytes on a >4 KiB CSI, never leaks an escape.
+# as text, as ANSI_RE's interrupted-CSI arm does). The CSI body is the SINGLE 0x20-0x3F
+# class ANSI_RE uses ([ -?], param and intermediate bytes in ANY order): an ordered
+# [0-?]*[ -/]* stopped on a param byte AFTER an intermediate (a malformed out-of-order
+# CSI, "\x1b[ 1m") and LEAKED that param tail as literal text on a chunk split, where
+# whole-stream ANSI_RE consumes it whole. One class needs no params-vs-intermediates
+# sub-state, so a continuation chunk restarts cleanly with no cross-chunk memory.
 _NONSTRING_BODY = {
-    '[': re.compile(r'[0-?]*[ -/]*'),   # CSI: parameter bytes 0x30-0x3F then intermediates
+    '[': re.compile(r'[ -?]*'),         # CSI: param + intermediate bytes 0x20-0x3F, any order
     '\x1b': re.compile(r'[ -/]*'),      # generic ESC: intermediate bytes 0x20-0x2F
 }
 _NONSTRING_FINAL = {'[': 0x40, '\x1b': 0x30}   # CSI final 0x40-0x7E; generic 0x30-0x7E
@@ -324,14 +345,27 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
     carry = ''
     if drop:
         if drop in _STRING_TERMINATOR:
-            m = _STRING_TERMINATOR[drop].search(text)
+            m = _STRING_DISCARD_END[drop].search(text)
             if not m:
                 dropped += len(text)
-                # still inside the sequence; a lone trailing ESC may be a split ST
+                # still inside the body; a lone trailing ESC may be a split ST
                 return '', ('\x1b' if text.endswith('\x1b') else ''), drop, dropped
-            text = text[m.end():]
-            drop = ''
-            dropped = 0
+            i = m.start()
+            if text[i] == '\x07':               # BEL: OSC terminator
+                text = text[i + 1:]
+                drop = ''
+                dropped = 0
+            elif i == len(text) - 1:            # lone trailing ESC: maybe a split ST
+                dropped += len(text)
+                return '', '\x1b', drop, dropped
+            elif text[i + 1] == '\\':           # ESC \ : ST terminator
+                text = text[i + 2:]
+                drop = ''
+                dropped = 0
+            else:                                # interrupting ESC: sequence ends before
+                text = text[i:]                  # it; re-parse from the ESC below
+                drop = ''
+                dropped = 0
         else:
             # CSI ('[') / generic-ESC ('\x1b') discard: consume the body prefix,
             # then its final byte -- or stop at an INTERRUPTING byte, which ends the
@@ -354,17 +388,20 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
             drop = g[1]                 # too long to hold -> swallow to terminator
             dropped = len(g)
             text = text[:m.start()]
-        elif len(g) <= cap:
-            carry = g                   # short incomplete escape -> hold for next chunk
+        elif len(g) <= cap or len(g) == 1:
+            # short incomplete escape -> hold for next chunk. A LONE trailing ESC (len 1) is
+            # held UNCONDITIONALLY, even under a tiny cap (cap <= 0): one byte can never be a
+            # DoS, and its introducer has not arrived yet, so guessing a discard TYPE now would
+            # mis-classify a real CSI/OSC as generic-ESC -- whose discard then eats the
+            # introducer's second byte as a "final byte" and LEAKS the body as literal text.
+            # Holding defers the type decision to the next chunk, where the introducer is known.
+            carry = g
             text = text[:m.start()]
         else:
-            # over-cap incomplete NON-string escape (CSI or generic ESC): enter the
-            # same O(1) discard state as an over-cap string sequence, so the
-            # continuation cannot leak as literal text on the next chunk. The
-            # len(g) >= 2 guard also covers a lone trailing ESC (len 1) that reaches
-            # here only under a tiny cap (cap <= 0), where neither branch above fires:
-            # treat it as a generic-ESC discard, never index g[1] out of range.
-            drop = '[' if len(g) >= 2 and g[1] == '[' else '\x1b'
+            # over-cap incomplete NON-string escape (CSI or generic ESC), len(g) >= 2 here (a
+            # lone ESC took the branch above): enter the same O(1) discard state as an over-cap
+            # string sequence, so the continuation cannot leak as literal text on the next chunk.
+            drop = '[' if g[1] == '[' else '\x1b'
             dropped = len(g)
             text = text[:m.start()]
     return text, carry, drop, dropped
