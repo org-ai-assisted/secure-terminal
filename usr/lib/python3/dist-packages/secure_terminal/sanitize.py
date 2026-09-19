@@ -354,17 +354,20 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
             drop = g[1]                 # too long to hold -> swallow to terminator
             dropped = len(g)
             text = text[:m.start()]
-        elif len(g) <= cap:
-            carry = g                   # short incomplete escape -> hold for next chunk
+        elif len(g) <= cap or len(g) == 1:
+            # short incomplete escape -> hold for next chunk. A LONE trailing ESC (len 1) is
+            # held UNCONDITIONALLY, even under a tiny cap (cap <= 0): one byte can never be a
+            # DoS, and its introducer has not arrived yet, so guessing a discard TYPE now would
+            # mis-classify a real CSI/OSC as generic-ESC -- whose discard then eats the
+            # introducer's second byte as a "final byte" and LEAKS the body as literal text.
+            # Holding defers the type decision to the next chunk, where the introducer is known.
+            carry = g
             text = text[:m.start()]
         else:
-            # over-cap incomplete NON-string escape (CSI or generic ESC): enter the
-            # same O(1) discard state as an over-cap string sequence, so the
-            # continuation cannot leak as literal text on the next chunk. The
-            # len(g) >= 2 guard also covers a lone trailing ESC (len 1) that reaches
-            # here only under a tiny cap (cap <= 0), where neither branch above fires:
-            # treat it as a generic-ESC discard, never index g[1] out of range.
-            drop = '[' if len(g) >= 2 and g[1] == '[' else '\x1b'
+            # over-cap incomplete NON-string escape (CSI or generic ESC), len(g) >= 2 here (a
+            # lone ESC took the branch above): enter the same O(1) discard state as an over-cap
+            # string sequence, so the continuation cannot leak as literal text on the next chunk.
+            drop = '[' if g[1] == '[' else '\x1b'
             dropped = len(g)
             text = text[:m.start()]
     return text, carry, drop, dropped
