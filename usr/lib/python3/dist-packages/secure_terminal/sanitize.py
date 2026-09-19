@@ -172,6 +172,13 @@ ANSI_RE = re.compile(
     # is rendered on the EOF flush so a program's final output is not lost (silent-final-
     # output-loss regression). The dangerous case -- CSI params like "31m" -- is caught by the
     # interrupted-CSI arm above; a generic remnant is left for the per-code-point classifier.
+    #
+    # An ESC + intermediate(s) ABORTED by a following ESC leaves its intermediates (printable
+    # 0x20-0x2F) as literal text here. That is INTENTIONALLY not stripped: stripping it in this
+    # one-shot regex (a lookahead on the next ESC) would DIVERGE from the streaming path, where
+    # the aborting ESC is often carried/dropped into a separate chunk and so cannot be seen --
+    # breaking T8 split-invariance to remove an INERT printable byte (T1 output-inertness is
+    # unaffected: the leaked byte is safe ASCII). Split-invariance is the stronger guarantee.
     r'|\x1b[ -/]*[0-~]'
 )
 
