@@ -375,6 +375,56 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                 row.no_newline = False
         super().erase_in_display(how)
 
+    def _scroll_margins(self):
+        m = self.margins
+        return (m.top, m.bottom) if m is not None else (0, self.lines - 1)
+
+    def scroll_up(self, count=None, *args, private=False, **kwargs):
+        # SU (CSI Ps S): scroll the region UP `count` lines -- top lines lost, blanks at the
+        # bottom; cursor unmoved (unlike delete_lines/index); region-local (no scrollback,
+        # as a full-screen program that scrolls its own canvas wants a fixed view, not
+        # history). pyte ships NEITHER SU nor SD, so a program that scrolls a region to open
+        # space -- editors do this on a paste/insert via DECSTBM + SD -- had its scroll
+        # SILENTLY DROPPED, leaving stale text (the nano/paste corruption).
+        if self._reject_scroll(private, args):
+            return
+        count = count or 1
+        top, bottom = self._scroll_margins()
+        count = min(count, bottom - top + 1)
+        self.dirty.update(range(top, bottom + 1))
+        for y in range(top, bottom + 1):
+            if y + count <= bottom and (y + count) in self.buffer:
+                self.buffer[y] = self.buffer[y + count]
+            else:
+                self.buffer.pop(y, None)
+
+    def scroll_down(self, count=None, *args, private=False, **kwargs):
+        # SD (CSI Ps T): scroll the region DOWN `count` lines -- bottom lines lost, blanks at
+        # the top; cursor unchanged (unlike insert_lines). See scroll_up.
+        if self._reject_scroll(private, args):
+            return
+        count = count or 1
+        top, bottom = self._scroll_margins()
+        count = min(count, bottom - top + 1)
+        self.dirty.update(range(top, bottom + 1))
+        for y in range(bottom, top - 1, -1):
+            if y - count >= top and (y - count) in self.buffer:
+                self.buffer[y] = self.buffer[y - count]
+            else:
+                self.buffer.pop(y, None)
+
+    @staticmethod
+    def _reject_scroll(private, args):
+        # Only the PLAIN one-parameter CSI Ps S / CSI Ps T is SU/SD. pyte dispatches by
+        # FINAL BYTE, so several unrelated sequences would else be misrouted here and move
+        # the screen: CSI ? ... S is XTSMGRAPHICS (a sixel/ReGIS query, private=True) and a
+        # 5-parameter CSI ... T is XTHIMOUSE (highlight mouse tracking). Reject a private or
+        # multi-parameter dispatch. RESIDUAL: pyte silently drops '>' / SP intermediates
+        # (SP_OR_GT: pass), so CSI > Ps T (XTRMTITLE) / CSI Ps SP T (DECSWBV) with a single
+        # parameter are indistinguishable from SD here -- only a pyte-parser change (the
+        # fork, which would have to surface the intermediate) can close that.
+        return private or bool(args)
+
 
 def _make_private_tolerant(base):
     """A private-CSI-tolerant wrapper: run pyte's base handler with its positional params,
@@ -435,6 +485,11 @@ class _Utf8CharsetByteStream(pyte.ByteStream):
     charset path. The Screen still character-filters every resulting cell via
     tui_cell, so a translated glyph is subject to the same neutralization as any
     other output; this only lets a benign box-drawing designation reach the grid."""
+
+    # pyte's CSI table lacks SU (CSI S) and SD (CSI T); add them so a scroll-region
+    # scroll reaches _SafeHistoryScreen.scroll_up/scroll_down. Without this an editor's
+    # paste/insert redraw (DECSTBM + SD) is dropped, leaving stale rows.
+    csi = {**pyte.Stream.csi, 'S': 'scroll_up', 'T': 'scroll_down'}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2149,17 +2204,27 @@ class SecureTerminal(QPlainTextEdit):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff if is_grid
             else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
+    def _grid_fixed_canvas(self):
+        """True when the TUI grid must behave as a fixed, non-scrolling canvas: the
+        alternate screen, OR a primary-buffer frame whose document is ENTIRELY the live
+        grid (no promoted scrollback: blockCount <= _grid_rows). The live grid is sized to
+        fit the viewport, so it must never be scrollable -- but QPlainTextEdit reports a
+        spurious 1-row range when the grid's pixel height lands exactly at the viewport
+        height (an exact-fit fencepost), and an advisory-banner inset can add more. Left
+        AsNeeded + follow-the-tail, that range lets the view scroll the program's OWN row 0
+        off the top (a full-screen app in the normal buffer -- e.g. one that omits ?1049 --
+        loses its top line, and its caret is drawn a row low). A shell keeps real
+        scrollback: once output exceeds one screen blockCount > _grid_rows and this is
+        False, so AsNeeded returns and history stays reachable."""
+        return self._alt_screen or self.document().blockCount() <= self._grid_rows
+
     def _apply_vscroll_policy(self):
-        """The alternate screen is a fixed canvas with NO scrollback -- the wheel is
-        sent to the child as arrow keys, not a Qt scroll -- so it must NEVER show a
-        vertical scrollbar (the vertical analog of the grid horizontal-bar suppression
-        above). The grid is laid out at QPlainTextEdit's lineSpacing() but SIZED by
-        fontMetrics().height() (no inter-line leading), so screen.lines blocks overrun
-        the viewport by the accumulated leading; under AsNeeded that raises a spurious
-        range that also GROWS as the font is zoomed up. Primary grid + CLI keep AsNeeded:
-        they have real scrollback."""
+        """A fixed canvas (see _grid_fixed_canvas) must NEVER show a vertical scrollbar --
+        the wheel is sent to the child as arrow keys, not a Qt scroll (the vertical analog
+        of the grid horizontal-bar suppression above). A primary grid WITH real scrollback
+        keeps AsNeeded so that history stays reachable."""
         self.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if self._alt_screen
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if self._grid_fixed_canvas()
             else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
     def _sync_display(self):
@@ -2873,15 +2938,15 @@ class SecureTerminal(QPlainTextEdit):
         # Re-applied every frame so it tracks alt<->primary flips AND a zoom (which
         # re-renders) can never leave a grown range behind.
         self._apply_vscroll_policy()
-        if self._alt_screen:
-            # The alternate screen is a fixed canvas with NO scrollback: its row 0 is the
-            # TOP of the program's screen and must always be visible, exactly as a real
-            # terminal shows it (a real terminal never scrolls the alt screen). Any
-            # off-by-one between the pyte grid and the viewport height leaves a 1-row
-            # scroll range, and following the TAIL there scrolls row 0 off the top -- so a
-            # SHORT full-screen frame (a one-line status program, or the alt-screen demo
-            # shot whose payload draws a single line at row 0) renders as an empty
-            # viewport even though the document holds the content. Pin to the top instead.
+        if self._grid_fixed_canvas():
+            # A fixed canvas (alt screen, or a primary full-screen frame with no promoted
+            # scrollback): its row 0 is the TOP of the program's screen and must always be
+            # visible, exactly as a real terminal shows it. Any off-by-one between the pyte
+            # grid and the viewport height (an exact-fit fencepost, or an advisory-banner
+            # inset) leaves a small scroll range, and following the TAIL there scrolls row 0
+            # off the top -- so a SHORT full-screen frame (a one-line status program, or the
+            # alt-screen demo shot whose payload draws a single line at row 0) renders as an
+            # empty viewport even though the document holds the content. Pin to the top.
             self._place_grid_cursor(screen)
             if bar is not None:
                 bar.setValue(bar.minimum())

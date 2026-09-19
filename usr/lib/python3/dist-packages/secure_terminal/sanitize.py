@@ -1517,7 +1517,7 @@ def whitespace_anomaly_cols(chars, flag_trailing=True, flag_leading=True):
     flagged."""
     n = len(chars)
     is_sp = [c == ' ' for c in chars]
-    flagged = set()
+    flagged: set[int] = set()
     i = 0
     while i < n and is_sp[i]:                 # scan the leading run
         i += 1
@@ -1915,8 +1915,13 @@ def sanitize_title(text, limit=80):
     ASCII: keep only printable ASCII (so no control, escape, bidi or homoglyph
     can ride in through a title), collapse whitespace to single spaces, cap the
     length."""
+    # Strip whole escape SEQUENCES first. The per-character filter below drops the ESC byte
+    # but would KEEP an escape's parameter/final bytes (ordinary printable ASCII -- e.g. the
+    # "[8m" of ESC[8m) as confusing literal text, contradicting "no escape can ride in". This
+    # matters on titles NOT pre-parsed by ANSI_RE (a directory basename may hold a raw ESC).
+    # ANSI_RE removes complete AND interrupted CSI/OSC/string sequences.
     kept = []
-    for ch in (text or ''):
+    for ch in ANSI_RE.sub('', text or ''):
         if 0x20 <= ord(ch) <= 0x7E:
             kept.append(ch)
         elif ch in '\t\n\r\f\v':
