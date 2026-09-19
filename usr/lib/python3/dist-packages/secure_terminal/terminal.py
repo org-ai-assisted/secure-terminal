@@ -1419,6 +1419,7 @@ class SecureTerminal(QPlainTextEdit):
         # restart). Maintained from the output stream (alt-screen enter/leave).
         self._alt_screen = False
         self._alt_owner_pgrp = None   # fg pgrp that entered alt from output (liveness on exit)
+        self._alt_owner_start = None  # its leader start-time, to tell it from a pgid-reuse
         self._wheel_accum = 0         # accumulated wheel delta for alt-screen scroll
         # The set of mouse DEC modes the child has enabled (1000/1002/1003 tracking,
         # 1004 focus, 1006 SGR), tracked off the output stream. When it requests
@@ -4302,6 +4303,14 @@ class SecureTerminal(QPlainTextEdit):
             return True                   # the program that drew the alt frame is gone
         except OSError:                   # pragma: no cover -- defensive: a pgrp we cannot
             return False                  #   signal (EPERM); exists but not ours -> keep it
+        # Something answers to the pgid -- but a reaped owner's pgid can be REUSED by an
+        # unrelated process (a new group leader has pid == pgid), which killpg(pg, 0) would
+        # read as "owner still alive" and keep a stale frame. If a live leader now holds the
+        # pgid with a DIFFERENT start-time than the owner had, the original owner is gone.
+        if self._alt_owner_start is not None:
+            cur = self._pid_start_time(pg)
+            if cur is not None and cur != self._alt_owner_start:
+                return True               # a different process reused the pgid -> owner dead
         return False                      # alive (running or stopped) -> keep the frame
 
     def _alt_enter(self):
@@ -4313,6 +4322,12 @@ class SecureTerminal(QPlainTextEdit):
         # program (a `cat` of ?1049h with no ?1049l) can be told apart from a still
         # alive SUSPENDED program's held frame when the shell later regains the fg.
         self._alt_owner_pgrp = self._foreground_pgrp()
+        # Capture the owner's leader start-time too, so _alt_owner_dead can tell the ORIGINAL
+        # owner from an unrelated process that reused the pgid after it exited (a killpg(pg, 0)
+        # liveness check alone would read a reused pgid as "owner still alive" and keep a stale
+        # alt frame). None if unreadable -> _alt_owner_dead falls back to the liveness check.
+        self._alt_owner_start = (self._pid_start_time(self._alt_owner_pgrp)
+                                 if self._alt_owner_pgrp is not None else None)
         # Freeze the primary scrollback text NOW, so 'Save Transcript' keeps returning it
         # while the program runs instead of the ephemeral alt grid. Render the pyte model
         # to the document FIRST: _feed_stream fed the pre-marker primary bytes (this read's
@@ -5735,14 +5750,24 @@ class SecureTerminal(QPlainTextEdit):
         return (True, None)
 
     def _kill_pgrp_survivor(self, pgrp, leader_start):
-        """Deferred SIGKILL of a SIGTERM'd foreground group's survivors -- but ONLY when the
-        group leader's start-time still matches the one captured at SIGTERM. This gates on
-        IDENTITY, not mere liveness: a pgid reused by an unrelated process after the original
-        job exited in the grace window must never be killed. If the leader is already gone
-        (start-time unreadable now, or was unreadable at SIGTERM) we skip the SIGKILL -- the
-        safe direction (a stuck job's leader is normally still alive), never a wrong kill."""
-        if leader_start is None or self._pid_start_time(pgrp) != leader_start:
-            return
+        """Deferred SIGKILL of a SIGTERM'd foreground group's survivors, gated on IDENTITY so a
+        pgid reused after the original job exited in the grace window is never killed -- WITHOUT
+        sparing a stuck group whose leader merely exited while its children ignore SIGTERM.
+
+        A pgid can only be REUSED by a brand-new group leader, and a leader has pid == pgid
+        (setsid/setpgid set pgid to the creator's pid). So a live /proc/<pgid> whose start-time
+        differs from the one sampled at SIGTERM is the ONLY reuse case -- refuse exactly that.
+        When /proc/<pgid> is gone, the pgid was NOT reused (no new leader claimed it), so any
+        surviving members are OUR original group's (leader reaped, children lingering) -> kill
+        them. leader_start None (leader died before we could sample it) + a live differing
+        leader now is treated as reuse; leader_start None + no live leader still escalates."""
+        cur = self._pid_start_time(pgrp)
+        if cur is not None and cur != leader_start:
+            return          # a different LIVE process reused the pgid as its leader -> spare it
+        try:
+            os.killpg(pgrp, 0)      # any member still alive?
+        except OSError:
+            return                  # group fully gone -> nothing to kill
         try:
             os.killpg(pgrp, signal.SIGKILL)
         except OSError:
