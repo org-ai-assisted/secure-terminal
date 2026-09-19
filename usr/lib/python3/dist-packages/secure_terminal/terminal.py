@@ -379,14 +379,15 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         m = self.margins
         return (m.top, m.bottom) if m is not None else (0, self.lines - 1)
 
-    def scroll_up(self, count=None, *args, **kwargs):
-        # SU (CSI S): scroll the scroll region UP `count` lines -- content moves up, the
-        # top `count` lines are lost, `count` blank lines appear at the bottom. The cursor
-        # is NOT moved (unlike delete_lines/index). Region-local: no scrollback push, as a
-        # DECSTBM region scroll must not commit lines to history. pyte ships NEITHER SU nor
-        # SD, so a full-screen program that scrolls a region to open space -- editors do
-        # this on a paste/insert via DECSTBM + SD -- had its scroll SILENTLY DROPPED,
-        # leaving stale text (the nano/paste corruption).
+    def scroll_up(self, count=None, *args, private=False, **kwargs):
+        # SU (CSI Ps S): scroll the region UP `count` lines -- top lines lost, blanks at the
+        # bottom; cursor unmoved (unlike delete_lines/index); region-local (no scrollback,
+        # as a full-screen program that scrolls its own canvas wants a fixed view, not
+        # history). pyte ships NEITHER SU nor SD, so a program that scrolls a region to open
+        # space -- editors do this on a paste/insert via DECSTBM + SD -- had its scroll
+        # SILENTLY DROPPED, leaving stale text (the nano/paste corruption).
+        if self._reject_scroll(private, args):
+            return
         count = count or 1
         top, bottom = self._scroll_margins()
         count = min(count, bottom - top + 1)
@@ -397,10 +398,11 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             else:
                 self.buffer.pop(y, None)
 
-    def scroll_down(self, count=None, *args, **kwargs):
-        # SD (CSI T): scroll the scroll region DOWN `count` lines -- content moves down,
-        # the bottom `count` lines are lost, `count` blank lines appear at the top. Cursor
-        # unchanged (unlike insert_lines). See scroll_up for why pyte needs this.
+    def scroll_down(self, count=None, *args, private=False, **kwargs):
+        # SD (CSI Ps T): scroll the region DOWN `count` lines -- bottom lines lost, blanks at
+        # the top; cursor unchanged (unlike insert_lines). See scroll_up.
+        if self._reject_scroll(private, args):
+            return
         count = count or 1
         top, bottom = self._scroll_margins()
         count = min(count, bottom - top + 1)
@@ -410,6 +412,18 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                 self.buffer[y] = self.buffer[y - count]
             else:
                 self.buffer.pop(y, None)
+
+    @staticmethod
+    def _reject_scroll(private, args):
+        # Only the PLAIN one-parameter CSI Ps S / CSI Ps T is SU/SD. pyte dispatches by
+        # FINAL BYTE, so several unrelated sequences would else be misrouted here and move
+        # the screen: CSI ? ... S is XTSMGRAPHICS (a sixel/ReGIS query, private=True) and a
+        # 5-parameter CSI ... T is XTHIMOUSE (highlight mouse tracking). Reject a private or
+        # multi-parameter dispatch. RESIDUAL: pyte silently drops '>' / SP intermediates
+        # (SP_OR_GT: pass), so CSI > Ps T (XTRMTITLE) / CSI Ps SP T (DECSWBV) with a single
+        # parameter are indistinguishable from SD here -- only a pyte-parser change (the
+        # fork, which would have to surface the intermediate) can close that.
+        return private or bool(args)
 
 
 def _make_private_tolerant(base):
