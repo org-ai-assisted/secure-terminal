@@ -147,9 +147,11 @@ The safety model above does not cost you the usual conveniences:
 - **Run a specific program** (File -> New Tab Running..., `Ctrl+Shift+R`). Opens
   a tab straight into `ssh host`, `tmux`, `claude`, etc. instead of the login
   shell. A plain new tab (`Ctrl+Shift+T`) still runs `$SHELL`.
-- **Optional title / notifications** (View menu, per tab, default off). When on,
-  and only in TUI mode, a program may set the tab title (OSC 0/2) and send
-  notifications (OSC 9), both sanitized to plain ASCII first. Clipboard-write
+- **Program-set title, shown as untrusted** (default on). In TUI mode a program
+  may set the tab title (OSC 0/1/2); it is reduced to plain ASCII first and shown
+  on a separate, visibly-untrusted second line of the tab (tinted, quote-wrapped,
+  with a caution glyph), so it can never pose as the trusted, app-set label on the
+  first line. **Desktop notifications** (OSC 9) stay opt-in. Clipboard-write
   (OSC 52) and hyperlink (OSC 8) escapes stay blocked either way.
 - **Menu bar** for the same actions, discoverable rather than memorized.
 
@@ -163,8 +165,10 @@ completion menus and progress displays. A yellow indicator and a hover tooltip
 flag it while it is active, because it is a deliberate, lower-guarantee mode:
 
 - Escapes are interpreted, but inside an isolated in-memory screen model (`pyte`)
-  that has no OS reach: it **cannot set the window title or touch the system
-  clipboard**, so those spoofing/exfil vectors stay closed.
+  that has no OS reach: it **cannot touch the system clipboard**, so that exfil
+  vector stays closed. A program MAY set the tab title (default on), but the title
+  is reduced to plain ASCII and shown on a separate, visibly-untrusted line of the
+  tab, so a spoofed title can never pose as the trusted, app-set label.
 - Every character placed on the screen is **still ASCII/unicode-filtered**, so a
   program can position and colour text but cannot smuggle an invisible, bidi or
   homoglyph character into what you read.
