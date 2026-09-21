@@ -2678,6 +2678,13 @@ class MainWindow(QMainWindow):
         # show the program title on line 2 only while this tab actually allows it
         shown = program if (program and term.osc_enabled('osc_title')) else ''
         bar.set_ptitle(index, shown)
+        # A tab with a title to show forces the quarantine band on even when the
+        # WINDOW default is off -- e.g. a restored session tab that kept osc_title
+        # while the global default is off. two_line is otherwise window-level (set
+        # from the osc_title default), which would hide such a tab's title. Reserved
+        # once on, so the strip height stays stable.
+        if shown:
+            bar.set_two_line(True)
 
     def set_tab_color(self, index, color):
         if index < 0:

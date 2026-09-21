@@ -195,8 +195,9 @@ append-only, while the line a program is currently writing can be redrawn by it
 interpreted;
 the only change from earlier versions is that it now does so **uniformly** (at a
 shell prompt too, not only while a full-screen program holds the alternate
-screen). No new class of side-effect is enabled -- title, clipboard (OSC 52) and
-hyperlink escapes remain neutralized in both modes -- and every on-screen cell is
+screen). No new class of side-effect is enabled -- clipboard (OSC 52) and
+hyperlink escapes remain neutralized in both modes, and a program-set title is
+shown only on the quarantined, untrusted tab line -- and every on-screen cell is
 still filtered. The extension is contained entirely within the opt-in, clearly
 indicated TUI mode.
 
