@@ -423,9 +423,12 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
 # side-effect. This is NOT about a program you deliberately run -- secure-terminal
 # does not sandbox programs; see the threat-model note in the security lamp.
 OSC_FEATURES = (
-    ('osc_title', 'Window / tab title', '0, 1, 2', False, 'medium',
+    ('osc_title', 'Window / tab title', '0, 1, 2', True, 'medium',
      'Untrusted output can rename the window or tab; a spoofed title can mislead '
-     'you, and a "report title" query can put text onto your input line.'),
+     'you. Shown by default, but QUARANTINED: a program-set title appears on the '
+     'tab bar\'s second line, styled as untrusted, and can never pose as the '
+     'trusted (app-set) label. It is also reduced to plain ASCII, so no control, '
+     'bidi or homoglyph can ride in through it.'),
     ('osc_notify', 'Desktop notifications', '9', False, 'medium',
      'Untrusted output can raise a desktop notification whose text is faked '
      '(for example a bogus "your session expired" prompt).'),

@@ -24,8 +24,8 @@ from PyQt6.QtCore import (
     qInstallMessageHandler)
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QIcon, QColor, QPalette, QPixmap,
-    QPainter, QPainterPath, QPen, QBrush, QFont, QFontDatabase, QDesktopServices,
-    QCursor, QTextCharFormat, QTextCursor, QTextDocument,
+    QPainter, QPainterPath, QPen, QBrush, QFont, QFontDatabase, QFontMetrics,
+    QDesktopServices, QCursor, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QTabBar, QToolBar, QSpinBox, QLabel,
@@ -34,12 +34,12 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame, QScrollArea,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QKeySequenceEdit,
     QTextEdit, QFontDialog, QFontComboBox, QGroupBox, QToolButton, QSplitter,
-    QToolTip,
+    QToolTip, QStyle, QStylePainter, QStyleOptionTab,
 )
 
 from secure_terminal import settings, session, ipc, resource_isolation
 from secure_terminal.sanitize import (
-    OSC_FEATURES, OSC_FEATURE_BY_KEY, OSC_NOTICE_DEFAULT_OFF, luminance,
+    OSC_FEATURES, OSC_FEATURE_BY_KEY, OSC_NOTICE_DEFAULT_OFF,
     osc_code_description, sanitize_title)
 from secure_terminal.terminal import (
     SecureTerminal, THEMES, DISPLAY_MODES,
@@ -240,14 +240,14 @@ def _fit_dump_reply(text):
 # drift guard (a test: a fresh-config window persists NOTHING) fails if any value
 # here diverges from the constructor's actual default, so this stays honest.
 _PERSIST_DEFAULTS = {
-    'allow_title': 'false', 'auto_tab_colors': 'true', 'bell': '', 'bell_sound': '',
+    'allow_title': 'true', 'auto_tab_colors': 'true', 'bell': 'tab', 'bell_sound': '',
     'colored_markings': 'true', 'colors': 'true', 'confirm_close': 'true',
     'copy_warn': 'unicode', 'escape_limit': '4096', 'font_family': DEFAULT_FONT_FAMILY,
     'font_size': '11', 'keybindings': '', 'line_edits': 'true', 'osc_clipboard': 'false',
     'osc_clipboard_read': 'false', 'osc_clipboard_read_always': 'false',
     'osc_colors': 'false', 'osc_cwd': 'false', 'osc_hyperlink': 'false',
     'osc_notice': 'true', 'osc_notice_off': ','.join(sorted(OSC_NOTICE_DEFAULT_OFF)),
-    'osc_notify': 'false', 'osc_title': 'false', 'paste_delay': '3',
+    'osc_notify': 'false', 'osc_title': 'true', 'paste_delay': '3',
     'paste_warn': 'unicode', 'persist_session': 'true', 'scrollback': '0',
     'systray': 'false', 'theme': 'light', 'tui': 'false', 'tui_autobox_notice': 'true',
     'ui_scale': '100', 'unicode_mode': 'detail', 'zoom': '100',
@@ -798,6 +798,293 @@ class FindBar(QWidget):
         super().keyPressEvent(event)
 
 
+class SecureTabBar(QTabBar):
+    """Two-line, trust-tiered tab bar.
+
+    LINE 1 (trusted, app-controlled): a left accent bar in the tab's colour, a lock
+    glyph, the tab number, and the trusted label (`tabText`: user rename / cwd
+    basename). Every pixel here is our own chrome -- a program cannot write to it.
+
+    LINE 2 (untrusted, program-set): the OSC window/tab title the running program
+    set, drawn in a QUARANTINE band -- tinted, hatched, divided off from line 1,
+    wrapped in guillemets, prefixed with a caution glyph, in a muted italic face --
+    so a misleading title can never pass as the trusted label. The band is reserved
+    (drawn empty) when there is no title, so the strip height does not jump as
+    titles come and go. Line 2 exists only while `set_two_line(True)` (window's
+    osc_title default on); with titles off the bar is single-line.
+
+    BELL MARKER: a trusted bell glyph on the tab that rang while backgrounded, with
+    a short bounded pulse (a decaying tint, `_PULSE_TICKS` frames) that then settles
+    to a static glyph until the tab is focused. The marker carries NO program text.
+
+    Per-tab state lives in Qt `tabData` (a dict), which Qt migrates with the tab on
+    a drag-reorder, so accent / title / bell travel with their tab. The window pushes
+    state via set_accent / set_ptitle / mark_bell / clear_bell; the bar paints it.
+    """
+
+    _ACCENT_W = 3            # left accent-bar width (px, pre-DPR)
+    _PAD = 7                 # horizontal content padding
+    _GLYPH = 13              # trust/caution/bell glyph box (px)
+    _LINE2_H = 16            # reserved height of the untrusted band
+    _PULSE_TICKS = 6         # bounded pulse frames (~3 on/off cycles)
+    _PULSE_MS = 90           # per-frame interval
+
+    # theme -> (muted_fg, band_bg, band_line, caution, bell); light first.
+    _THEME = {
+        False: ('#5c5c5c', '#fbf1df', '#d9a441', '#8a5713', '#b5540a'),
+        True:  ('#98a2ae', '#33291a', '#6a5326', '#e0b579', '#f0b25f'),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._two_line = False
+        self._dark = False
+        self._pulse = QTimer(self)
+        self._pulse.setInterval(self._PULSE_MS)
+        self._pulse.timeout.connect(self._tick_pulse)
+
+    # -- per-tab model (stored in tabData, so it rides a drag-reorder) ---------
+    # NB: Qt round-trips tabData through a QVariant, so tabData() returns a COPY --
+    # a returned dict cannot be mutated in place. Every setter reads a copy, updates
+    # it, and writes it back with setTabData (which Qt migrates with the tab on move).
+    _DEFAULT_MODEL = {'accent': None, 'ptitle': '', 'bell': False, 'pulse': 0}
+
+    def _model(self, index):
+        m = self.tabData(index)
+        return dict(m) if isinstance(m, dict) else dict(self._DEFAULT_MODEL)
+
+    def set_accent(self, index, color_name):
+        if 0 <= index < self.count():
+            m = self._model(index)
+            m['accent'] = color_name or None
+            self.setTabData(index, m)
+            self.update()
+
+    def set_ptitle(self, index, title):
+        """Set the UNTRUSTED program title shown on line 2 ('' hides it)."""
+        if 0 <= index < self.count():
+            m = self._model(index)
+            m['ptitle'] = title or ''
+            self.setTabData(index, m)
+            self.update()
+
+    def set_two_line(self, on):
+        on = bool(on)
+        if on != self._two_line:
+            self._two_line = on
+            self.updateGeometry()        # tabSizeHint changed
+            self.update()
+
+    def set_theme(self, dark):
+        dark = bool(dark)
+        if dark != self._dark:
+            self._dark = dark
+            self.update()
+
+    def two_line(self):
+        return self._two_line
+
+    def mark_bell(self, index):
+        """Mark the tab that rang: static glyph + a bounded pulse. Idempotent under a
+        BEL flood -- re-marking just re-arms the pulse, never spawns a second timer."""
+        if not (0 <= index < self.count()):
+            return
+        m = self._model(index)
+        m['bell'] = True
+        m['pulse'] = self._PULSE_TICKS
+        self.setTabData(index, m)
+        if not self._pulse.isActive():
+            self._pulse.start()
+        self.update()
+
+    def clear_bell(self, index):
+        if 0 <= index < self.count():
+            m = self._model(index)
+            m['bell'] = False
+            m['pulse'] = 0
+            self.setTabData(index, m)
+            self.update()
+
+    def has_bell(self, index):
+        return bool(0 <= index < self.count() and self._model(index)['bell'])
+
+    def tab_lines(self, index):
+        """Structural view of a tab's content, for tests (no pixels): the trusted
+        line-1 label, the untrusted line-2 title actually shown ('' when hidden or
+        single-line), and whether a bell marker is set."""
+        if not (0 <= index < self.count()):
+            return {'label': '', 'ptitle': '', 'bell': False, 'accent': None}
+        m = self._model(index)
+        return {'label': self.tabText(index),
+                'ptitle': m['ptitle'] if self._two_line else '',
+                'bell': m['bell'], 'accent': m['accent']}
+
+    def _tick_pulse(self):
+        any_left = False
+        for i in range(self.count()):
+            m = self._model(i)
+            if m['pulse'] > 0:
+                m['pulse'] -= 1
+                self.setTabData(i, m)
+                any_left = any_left or m['pulse'] > 0
+        if not any_left:
+            self._pulse.stop()
+        self.update()
+
+    # -- geometry + paint -----------------------------------------------------
+    def tabSizeHint(self, index):
+        sz = super().tabSizeHint(index)
+        sz.setWidth(sz.width() + self._ACCENT_W + self._PAD + self._GLYPH + 4)
+        if self._two_line:
+            sz.setHeight(sz.height() + self._LINE2_H)
+        return sz
+
+    def paintEvent(self, event):
+        sp = QStylePainter(self)
+        opt = QStyleOptionTab()
+        for i in range(self.count()):
+            self.initStyleOption(opt, i)
+            text = opt.text
+            opt.text = ''                 # paint the SHAPE only; we draw the content
+            opt.icon = QIcon()
+            sp.drawControl(QStyle.ControlElement.CE_TabBarTabShape, opt)
+            self._paint_content(sp, i, self.tabRect(i), text,
+                                bool(opt.state & QStyle.StateFlag.State_Selected))
+
+    def _paint_content(self, painter, index, rect, label, selected):
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        m = self._model(index)
+        muted, band_bg, band_line, caution, bell_c = self._THEME[self._dark]
+        fg = self.palette().color(QPalette.ColorRole.WindowText)
+        line1_h = rect.height() - (self._LINE2_H if self._two_line else 0)
+        line1 = QRect(rect.left(), rect.top(), rect.width(), line1_h)
+
+        # bell pulse: a decaying tint over the whole tab, brightest at full pulse
+        if m['pulse'] > 0:
+            frac = m['pulse'] / self._PULSE_TICKS
+            tint = QColor(bell_c)
+            tint.setAlphaF(0.35 * frac)
+            painter.fillRect(rect, tint)
+
+        # left accent bar (trusted, tab colour; a neutral stub when uncoloured)
+        acc = QColor(m['accent']) if m['accent'] else QColor(muted)
+        painter.fillRect(QRect(line1.left() + 2, line1.top() + 5,
+                               self._ACCENT_W, line1.height() - 10), acc)
+
+        x = line1.left() + 2 + self._ACCENT_W + self._PAD
+        gy = line1.top() + (line1.height() - self._GLYPH) // 2
+        # lock glyph = "this label is app-controlled"
+        self._draw_lock(painter, QRect(x, gy, self._GLYPH, self._GLYPH), fg)
+        x += self._GLYPH + 5
+
+        # bell marker sits at the RIGHT of line 1
+        right = line1.right() - self._PAD
+        if m['bell']:
+            bx = right - self._GLYPH
+            self._draw_bell(painter, QRect(bx, gy, self._GLYPH, self._GLYPH),
+                            QColor(bell_c))
+            right = bx - 4
+
+        # trusted line-1 text: "N label" (semibold, full contrast)
+        f1 = QFont(self.font())
+        f1.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(f1)
+        painter.setPen(fg)
+        avail = max(0, right - x)
+        text = '%d  %s' % (index + 1, label)
+        shown = QFontMetrics(f1).elidedText(text, Qt.TextElideMode.ElideMiddle, avail)
+        painter.drawText(QRect(x, line1.top(), avail, line1.height()),
+                         int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                         shown)
+
+        # untrusted line-2 quarantine band
+        if self._two_line:
+            band = QRect(rect.left(), line1.bottom() + 1,
+                         rect.width(), self._LINE2_H - 1)
+            painter.fillRect(band, QColor(band_bg))
+            # diagonal hatch marks the band as a quarantine zone
+            hatch = QColor(band_line)
+            hatch.setAlphaF(0.30)
+            painter.setPen(QPen(hatch, 1))
+            step = 6
+            for hx in range(band.left() - band.height(), band.right(), step):
+                painter.drawLine(hx, band.bottom(), hx + band.height(), band.top())
+            # divider between the trusted line and the quarantine band
+            painter.setPen(QPen(QColor(band_line), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(band.left() + 2, band.top(), band.right() - 2, band.top())
+            ptitle = m['ptitle']
+            if ptitle:
+                bx = band.left() + 2 + self._ACCENT_W + self._PAD
+                by = band.top() + (band.height() - self._GLYPH) // 2
+                self._draw_caution(painter, QRect(bx, by, self._GLYPH - 2,
+                                                  self._GLYPH - 2), QColor(caution))
+                tx = bx + self._GLYPH
+                f2 = QFont(self.font())
+                f2.setItalic(True)
+                f2.setPointSizeF(max(6.0, self.font().pointSizeF() - 1.5))
+                painter.setFont(f2)
+                painter.setPen(QColor(caution))
+                # guillemets read the title as "a program's claim", not a fact.
+                wrapped = '%s%s%s' % (chr(0x00AB), ptitle, chr(0x00BB))
+                avail2 = max(0, band.right() - self._PAD - tx)
+                shown2 = QFontMetrics(f2).elidedText(
+                    wrapped, Qt.TextElideMode.ElideRight, avail2)
+                painter.drawText(QRect(tx, band.top(), avail2, band.height()),
+                                 int(Qt.AlignmentFlag.AlignVCenter
+                                     | Qt.AlignmentFlag.AlignLeft), shown2)
+        painter.restore()
+
+    # -- trusted glyphs (drawn, ASCII source, unspoofable by program text) -----
+    @staticmethod
+    def _draw_lock(painter, box, color):
+        painter.save()
+        painter.setPen(QPen(color, 1.4))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        w, h = box.width(), box.height()
+        body = QRectF(box.left() + w * 0.18, box.top() + h * 0.45,
+                      w * 0.64, h * 0.42)
+        painter.drawRoundedRect(body, 2, 2)
+        shackle = QRectF(box.left() + w * 0.30, box.top() + h * 0.18,
+                         w * 0.40, h * 0.42)
+        painter.drawArc(shackle, 0, 180 * 16)
+        painter.restore()
+
+    @staticmethod
+    def _draw_bell(painter, box, color):
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(color))
+        w, h = box.width(), box.height()
+        path = QPainterPath()
+        path.moveTo(box.left() + w * 0.5, box.top() + h * 0.12)
+        path.lineTo(box.left() + w * 0.8, box.top() + h * 0.68)
+        path.lineTo(box.left() + w * 0.2, box.top() + h * 0.68)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawEllipse(QRectF(box.left() + w * 0.40, box.top() + h * 0.70,
+                                   w * 0.20, h * 0.18))
+        painter.restore()
+
+    @staticmethod
+    def _draw_caution(painter, box, color):
+        painter.save()
+        painter.setPen(QPen(color, 1.3))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        w, h = box.width(), box.height()
+        path = QPainterPath()
+        path.moveTo(box.left() + w * 0.5, box.top() + h * 0.10)
+        path.lineTo(box.left() + w * 0.92, box.top() + h * 0.88)
+        path.lineTo(box.left() + w * 0.08, box.top() + h * 0.88)
+        path.closeSubpath()
+        painter.drawPath(path)
+        cx = box.left() + w * 0.5
+        painter.drawLine(int(cx), int(box.top() + h * 0.38),
+                         int(cx), int(box.top() + h * 0.66))
+        painter.drawPoint(int(cx), int(box.top() + h * 0.78))
+        painter.restore()
+
+
 def _valid_uid(value) -> TypeGuard[int]:
     """A durable tab id is a non-negative int. Reject bool (a JSON true/false is an
     int subclass) and any non-int a hand-edited/corrupt session.json could carry, so
@@ -903,16 +1190,20 @@ class MainWindow(QMainWindow):
         # the red review lamp until acknowledged (the security-details dialog clears it).
         self._unreviewed_risk = False
         self._default_tui = cfg.get('tui') == 'true'
-        self._default_allow_title = cfg.get('allow_title') == 'true'
-        # granular per-OSC-feature defaults (each off = neutralized).
+        _explicit_allow_title = cfg.get('allow_title') == 'true'
+        # granular per-OSC-feature defaults. An ABSENT key takes the feature's OWN
+        # default from the registry (OSC_FEATURES); only osc_title ships on (a
+        # program-set title is now shown, quarantined on the tab bar's line 2), every
+        # other feature ships off (neutralized).
         self._osc_defaults = {}
         for _key, _lbl, _codes, _dflt, _risk, _hint in OSC_FEATURES:
-            self._osc_defaults[_key] = cfg.get(_key) == 'true'
+            _v = cfg.get(_key)
+            self._osc_defaults[_key] = (_v == 'true') if _v is not None else _dflt
         # legacy allow_title seeds title + notify ONLY as a migration fallback --
         # when the granular key is absent. It must not clobber an explicit granular
         # value (a user enabling osc_title but disabling osc_notify would otherwise
         # find osc_notify forced back on every restart).
-        if self._default_allow_title:
+        if _explicit_allow_title:
             if cfg.get('osc_title') is None:
                 self._osc_defaults['osc_title'] = True
             if cfg.get('osc_notify') is None:
@@ -920,8 +1211,13 @@ class MainWindow(QMainWindow):
         # a locked legacy allow_title enforces BOTH granular title settings, in
         # either direction (an admin can require or forbid the capability).
         if 'allow_title' in self._locked:
-            self._osc_defaults['osc_title'] = self._default_allow_title
-            self._osc_defaults['osc_notify'] = self._default_allow_title
+            self._osc_defaults['osc_title'] = _explicit_allow_title
+            self._osc_defaults['osc_notify'] = _explicit_allow_title
+        # the legacy aggregate is the honest OR of the two granular title defaults
+        # (same invariant set_osc keeps), so the combined menu action and _persist
+        # stay consistent with the granular defaults.
+        self._default_allow_title = (self._osc_defaults['osc_title']
+                                     or self._osc_defaults['osc_notify'])
         # notice (a dismissible banner) when a program uses an OSC escape that line
         # mode strips; on by default, a global toggle turns it off
         self._osc_notice = cfg.get('osc_notice') != 'false'
@@ -947,13 +1243,13 @@ class MainWindow(QMainWindow):
         # security-relevant (any untrusted output could then exfiltrate the
         # clipboard), so it is opt-in and lockable like the other high-risk toggles.
         self._osc_clipboard_read_always = cfg.get('osc_clipboard_read_always') == 'true'
-        # bell (BEL 0x07) policy: off (default, silent), audible (system beep) or
-        # visual (window/taskbar urgency flash). BEL from untrusted output is a
-        # nuisance surface, so silence is the safe default.
-        # bell notification channels (comma-separated: audible, visual, tray;
-        # empty = silent). Legacy single 'audible'/'visual' still parse. An optional
-        # sound file (restricted to allowed dirs) replaces the beep for 'audible'.
-        self._default_bell = SecureTerminal._parse_bell(cfg.get('bell', ''))
+        # bell (BEL 0x07) notification channels (comma-separated: audible, visual,
+        # tray, tab; empty = silent). Legacy single 'audible'/'visual' still parse.
+        # The default is 'tab' (the in-window tab marker) -- the least-intrusive
+        # channel: no sound, no window flash, cleared on focus, and program text can
+        # never reach it. The louder channels stay opt-in. An optional sound file
+        # (restricted to allowed dirs) replaces the beep for 'audible'.
+        self._default_bell = SecureTerminal._parse_bell(cfg.get('bell', 'tab'))
         self._default_bell_sound = cfg.get('bell_sound', '')
         # system tray: opt-in, OFF by default. When on, a tray icon offers a few
         # fixed, safe actions (Show/Hide, New Tab, Quit) and the 'tray' bell
@@ -1037,6 +1333,10 @@ class MainWindow(QMainWindow):
         self._next_tab_id = 0
 
         self.tabs = QTabWidget(self)
+        # Custom two-line, trust-tiered tab bar: line 1 (trusted, app-controlled)
+        # over an optional line 2 quarantine band for the untrusted program-set OSC
+        # title, plus the per-tab bell marker. Installed BEFORE configuring the bar.
+        self.tabs.setTabBar(SecureTabBar())
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
@@ -1045,6 +1345,9 @@ class MainWindow(QMainWindow):
         # double-click a tab to rename it; right-click for rename/colour/close.
         self.tabs.tabBarDoubleClicked.connect(self.rename_tab)
         bar = self.tabs.tabBar()
+        # line 2 (untrusted title) is reserved when the window default allows titles
+        bar.set_two_line(self._osc_defaults.get('osc_title', False))
+        bar.set_theme(self._default_theme == 'dark')
         # Elide in the MIDDLE, not the (default) right: many same-prefixed tabs
         # (claude-rc-session opens dev46x/dev47x/... as one tab each) collapse to
         # window_width/tab_count, and ElideRight drops the trailing session NUMBER
@@ -2361,14 +2664,27 @@ class MainWindow(QMainWindow):
             return
         user = self._user_titles.get(term)
         program = self._prog_titles.get(term)
-        # plain text only; setTabText does not interpret markup. The default is
-        # the working-directory name (tracked live by the fg poll), which says far
-        # more than a static "shell"; fall back to "shell" only if it is unreadable.
-        # sanitize_title like every other label source: the live cwd basename is a raw
-        # filesystem name and could carry bidi/control/homoglyph into the tab bar.
+        # The default is the working-directory name (tracked live by the fg poll),
+        # which says far more than a static "shell"; fall back to "shell" only if it
+        # is unreadable. sanitize_title like every other label source: the live cwd
+        # basename is a raw filesystem name and could carry bidi/control/homoglyph.
         default = sanitize_title(term.cwd_basename() or '') or 'shell'
-        self.tabs.setTabText(index, user or program or default)
+        # LINE 1 (trusted) carries only OUR text -- a user rename or the cwd basename.
+        # The program-set OSC title is UNTRUSTED: it goes to the tab bar's line-2
+        # quarantine band, never to setTabText, so it can never pose as line 1.
+        self.tabs.setTabText(index, user or default)
         self.tabs.setTabToolTip(index, self._tab_tooltip(term))
+        bar = self.tabs.tabBar()
+        # show the program title on line 2 only while this tab actually allows it
+        shown = program if (program and term.osc_enabled('osc_title')) else ''
+        bar.set_ptitle(index, shown)
+        # A tab with a title to show forces the quarantine band on even when the
+        # WINDOW default is off -- e.g. a restored session tab that kept osc_title
+        # while the global default is off. two_line is otherwise window-level (set
+        # from the osc_title default), which would hide such a tab's title. Reserved
+        # once on, so the strip height stays stable.
+        if shown:
+            bar.set_two_line(True)
 
     def set_tab_color(self, index, color):
         if index < 0:
@@ -2568,43 +2884,15 @@ class MainWindow(QMainWindow):
                 self._find_bar.input.setFocus()
                 return
 
-    def _number_icon(self, n, color):
-        """The tab's position number drawn inside its colour swatch (a neutral
-        grey dot when the tab has no colour), so tabs are quickly addressable by
-        number. Text colour follows the swatch luminance so the digit stays
-        readable. Drawn, ASCII-only, always available."""
-        pixmap = QPixmap(18, 18)
-        pixmap.fill(QColor(0, 0, 0, 0))
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        dot = QColor(color) if color is not None else QColor('#9aa0a6')
-        painter.setBrush(QBrush(dot))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(1, 1, 16, 16, 4, 4)
-        label = str(n)
-        # pick the digit colour by relative luminance, the same rule the contrast
-        # guard uses -- HSL lightness misjudges saturated swatches (bright yellow
-        # would wrongly take white text), luminance does not.
-        painter.setPen(QColor('#000000')
-                       if luminance((dot.red(), dot.green(), dot.blue())) > 127
-                       else QColor('#ffffff'))
-        font = QFont()
-        font.setPixelSize(11 if len(label) == 1 else 9)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.drawText(QRect(0, 0, 18, 18),
-                         Qt.AlignmentFlag.AlignCenter, label)
-        painter.end()
-        return QIcon(pixmap)
-
     def _renumber_tabs(self):
-        """Redraw every tab's number swatch to match its current position, so the
+        """Push each tab's accent colour to the tab bar and repaint. The tab NUMBER
+        and the left accent bar are painted by SecureTabBar (trusted line 1), so the
         numbers stay 1..N left to right after a tab is added, closed or moved."""
+        bar = self.tabs.tabBar()
         for i in range(self.tabs.count()):
             term = self.tabs.widget(i)
-            cname = self._tab_colors.get(term)
-            color = QColor(cname) if cname else None
-            self.tabs.setTabIcon(i, self._number_icon(i + 1, color))
+            bar.set_accent(i, self._tab_colors.get(term))
+        bar.update()
 
     def _tab_index(self, term):
         """indexOf(term) that tolerates a term whose C++ object was DELETED while a menu was
@@ -2846,6 +3134,8 @@ class MainWindow(QMainWindow):
         base = THEMES.get(theme, THEMES['dark'])[0]
         self.tabs.setStyleSheet(
             'QTabWidget::pane, QStackedWidget { background: %s; }' % base)
+        # the two-line tab bar picks its muted/quarantine/bell colours by theme
+        self.tabs.tabBar().set_theme(theme == 'dark')
 
     # Chrome palette for the dark theme -- modern soft-dark (near-black slate, off-white
     # text), matching the tab container. Base is the terminal's OWN dark bg (#14161b) so
@@ -2919,6 +3209,10 @@ class MainWindow(QMainWindow):
 
     def _sync_chrome_to_tab(self, *_args):
         self._update_render_active()        # foreground tab renders fast, others slow
+        # focusing a tab clears its pending bell marker (you are now looking at it)
+        idx = self.tabs.currentIndex()
+        if idx >= 0:
+            self.tabs.tabBar().clear_bell(idx)
         term = self.current()
         if not isinstance(term, SecureTerminal):
             return                          # a restore placeholder is transiently current
@@ -3062,38 +3356,6 @@ class MainWindow(QMainWindow):
         self._review_bar.rerender_mirror()   # flip the tab's mode -> mirror re-renders
         self._persist()
 
-    def set_font_family(self, family):
-        """Set the current tab's font family and make it the default for new tabs
-        (existing tabs keep their own, mirroring how mode/theme are sticky). An
-        empty or admin-locked value is ignored; the widget falls back on a family
-        that is not installed."""
-        if 'font_family' in self._locked:
-            return                        # admin-locked; not user-changeable
-        family = (family or '').strip() or DEFAULT_FONT_FAMILY
-        term = self.current()
-        if term is not None:
-            term.set_font_family(family)
-        self._default_font_family = family
-        self._review_bar.rerender_mirror()   # an open review follows the font family
-        self._persist()
-
-    def choose_font(self):
-        """Per-tab font picker: a monospaced-only font dialog seeded with the
-        current tab's family. Only the family is taken (size is the zoom control);
-        a proportional pick is prevented by the dialog's monospaced filter and, as
-        a backstop, the widget's fixed-pitch fallback chain."""
-        term = self.current()
-        if term is None:
-            return
-        current = QFont(term.current_font_family())
-        try:
-            opts = QFontDialog.FontDialogOption.MonospacedFonts
-        except AttributeError:
-            opts = QFontDialog.FontDialogOption(0)
-        font, ok = QFontDialog.getFont(current, self, 'Terminal font', opts)
-        if ok:
-            self.set_font_family(font.family())
-
     def _sync_mode_toggles(self, mode):
         """Check the button for the active display mode in the exclusive group.
         setChecked() does not fire triggered, so this cannot loop back into
@@ -3139,66 +3401,12 @@ class MainWindow(QMainWindow):
         self._default_colors = bool(enabled)
         self._persist()
 
-    def set_line_edits(self, enabled):
-        if 'line_edits' in self._locked:
-            return                        # admin-locked; not user-changeable
-        for t in self._real_terms():      # EVERY tab, not just current() -- a background
-            t.apply_line_edits(enabled)   # tab must not silently keep the old line-editing
-                                          # policy (mirrors set_paste_warn / set_copy_warn)
-        self.act_line_edits.setChecked(enabled)
-        self._default_line_edits = bool(enabled)
-        self._persist()
-
     def set_auto_tab_colors(self, enabled):
         if 'auto_tab_colors' in self._locked:
             return                        # admin-locked; not user-changeable
         self._auto_tab_colors = bool(enabled)
         self.act_auto_tab_colors.setChecked(enabled)
         self._persist()               # affects new tabs; existing keep their colour
-
-    def set_osc_notice(self, enabled):
-        if 'osc_notice' in self._locked:
-            return                        # admin-locked; not user-changeable
-        self._osc_notice = bool(enabled)
-        self.act_osc_notice.setChecked(enabled)
-        if not self._osc_notice:
-            self._clear_advisories('osc')   # a switched-off notice must not linger
-        self._persist()
-
-    def set_osc_notice_type(self, key, notify):
-        """Mute or un-mute the OSC notice for one type (the feature is unaffected;
-        this only controls whether its neutralized use raises a banner)."""
-        if 'osc_notice_off' in self._locked:
-            return                        # admin-locked; not user-changeable
-        if notify:
-            self._osc_notice_off.discard(key)
-        else:
-            self._osc_notice_off.add(key)
-            self._clear_advisories('osc')   # drop a showing notice for a muted type
-        self._persist()
-
-    def set_tui_autobox_notice(self, enabled):
-        """Toggle the passive notice shown when TUI auto-switches Reveal/Detail to
-        Box. Off removes any showing notice too (a switched-off notice must not
-        linger). The auto-switch itself is unaffected -- this only governs whether
-        it is announced."""
-        if 'tui_autobox_notice' in self._locked:
-            return                        # admin-locked; not user-changeable
-        self._tui_autobox_notice = bool(enabled)
-        self.act_tui_autobox_notice.setChecked(enabled)
-        if not self._tui_autobox_notice:
-            self._clear_advisories('autobox')
-        self._persist()
-
-    def set_markings(self, enabled):
-        if 'colored_markings' in self._locked:
-            return                        # admin-locked; not user-changeable
-        term = self.current()
-        if term is not None:
-            term.apply_markings(enabled)
-        self.act_markings.setChecked(enabled)
-        self._default_markings = bool(enabled)
-        self._persist()
 
     def set_tui(self, enabled):
         if 'tui' in self._locked:
@@ -3531,51 +3739,6 @@ class MainWindow(QMainWindow):
             t.set_clipboard_read_always(bool(on))
         self._persist()
 
-    def set_osc(self, key, enabled):
-        """Enable/disable one OSC feature: apply it to the current tab, remember it
-        as the default for new tabs, persist, and refresh the security lamp (an
-        enabled feature dims it by its risk class)."""
-        if key in self._locked:
-            return                        # admin-locked; not user-changeable
-        # a legacy lock=allow_title locks the title + notify granular controls too,
-        # or the lock would be bypassable through the new per-feature menu.
-        if key in ('osc_title', 'osc_notify') and 'allow_title' in self._locked:
-            return
-        term = self.current()
-        if term is not None:
-            term.apply_osc(key, enabled)
-        self._osc_defaults[key] = bool(enabled)
-        if key in self._osc_actions:
-            self._osc_actions[key].setChecked(bool(enabled))
-        # title/notify keep the legacy allow_title default in sync
-        self._default_allow_title = (self._osc_defaults.get('osc_title')
-                                     or self._osc_defaults.get('osc_notify'))
-        if enabled:
-            self._clear_advisories('osc')   # the "was ignored" notice is now stale
-        self._update_security_indicator()
-        self._persist()
-
-    def set_bell_channel(self, channel, enabled):
-        """Enable/disable one notification channel (audible/visual/tray) on the
-        current tab, remember it as the default for new tabs, and persist. The
-        channels are independent -- any combination may be on."""
-        if 'bell' in self._locked:
-            return
-        if enabled:
-            self._default_bell.add(channel)
-        else:
-            self._default_bell.discard(channel)
-        # toggle only THIS channel on the current tab, preserving its other
-        # channels (a restored tab may differ from the global default)
-        term = self.current()
-        if term is not None:
-            chans = term.bell_channels()
-            chans.add(channel) if enabled else chans.discard(channel)
-            term.apply_bell(chans)
-        if channel in self._bell_actions:
-            self._bell_actions[channel].setChecked(enabled)
-        self._persist()
-
     def _bell_sound_locked(self):
         return 'bell' in self._locked or 'bell_sound' in self._locked
 
@@ -3727,6 +3890,19 @@ class MainWindow(QMainWindow):
 
     def _connect_bell_tray(self, term):
         term.bell_tray.connect(lambda label: self._on_bell_tray(term, label))
+        term.bell_tab.connect(lambda: self._on_bell_tab(term))
+
+    def _on_bell_tab(self, term):
+        """A bell rang with the 'tab' channel on: mark the tab (a trusted glyph +
+        a short pulse), but only while it is a BACKGROUND tab -- a bell on the
+        focused tab needs no marker (you are already looking at it), and it would
+        be cleared on the next chrome sync anyway. The marker carries no program
+        text; the flood rate-limit lives in Terminal._ring()."""
+        if term is self.current():
+            return
+        index = self.tabs.indexOf(term)
+        if index >= 0:
+            self.tabs.tabBar().mark_bell(index)
 
     def _on_bell_tray(self, term, _label):
         from PyQt6.QtWidgets import QSystemTrayIcon
@@ -4034,37 +4210,6 @@ class MainWindow(QMainWindow):
             want = secs == self._paste_delay
             if act.isChecked() != want:
                 act.setChecked(want)
-
-    def set_paste_warn(self, mode):
-        """When to review a paste: always / unicode (default) / never. Applies to
-        every tab and becomes the default for new ones."""
-        if mode not in ('always', 'unicode', 'never') or 'paste_warn' in self._locked:
-            return
-        self._paste_warn = mode
-        for t in self._real_terms():
-            t.apply_paste_warn(mode)
-        if hasattr(self, '_paste_warn_actions'):
-            act = self._paste_warn_actions.get(mode)
-            if act is not None and not act.isChecked():
-                act.setChecked(True)
-        self._update_security_indicator()          # review lamp reflects the level
-        self._persist()
-
-    def set_copy_warn(self, mode):
-        """When to review a copy leaving for the clipboard: always / unicode
-        (default) / never. Separate from the paste warning (copy and paste are
-        opposite trust directions). Applies to every tab and new ones."""
-        if mode not in ('always', 'unicode', 'never') or 'copy_warn' in self._locked:
-            return
-        self._copy_warn = mode
-        for t in self._real_terms():
-            t.apply_copy_warn(mode)
-        if hasattr(self, '_copy_warn_actions'):
-            act = self._copy_warn_actions.get(mode)
-            if act is not None and not act.isChecked():
-                act.setChecked(True)
-        self._update_security_indicator()          # review lamp reflects the level
-        self._persist()
 
     # The two captures share one writer each, differing only in the text getter:
     #   Transcript      -> scrollback_text(): append-only history, alt grid EXCLUDED
@@ -4674,7 +4819,6 @@ class MainWindow(QMainWindow):
             'tab from Reveal/Detail to Box (the fixed grid cannot expand a '
             'codepoint inline). On by default. Box still marks every non-ASCII '
             'byte, so the switch loses no security.')
-        self.act_tui_autobox_notice.toggled.connect(self.set_tui_autobox_notice)
         self._sync_mode_toggles(self._default_mode)
 
         self.act_font = QAction('Fo&nt...', self)
@@ -4683,7 +4827,6 @@ class MainWindow(QMainWindow):
             'The default, Hack, is designed to disambiguate look-alike glyphs '
             '(dotted zero, distinct 1/l/I) and ships no ligatures, which could '
             'otherwise hide characters.')
-        self.act_font.triggered.connect(self.choose_font)
 
         self.act_colors = QAction(
             _toggle_icon('format-text-color', 'C', '#0969da'),
@@ -4707,7 +4850,6 @@ class MainWindow(QMainWindow):
             'against escapes, so nothing can redraw a line it already wrote, and '
             'completion appends instead. Full explanation: secure-terminal(1), '
             'CONFIGURATION.')
-        self.act_line_edits.toggled.connect(self.set_line_edits)
 
         self.act_markings = QAction('Colored &markings', self, checkable=True)
         self.act_markings.setChecked(self._default_markings)
@@ -4720,7 +4862,6 @@ class MainWindow(QMainWindow):
             'output cannot recolour a marking to blend in, and the contrast guard '
             'keeps it readable, so it cannot be hidden. On by default; independent '
             'of the ANSI Colors setting.')
-        self.act_markings.toggled.connect(self.set_markings)
 
         self.act_auto_tab_colors = QAction('&Automatic tab colours', self,
                                            checkable=True)
@@ -4739,12 +4880,10 @@ class MainWindow(QMainWindow):
             'Show a dismissible banner (at most once per TYPE per tab) when a '
             'program uses an OSC escape secure-terminal neutralized. On by '
             'default. Untick a specific type below to mute just that one.')
-        self.act_osc_notice.toggled.connect(self.set_osc_notice)
         for key, label, codes, _d, _r, _h in OSC_FEATURES:
             act = QAction(label + '  (OSC ' + codes + ')', self, checkable=True)
             act.setChecked(key not in self._osc_notice_off)   # ticked == notify
             act.setToolTip('Notify when untrusted output uses this OSC escape.')
-            act.toggled.connect(lambda on, k=key: self.set_osc_notice_type(k, on))
             self._osc_notice_actions[key] = act
 
         # Granular OSC control: every way a program can reach OUT of the terminal,
@@ -4756,7 +4895,6 @@ class MainWindow(QMainWindow):
             act = QAction(label + '  (OSC ' + codes + ')', self, checkable=True)
             act.setChecked(self._osc_defaults.get(key, False))
             act.setToolTip(hint + _RISK_TAG[risk])
-            act.toggled.connect(lambda on, k=key: self.set_osc(k, on))
             self._osc_actions[key] = act
         self.act_clip_read_always = QAction(
             'Always allow clipboard READ (all tabs, no prompt)', self, checkable=True)
@@ -4772,10 +4910,11 @@ class MainWindow(QMainWindow):
         # Bell stays on the View menu: it is NOT a Global-settings duplicate (no dialog
         # twin), so it does not cause the menu/dialog scope inconsistency the dedup
         # removed. Its channels are per-tab.
-        bell_menu = view_menu.addMenu('&Bell')
-        # Independent channels (not mutually exclusive): a BEL may ring any
-        # combination. None ticked = silent, the safe default (a bell rung by
-        # untrusted output is a nuisance/attention-grab surface).
+        # Bell lives in Global settings now (all four channels + the sound file). The
+        # channel/sound QActions are kept as hidden state-holders: _apply_locks greys
+        # them, _sync_chrome_to_tab ticks the channels, _update_bell_tray_action drives
+        # the tray channel -- the dialog's Bell section is the user-facing control.
+        # Independent channels (not mutually exclusive): a BEL may ring any combination.
         self._bell_actions = {}
         for label, channel, tip in (
             ('&Audible', 'audible',
@@ -4787,30 +4926,26 @@ class MainWindow(QMainWindow):
             ('&Tray popup', 'tray',
              'Show a passive system-tray popup. A subtle, non-focus-stealing '
              'notification. Rate-limited.'),
+            ('Tab &marker', 'tab',
+             'Mark the tab that rang while it was in the background (a bell glyph '
+             'on the tab, a brief pulse), cleared when you focus the tab. On by '
+             'default, the least-intrusive channel -- no sound, no window flash.'),
         ):
             act = QAction(label, self, checkable=True)
             act.setToolTip(tip)
             act.setChecked(channel in self._default_bell)
-            act.triggered.connect(
-                lambda checked, c=channel: self.set_bell_channel(c, checked))
-            bell_menu.addAction(act)
             self._bell_actions[channel] = act
         # base tooltip for the tray channel, so _update_bell_tray_action can append
         # / remove the "needs the tray enabled" hint without mangling the text.
         self._bell_tray_base_tip = self._bell_actions['tray'].toolTip()
-        bell_menu.addSeparator()
         self.act_bell_sound = QAction(self._bell_sound_label(), self)
         self.act_bell_sound.setToolTip(
             'Choose the sound file for the audible bell. Restricted to the allowed '
             'sound folders (' + ', '.join(BELL_SOUND_DIRS) + ') so the AppArmor '
             'profile stays enforceable. Clear it to use the plain system beep.')
-        self.act_bell_sound.triggered.connect(self._pick_bell_sound)
-        bell_menu.addAction(self.act_bell_sound)
         self.act_bell_sound_clear = QAction('Use system beep (clear sound)', self)
         self.act_bell_sound_clear.setToolTip(
             'Clear the chosen sound file so the audible bell is the plain system beep.')
-        self.act_bell_sound_clear.triggered.connect(lambda: self.set_bell_sound(''))
-        bell_menu.addAction(self.act_bell_sound_clear)
 
         self.act_tui = QAction(_toggle_icon('utilities-terminal', 'T', MODE_NEUTRAL),
                                'TUI mo&de', self, checkable=True)
@@ -4884,7 +5019,6 @@ class MainWindow(QMainWindow):
             act = QAction(label, self, checkable=True)
             act.setToolTip(tip)
             act.setChecked(key == self._paste_warn)
-            act.triggered.connect(lambda _checked, k=key: self.set_paste_warn(k))
             pw_group.addAction(act)
             self._paste_warn_actions[key] = act
 
@@ -4904,7 +5038,6 @@ class MainWindow(QMainWindow):
             act = QAction(label, self, checkable=True)
             act.setToolTip(tip)
             act.setChecked(key == self._copy_warn)
-            act.triggered.connect(lambda _checked, k=key: self.set_copy_warn(k))
             cw_group.addAction(act)
             self._copy_warn_actions[key] = act
 
@@ -5697,6 +5830,54 @@ class MainWindow(QMainWindow):
                  'system tray on -- it is a tray app, so turning the tray off turns '
                  'this off too.')
 
+        # Bell: the four notification channels + the sound file, applied to every tab.
+        # Channels are independent (any combination). The sound is an immediate action
+        # (a sub-dialog), unlike the collect-then-apply checkboxes.
+        bell_box = _section('Bell')
+        bell_checks = {}
+        for _blabel, _bchan, _btip in (
+            ('Audible', 'audible',
+             'Ring a short system beep (or the chosen sound file). Rate-limited.'),
+            ('Visual', 'visual',
+             'Flag the window for attention (window-manager urgency / taskbar '
+             'flash). Rate-limited.'),
+            ('Tray popup', 'tray',
+             'Show a passive system-tray popup. Needs the system tray enabled '
+             '(above); otherwise it has no effect. Rate-limited.'),
+            ('Tab marker', 'tab',
+             'Mark the tab that rang while in the background (a bell glyph + brief '
+             'pulse), cleared when you focus it. On by default -- the least '
+             'intrusive channel, no sound or window flash.'),
+        ):
+            _bcb = QCheckBox()
+            _bcb.setChecked(_bchan in self._default_bell)
+            _tip_row(bell_box, _blabel, _bcb, _btip)
+            bell_checks[_bchan] = _bcb
+        _bell_sound_lbl = QLabel(self._bell_sound_label())
+        _bell_sound_lbl.setWordWrap(True)
+        _bell_sound_choose = QPushButton('Choose...')
+        _bell_sound_beep = QPushButton('Use system beep')
+        _bell_sound_row = QWidget()
+        _bsr = QHBoxLayout(_bell_sound_row)
+        _bsr.setContentsMargins(0, 0, 0, 0)
+        _bsr.addWidget(_bell_sound_lbl, 1)
+        _bsr.addWidget(_bell_sound_choose)
+        _bsr.addWidget(_bell_sound_beep)
+
+        def _refresh_bell_sound(_lbl=_bell_sound_lbl):
+            _lbl.setText(self._bell_sound_label())
+        _bell_sound_choose.clicked.connect(
+            lambda: (self._pick_bell_sound(), _refresh_bell_sound()))
+        _bell_sound_beep.clicked.connect(
+            lambda: (self.set_bell_sound(''), _refresh_bell_sound()))
+        if self._bell_sound_locked():
+            _bell_sound_choose.setEnabled(False)
+            _bell_sound_beep.setEnabled(False)
+        _tip_row(bell_box, 'Sound file', _bell_sound_row,
+                 'The audible channel plays this file (restricted to the allowed '
+                 'sound folders) or the plain system beep. Choosing / clearing applies '
+                 'to every tab immediately.')
+
         # Size every dropdown to its own item count (capped): a Qt desktop theme
         # that reserves maxVisibleItems rows for the popup would otherwise leave
         # scrollable empty space below a short list -- most visibly the Font list,
@@ -5726,6 +5907,10 @@ class MainWindow(QMainWindow):
             (clip_warn_any, 'clip_warn_any'),
         ):
             _w.setEnabled(_lock_key not in self._locked)
+        # Bell channels are greyed together under the single 'bell' lock (the sound
+        # buttons are gated by _bell_sound_locked where they are built).
+        for _bcb in bell_checks.values():
+            _bcb.setEnabled('bell' not in self._locked)
         # OSC feature checkboxes: _osc_locked, so a legacy allow_title lock also
         # greys osc_title/osc_notify (same reason _apply_global uses it).
         for _key, _cb in osc_checks.items():
@@ -5785,6 +5970,10 @@ class MainWindow(QMainWindow):
             _set(auto_tab_colors, lambda: auto_tab_colors.setChecked(True))
             _set(clip_warn_any, lambda: clip_warn_any.setChecked(False))
             _set(clip_autostart, lambda: clip_autostart.setChecked(False))
+            # Bell channels: shipped default is 'tab' only (the least-intrusive
+            # channel), every other channel off.
+            for _rc, _rcb in bell_checks.items():
+                _set(_rcb, lambda _rcb=_rcb, _rc=_rc: _rcb.setChecked(_rc == 'tab'))
 
         buttons = QHBoxLayout()
         reset = QPushButton('Reset to defaults')
@@ -5875,6 +6064,7 @@ class MainWindow(QMainWindow):
                 'auto_tab_colors': auto_tab_colors.isChecked(),
                 'clip_warn_any': clip_warn_any.isChecked(),
                 'clip_autostart': clip_autostart.isChecked(),
+                'bell': {c: cb.isChecked() for c, cb in bell_checks.items()},
             })
         except Exception:
             import traceback as _tb
@@ -5932,6 +6122,24 @@ class MainWindow(QMainWindow):
                 self._osc_actions[key].setChecked(value)
         self._default_allow_title = (self._osc_defaults.get('osc_title')
                                      or self._osc_defaults.get('osc_notify'))
+        # keep the two-line tab bar in step with the osc_title default: the line-2
+        # quarantine band (untrusted program title) is reserved only while titles
+        # are allowed. (Placed here, the sole global osc-apply site, so it survives
+        # the removal of the per-tab set_osc menu handler.)
+        self.tabs.tabBar().set_two_line(self._osc_defaults.get('osc_title', False))
+        # Bell channels (all four): a 'bell' lock keeps the current set (the dialog
+        # greyed the checkboxes, but guard like every other locked key); otherwise the
+        # dialog's set becomes the new default. Tick the hidden state-holder actions so
+        # _sync_chrome_to_tab / _apply_locks stay consistent. Applied per-tab below.
+        bell_chans = None
+        if 'bell' in opts:
+            if 'bell' in self._locked:
+                bell_chans = set(self._default_bell)
+            else:
+                bell_chans = {c for c, on in opts['bell'].items() if on}
+                self._default_bell = bell_chans
+            for _c, _act in self._bell_actions.items():
+                _act.setChecked(_c in bell_chans)
         for term in self._real_terms():
             term.apply_theme(opts['theme'])
             term.apply_zoom(opts['zoom'])
@@ -5943,14 +6151,14 @@ class MainWindow(QMainWindow):
             term.apply_line_edits(opts['line_edits'])
             for key, value in osc.items():
                 term.apply_osc(key, value)
+            self._refresh_tab_label(term)   # line-2 title visibility follows osc_title
             term.apply_scrollback(opts['scrollback'])
             term.apply_paste_delay(opts['paste_delay'])
             term.apply_escape_limit(opts['escape_limit'])
             term.apply_paste_warn(self._paste_warn)
             term.apply_copy_warn(self._copy_warn)
-            # NB: bell is intentionally NOT applied here. This global-settings
-            # dialog has no bell field, so touching it would silently reset each
-            # tab's per-tab bell choice; the bell is managed via the View menu only.
+            if bell_chans is not None:
+                term.apply_bell(bell_chans)   # bell now lives in this dialog (all tabs)
         self._apply_container_theme(opts['theme'])   # keep the container in step
         self._apply_app_palette(opts['theme'])        # chrome follows the applied theme
         # An OPEN review mirrors the reviewed tab's theme/mode/font/zoom, and this
