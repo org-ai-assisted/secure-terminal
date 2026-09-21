@@ -1208,6 +1208,10 @@ class SecureTerminal(QPlainTextEdit):
     # a bell fired with the 'tray' channel enabled; the window shows a passive
     # system-tray popup (the terminal has no tray icon of its own). Carries a label.
     bell_tray = pyqtSignal(str)
+    # a bell fired with the 'tab' channel enabled; the window marks this tab (a
+    # trusted glyph on the tab bar, cleared when the tab is focused). Carries no
+    # program text -- the marker is our own chrome, not a reflected title.
+    bell_tab = pyqtSignal()
     # a program in this tab asked to READ the clipboard (OSC 52 query) and the tab
     # has not yet decided; the window asks the user ONCE PER TAB (see osc_clipboard_read).
     clipboard_read_requested = pyqtSignal()
@@ -2361,7 +2365,9 @@ class SecureTerminal(QPlainTextEdit):
     #   audible  a system beep, or a chosen sound file (see apply_bell_sound)
     #   visual   a window-manager urgency hint / taskbar flash
     #   tray     a passive system-tray popup (dispatched by the window)
-    BELL_CHANNELS = ('audible', 'visual', 'tray')
+    #   tab      a marker on the tab that rang (dispatched by the window), the
+    #            in-window peer of the WM urgency hint; cleared when the tab is focused
+    BELL_CHANNELS = ('audible', 'visual', 'tray', 'tab')
 
     @classmethod
     def _parse_bell(cls, spec):
@@ -2420,6 +2426,8 @@ class SecureTerminal(QPlainTextEdit):
                 app.alert(win, 0)       # WM urgency hint on our window
         if 'tray' in self._bell_channels:
             self.bell_tray.emit(self._last_title or 'secure-terminal')
+        if 'tab' in self._bell_channels:
+            self.bell_tab.emit()
 
     def _play_sound(self):
         """Play the configured sound file via QtMultimedia (a hard dependency).
