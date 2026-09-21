@@ -934,7 +934,13 @@ class SecureTabBar(QTabBar):
     # -- geometry + paint -----------------------------------------------------
     def tabSizeHint(self, index):
         sz = super().tabSizeHint(index)
-        sz.setWidth(sz.width() + self._ACCENT_W + self._PAD + self._GLYPH + 4)
+        # _paint_content prepends the tab number ("N  ") in DemiBold and draws the
+        # accent bar + lock glyph + (reserved) bell marker. super() measured only the
+        # bare tabText, so add every extra we paint or the label elides ("1  s...").
+        f1 = QFont(self.font())
+        f1.setWeight(QFont.Weight.DemiBold)
+        prefix_w = QFontMetrics(f1).horizontalAdvance('%d  ' % (index + 1))
+        sz.setWidth(sz.width() + self._ACCENT_W + self._PAD + self._GLYPH + 4 + prefix_w)
         if self._two_line:
             sz.setHeight(sz.height() + self._LINE2_H)
         return sz
@@ -954,18 +960,22 @@ class SecureTabBar(QTabBar):
     def _paint_content(self, painter, index, rect, label, selected):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # clip everything we draw to this tab's rect: keeps the pulse tint (and any
+        # elided text) from bleeding past the tab shape onto the bar or a neighbour.
+        painter.setClipRect(rect)
         m = self._model(index)
         muted, band_bg, band_line, caution, bell_c = self._THEME[self._dark]
         fg = self.palette().color(QPalette.ColorRole.WindowText)
         line1_h = rect.height() - (self._LINE2_H if self._two_line else 0)
         line1 = QRect(rect.left(), rect.top(), rect.width(), line1_h)
 
-        # bell pulse: a decaying tint over the whole tab, brightest at full pulse
+        # bell pulse: a decaying tint over the tab, brightest at full pulse. Inset by
+        # 1px so the semitransparent fill sits inside the tab edge, not on the seam.
         if m['pulse'] > 0:
             frac = m['pulse'] / self._PULSE_TICKS
             tint = QColor(bell_c)
             tint.setAlphaF(0.35 * frac)
-            painter.fillRect(rect, tint)
+            painter.fillRect(rect.adjusted(1, 1, -1, -1), tint)
 
         # left accent bar (trusted, tab colour; a neutral stub when uncoloured)
         acc = QColor(m['accent']) if m['accent'] else QColor(muted)
@@ -978,8 +988,13 @@ class SecureTabBar(QTabBar):
         self._draw_lock(painter, QRect(x, gy, self._GLYPH, self._GLYPH), fg)
         x += self._GLYPH + 5
 
-        # bell marker sits at the RIGHT of line 1
+        # bell marker sits at the RIGHT of line 1, LEFT of the close button. The close
+        # button is a child widget painted AFTER paintEvent, so drawing at the bare
+        # right edge would put the bell under it -- reserve its rect.
         right = line1.right() - self._PAD
+        btn = self.tabButton(index, QTabBar.ButtonPosition.RightSide)
+        if btn is not None and btn.isVisible():
+            right = min(right, btn.geometry().left() - 4)
         if m['bell']:
             bx = right - self._GLYPH
             self._draw_bell(painter, QRect(bx, gy, self._GLYPH, self._GLYPH),
@@ -1190,7 +1205,8 @@ class MainWindow(QMainWindow):
         # the red review lamp until acknowledged (the security-details dialog clears it).
         self._unreviewed_risk = False
         self._default_tui = cfg.get('tui') == 'true'
-        _explicit_allow_title = cfg.get('allow_title') == 'true'
+        _legacy_allow_title = cfg.get('allow_title')   # 'true' / 'false' / None
+        _explicit_allow_title = _legacy_allow_title == 'true'
         # granular per-OSC-feature defaults. An ABSENT key takes the feature's OWN
         # default from the registry (OSC_FEATURES); only osc_title ships on (a
         # program-set title is now shown, quarantined on the tab bar's line 2), every
@@ -1199,15 +1215,17 @@ class MainWindow(QMainWindow):
         for _key, _lbl, _codes, _dflt, _risk, _hint in OSC_FEATURES:
             _v = cfg.get(_key)
             self._osc_defaults[_key] = (_v == 'true') if _v is not None else _dflt
-        # legacy allow_title seeds title + notify ONLY as a migration fallback --
-        # when the granular key is absent. It must not clobber an explicit granular
-        # value (a user enabling osc_title but disabling osc_notify would otherwise
-        # find osc_notify forced back on every restart).
-        if _explicit_allow_title:
+        # legacy allow_title seeds title + notify as a migration fallback ONLY when the
+        # granular key is absent (never clobbering an explicit granular value). BOTH
+        # directions matter: an explicit legacy allow_title=false is a user's DELIBERATE
+        # disable and must survive the osc_title default flip to on -- else a config
+        # predating the granular keys silently re-enables titles/notifications.
+        if _legacy_allow_title in ('true', 'false'):
+            _want = _explicit_allow_title
             if cfg.get('osc_title') is None:
-                self._osc_defaults['osc_title'] = True
+                self._osc_defaults['osc_title'] = _want
             if cfg.get('osc_notify') is None:
-                self._osc_defaults['osc_notify'] = True
+                self._osc_defaults['osc_notify'] = _want
         # a locked legacy allow_title enforces BOTH granular title settings, in
         # either direction (an admin can require or forbid the capability).
         if 'allow_title' in self._locked:
@@ -3699,6 +3717,10 @@ class MainWindow(QMainWindow):
         term = self.current()
         if term is not None:
             term.apply_allow_title(enabled)
+            # refresh the tab-bar line-2 now: disabling must drop a still-showing
+            # program title immediately, not leave a stale (possibly spoofed) title
+            # up until some later, unrelated label refresh.
+            self._refresh_tab_label(term)
         self._default_allow_title = bool(enabled)
         # Sync the granular OSC defaults that seed NEW tabs (_apply_osc_defaults reads
         # _osc_defaults), mirroring set_osc's reverse sync -- else unchecking the legacy
@@ -5951,7 +5973,9 @@ class MainWindow(QMainWindow):
             _set(tui_autobox_notice, lambda: tui_autobox_notice.setChecked(True))
             _set(osc, lambda: osc.setChecked(True))
             for _rk, _rcb in osc_checks.items():
-                _set(_rcb, lambda _rcb=_rcb: _rcb.setChecked(False))
+                # osc_title SHIPS on (title shown but quarantined to line 2); every other
+                # OSC feature ships off. Reset to those shipped defaults, not all-off.
+                _set(_rcb, lambda _rcb=_rcb, _rk=_rk: _rcb.setChecked(_rk == 'osc_title'))
             # Per-type notice toggles: ticked == notify, so reset to the shipped
             # default mute set (title/palette OFF, the rest ON). Missing here, Reset
             # left them as the user set them and a following Apply persisted a mute
