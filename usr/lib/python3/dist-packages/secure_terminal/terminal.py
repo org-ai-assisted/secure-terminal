@@ -82,6 +82,7 @@ import termios
 import shlex
 import unicodedata
 import inspect
+from typing import Any
 
 import pyte
 import pyte.charsets
@@ -127,7 +128,7 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         # palette name, which _pyte_qcolor renders from ANSI_PALETTE[8..15] (OSC-palette
         # aware). Scan in order so a later reset / normal / 256 colour still wins over an
         # earlier bright one.
-        passthrough = []
+        passthrough: list[Any] = []
         bright_bg = None
         bright_fg = None
         it = iter(attrs)
@@ -146,7 +147,8 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                 # component (e.g. the 90 in 38;3;90) can never fall through to the outer loop
                 # and be misread as a top-level bright SGR: 0/1 carry no data, 2 (RGB) and
                 # 3 (CMY) three, 4 (CMYK) four, 5 (indexed) one. An unknown id carries none.
-                need = {0: 0, 1: 0, 2: 3, 3: 3, 4: 4, 5: 1}.get(mode, 0)
+                need = ({0: 0, 1: 0, 2: 3, 3: 3, 4: 4, 5: 1}.get(mode, 0)
+                        if isinstance(mode, int) else 0)
                 comps = []
                 for _ in range(need):
                     comp = next(it, None)
@@ -5923,7 +5925,8 @@ class SecureTerminal(QPlainTextEdit):
             out.append('%-24s %s' % (key, val))
 
         def err(exc):
-            code = _errno.errorcode.get(getattr(exc, 'errno', None), getattr(exc, 'errno', '?'))
+            _eno = getattr(exc, 'errno', None)
+            code = _errno.errorcode.get(_eno, _eno) if isinstance(_eno, int) else '?'
             return 'ERROR %s: %s' % (code, exc)
 
         line('pty fd', self._fd)
