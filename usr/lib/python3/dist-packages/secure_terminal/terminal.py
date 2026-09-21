@@ -2456,14 +2456,21 @@ class SecureTerminal(QPlainTextEdit):
         one column too many -- it overflowed by the margin and showed a useless
         horizontal scrollbar (and nano-style apps drew past the right edge).
 
-        The vertical scrollbar's width is reserved UNCONDITIONALLY: Qt already
-        subtracts it from the viewport when the (AsNeeded) bar is shown, so we
-        subtract it ourselves when it is HIDDEN, and the text width is then the SAME
-        either way. Otherwise the width jumps by a scrollbar the instant the bar
-        toggles, which changes the column count -> SIGWINCH -> the child's redraw
-        toggles the bar back: an endless flicker of a full-screen app (nano was the
-        report). A stable width breaks that feedback loop, and matches both size
-        helpers' intent (line mode excludes the scrollbar; TUI never reclaims it).
+        The vertical scrollbar's width is reserved EVERYWHERE the bar could ever
+        appear -- i.e. the whole primary buffer, whether the bar is shown (Qt already
+        removed it) or hidden (we subtract it) or not-yet-needed (an empty grid that
+        will gain scrollback). Keeping it reserved across all three keeps the column
+        count STABLE, so neither an AsNeeded bar toggle NOR the no-scrollback ->
+        scrollback transition changes the width -> no SIGWINCH, no flicker loop (nano),
+        no reflow the instant the first line scrolls off.
+
+        The ALT SCREEN is the one exception: it is a fixed canvas with NO scrollback
+        that can never gain any (leaving alt screen returns to the primary buffer), so
+        its bar is permanently off and reserving its width just wastes a column -- the
+        child then wraps one column early (the premature-wrap report, e.g. a full-screen
+        TUI). There, and only there, we reserve nothing and reclaim the column. The
+        width still changes by one column when ENTERING/LEAVING the alt screen, but that
+        is already a full mode switch the program redraws around -- not a toggle loop.
 
         The advisory-banner inset is added BACK to the height for the same reason:
         the banner floats over the top of the viewport (reserved via setViewportMargins),
@@ -2474,7 +2481,9 @@ class SecureTerminal(QPlainTextEdit):
         vp = self.viewport()
         bar = self.verticalScrollBar()
         reserve = (bar.sizeHint().width()
-                   if bar is not None and not bar.isVisible() else 0)
+                   if (bar is not None and not bar.isVisible()
+                       and not self._alt_screen)
+                   else 0)
         return (max(1, vp.width() - reserve - 2 * margin),
                 max(1, vp.height() - 2 * margin + self._chrome_top_inset))
 
@@ -6307,6 +6316,11 @@ class SecureTerminal(QPlainTextEdit):
                 and (key not in SecureTerminal._NON_CONTENT_KEYS
                      or self._line_buffer)):
             self._line_dirty = True
+        # Genuine input re-arms tail-follow: typing while scrolled up snaps the view
+        # back to the bottom on the child's redraw (the konsole convention). A fixed
+        # canvas (alt screen) still top-pins in _render_tui_body regardless, so this
+        # only affects a primary grid with real scrollback.
+        self._tui_follow = True
         self._write(out)
 
     def resizeEvent(self, event):

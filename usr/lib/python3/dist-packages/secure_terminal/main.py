@@ -4610,8 +4610,13 @@ class MainWindow(QMainWindow):
         self.act_full.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(self.act_full)
 
-        view_menu.addSeparator()
-        theme_menu = view_menu.addMenu('&Theme')
+        # The per-tab display/OSC/paste toggles below duplicated Global settings and
+        # disagreed with it on scope (menu = current tab, dialog = all tabs), so they
+        # are no longer shown on the View menu (Global settings is the single source of
+        # truth). Their QAction objects are still BUILT -- as hidden state-holders that
+        # _sync_chrome_to_tab ticks, _apply_locks greys, and the slash-commands /
+        # toolbar chips drive -- but never added to a menu (the act_systray /
+        # act_auto_tab_colors pattern).
         group = QActionGroup(self)
         group.setExclusive(True)
         for label, key in THEME_LABELS:
@@ -4619,7 +4624,6 @@ class MainWindow(QMainWindow):
             act.setChecked(key == self._default_theme)
             act.triggered.connect(lambda _checked, k=key: self.set_theme(k))
             group.addAction(act)
-            theme_menu.addAction(act)
             self._theme_actions[key] = act
 
         # Mutually-exclusive display modes as a colour-coded segmented control.
@@ -4627,8 +4631,6 @@ class MainWindow(QMainWindow):
         # adjacent. Box, Reveal and Detail are green (all safe): Box replaces
         # non-ASCII with a coloured box, hard to miss though lossy; Reveal/Detail
         # show the exact codepoint. Show is red (a rendered glyph can deceive).
-        mode_menu = view_menu.addMenu('&Unicode')
-        mode_menu.addSection('Changes DISPLAY, not bytes piped elsewhere')
         self._mode_group = QActionGroup(self)
         self._mode_group.setExclusive(True)
         self._mode_actions = {}
@@ -4658,14 +4660,12 @@ class MainWindow(QMainWindow):
             act.setToolTip(tip)
             act.triggered.connect(lambda _checked, k=key: self.set_mode(k))
             self._mode_group.addAction(act)
-            mode_menu.addAction(act)
             self._mode_actions[key] = act
         self.act_box = self._mode_actions['box']
         self.act_reveal = self._mode_actions['reveal']
         self.act_detail = self._mode_actions['detail']
         self.act_show = self._mode_actions['show']
 
-        mode_menu.addSeparator()
         self.act_tui_autobox_notice = QAction(
             '&Notify on TUI auto-Box', self, checkable=True)
         self.act_tui_autobox_notice.setChecked(self._tui_autobox_notice)
@@ -4675,7 +4675,6 @@ class MainWindow(QMainWindow):
             'codepoint inline). On by default. Box still marks every non-ASCII '
             'byte, so the switch loses no security.')
         self.act_tui_autobox_notice.toggled.connect(self.set_tui_autobox_notice)
-        mode_menu.addAction(self.act_tui_autobox_notice)
         self._sync_mode_toggles(self._default_mode)
 
         self.act_font = QAction('Fo&nt...', self)
@@ -4685,9 +4684,7 @@ class MainWindow(QMainWindow):
             '(dotted zero, distinct 1/l/I) and ships no ligatures, which could '
             'otherwise hide characters.')
         self.act_font.triggered.connect(self.choose_font)
-        view_menu.addAction(self.act_font)
 
-        view_menu.addSeparator()
         self.act_colors = QAction(
             _toggle_icon('format-text-color', 'C', '#0969da'),
             '&Colors', self, checkable=True)
@@ -4699,7 +4696,6 @@ class MainWindow(QMainWindow):
             'NO_COLOR environment variable is set, colors stay off even when this '
             'is on.')
         self.act_colors.toggled.connect(self.set_colors)
-        view_menu.addAction(self.act_colors)
 
         self.act_line_edits = QAction(
             _toggle_icon('format-text-direction-ltr', 'L', '#0969da'),
@@ -4712,7 +4708,6 @@ class MainWindow(QMainWindow):
             'completion appends instead. Full explanation: secure-terminal(1), '
             'CONFIGURATION.')
         self.act_line_edits.toggled.connect(self.set_line_edits)
-        view_menu.addAction(self.act_line_edits)
 
         self.act_markings = QAction('Colored &markings', self, checkable=True)
         self.act_markings.setChecked(self._default_markings)
@@ -4726,7 +4721,6 @@ class MainWindow(QMainWindow):
             'keeps it readable, so it cannot be hidden. On by default; independent '
             'of the ANSI Colors setting.')
         self.act_markings.toggled.connect(self.set_markings)
-        view_menu.addAction(self.act_markings)
 
         self.act_auto_tab_colors = QAction('&Automatic tab colours', self,
                                            checkable=True)
@@ -4739,7 +4733,6 @@ class MainWindow(QMainWindow):
         # Window-global (not per-tab): lives in Global settings, not this menu. The
         # action is kept as the state-holder set_auto_tab_colors ticks.
 
-        osc_notice_menu = view_menu.addMenu('Notif&y on OSC use')
         self.act_osc_notice = QAction('&All OSC notices', self, checkable=True)
         self.act_osc_notice.setChecked(self._osc_notice)
         self.act_osc_notice.setToolTip(
@@ -4747,14 +4740,11 @@ class MainWindow(QMainWindow):
             'program uses an OSC escape secure-terminal neutralized. On by '
             'default. Untick a specific type below to mute just that one.')
         self.act_osc_notice.toggled.connect(self.set_osc_notice)
-        osc_notice_menu.addAction(self.act_osc_notice)
-        osc_notice_menu.addSeparator()
         for key, label, codes, _d, _r, _h in OSC_FEATURES:
             act = QAction(label + '  (OSC ' + codes + ')', self, checkable=True)
             act.setChecked(key not in self._osc_notice_off)   # ticked == notify
             act.setToolTip('Notify when untrusted output uses this OSC escape.')
             act.toggled.connect(lambda on, k=key: self.set_osc_notice_type(k, on))
-            osc_notice_menu.addAction(act)
             self._osc_notice_actions[key] = act
 
         # Granular OSC control: every way a program can reach OUT of the terminal,
@@ -4762,21 +4752,12 @@ class MainWindow(QMainWindow):
         # by default; enabling one only has effect in TUI mode and dims the OSC
         # security lamp by its risk class. Kept next to "Notify on OSC use" -- both
         # govern the same OSC escapes.
-        osc_menu = view_menu.addMenu('OSC f&eatures')
-        osc_menu.setToolTip('Each is a way a program can act on your system '
-                            '(title, clipboard, ...). All neutralized by default; '
-                            'enable at your own risk (only in TUI mode). iTerm2 '
-                            'file-transfer escapes (OSC 1337) are always '
-                            'neutralized and have no toggle -- they can never be '
-                            'safely enabled.')
         for key, label, codes, _dflt, risk, hint in OSC_FEATURES:
             act = QAction(label + '  (OSC ' + codes + ')', self, checkable=True)
             act.setChecked(self._osc_defaults.get(key, False))
             act.setToolTip(hint + _RISK_TAG[risk])
             act.toggled.connect(lambda on, k=key: self.set_osc(k, on))
-            osc_menu.addAction(act)
             self._osc_actions[key] = act
-        osc_menu.addSeparator()
         self.act_clip_read_always = QAction(
             'Always allow clipboard READ (all tabs, no prompt)', self, checkable=True)
         self.act_clip_read_always.setChecked(self._osc_clipboard_read_always)
@@ -4787,8 +4768,10 @@ class MainWindow(QMainWindow):
             'the "System clipboard (read)" OSC feature is also enabled. A per-tab '
             'Deny still wins over this.')
         self.act_clip_read_always.toggled.connect(self.set_clipboard_read_always)
-        osc_menu.addAction(self.act_clip_read_always)
 
+        # Bell stays on the View menu: it is NOT a Global-settings duplicate (no dialog
+        # twin), so it does not cause the menu/dialog scope inconsistency the dedup
+        # removed. Its channels are per-tab.
         bell_menu = view_menu.addMenu('&Bell')
         # Independent channels (not mutually exclusive): a BEL may ring any
         # combination. None ticked = silent, the safe default (a bell rung by
@@ -4834,7 +4817,6 @@ class MainWindow(QMainWindow):
         self.act_tui.setChecked(self._default_tui)
         self.act_tui.setToolTip(TUI_TOOLTIP)
         self.act_tui.toggled.connect(self.set_tui)
-        view_menu.addAction(self.act_tui)
 
         self.act_systray = QAction('S&ystem tray icon', self, checkable=True)
         self.act_systray.setChecked(self._systray)
@@ -4865,8 +4847,6 @@ class MainWindow(QMainWindow):
         self.act_title.setChecked(self._default_allow_title)
         self.act_title.toggled.connect(self.set_allow_title)
 
-        view_menu.addSeparator()
-        sb_menu = view_menu.addMenu('&Scrollback')
         sb_group = QActionGroup(self)
         sb_group.setExclusive(True)
         self._scrollback_actions = {}
@@ -4875,10 +4855,8 @@ class MainWindow(QMainWindow):
             act.setChecked(lines == self._scrollback)
             act.triggered.connect(lambda _checked, n=lines: self.set_scrollback(n))
             sb_group.addAction(act)
-            sb_menu.addAction(act)
             self._scrollback_actions[lines] = act
 
-        pd_menu = view_menu.addMenu('&Paste delay')
         pd_group = QActionGroup(self)
         pd_group.setExclusive(True)
         self._paste_delay_actions = {}
@@ -4887,10 +4865,8 @@ class MainWindow(QMainWindow):
             act.setChecked(secs == self._paste_delay)
             act.triggered.connect(lambda _checked, n=secs: self.set_paste_delay(n))
             pd_group.addAction(act)
-            pd_menu.addAction(act)
             self._paste_delay_actions[secs] = act
 
-        pw_menu = view_menu.addMenu('Paste &warning')
         pw_group = QActionGroup(self)
         pw_group.setExclusive(True)
         self._paste_warn_actions = {}
@@ -4910,10 +4886,8 @@ class MainWindow(QMainWindow):
             act.setChecked(key == self._paste_warn)
             act.triggered.connect(lambda _checked, k=key: self.set_paste_warn(k))
             pw_group.addAction(act)
-            pw_menu.addAction(act)
             self._paste_warn_actions[key] = act
 
-        cw_menu = view_menu.addMenu('Copy warnin&g')
         cw_group = QActionGroup(self)
         cw_group.setExclusive(True)
         self._copy_warn_actions = {}
@@ -4932,7 +4906,6 @@ class MainWindow(QMainWindow):
             act.setChecked(key == self._copy_warn)
             act.triggered.connect(lambda _checked, k=key: self.set_copy_warn(k))
             cw_group.addAction(act)
-            cw_menu.addAction(act)
             self._copy_warn_actions[key] = act
 
         tabs_menu = bar.addMenu('Ta&bs')
@@ -5434,6 +5407,11 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Sideways scroll is never wanted here (it reads as "the settings scroll
+        # right"); the dialog is opened wide enough below to fit the content plus the
+        # vertical scrollbar, so nothing clips. Vertical stays AsNeeded.
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setSpacing(12)
@@ -5846,7 +5824,14 @@ class MainWindow(QMainWindow):
             _m = outer.contentsMargins()
             _need_h = (_chint.height() + reset.sizeHint().height()
                        + _m.top() + _m.bottom() + outer.spacing() + 8)
-            _need_w = _chint.width() + 2 * scroll.frameWidth() + 24  # scrollbar allowance
+            # Reserve the REAL vertical-scrollbar width plus the outer layout margins,
+            # so when the height cap engages the vbar and Qt steals its width from the
+            # viewport, the content still fits at its natural width -- no horizontal
+            # overflow (the horizontal bar is AlwaysOff above; an undersized allowance
+            # would clip instead of scroll).
+            _sb = scroll.verticalScrollBar().sizeHint().width()
+            _need_w = (_chint.width() + _m.left() + _m.right()
+                       + 2 * scroll.frameWidth() + _sb + 4)
             dialog.resize(min(_avail.width(), max(dialog.width(), _need_w)),
                           min(int(_avail.height() * 0.9), _need_h))
         prev_ui_scale = self._ui_scale
