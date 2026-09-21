@@ -5973,7 +5973,9 @@ class MainWindow(QMainWindow):
             _set(tui_autobox_notice, lambda: tui_autobox_notice.setChecked(True))
             _set(osc, lambda: osc.setChecked(True))
             for _rk, _rcb in osc_checks.items():
-                _set(_rcb, lambda _rcb=_rcb: _rcb.setChecked(False))
+                # osc_title SHIPS on (title shown but quarantined to line 2); every other
+                # OSC feature ships off. Reset to those shipped defaults, not all-off.
+                _set(_rcb, lambda _rcb=_rcb, _rk=_rk: _rcb.setChecked(_rk == 'osc_title'))
             # Per-type notice toggles: ticked == notify, so reset to the shipped
             # default mute set (title/palette OFF, the rest ON). Missing here, Reset
             # left them as the user set them and a following Apply persisted a mute
