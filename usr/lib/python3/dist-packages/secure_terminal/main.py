@@ -1007,8 +1007,12 @@ class SecureTabBar(QTabBar):
                 norm = normalize_ptitle(raw)
                 if norm == raw:
                     return '%s\n\nTitle: %s' % (base, raw)
-                shown = norm if norm else '(nothing shown -- trimmed to prompt noise)'
-                return '%s\n\nShown: %s\nFull: %s' % (base, shown, raw)
+                if not norm:
+                    # explain WHY the band is blank (Option B: an all-prompt-noise title).
+                    return ('%s\n\nBlank here: this title is only the shell prompt '
+                            '(user@host, path, tty) -- nothing beyond the tab name -- so the '
+                            'band is left empty.\n\nFull title: %s' % (base, raw))
+                return '%s\n\nShown: %s\nFull: %s' % (base, norm, raw)
         return None
 
     def _tick_pulse(self):
