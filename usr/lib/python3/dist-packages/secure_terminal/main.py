@@ -1123,27 +1123,29 @@ class SecureTabBar(QTabBar):
                          int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
                          shown)
 
-        # untrusted line-2 quarantine band
+        # untrusted line-2 quarantine band. DISPLAY the normalized residue (raw stays in the
+        # model + hover); empty == the title was pure prompt noise.
         if self._two_line:
             band = QRect(rect.left(), line1.bottom() + 1,
                          rect.width(), self._LINE2_H - 1)
             painter.fillRect(band, QColor(band_bg))
-            # diagonal hatch marks the band as a quarantine zone
-            hatch = QColor(band_line)
-            hatch.setAlphaF(0.30)
-            painter.setPen(QPen(hatch, 1))
-            step = 6
-            for hx in range(band.left() - band.height(), band.right(), step):
-                painter.drawLine(hx, band.bottom(), hx + band.height(), band.top())
             # divider between the trusted line and the quarantine band -- full width so it
-            # meets the vertical tab divider at the corner.
+            # meets the vertical tab divider at the corner. Always drawn, so the two-line
+            # structure stays put even when this tab has nothing to show.
             painter.setPen(QPen(QColor(band_line), 1, Qt.PenStyle.DashLine))
             painter.drawLine(band.left(), band.top(), band.right(), band.top())
-            # DISPLAY the normalized residue (raw stays in the model + hover). Empty ==
-            # the title was pure prompt noise -> leave the band empty rather than echo the
-            # cwd the tab label already shows.
             ptitle = normalize_ptitle(m['ptitle'])
             if ptitle:
+                # quarantine markings (hatch + caution glyph) mark UNTRUSTED CONTENT, so
+                # they belong only on a tab that actually shows a program title -- an empty
+                # band (a bare prompt) recedes to a plain tinted strip instead of drawing
+                # the eye with a caution glyph over nothing.
+                hatch = QColor(band_line)
+                hatch.setAlphaF(0.30)
+                painter.setPen(QPen(hatch, 1))
+                step = 6
+                for hx in range(band.left() - band.height(), band.right(), step):
+                    painter.drawLine(hx, band.bottom(), hx + band.height(), band.top())
                 bx = band.left() + 2 + self._ACCENT_W + self._PAD
                 by = band.top() + (band.height() - self._GLYPH) // 2
                 self._draw_caution(painter, QRect(bx, by, self._GLYPH - 2,
