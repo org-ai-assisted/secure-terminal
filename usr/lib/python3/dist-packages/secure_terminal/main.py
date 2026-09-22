@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
     QToolTip, QStyle, QStylePainter, QStyleOptionTab,
 )
 
-from secure_terminal import settings, session, ipc, resource_isolation
+from secure_terminal import settings, session, ipc, resource_isolation, crashdiag
 from secure_terminal.sanitize import (
     OSC_FEATURES, OSC_FEATURE_BY_KEY, OSC_NOTICE_DEFAULT_OFF,
     osc_code_description, sanitize_title)
@@ -6903,14 +6903,25 @@ def _is_font_noise(_category, message):
     return 'OpenType support missing' in message
 
 
+# Set once crash diagnostics are wired (crashdiag.install); a one-element list so the
+# already-installed Qt message handler closure can tee later without a global rebind.
+_CRASH_LOG = []
+
+
 def _quiet_font_warnings():
     """Drop the font-shaping warnings (see _is_font_noise) and pass everything
     else through. They are emitted straight to the message handler and ignore
     QT_LOGGING_RULES, so a handler is the only thing that catches them."""
-    def handler(_mode, context, message):
+    def handler(mode, context, message):
         if _is_font_noise(getattr(context, 'category', '') or '', message):
             return
         sys.stderr.write(message + '\n')
+        # A Qt Critical/Fatal (qFatal aborts right after this) is a crash cause;
+        # persist it beside the faulthandler/excepthook traces so a GUI launch's
+        # invisible stderr is not the only copy. Called unconditionally: the fatal
+        # and no-log-yet checks live in note_qt_message (a no-op otherwise).
+        crashdiag.note_qt_message(_CRASH_LOG[0] if _CRASH_LOG else None,
+                                  mode, message)
     qInstallMessageHandler(handler)
 
 
@@ -7506,6 +7517,14 @@ def main(cg_base=None):
     # See CANARY_TOKEN.
     if launch.test_canary:
         return _test_canary()
+
+    # Durable crash diagnostics BEFORE any window work. A GUI launch has no visible
+    # stderr, so a Python exception escaping a Qt slot (PyQt aborts after excepthook)
+    # or a native fault (SIGSEGV/SIGABRT from Qt's C++ layer, e.g. a bad paint at
+    # extreme zoom) would else vanish with no trace. Tee both to a fixed crash.log
+    # under the state root and to stderr. Best-effort throughout (never blocks a
+    # launch); the Qt message handler installed above tees a captured qFatal too.
+    _CRASH_LOG[:] = [crashdiag.install_best_effort(session.ensure_instances_root())]
 
     # New INDEPENDENT instance per launch (konsole/qterminal model): every launch
     # opens its own window+process. Reuse is opt-IN via --reuse, which hands the
