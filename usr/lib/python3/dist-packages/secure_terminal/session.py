@@ -132,7 +132,8 @@ def ensure_instances_root():
         _makedirs_private(root)
         os.chmod(root, 0o700)
     except OSError:
-        pass
+        pass                # best-effort: the crash log is only a diagnostic, so a
+                            # create/chmod failure must never abort the launch
     return root
 
 
