@@ -805,11 +805,16 @@ _MAX_NUM_DIGITS = 8
 
 
 def _safe_int(digits, default=0):
-    """int(digits) when it is a short ASCII digit run, else `default` -- never the
-    ValueError a 4300+-digit hostile parameter would raise (nor a non-ASCII-digit
-    one, which int() also rejects)."""
-    return (int(digits) if digits.isascii() and digits.isdigit()
-            and len(digits) <= _MAX_NUM_DIGITS else default)
+    """int(digits) for an ASCII digit run, else `default` -- never the ValueError a
+    long hostile parameter would raise (nor a non-ASCII-digit one, which int() also
+    rejects). Leading zeros are stripped BEFORE the length cap, so a zero-padded value
+    is read at its numeric width, not dropped as over-long: else a padded alt-screen /
+    mouse mode (ESC[?0000001049h) would slip past detection exactly as the un-parsed
+    string compare did."""
+    if not (digits.isascii() and digits.isdigit()):
+        return default
+    digits = digits.lstrip('0') or '0'
+    return int(digits) if len(digits) <= _MAX_NUM_DIGITS else default
 
 
 _LINE_CSI_RE = re.compile(r'\x1b\[([0-9]*)([CDGK])')
@@ -1381,28 +1386,10 @@ def is_invisible(ch):
 
 
 @functools.lru_cache(maxsize=8192)
-def marking_cp_for_cell(data):
-    """The source code point to risk-classify / inspect for a TUI grid cell. A pyte
-    cell can hold a base grapheme plus combining / zero-width / format code points, so
-    a cell like 'a'+U+200B or U+2500+U+202E carries more than one. Return the MOST
-    DANGEROUS non-ASCII code point in the cell (by marking_class severity: bidi >
-    control > invisible > confusable > combining > other non-ASCII), with box-drawing / block
-    structure ranked LOWEST -- so a bidi override or zero-width riding in the same
-    neutralized cell as a benign line is never masked by the line, and the grid tint
-    plus the inspect popup name the real hazard. None when every code point is plain
-    printable ASCII (not a marking). Pure, so dist-ai unit-tests it beside
-    marking_class -- and memoized (bounded): it is the per-cell classification the
-    TUI grid runs for every cell every frame, over a small recurring set of cell
-    strings. Its result is a source code point, independent of theme/mode/markings,
-    so caching cannot leak state across those (they are applied downstream)."""
-    # Cap the scanned run at the SAME bound tui_cell applies: pyte merges every combining
-    # mark into the preceding cell's data, so one growing grid cell can hold thousands of
-    # code points, and the call sites (_grid_cell_format, cells_to_runs) pass raw cell.data
-    # with no length cap. Without this each distinct growing string is a fresh lru_cache key
-    # of unbounded length, doing O(len) work per miss. Lossless for conformant text (UAX #15
-    # stream-safe: <= 30 marks per base).
-    if len(data) > _COMBINING_RUN_MAX + 1:
-        data = data[:_COMBINING_RUN_MAX + 1]
+def _marking_cp_scan(data):
+    """The cached scan behind marking_cp_for_cell. `data` is ALREADY capped by the
+    wrapper, so the lru_cache key is bounded -- see marking_cp_for_cell for why the cap
+    must sit outside the cache."""
     best_cp = None
     best_rank = -1
     for ch in data:
@@ -1413,6 +1400,32 @@ def marking_cp_for_cell(data):
         if rank > best_rank:                  # first of an equal rank wins (stable)
             best_rank, best_cp = rank, cp
     return best_cp
+
+
+def marking_cp_for_cell(data):
+    """The source code point to risk-classify / inspect for a TUI grid cell. A pyte
+    cell can hold a base grapheme plus combining / zero-width / format code points, so
+    a cell like 'a'+U+200B or U+2500+U+202E carries more than one. Return the MOST
+    DANGEROUS non-ASCII code point in the cell (by marking_class severity: bidi >
+    control > invisible > confusable > combining > other non-ASCII), with box-drawing / block
+    structure ranked LOWEST -- so a bidi override or zero-width riding in the same
+    neutralized cell as a benign line is never masked by the line, and the grid tint
+    plus the inspect popup name the real hazard. None when every code point is plain
+    printable ASCII (not a marking). Pure, so dist-ai unit-tests it beside
+    marking_class -- and its scan is memoized (bounded). Its result is a source code
+    point, independent of theme/mode/markings, so caching cannot leak state across
+    those (they are applied downstream)."""
+    # Cap the run at the SAME bound tui_cell applies, BEFORE the cache: pyte merges every
+    # combining mark into the preceding cell's data, so one growing grid cell can hold
+    # thousands of code points, and the call sites (_grid_cell_format, cells_to_runs) pass
+    # raw cell.data. @lru_cache hashes and RETAINS the whole argument, so capping inside the
+    # cached function would still let each distinct growing string become an arbitrarily-long
+    # cache KEY -- the unbounded-memory DoS. Capping here bounds the key AND collapses a cell
+    # growing past the cap onto one entry. Lossless for conformant text (UAX #15 stream-safe:
+    # <= 30 marks per base).
+    if len(data) > _COMBINING_RUN_MAX + 1:
+        data = data[:_COMBINING_RUN_MAX + 1]
+    return _marking_cp_scan(data)
 
 
 @functools.lru_cache(maxsize=4096)

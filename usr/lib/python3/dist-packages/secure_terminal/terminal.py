@@ -847,10 +847,14 @@ def _alt_partial_tail(data):
     i.e. it may be the START of a marker split across an os.read() boundary. 0 when
     the tail is not a partial marker (so a COMPLETE marker at the end is not held back
     -- that would delay its snapshot/restore, which is the whole point of feeding).
-    Reunites the CANONICAL marker forms only; a numeric-equivalent variant
-    (ESC[?01049h) that is ALSO split at the boundary is not carried and so is not
-    detected -- fail-safe (a frame merely goes un-snapshotted, bounded by the
-    scrollback cap and _ALT_TRANSITIONS_MAX), not a leak."""
+    Reunites the CANONICAL single-marker forms only. A COMBINED (ESC[?1047;1049h) or a
+    numeric-equivalent (ESC[?01049h) form that is ALSO split at this exact read boundary
+    is not carried, so the snapshot machinery misses it -- a KNOWN, pre-existing residual:
+    _alt_transitions_bytes detects those forms in one read, but this split-read carry (and
+    its str sibling _alt_scan_carry) recognize only the literal single markers. Fail-safe,
+    not a leak: a frame merely goes un-snapshotted (bounded by the scrollback cap and
+    _ALT_TRANSITIONS_MAX). Closing it fully means a bounded partial-private-CSI carry across
+    both the bytes and str paths; deferred as disproportionate for a rendering hint."""
     markers = _ALT_ENTER_BYTES + _ALT_LEAVE_BYTES
     for k in range(min(_ALT_MARKER_MAX_BYTES - 1, len(data)), 0, -1):
         tail = data[-k:]
