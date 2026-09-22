@@ -1135,14 +1135,10 @@ class SecureTabBar(QTabBar):
             step = 6
             for hx in range(band.left() - band.height(), band.right(), step):
                 painter.drawLine(hx, band.bottom(), hx + band.height(), band.top())
-            # divider between the trusted line and the quarantine band
+            # divider between the trusted line and the quarantine band -- full width so it
+            # meets the vertical tab divider at the corner.
             painter.setPen(QPen(QColor(band_line), 1, Qt.PenStyle.DashLine))
-            painter.drawLine(band.left() + 2, band.top(), band.right() - 2, band.top())
-            # vertical separator at the tab's right edge: each tab's band reads as ITS OWN
-            # line 2, not one strip spanning every tab (the "applies to all tabs" report).
-            painter.setPen(QPen(QColor(band_line), 1))
-            painter.drawLine(band.right() - 1, band.top() + 2,
-                             band.right() - 1, band.bottom() - 1)
+            painter.drawLine(band.left(), band.top(), band.right(), band.top())
             # DISPLAY the normalized residue (raw stays in the model + hover). Empty ==
             # the title was pure prompt noise -> leave the band empty rather than echo the
             # cwd the tab label already shows.
@@ -1169,6 +1165,12 @@ class SecureTabBar(QTabBar):
                 painter.drawText(QRect(tx, band.top(), avail2, band.height()),
                                  int(Qt.AlignmentFlag.AlignVCenter
                                      | Qt.AlignmentFlag.AlignLeft), shown2)
+        # ONE vertical divider down the tab's right edge, spanning BOTH lines, so the line-1
+        # and line-2 borders are a single aligned line (not Qt's tab-shape edge on line 1
+        # plus a separate band separator on line 2 at a slightly different x). Also gives
+        # each tab's band its own boundary, so line 2 does not read as one strip.
+        painter.setPen(QPen(QColor(band_line), 1))
+        painter.drawLine(rect.right(), rect.top() + 3, rect.right(), rect.bottom() - 1)
         painter.restore()
 
     # -- trusted glyphs (drawn, ASCII source, unspoofable by program text) -----
