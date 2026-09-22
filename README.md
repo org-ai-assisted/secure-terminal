@@ -177,7 +177,7 @@ flag it while it is active, because it is a deliberate, lower-guarantee mode:
 TUI mode renders through the confined screen model at all times (with its own
 scrollback), so a program that positions the cursor renders faithfully: a
 completion menu, a progress bar, or a full-screen program on the alternate screen
-(which is snapshotted and restored so it never disturbs your scrollback).
+(which is snapshotted and restored so it normally leaves your scrollback untouched).
 
 What you give up: because the cursor can be positioned, a program can draw a
 *misleading interface* (a fake prompt, say) or overwrite a line you already read,
