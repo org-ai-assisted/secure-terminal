@@ -2335,7 +2335,11 @@ class MainWindow(QMainWindow):
             # whole frame rather than open a flood.
             return {'ok': False,
                     'error': 'too many tabs requested (max %d)' % _MAX_OPEN_TABS}
-        if_absent = bool(request.get('if_absent'))
+        # Strict type check, matching the other IPC fields (submit, lines): a bool-as-int
+        # or a "false" STRING must be rejected, not truthy-coerced into the wrong dedup mode.
+        if_absent = request.get('if_absent', False)
+        if not isinstance(if_absent, bool):
+            return {'ok': False, 'error': 'if_absent must be a boolean'}
         present = self._live_commands() if if_absent else set()
         opened = skipped = 0
         for spec in (tabs if isinstance(tabs, list) else []):
@@ -7284,10 +7288,17 @@ def _ctl_main(argv):
             # mode is reused, leaking the dump). An unguessable O_EXCL name defeats
             # both; a reader also never sees a half-written file.
             directory = os.path.dirname(args.file) or '.'
-            fd, tmp = tempfile.mkstemp(dir=directory, prefix='.st-dump-', suffix='.tmp')
-            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                handle.write(text)
-            os.replace(tmp, args.file)          # atomic; replaces a symlink, not its target
+            try:
+                fd, tmp = tempfile.mkstemp(dir=directory, prefix='.st-dump-', suffix='.tmp')
+                with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                    handle.write(text)
+                os.replace(tmp, args.file)      # atomic; replaces a symlink, not its target
+            except OSError as exc:
+                # A bad/unwritable --file dir must fail like the rest of ctl (stderr +
+                # exit 1), not dump a traceback.
+                sys.stderr.write('secure-terminal ctl: cannot write %r: %s\n'
+                                 % (args.file, exc))
+                return 1
         else:
             sys.stdout.write(text)
     elif args.cmd == 'zoom':
