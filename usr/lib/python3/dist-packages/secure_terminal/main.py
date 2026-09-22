@@ -2664,7 +2664,13 @@ class MainWindow(QMainWindow):
         add('mode', 'TUI' if term.current_tui() else 'CLI')
         add('pid', term._pid)
         add('pts', self._tab_pts(term))
-        add('cwd', self._osc_cwd.get(term) or term.shell_cwd() or term.cwd_basename())
+        # _osc_cwd is already sanitize_title'd at its source (terminal.py OSC-7 handler);
+        # the /proc fallbacks are RAW fs paths -- a bidi/control byte in a real directory
+        # name would ride html.escape into the rich-text tooltip. Neutralize them like the
+        # tab label does (_refresh_tab_label), so every cwd surface reads plain ASCII.
+        add('cwd', self._osc_cwd.get(term)
+            or sanitize_title(term.shell_cwd() or term.cwd_basename() or '', limit=4096)
+            or None)
         live = term._transcript_path()
         if live:
             add('transcript', live)

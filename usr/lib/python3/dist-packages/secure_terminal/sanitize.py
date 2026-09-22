@@ -146,13 +146,15 @@ ANSI_RE = re.compile(
     # across reads is held by feed_chunk_carry, not leaked.)
     r'|\x1b\[[ -?]*'
     r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?'
-    # DCS (ESC P), SOS (ESC X), PM (ESC ^), APC (ESC _): a string sequence whose
-    # BODY runs to an ST (ESC \) terminator. Unlike OSC, BEL does NOT terminate
-    # these -- a BEL byte is part of the (often binary) body -- so the body is
-    # "anything but ESC" up to the ST. Consume the whole body: matching only the
-    # two-byte opener (the generic arm below) would leak the body as text, so a
-    # cat'd DECRQSS/XTGETTCAP/Sixel/APC payload ("\x1bP$qm\x1b\\") would show "$qm".
-    r'|\x1b[PX^_][^\x1b]*(?:\x1b\\)?'
+    # DCS (ESC P), SOS (ESC X), PM (ESC ^), APC (ESC _) and the GNU Screen / tmux
+    # window-title escape ESC k: a string sequence whose BODY runs to an ST (ESC \)
+    # terminator. Unlike OSC, BEL does NOT terminate these -- a BEL byte is part of
+    # the (often binary) body -- so the body is "anything but ESC" up to the ST.
+    # Consume the whole body: matching only the two-byte opener (the generic arm
+    # below) would leak the body as text, so a cat'd DECRQSS/XTGETTCAP/Sixel/APC
+    # payload ("\x1bP$qm\x1b\\") would show "$qm", and ESC k's title body would
+    # render verbatim (an unmarked, unbounded ASCII leak past the OSC-title guard).
+    r'|\x1b[PX^_k][^\x1b]*(?:\x1b\\)?'
     # SS2 / SS3 (ESC N, ESC O): a single shift, which takes the ONE graphic byte
     # after it from an alternate character set. Three bytes, so the generic arm
     # below would consume only two and leave that byte on screen as text.
@@ -195,7 +197,7 @@ SGR_RE = re.compile(r'\x1b\[([0-9;]*)m')
 _TRAILING_ESCAPE = re.compile(
     r'\x1b(?:'
     r'\][^\x07\x1b]*'        # OSC: ESC ] ... still awaiting its BEL or ST
-    r'|[PX^_][^\x1b]*'       # DCS/SOS/PM/APC: ESC P/X/^/_ ... awaiting ST (BEL is body)
+    r'|[PX^_k][^\x1b]*'      # DCS/SOS/PM/APC + ESC k title: awaiting ST (BEL is body)
     r'|\[[ -?]*'             # CSI: ESC [ param/intermediate bytes (any order), no final yet
     r'|[NO]'                 # SS2/SS3: ESC N/O awaiting the ONE byte it shifts.
                              # ANSI_RE consumes that byte, so without this arm a
@@ -282,13 +284,14 @@ def split_trailing_escape(text, cap=4096):
 # leaked as text -- the property this machinery exists to hold), so the discard
 # count is tracked and RETURNED: the caller surfaces a one-time notice when the
 # silent suppression has grown large, rather than lifting it.
-_STRING_INTRO = ']PX^_'                 # 2nd byte of ESC-<x> string introducers
+_STRING_INTRO = ']PX^_k'                # 2nd byte of ESC-<x> string introducers
 _STRING_TERMINATOR = {
     ']': re.compile(r'\x07|\x1b\\'),    # OSC ends on BEL or ST
     'P': re.compile(r'\x1b\\'),         # DCS ends on ST only (BEL is body)
     'X': re.compile(r'\x1b\\'),         # SOS
     '^': re.compile(r'\x1b\\'),         # PM
     '_': re.compile(r'\x1b\\'),         # APC
+    'k': re.compile(r'\x1b\\'),         # ESC k window title: ST only (BEL is body)
 }
 # Where a string-sequence BODY ends while discarding, matching ANSI_RE's body class
 # (OSC: [^\x07\x1b]*, DCS/SOS/PM/APC: [^\x1b]*): the first BEL (OSC only) or ESC. An
@@ -302,6 +305,7 @@ _STRING_DISCARD_END = {
     'X': re.compile(r'\x1b'),
     '^': re.compile(r'\x1b'),
     '_': re.compile(r'\x1b'),
+    'k': re.compile(r'\x1b'),           # ESC k title: any ESC ends the body
 }
 
 # An over-cap INCOMPLETE non-string escape -- a CSI (ESC [ ...) or a generic ESC
@@ -627,7 +631,7 @@ def render_cap_prefix(text, budget):
 # switches to the alternate screen buffer is a full-screen (TUI) app -- htop,
 # vim, less -- which line mode, having no escape parser, cannot draw. Detecting
 # this lets the widget hint that TUI mode is needed, rather than showing garbage.
-_ALT_MODES = frozenset(('47', '1047', '1049'))
+_ALT_MODES = frozenset((47, 1047, 1049))
 # A private-mode CSI: ESC[? <;-separated numbers> h|l. Matched (not exact-substring) so a
 # COMBINED sequence -- ESC[?1047;1049h, or leaving via ESC[?1049;1047l -- is still recognised;
 # the old literal markers required the mode digits to be immediately followed by h/l and so
@@ -638,9 +642,11 @@ _ALT_CSI_RE = re.compile(r'\x1b\[\?([0-9;]+)([hl])')
 def alt_screen_transitions(text):
     """Yield (start, end, 'enter'|'leave') for each private-mode CSI in `text` that sets ('h',
     enter) or resets ('l', leave) an alternate-screen mode (47/1047/1049), combined forms
-    included. Exact token match on the ;-split params, so ESC[?147h (mode 147) is NOT alt."""
+    included. Params are parsed as INTEGERS, so numeric-equivalent forms (ESC[?01049h, a
+    redundant leading zero) are unified with 1049 and cannot bypass detection; ESC[?147h
+    (mode 147) is still NOT alt."""
     for m in _ALT_CSI_RE.finditer(text):
-        if _ALT_MODES & set(m.group(1).split(';')):
+        if _ALT_MODES & {_safe_int(p) for p in m.group(1).split(';') if p}:
             yield (m.start(), m.end(), 'enter' if m.group(2) == 'h' else 'leave')
 
 
@@ -1389,6 +1395,14 @@ def marking_cp_for_cell(data):
     TUI grid runs for every cell every frame, over a small recurring set of cell
     strings. Its result is a source code point, independent of theme/mode/markings,
     so caching cannot leak state across those (they are applied downstream)."""
+    # Cap the scanned run at the SAME bound tui_cell applies: pyte merges every combining
+    # mark into the preceding cell's data, so one growing grid cell can hold thousands of
+    # code points, and the call sites (_grid_cell_format, cells_to_runs) pass raw cell.data
+    # with no length cap. Without this each distinct growing string is a fresh lru_cache key
+    # of unbounded length, doing O(len) work per miss. Lossless for conformant text (UAX #15
+    # stream-safe: <= 30 marks per base).
+    if len(data) > _COMBINING_RUN_MAX + 1:
+        data = data[:_COMBINING_RUN_MAX + 1]
     best_cp = None
     best_rank = -1
     for ch in data:
