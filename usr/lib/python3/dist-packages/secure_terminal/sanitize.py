@@ -327,6 +327,28 @@ _NONSTRING_BODY = {
 _NONSTRING_FINAL = {'[': 0x40, '\x1b': 0x30}   # CSI final 0x40-0x7E; generic 0x30-0x7E
 
 
+def _carry_still_open(carry, text):
+    """True iff `carry` -- a held INCOMPLETE escape beginning with ESC at index 0 --
+    stays incomplete when `text` (only new bytes) is appended: every byte of `text`
+    continues carry's escape BODY, so carry+text is still one trailing escape that
+    _TRAILING_ESCAPE would match from index 0. Lets feed_chunk_carry skip the O(len)
+    re-match of the whole held sequence each chunk (the O(carry)-per-byte ramp a child
+    can drive by byte-pacing a near-cap-but-terminated sequence). Conservative: any byte
+    that could terminate, interrupt, or fall outside the body -> False (use the regex).
+    Covers the realistic ramps (OSC title, DCS/APC, CSI params); rarer types defer to
+    the regex. Body classes mirror the _TRAILING_ESCAPE arms exactly."""
+    if len(carry) < 2 or carry[0] != '\x1b':
+        return False                         # lone ESC / malformed: let the regex classify
+    intro = carry[1]
+    if intro == ']':                         # OSC body: anything but BEL (0x07) or ESC
+        return '\x07' not in text and '\x1b' not in text
+    if intro in _STRING_INTRO:               # DCS/SOS/PM/APC/ESC-k body: anything but ESC
+        return '\x1b' not in text
+    if intro == '[':                         # CSI param/intermediate bytes: 0x20-0x3F
+        return all(0x20 <= ord(c) <= 0x3F for c in text)
+    return False                             # SS2/SS3, charset intermediates, ...: use the regex
+
+
 def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
     """CLI-mode incremental escape handling across read() chunks. Given the new
     `text`, the short `carry` held from the previous chunk (str), `drop` (the
@@ -345,6 +367,20 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
     verify). The caller watches it to surface a one-time notice when an unterminated
     sequence has silently suppressed a lot of output, without lifting the
     suppression."""
+    if not drop and carry and _carry_still_open(carry, text):
+        # FAST PATH: a held escape that only GROWS. The incoming `carry` is an incomplete
+        # escape starting at index 0, and `text` adds only body-continuation bytes, so the
+        # sequence stays incomplete and _TRAILING_ESCAPE would match the WHOLE carry+text
+        # from index 0 (a trailing escape must start at the last ESC; every arm stops at
+        # \x1b, so an earlier ESC cannot reach \Z past this one). Decide by LENGTH, without
+        # the O(len) regex re-scan of the already-validated body -- the branch is identical
+        # to the general path below with g = carry+text and m.start() == 0.
+        g = carry + text
+        if len(g) >= 2 and g[1] in _STRING_INTRO and len(g) > cap:
+            return '', '', g[1], len(g)      # string over cap -> discard state
+        if len(g) <= cap or len(g) == 1:
+            return '', g, '', dropped        # still short -> hold the whole sequence
+        return '', '', ('[' if g[1] == '[' else '\x1b'), len(g)   # non-string over cap
     text = carry + text
     carry = ''
     if drop:
@@ -614,17 +650,54 @@ def render_cap_prefix(text, budget):
         # `budget` source characters either.
         if index >= budget:
             return text[:index]
-        cp = ord(ch)
-        if cp in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= cp <= 0x7E:
-            width = 1                        # printable ASCII + the passthrough controls
-        elif cp == 0x07:
-            width = 0                        # a standalone BEL is dropped, never badged
-        else:
-            width = len(_detail_badge(cp))   # <U+XXXX NAME>, the expanding case
+        width = _detail_render_width(ord(ch))
         if total + width > budget:
             return text[:index]
         total += width
     return text
+
+
+def _detail_render_width(cp):
+    """DETAIL-mode render width of ONE source code point, in output characters:
+    printable ASCII plus the passthrough controls (BS/HT/LF/CR) are 1 column, a
+    standalone BEL is 0 (dropped, never badged), everything else expands to its
+    <U+XXXX NAME> badge. Shared by render_cap_prefix (HEAD budget) and
+    render_bounded_tail (TAIL budget) so the two render-budget scanners cannot drift
+    from each other or from render_output's own detail path."""
+    if cp in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= cp <= 0x7E:
+        return 1
+    if cp == 0x07:
+        return 0
+    return len(_detail_badge(cp))
+
+
+def render_bounded_tail(text, budget):
+    r"""Longest SUFFIX of `text` whose DETAIL render is at most `budget` characters,
+    snapped to an escape boundary (tail_from_escape_boundary). The tail analogue of
+    render_cap_prefix.
+
+    A width-change reflow re-renders the retained output at the new column count. In
+    detail/reveal mode each source char expands 8-99x, so replaying the FULL retained
+    buffer (up to _RAW_MAX source) would feed tens of millions of rendered chars into
+    the document in one blocking GUI-thread call = whole-app freeze on an ordinary
+    resize. Keeping only the render-bounded TAIL bounds that single synchronous render
+    while preserving the MOST RECENT scrollback (what the block-capped document shows);
+    an oldest region whose detail render exceeds `budget` is dropped, deliberately, in
+    exchange for a bounded reflow. Also bounds the SOURCE length by `budget` (a
+    zero-render-width byte advances no budget, so a BEL run would else walk the whole
+    buffer), symmetric with render_cap_prefix."""
+    if budget <= 0:
+        return ''
+    total = 0
+    n = len(text)
+    keep = 0
+    while keep < n and keep < budget:        # keep < budget: source-length bound
+        width = _detail_render_width(ord(text[n - 1 - keep]))
+        if total + width > budget:
+            break
+        total += width
+        keep += 1
+    return tail_from_escape_boundary(text, keep)
 
 
 # The alternate-screen enable sequences (private DEC modes). A program that
@@ -826,6 +899,37 @@ _SGR_ONLY_RE = re.compile(r'\x1b\[([0-9;]*)m')
 # digits) must not allocate an arbitrary blank run -- cap it at a sane maximum
 # line width (matches terminal.py _MAX_LINE).
 _UNBOUNDED_MAX_COL = 8192
+
+# Whole-CALL cap on cumulative BULK cell work (blank-pad + erase) in one feed_line_edits.
+# The per-SEQUENCE cap (_UNBOUNDED_MAX_COL) bounds ONE pad, but a pad-then-erase CYCLE --
+# "\x1b[8192C\r\x1b[0K" (pad the width, then del it) or "\x1b[8192C\x1b[2K" (pad, then
+# re-blank the whole line) -- re-does O(width) work EVERY cycle, so a chunk of them is
+# O(chunk x width) synchronous work on the GUI thread. Once this budget is spent, further
+# C/G pads stop appending blanks (the cursor clamps to the current line length, keeping the
+# trim-to-cursor invariant col <= len(cells)) and further K erases are skipped (leaving the
+# line as-is under-displays, never leaks), so a re-pad flood cannot spin. Sized far above any
+# realistic per-read padding (64 full-width lines, or ~6.5K right-prompts), so honest output
+# is untouched; only a pathological flood is bounded. Per CALL (each PTY read), so the event
+# loop still breathes between reads even under an unbounded hostile stream.
+_LINE_WORK_BUDGET = 64 * _UNBOUNDED_MAX_COL      # 524288 bulk cell-ops per feed_line_edits
+
+
+def _bounded_pad(cells, target, pad_cell, work_left):
+    """Blank-pad `cells` up to column `target` (a CSI C/G forward/absolute jump), but only
+    while the whole-call `work_left` budget lasts. Returns (col, work_left): when the budget
+    runs out mid-pad, `col` is clamped to len(cells) so col <= len(cells) still holds and a
+    pad-then-erase flood cannot re-pad unboundedly. A jump that lands within existing content
+    (target <= len) pads nothing and spends no budget."""
+    need = target - len(cells)
+    if need <= 0:
+        return target, work_left
+    if need > work_left:
+        need = work_left if work_left > 0 else 0
+        target = len(cells) + need               # clamp col to what was actually padded
+    if need:
+        cells.extend([pad_cell] * need)
+    return target, work_left - need
+
 
 # Bracketed-paste enable (DECSET 2004): a shell's line editor emits it right
 # before each prompt (bash readline, zsh zle, fish, ...). We use it as the
@@ -1034,6 +1138,10 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
     # _SGR_ONLY_RE branch below, so build the tuple once and recompute it there --
     # not per printable char (this loop is the per-byte hot path).
     state = tuple(sorted(sgr.items()))
+    # Whole-call bulk-cell-work budget: bounds the pad-then-erase amplification (see
+    # _LINE_WORK_BUDGET). Spent by C/G blank-pads and K erases; once 0, pads clamp and
+    # erases skip, so a re-pad flood cannot spin. A fresh budget per call (per PTY read).
+    work_left = _LINE_WORK_BUDGET
     i, n = 0, len(raw)
     while i < n:
         # Fast path: store a whole run of ordinary characters (see _SAFE_RUN_RE) in one slice
@@ -1085,24 +1193,33 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                     # leaves BLANKS in the gap (a right-prompt jumps here, e.g.
                     # "\x1b[43C[pts/N]"). Pad up to the target column, bounded by
                     # the width, instead of collapsing the gap onto the last cell.
+                    # Bounded by the whole-call work budget (anti-flood, see above).
                     col = col + (num or 1)
                     col = min(col, max_line - 1) if max_line else min(col, _UNBOUNDED_MAX_COL)
-                    while len(cells) < col:
-                        cells.append((' ', state))
+                    col, work_left = _bounded_pad(cells, col, (' ', state), work_left)
                 elif op == 'D':
                     col = max(0, col - (num or 1))
                 elif op == 'G':
                     col = max(0, (num or 1) - 1)          # absolute column (1-based)
                     col = min(col, max_line - 1) if max_line else min(col, _UNBOUNDED_MAX_COL)
-                    while len(cells) < col:
-                        cells.append((' ', state))
+                    col, work_left = _bounded_pad(cells, col, (' ', state), work_left)
                 else:                                   # K: erase in line
+                    # Each erase is O(cells) work; a pad-then-erase flood spins on it, so
+                    # skip the erase once the whole-call budget is spent (leaving stale
+                    # trailing cells under-displays, never leaks -- the same containment
+                    # the trim-to-cursor cases below rely on). col is unchanged by K, so
+                    # skipping preserves col <= len(cells).
                     if num in (None, 0):
-                        del cells[col:]                 # cursor -> end of line
+                        if work_left > 0:
+                            work_left -= max(0, len(cells) - col)
+                            del cells[col:]             # cursor -> end of line
                     elif num == 1:
-                        for j in range(0, min(col + 1, len(cells))):
-                            cells[j] = (' ', state)   # erase uses current SGR
-                    elif num == 2:                      # erase whole line; the
+                        end = min(col + 1, len(cells))
+                        if work_left > 0:
+                            work_left -= end
+                            for j in range(0, end):
+                                cells[j] = (' ', state)   # erase uses current SGR
+                    elif num == 2 and work_left > 0:    # erase whole line; the
                         # cursor does NOT move (like n=0/n=1). This intentionally
                         # trims the line to col blank cells rather than blanking
                         # every cell in place as strict ECMA-48 EL2 would: the cells
@@ -1112,6 +1229,7 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                         # trim-to-cursor invariant col <= len(cells). Preserving
                         # trailing length here would buy no visual/security gain and
                         # would diverge from EL0, so it is deliberately not done.
+                        work_left -= col
                         cells = [(' ', state)] * col
                 # A cursor/erase op clears the pending autowrap (the implicit
                 # col == max_line "phantom" past the last column), so a following
@@ -1905,18 +2023,21 @@ _BOX_VERTICAL = frozenset({
 
 
 def _display_glyph_to_ascii(ch):
-    """The ASCII stand-in for one INERT display glyph Show mode keeps: the
-    neutralization box (U+25A1), the non-ASCII-space marker (SPACE_MARK, U+2423), or
-    a structural box-drawing / block glyph. Any other character is returned unchanged
-    for the caller's non-ASCII strip to handle -- a
-    homoglyph is NOT turned into its ASCII look-alike here (is_structural already
-    excludes the two confusable diagonals U+2571/U+2573)."""
+    """The ASCII stand-in for one INERT STRUCTURAL display glyph Show mode keeps in the
+    program's OWN colour -- a box-drawing (U+2500..257F) or block-element (U+2580..259F)
+    glyph. These are NEVER synthetic markers, so a copied table keeps its lines as ASCII art
+    instead of collapsing to spaces.
+
+    Any other character is returned UNCHANGED for the caller's non-ASCII strip to drop --
+    including the marker code points U+25A1 (BOX) and U+2423 (SPACE_MARK). This function is
+    cp-LESS, so it cannot tell a SYNTHETIC marker from a real U+25A1/U+2423 the program
+    printed; mapping either to '_' here silently corrupted the real glyph into something
+    indistinguishable from a neutralization marker. The synthetic markers are resolved to '_'
+    UPSTREAM by the cp-aware export (_export_selection_fragment / _walk_document_text), so a
+    bare U+25A1/U+2423 reaching here is real content and is stripped like any other non-ASCII
+    glyph. (is_structural already excludes the two confusable diagonals U+2571/U+2573.)"""
     cp = ord(ch)
-    if cp == 0x25A1:                     # BOX: the neutralization placeholder
-        return '_'
-    if cp == 0x2423:                     # SPACE_MARK: neutralized non-ASCII space
-        return '_'                       # never ' ' -- that would restore the deception
-    if not is_structural(cp):            # leave homoglyphs / foreign text to the strip
+    if not is_structural(cp):            # markers resolved upstream; real glyphs -> the strip
         return ch
     if cp >= 0x2580:                     # block elements U+2580..U+259F
         return '#'
@@ -1930,13 +2051,17 @@ def _display_glyph_to_ascii(ch):
 def sanitize_clipboard_display(text):
     """sanitize_clipboard for text lifted from the RENDERED display (a mouse/PRIMARY
     selection, a drag, or the copy review's 'stripped' action). First map the inert
-    display glyphs Show mode keeps -- the neutralization box (U+25A1) and the
-    structural box-drawing / block elements -- to an ASCII stand-in, THEN drop the
-    remaining non-ASCII. Plain sanitize_clipboard drops these glyphs to NOTHING, so a
-    copied box collapses to the surrounding spaces (on screen, gone on the clipboard)
-    -- present-but-lost, the "silently wrong" failure. Security is unchanged: the raw
-    neutralized codepoint is never in the display text (it rides the cell format), so
-    only inert glyphs are rewritten and a homoglyph is still dropped, never emitted."""
+    STRUCTURAL glyphs Show mode keeps -- box-drawing / block elements -- to an ASCII
+    stand-in, THEN drop the remaining non-ASCII. Plain sanitize_clipboard drops those
+    structural glyphs to NOTHING, so a copied table collapses to spaces (on screen,
+    gone on the clipboard) -- present-but-lost, the "silently wrong" failure.
+
+    The SYNTHETIC neutralization markers (BOX U+25A1, SPACE_MARK U+2423) are resolved to
+    '_' UPSTREAM by the cp-aware export, which distinguishes them from a real U+25A1/U+2423
+    the program printed; this cp-LESS function no longer rewrites those two code points, so
+    a real one is stripped like any other non-ASCII glyph instead of being clobbered into a
+    marker-look-alike '_'. Security is unchanged: only structural glyphs are rewritten (never
+    to a homoglyph), and every other non-ASCII code point -- markers included -- is dropped."""
     return sanitize_clipboard(''.join(_display_glyph_to_ascii(ch) for ch in text))
 
 
