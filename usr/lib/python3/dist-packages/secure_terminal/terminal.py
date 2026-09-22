@@ -540,7 +540,7 @@ from secure_terminal.sanitize import (
     SPACE_MARK,
     WS_ANOMALY, whitespace_anomaly_cols,
     render_output, render_cap_prefix,
-    wants_full_screen, leaves_full_screen, alt_screen_transitions,
+    wants_full_screen, leaves_full_screen, alt_screen_transitions, _safe_int,
     wants_screen_repaint, wants_clear, wants_line_clears,
     describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
     PROMPT_START, _printable_follows,
@@ -821,14 +821,17 @@ _ALT_LEAVE_BYTES = (b'\x1b[?1049l', b'\x1b[?1047l', b'\x1b[?47l')
 # alt-screen mode, COMBINED forms included (ESC[?1047;1049h). Exact-substring markers missed
 # those, so _feed_stream never snapshotted the primary screen and full-screen frames polluted
 # scrollback -- the unbounded-growth condition the snapshot machinery exists to prevent.
-_ALT_MODES_BYTES = frozenset((b'47', b'1047', b'1049'))
+_ALT_MODES_BYTES = frozenset((47, 1047, 1049))
 _ALT_CSI_RE_BYTES = re.compile(rb'\x1b\[\?([0-9;]+)([hl])')
 
 
 def _alt_transitions_bytes(data):
-    """Yield (end, 'enter'|'leave') for each alt-screen private-mode CSI in `data`, in order."""
+    """Yield (end, 'enter'|'leave') for each alt-screen private-mode CSI in `data`, in order.
+    Params are parsed as INTEGERS (via _safe_int on the decoded digits, which also caps a
+    hostile digit-run so int() cannot raise), so a numeric-equivalent form -- ESC[?01049h, a
+    redundant leading zero -- is unified with 1049 and cannot bypass the snapshot boundary."""
     for m in _ALT_CSI_RE_BYTES.finditer(data):
-        if _ALT_MODES_BYTES & set(m.group(1).split(b';')):
+        if _ALT_MODES_BYTES & {_safe_int(p.decode('ascii')) for p in m.group(1).split(b';') if p}:
             yield (m.end(), 'enter' if m.group(2) == b'h' else 'leave')
 # longest alt-screen marker, so a tail of (len-1) carried between reads reunites a
 # marker split across an os.read() boundary (F6).
@@ -843,7 +846,15 @@ def _alt_partial_tail(data):
     """Length of the tail of `data` that is a PROPER prefix of an alt-screen marker,
     i.e. it may be the START of a marker split across an os.read() boundary. 0 when
     the tail is not a partial marker (so a COMPLETE marker at the end is not held back
-    -- that would delay its snapshot/restore, which is the whole point of feeding)."""
+    -- that would delay its snapshot/restore, which is the whole point of feeding).
+    Reunites the CANONICAL single-marker forms only. A COMBINED (ESC[?1047;1049h) or a
+    numeric-equivalent (ESC[?01049h) form that is ALSO split at this exact read boundary
+    is not carried, so the snapshot machinery misses it -- a KNOWN, pre-existing residual:
+    _alt_transitions_bytes detects those forms in one read, but this split-read carry (and
+    its str sibling _alt_scan_carry) recognize only the literal single markers. Fail-safe,
+    not a leak: a frame merely goes un-snapshotted (bounded by the scrollback cap and
+    _ALT_TRANSITIONS_MAX). Closing it fully means a bounded partial-private-CSI carry across
+    both the bytes and str paths; deferred as disproportionate for a rendering hint."""
     markers = _ALT_ENTER_BYTES + _ALT_LEAVE_BYTES
     for k in range(min(_ALT_MARKER_MAX_BYTES - 1, len(data)), 0, -1):
         tail = data[-k:]
@@ -4755,7 +4766,7 @@ class SecureTerminal(QPlainTextEdit):
         # encoded with 'replace', so decode-ignore removes ONLY that cut fragment).
         raw = raw.decode('utf-8', 'ignore').encode('utf-8')
         reply = b'\x1b]52;c;' + base64.b64encode(raw) + b'\x07'
-        if self._write(reply) is False:
+        if self._write(reply) < len(reply):
             # A slow/gone child left the ~87 KiB reply truncated -- its buffered prefix
             # then lacks the OSC terminator, so a draining reader's own next output
             # would be swallowed into the unterminated string. Best-effort close it
@@ -5625,28 +5636,33 @@ class SecureTerminal(QPlainTextEdit):
         self._reviewed_context_menu(event.pos()).exec(event.globalPos())
 
     def _write(self, data):
-        """Write ALL of `data` to the pty. The single point where anything reaches
-        the child's input (keystrokes, paste, the one gated clipboard reply), so it
-        is the choke point the reflection-oracle test spies. Retries a partial write
-        / EAGAIN on the non-blocking fd (a large clipboard reply is ~87 KiB, more
-        than one os.write may accept), bounded so a program that never drains its
-        input cannot hang us. Returns True when every byte was written, False when a
-        wedged/gone child left some unwritten -- the OSC-52 reply path uses that to
-        avoid leaving a dangling, unterminated escape."""
+        """Write as much of `data` to the pty as the child accepts and return the
+        number of BYTES actually written (0..len(data)); a full write returns
+        len(data). The single point where anything reaches the child's input
+        (keystrokes, paste, the one gated clipboard reply), so it is the choke point
+        the reflection-oracle test spies. Retries a partial write / EAGAIN on the
+        non-blocking fd (a large clipboard reply is ~87 KiB, more than one os.write
+        may accept), bounded so a program that never drains its input cannot hang us.
+        A SHORT return (< len(data)) means a wedged/gone or slow child left a tail
+        unwritten: the OSC-52 reply path uses it to avoid leaving a dangling escape,
+        and the staged-paste path to RESUME from the offset rather than re-send (and
+        duplicate) the already-delivered prefix."""
         if self._fd is None:
-            return False
-        view = memoryview(data if isinstance(data, (bytes, bytearray)) else bytes(data))
+            return 0
+        raw = data if isinstance(data, (bytes, bytearray)) else bytes(data)
+        total = len(raw)
+        view = memoryview(raw)
         deadline = time.monotonic() + 2.0
         while view:
             try:
                 view = view[os.write(self._fd, view):]
             except BlockingIOError:
                 if time.monotonic() > deadline:
-                    return False
+                    break
                 select.select([], [self._fd], [], 0.05)
             except OSError:
-                return False    # child gone / pty closed -> input is dropped
-        return True
+                break           # child gone / pty closed -> the unwritten tail is dropped
+        return total - len(view)
 
     # -- signalling the foreground program ------------------------------------
     def _foreground_pgrp(self):
@@ -7140,7 +7156,11 @@ class SecureTerminal(QPlainTextEdit):
         # so light the risk lamp -- visible, not silent.
         if warn == 'never' and risky:
             self.unreviewed_risk.emit()
-        self._dispatch_paste(raw, 'unicode' if warn == 'never' else 'stripped')
+        if self._dispatch_paste(raw, 'unicode' if warn == 'never' else 'stripped') is False:
+            # A partial / timed-out write to a wedged or slow child: surface it rather
+            # than silently drop the paste (ctl_send_text reports the same failure).
+            self._advise('The paste was only partially delivered -- the program is not '
+                         'reading its input.')
 
     def dispatch_pending_paste(self, action, text=None):
         """Resolve a held paste review: 'stripped' or 'unicode' sends it (sanitized
@@ -7157,7 +7177,10 @@ class SecureTerminal(QPlainTextEdit):
         self.paste_review_resolved.emit()
         if raw is None or action == 'reject':
             return
-        self._dispatch_paste(raw, action)
+        if self._dispatch_paste(raw, action) is False:
+            # Partial / timed-out write: surface it rather than silently drop the paste.
+            self._advise('The paste was only partially delivered -- the program is not '
+                         'reading its input.')
 
     def review_pending(self):
         """True while a pasted text is held awaiting the user's review choice."""
@@ -7226,7 +7249,7 @@ class SecureTerminal(QPlainTextEdit):
             # prompt (a prior staged line, or the user's own input) -- never do that.
             self._line_buffer = ''
             self._line_dirty = False
-            if not self._write(b'\r'):
+            if self._write(b'\r') < 1:              # _write returns bytes written; 0 == the CR was dropped
                 return ('the line was delivered but its submit newline was not (a '
                         'partial or timed-out write)')
         return None
@@ -7298,12 +7321,13 @@ class SecureTerminal(QPlainTextEdit):
         data = safe.encode('utf-8')
         if bracketed:
             data = b'\x1b[200~' + data + b'\x1b[201~'
-        # Report delivery from the ACTUAL write: True = every byte reached the pty, False =
+        # Report delivery as a tri-state: True = every byte reached the pty, False =
         # a partial / timed-out write to a wedged or slow child (e.g. SIGSTOP-ed). The early
         # returns above yield None: the payload sanitized to empty (nothing to send).
-        # ctl_send_text distinguishes all three -- submit the withheld CR only on True,
-        # report False as a partial-write error, treat None as a benign no-op.
-        return self._write(data)
+        # ctl_send_text and the GUI paste sites distinguish all three -- submit the withheld
+        # CR / stay silent only on True, report False as a partial-write error, treat None as
+        # a benign no-op. (_write returns a byte count; collapse it to this bool contract.)
+        return self._write(data) == len(data)
 
     def _insert_next_staged(self):
         """Insert the next HELD line of a reviewed multi-line paste at the prompt, on
@@ -7339,11 +7363,20 @@ class SecureTerminal(QPlainTextEdit):
             return
         line = self._staged_paste[0]              # peek: consume only once actually delivered
         if line:
-            # the inserted line sits at the shell prompt unmirrored, like any paste
+            # the inserted line sits at the shell prompt unmirrored, like any paste.
+            # A partially-delivered head was re-staged as its UNDELIVERED bytes (below), so
+            # accept either a fresh str line or that bytes remainder.
             self._line_dirty = True
-            if self._write(line.encode('utf-8')) is False:
-                # a partial / timed-out pty write (a wedged or slow child): leave the reviewed
-                # line staged so the next paste gesture retries it, rather than silently drop it
-                # (matches _write's False contract that ctl_send_text also honours).
+            data = line if isinstance(line, (bytes, bytearray)) else line.encode('utf-8')
+            written = self._write(data)
+            if written < len(data):
+                # a partial / timed-out pty write (a wedged or slow child): re-stage only the
+                # UNDELIVERED bytes so the next paste gesture RESUMES from the offset. Re-sending
+                # the whole line would duplicate the delivered prefix into the child; dropping it
+                # would silently lose the reviewed line. Byte-level (not char-level) because a
+                # partial write can cut a multi-byte char -- the child reassembles across writes.
+                self._staged_paste[0] = bytes(data[written:])
+                self._advise('The held line was only partially delivered -- press Paste '
+                             'to resume it.')
                 return
         self._staged_paste.pop(0)                 # delivered (or an empty held line) -> consume
