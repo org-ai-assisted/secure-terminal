@@ -815,18 +815,36 @@ _PTITLE_HOST = re.compile(r'^[^\s@/]+@[^\s:/]+:\s*')       # user@host:  (shell-
 _PTITLE_PATH = re.compile(r'^[~/][^\s(]*\s*')              # leading cwd path token
 
 
+def _one_paren_group(s):
+    """True only when s is a SINGLE parenthesised group -- '(cmd)', not '(a) b (c)'."""
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0 and i != len(s) - 1:
+                return False                  # closed before the end -> not one group
+    return depth == 0
+
+
 def normalize_ptitle(text):
-    """Strip a shell prompt's noise from its OSC title: the trailing [pts/N] tty tag, the
-    leading user@host: prefix, and the leading cwd path -- all redundant with the trusted
-    tab label / prompt -- leaving the genuinely informative residue (grml zsh's running
-    ` (command)`, or an app's own title such as vim's `file (dir) - VIM`). A bare
-    parenthesised command is unwrapped. Empty result == the title carried nothing beyond
-    the prompt. The RAW title is kept elsewhere (tab model + hover), so no information is
-    lost -- this only decides what the narrow band SHOWS."""
+    """Strip a shell prompt's noise from its OSC title -- the trailing [pts/N] tty tag, the
+    leading user@host: prefix, and the cwd path that FOLLOWS that prefix -- leaving the
+    informative residue (grml zsh's running ` (command)`, or an app's own title such as
+    vim's `file (dir) - VIM`). The RAW title is kept elsewhere (tab model + hover), so
+    nothing is lost -- this only decides what the narrow band SHOWS.
+
+    The cwd path is stripped ONLY inside a `user@host:` shell prompt, never from a plain
+    title: a leading `/path` in an app title (`/tmp/foo.py - VIM`) or a command
+    (`/bin/rm ...`) is content, not prompt noise."""
     s = _PTITLE_TTY.sub('', text or '').strip()
-    s = _PTITLE_HOST.sub('', s)
-    s = _PTITLE_PATH.sub('', s).strip()
-    if len(s) >= 2 and s[0] == '(' and s[-1] == ')':
+    host = _PTITLE_HOST.match(s)
+    if host:
+        s = _PTITLE_PATH.sub('', s[host.end():]).strip()
+    # unwrap ONLY a title that is entirely one parenthesised group (grml zsh's ` (cmd)`);
+    # never one that merely starts '(' and ends ')' (e.g. '(gdb) backtrace (full)').
+    if len(s) >= 2 and s[0] == '(' and s[-1] == ')' and _one_paren_group(s):
         s = s[1:-1].strip()
     return s
 
@@ -875,6 +893,11 @@ class SecureTabBar(QTabBar):
         self._pulse = QTimer(self)
         self._pulse.setInterval(self._PULSE_MS)
         self._pulse.timeout.connect(self._tick_pulse)
+        # setCurrentIndex re-lays-out the old + new current tab's close button WITHOUT
+        # firing tabLayoutChange, dropping those two buttons back to the full-height centre
+        # (onto the untrusted band, where a band click then hits the button). Re-place them
+        # on every current-tab change too.
+        self.currentChanged.connect(self._place_close_buttons)
 
     # -- per-tab model (stored in tabData, so it rides a drag-reorder) ---------
     # NB: Qt round-trips tabData through a QVariant, so tabData() returns a COPY --
@@ -943,8 +966,9 @@ class SecureTabBar(QTabBar):
 
     def tab_lines(self, index):
         """Structural view of a tab's content, for tests (no pixels): the trusted
-        line-1 label, the untrusted line-2 title actually shown ('' when hidden or
-        single-line), and whether a bell marker is set."""
+        line-1 label, the RAW untrusted line-2 program title ('' when hidden or
+        single-line -- this is the model value, NOT the normalized string the band paints;
+        normalize_ptitle decides the shown form), and whether a bell marker is set."""
         if not (0 <= index < self.count()):
             return {'label': '', 'ptitle': '', 'bell': False, 'accent': None}
         m = self._model(index)
@@ -968,7 +992,9 @@ class SecureTabBar(QTabBar):
             return ('Trusted label: set by the app (your rename or the cwd), never by the '
                     'running program, so terminal output cannot spoof it.')
         if self._two_line:
-            band = QRect(rect.left(), rect.top() + line1_h + 1,
+            # match the PAINTED band rect exactly (see _paint_content) so the hit area
+            # does not sit one pixel below what the eye sees.
+            band = QRect(rect.left(), rect.top() + line1_h,
                          rect.width(), self._LINE2_H - 1)
             if band.contains(pos):
                 raw = self._model(idx)['ptitle']
@@ -981,8 +1007,12 @@ class SecureTabBar(QTabBar):
                 norm = normalize_ptitle(raw)
                 if norm == raw:
                     return '%s\n\nTitle: %s' % (base, raw)
-                shown = norm if norm else '(blank -- the title was only the shell prompt)'
-                return '%s\n\nShown: %s\nFull: %s' % (base, shown, raw)
+                if not norm:
+                    # explain WHY the band is blank (Option B: an all-prompt-noise title).
+                    return ('%s\n\nBlank here: this title is only the shell prompt '
+                            '(user@host, path, tty) -- nothing beyond the tab name -- so the '
+                            'band is left empty.\n\nFull title: %s' % (base, raw))
+                return '%s\n\nShown: %s\nFull: %s' % (base, norm, raw)
         return None
 
     def _tick_pulse(self):
@@ -1097,31 +1127,29 @@ class SecureTabBar(QTabBar):
                          int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
                          shown)
 
-        # untrusted line-2 quarantine band
+        # untrusted line-2 quarantine band. DISPLAY the normalized residue (raw stays in the
+        # model + hover); empty == the title was pure prompt noise.
         if self._two_line:
             band = QRect(rect.left(), line1.bottom() + 1,
                          rect.width(), self._LINE2_H - 1)
             painter.fillRect(band, QColor(band_bg))
-            # diagonal hatch marks the band as a quarantine zone
-            hatch = QColor(band_line)
-            hatch.setAlphaF(0.30)
-            painter.setPen(QPen(hatch, 1))
-            step = 6
-            for hx in range(band.left() - band.height(), band.right(), step):
-                painter.drawLine(hx, band.bottom(), hx + band.height(), band.top())
-            # divider between the trusted line and the quarantine band
+            # divider between the trusted line and the quarantine band -- full width so it
+            # meets the vertical tab divider at the corner. Always drawn, so the two-line
+            # structure stays put even when this tab has nothing to show.
             painter.setPen(QPen(QColor(band_line), 1, Qt.PenStyle.DashLine))
-            painter.drawLine(band.left() + 2, band.top(), band.right() - 2, band.top())
-            # vertical separator at the tab's right edge: each tab's band reads as ITS OWN
-            # line 2, not one strip spanning every tab (the "applies to all tabs" report).
-            painter.setPen(QPen(QColor(band_line), 1))
-            painter.drawLine(band.right() - 1, band.top() + 2,
-                             band.right() - 1, band.bottom() - 1)
-            # DISPLAY the normalized residue (raw stays in the model + hover). Empty ==
-            # the title was pure prompt noise -> leave the band empty rather than echo the
-            # cwd the tab label already shows.
+            painter.drawLine(band.left(), band.top(), band.right(), band.top())
             ptitle = normalize_ptitle(m['ptitle'])
             if ptitle:
+                # quarantine markings (hatch + caution glyph) mark UNTRUSTED CONTENT, so
+                # they belong only on a tab that actually shows a program title -- an empty
+                # band (a bare prompt) recedes to a plain tinted strip instead of drawing
+                # the eye with a caution glyph over nothing.
+                hatch = QColor(band_line)
+                hatch.setAlphaF(0.30)
+                painter.setPen(QPen(hatch, 1))
+                step = 6
+                for hx in range(band.left() - band.height(), band.right(), step):
+                    painter.drawLine(hx, band.bottom(), hx + band.height(), band.top())
                 bx = band.left() + 2 + self._ACCENT_W + self._PAD
                 by = band.top() + (band.height() - self._GLYPH) // 2
                 self._draw_caution(painter, QRect(bx, by, self._GLYPH - 2,
@@ -1143,6 +1171,12 @@ class SecureTabBar(QTabBar):
                 painter.drawText(QRect(tx, band.top(), avail2, band.height()),
                                  int(Qt.AlignmentFlag.AlignVCenter
                                      | Qt.AlignmentFlag.AlignLeft), shown2)
+        # ONE vertical divider down the tab's right edge, spanning BOTH lines, so the line-1
+        # and line-2 borders are a single aligned line (not Qt's tab-shape edge on line 1
+        # plus a separate band separator on line 2 at a slightly different x). Also gives
+        # each tab's band its own boundary, so line 2 does not read as one strip.
+        painter.setPen(QPen(QColor(band_line), 1))
+        painter.drawLine(rect.right(), rect.top() + 3, rect.right(), rect.bottom() - 1)
         painter.restore()
 
     # -- trusted glyphs (drawn, ASCII source, unspoofable by program text) -----
@@ -2301,7 +2335,11 @@ class MainWindow(QMainWindow):
             # whole frame rather than open a flood.
             return {'ok': False,
                     'error': 'too many tabs requested (max %d)' % _MAX_OPEN_TABS}
-        if_absent = bool(request.get('if_absent'))
+        # Strict type check, matching the other IPC fields (submit, lines): a bool-as-int
+        # or a "false" STRING must be rejected, not truthy-coerced into the wrong dedup mode.
+        if_absent = request.get('if_absent', False)
+        if not isinstance(if_absent, bool):
+            return {'ok': False, 'error': 'if_absent must be a boolean'}
         present = self._live_commands() if if_absent else set()
         opened = skipped = 0
         for spec in (tabs if isinstance(tabs, list) else []):
@@ -4395,8 +4433,11 @@ class MainWindow(QMainWindow):
         path = session.tab_file(stem, self._tab_ids[term])
         try:
             session.ensure_state_dir()
-            # 0600 + O_NOFOLLOW, exactly as the matching Open action writes it: owner-only,
-            # and a planted symlink at the target fails the open rather than redirecting.
+            # 0600 (on CREATE) + O_NOFOLLOW, exactly as the matching Open action writes it;
+            # a planted symlink at the target fails the open rather than redirecting. The
+            # owner-only guarantee comes from ensure_state_dir's 0700 dir (+ the AppArmor
+            # confinement on these writes), not the per-file mode -- 0600 does not re-tighten
+            # a pre-existing looser file, but no other user can reach one inside the 0700 dir.
             fd = os.open(path,
                          os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
@@ -7250,10 +7291,17 @@ def _ctl_main(argv):
             # mode is reused, leaking the dump). An unguessable O_EXCL name defeats
             # both; a reader also never sees a half-written file.
             directory = os.path.dirname(args.file) or '.'
-            fd, tmp = tempfile.mkstemp(dir=directory, prefix='.st-dump-', suffix='.tmp')
-            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                handle.write(text)
-            os.replace(tmp, args.file)          # atomic; replaces a symlink, not its target
+            try:
+                fd, tmp = tempfile.mkstemp(dir=directory, prefix='.st-dump-', suffix='.tmp')
+                with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                    handle.write(text)
+                os.replace(tmp, args.file)      # atomic; replaces a symlink, not its target
+            except OSError as exc:
+                # A bad/unwritable --file dir must fail like the rest of ctl (stderr +
+                # exit 1), not dump a traceback.
+                sys.stderr.write('secure-terminal ctl: cannot write %r: %s\n'
+                                 % (args.file, exc))
+                return 1
         else:
             sys.stdout.write(text)
     elif args.cmd == 'zoom':

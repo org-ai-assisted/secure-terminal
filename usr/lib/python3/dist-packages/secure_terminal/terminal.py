@@ -277,14 +277,15 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             super().draw(ch)
 
     def _mark_own_cell(self, ch):
-        """Mark a zero-width character in the cell AT the cursor. Reached only at
-        the screen origin, where there is no preceding cell to merge into. If the
-        cell already holds a character (the cursor was repositioned back onto an
-        already-drawn cell), APPEND the invisible to that cell's data so the base
-        character is preserved and merely marked -- NEVER overwritten: only-mark-
-        never-destroy holds even here. An empty cell is occupied outright and the
-        cursor steps past it. tui_cell renders any non-purely-printable cell as the
-        placeholder, so the character is marked rather than silently dropped."""
+        """Mark a zero-width character in the cell AT the cursor. Reached whenever the
+        PRECEDING cell has no glyph to merge into -- the true screen origin (0,0), but also
+        any never-written cell (rows are sparse, so `.get()` returns None at a mid-row gap
+        after a CUP). If the cell already holds a character (the cursor was repositioned
+        back onto an already-drawn cell), APPEND the invisible to that cell's data so the
+        base character is preserved and merely marked -- NEVER overwritten: only-mark-never-
+        destroy holds even here. An empty cell is occupied outright. tui_cell renders any
+        non-purely-printable cell as the placeholder, so the character is marked rather than
+        silently dropped."""
         row = self.buffer[self.cursor.y]
         existing = row.get(self.cursor.x)
         if existing is not None:
@@ -294,7 +295,12 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             return                       # merged (or at the cap): the cell is not re-occupied
         row[self.cursor.x] = self.cursor.attrs._replace(data=ch)
         self.dirty.add(self.cursor.y)
-        self.cursor.x = min(self.cursor.x + 1, self.columns)
+        # A zero-width character never advances the cursor. Step past ONLY at the true
+        # origin (0,0), where the lone mark is shown as a placeholder occupying that cell
+        # -- at a MID-ROW gap, advancing shifted every later glyph one column right of a
+        # real terminal (the reported off-by-one), so mark in place and leave the cursor.
+        if self.cursor.x == 0 and self.cursor.y == 0:
+            self.cursor.x = min(self.cursor.x + 1, self.columns)
 
     def _merge_invisible(self, target, ch):
         """Append a zero-width character to `target`'s data so the cell is marked.
@@ -877,8 +883,13 @@ def _alt_partial_tail(data):
     not a leak: a frame merely goes un-snapshotted (bounded by the scrollback cap and
     _ALT_TRANSITIONS_MAX). Closing it fully means a bounded partial-private-CSI carry across
     both the bytes and str paths; deferred as disproportionate for a rendering hint."""
-    markers = _ALT_ENTER_BYTES + _ALT_LEAVE_BYTES
-    for k in range(min(_ALT_MARKER_MAX_BYTES - 1, len(data)), 0, -1):
+    # Also carry a split PROMPT_START (\x1b[?2004h): the TUI feed path holds this tail
+    # back so _feed_prompt_aware sees the WHOLE marker next read and injects its leftover-
+    # SGR reset -- else a boundary split lets a finished program's colour bleed into the
+    # prompt (the CLI path is already covered by feed_chunk_carry).
+    markers = _ALT_ENTER_BYTES + _ALT_LEAVE_BYTES + (_PROMPT_START_BYTES,)
+    maxlen = max(_ALT_MARKER_MAX_BYTES, len(_PROMPT_START_BYTES))
+    for k in range(min(maxlen - 1, len(data)), 0, -1):
         tail = data[-k:]
         if any(len(tail) < len(m) and m.startswith(tail) for m in markers):
             return k
@@ -1837,8 +1848,14 @@ class SecureTerminal(QPlainTextEdit):
         self._line_fmt_cache = {}     # and the line-mode SGR format cache
         self._grid_mark_cache = {}    # and the grid risk-class marking formats
         self._row_sig_cache = {}      # so cached grid rows re-render in the new theme
-        if self._grid_mode():         # repaint the grid ONLY while it owns the
-            self._render_timer.start(16)   # screen; line-TUI keeps its scrollback
+        if self._grid_mode():
+            # Repaint the grid (it owns the screen). Rebuild the WHOLE view, not just the
+            # live tail: rows already promoted into permanent scrollback keep the format
+            # baked in at promotion time and a cache clear does not touch them, so a bare
+            # _render_tui() would leave scrollback in the OLD theme. Mirror the markings
+            # path (_rerender's grid branch).
+            self._reset_grid_view()
+            self._render_tui()
         elif changed and getattr(self, '_paint_timer', None) is not None:
             # CLI (line) view: existing markings hold the OLD theme's colours in
             # their stored QTextCharFormats -- clearing the caches does not touch a
@@ -2009,6 +2026,13 @@ class SecureTerminal(QPlainTextEdit):
         self._paint_pending_wraps = []
         self._paint_dirty = False
         if self._grid_mode():
+            # A theme / markings / colour toggle changes how EVERY cell formats, but a bare
+            # _render_tui() reconciles only the LIVE grid -- rows already promoted into
+            # permanent scrollback keep the format baked in at promotion time and never
+            # repaint (the CLI branch below rebuilds from _raw for exactly this reason).
+            # Reset the grid view so the whole retained grid + history is rebuilt under the
+            # new format, bounded by pyte's own history cap (as apply_scrollback is).
+            self._reset_grid_view()
             self._render_tui()
             return
         self.clear()
@@ -3077,6 +3101,13 @@ class SecureTerminal(QPlainTextEdit):
         point so hover/click can name it. Strict modes keep risk-colouring it."""
         cp = marking_cp_for_cell(cell.data)
         if cp is None or not (disp == BOX or self._mode == 'show'):
+            if not self._effective_colors():
+                # colors=false hardening: strip the program's ANSI colour (fg/bg/reverse)
+                # from a plain grid cell -- the same monochrome treatment the CLI path
+                # (cells_to_runs, colors=False) applies -- so a TUI program cannot deceive
+                # with colour. Keeps bold/underscore (shape). _rerender clears the caches.
+                return self._pyte_format(cell._replace(fg='default', bg='default',
+                                                       reverse=False))
             return self._pyte_format(cell)
         # box-drawing / block elements shown as their real glyph in SHOW mode are
         # purely structural, not a deception: they wear the program's OWN SGR like a
@@ -4591,8 +4622,19 @@ class SecureTerminal(QPlainTextEdit):
         # _alt_enter): the whole enter/draw/leave can arrive in one read before the render
         # timer fires, so a bare walk would snapshot a stale (or empty) frame, not the
         # program's actual last screen.
+        # Force the ALT render branch (mirror of _alt_enter forcing the primary branch):
+        # _read_and_render already flipped _alt_screen OFF for this leaving read, so an
+        # unguarded render here would take the primary branch on the still-alt screen and
+        # PROMOTE the alt program's history.top as scrollback -- inflating the snapshot with
+        # the whole pre-program shell scrollback (a Save-Transcript that lies about what was
+        # shown). The alt branch renders only the final grid frame.
         if self._grid_mode():
-            self._render_tui()
+            _was_alt = self._alt_screen
+            self._alt_screen = True
+            try:
+                self._render_tui()
+            finally:
+                self._alt_screen = _was_alt
         self._append_exit_snapshot(self._walk_document_text())
         self._screen.buffer, self._screen.history, self._screen.cursor = \
             self._alt_saved
@@ -4798,7 +4840,22 @@ class SecureTerminal(QPlainTextEdit):
                 self._reply_clipboard()             # global always-allow, no prompt
             else:
                 self._clipboard_read = 'pending'    # ask once; ignore repeats
-                self.clipboard_read_requested.emit()
+                # The connected slot opens a MODAL consent dialog (a nested Qt event loop).
+                # Disable this tab's pty notifier across the emit so a child write DURING the
+                # dialog cannot re-enter _on_readable and append to _raw out of order --
+                # which would scramble Save Transcript and the CLI<->TUI reseed. The kernel
+                # pty buffer preserves the bytes; they are read in order once re-enabled.
+                _notifier = self._notifier
+                if _notifier is not None:
+                    _notifier.setEnabled(False)
+                try:
+                    self.clipboard_read_requested.emit()
+                finally:
+                    # Skip re-enable if the tab was torn down during the modal (shutdown
+                    # nulls _fd and frees the notifier -- re-enabling it would fault).
+                    if (_notifier is not None and self._fd is not None
+                            and self._notifier is _notifier):
+                        _notifier.setEnabled(True)
         # 'pending' (dialog open) -> no reply
 
     # the clipboard-read decisions the dialog can return
@@ -6169,6 +6226,10 @@ class SecureTerminal(QPlainTextEdit):
         ctrl = mods & Qt.KeyboardModifier.ControlModifier
         shift = mods & Qt.KeyboardModifier.ShiftModifier
         alt = mods & Qt.KeyboardModifier.AltModifier
+        # metaSendsEscape (xterm default, matching _tui_key): a plain Alt+key sends an ESC
+        # prefix so readline Meta bindings (M-b/f/d, M-DEL) work at a shell prompt in line
+        # mode too. Ctrl+Alt keeps its own meta handling in the Ctrl block below.
+        alt_esc = b'\x1b' if (alt and not ctrl) else b''
 
         # Tab navigation is a window action and must work in both modes (even
         # while a full-screen program owns the keyboard): Ctrl+PageUp/Down switch
@@ -6286,18 +6347,21 @@ class SecureTerminal(QPlainTextEdit):
             # line reviewed for this shell cannot ride the Enter that launched a program.
             self._line_buffer = ''
             self._line_dirty = False
-            self._write(b'\r')
+            self._write(alt_esc + b'\r')
             return
         if key == Qt.Key.Key_Backspace and not (ctrl and shift):
-            self._line_buffer = self._line_buffer[:-1]
-            self._write(b'\x7f')
+            if alt_esc:
+                self._line_dirty = True             # M-DEL kills a WORD, not one char
+            else:
+                self._line_buffer = self._line_buffer[:-1]
+            self._write(alt_esc + b'\x7f')
             return
         if key == Qt.Key.Key_Tab and not (ctrl and shift):
             # Tab completion rewrites the shell's line (path/command completion)
             # without updating _line_buffer, so mark the mirror unreliable for
             # _line_pending().
             self._line_dirty = True
-            self._write(b'\t')
+            self._write(alt_esc + b'\t')
             return
 
         # Line editing and history: forward the cursor/history/delete keys to the
@@ -6336,8 +6400,14 @@ class SecureTerminal(QPlainTextEdit):
         # reachable from a keyboard anyway. How it then DISPLAYS is still the
         # display mode's call (box shows a placeholder, show shows the glyph).
         if text and all(ch.isprintable() for ch in text):
-            self._line_buffer += text
-            self._write(text.encode('utf-8'))
+            if alt_esc:
+                # a Meta binding (M-b/f/d ...) edits the line in the shell's editor -- it is
+                # NOT literal input, so do not mirror it, and mark the buffer unreliable.
+                self._line_dirty = True
+                self._write(alt_esc + text.encode('utf-8'))
+            else:
+                self._line_buffer += text
+                self._write(text.encode('utf-8'))
         # non-printable input and arrow/navigation keys are intentionally ignored
 
     def _scroll_key(self, key, shift):
