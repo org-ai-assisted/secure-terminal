@@ -903,7 +903,8 @@ class SecureTabBar(QTabBar):
     # NB: Qt round-trips tabData through a QVariant, so tabData() returns a COPY --
     # a returned dict cannot be mutated in place. Every setter reads a copy, updates
     # it, and writes it back with setTabData (which Qt migrates with the tab on move).
-    _DEFAULT_MODEL = {'accent': None, 'ptitle': '', 'bell': False, 'pulse': 0}
+    _DEFAULT_MODEL = {'accent': None, 'ptitle': '', 'bell': False, 'pulse': 0,
+                      'activity': False}
 
     def _model(self, index):
         m = self.tabData(index)
@@ -964,17 +965,44 @@ class SecureTabBar(QTabBar):
     def has_bell(self, index):
         return bool(0 <= index < self.count() and self._model(index)['bell'])
 
+    def mark_activity(self, index):
+        """Mark a BACKGROUND tab that produced output since it was last viewed: a calm
+        STATIC glyph (no pulse -- distinct from the bell's attention pulse), cleared when
+        the tab is focused. Idempotent: fired per output chunk, so once set it repaints
+        nothing (a busy background tab must not drive a repaint per read)."""
+        if not (0 <= index < self.count()):
+            return
+        m = self._model(index)
+        if m['activity']:
+            return
+        m['activity'] = True
+        self.setTabData(index, m)
+        self.update()
+
+    def clear_activity(self, index):
+        if 0 <= index < self.count():
+            m = self._model(index)
+            if not m['activity']:
+                return
+            m['activity'] = False
+            self.setTabData(index, m)
+            self.update()
+
+    def has_activity(self, index):
+        return bool(0 <= index < self.count() and self._model(index)['activity'])
+
     def tab_lines(self, index):
         """Structural view of a tab's content, for tests (no pixels): the trusted
         line-1 label, the RAW untrusted line-2 program title ('' when hidden or
         single-line -- this is the model value, NOT the normalized string the band paints;
         normalize_ptitle decides the shown form), and whether a bell marker is set."""
         if not (0 <= index < self.count()):
-            return {'label': '', 'ptitle': '', 'bell': False, 'accent': None}
+            return {'label': '', 'ptitle': '', 'bell': False, 'accent': None,
+                    'activity': False}
         m = self._model(index)
         return {'label': self.tabText(index),
                 'ptitle': m['ptitle'] if self._two_line else '',
-                'bell': m['bell'], 'accent': m['accent']}
+                'bell': m['bell'], 'accent': m['accent'], 'activity': m['activity']}
 
     def element_tooltip(self, pos):
         """Tooltip for the specific tab element under `pos` (bar-local): the trust lock or
@@ -1114,6 +1142,13 @@ class SecureTabBar(QTabBar):
             self._draw_bell(painter, QRect(bx, gy, self._GLYPH, self._GLYPH),
                             QColor(bell_c))
             right = bx - 4
+        # activity marker: a calm static dot, LEFT of the bell (if any). Muted, so an
+        # unfocused tab that merely produced output reads quieter than one that rang.
+        if m['activity']:
+            ax = right - self._GLYPH
+            self._draw_activity(painter, QRect(ax, gy, self._GLYPH, self._GLYPH),
+                                QColor(muted))
+            right = ax - 4
 
         # trusted line-1 text: "N label" (semibold, full contrast)
         f1 = QFont(self.font())
@@ -1208,6 +1243,20 @@ class SecureTabBar(QTabBar):
         painter.drawPath(path)
         painter.drawEllipse(QRectF(box.left() + w * 0.40, box.top() + h * 0.70,
                                    w * 0.20, h * 0.18))
+        painter.restore()
+
+    @staticmethod
+    def _draw_activity(painter, box, color):
+        """A small filled dot: this tab produced output while unfocused. Distinct in
+        SHAPE from the bell (a filled disc, not a bell), so the two states read apart
+        without relying on colour (accessible / colour-blind safe)."""
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(color))
+        w, h = box.width(), box.height()
+        d = min(w, h) * 0.42
+        painter.drawEllipse(QRectF(box.left() + (w - d) / 2.0,
+                                   box.top() + (h - d) / 2.0, d, d))
         painter.restore()
 
     @staticmethod
@@ -3366,10 +3415,12 @@ class MainWindow(QMainWindow):
 
     def _sync_chrome_to_tab(self, *_args):
         self._update_render_active()        # foreground tab renders fast, others slow
-        # focusing a tab clears its pending bell marker (you are now looking at it)
+        # focusing a tab clears its pending bell + activity markers (you are now looking
+        # at it, so its unseen-output / bell state is now seen)
         idx = self.tabs.currentIndex()
         if idx >= 0:
             self.tabs.tabBar().clear_bell(idx)
+            self.tabs.tabBar().clear_activity(idx)
         term = self.current()
         if not isinstance(term, SecureTerminal):
             return                          # a restore placeholder is transiently current
@@ -4052,6 +4103,17 @@ class MainWindow(QMainWindow):
     def _connect_bell_tray(self, term):
         term.bell_tray.connect(lambda label: self._on_bell_tray(term, label))
         term.bell_tab.connect(lambda: self._on_bell_tab(term))
+        term.activity.connect(lambda: self._on_activity(term))
+
+    def _on_activity(self, term):
+        """Output arrived on a tab. Mark it ONLY while it is a BACKGROUND tab -- the
+        focused tab needs no 'unseen output' marker. Fires per output chunk, so
+        mark_activity is idempotent (no repaint once set)."""
+        if term is self.current():
+            return
+        index = self.tabs.indexOf(term)
+        if index >= 0:
+            self.tabs.tabBar().mark_activity(index)
 
     def _on_bell_tab(self, term):
         """A bell rang with the 'tab' channel on: mark the tab (a trusted glyph +

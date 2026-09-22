@@ -1258,6 +1258,10 @@ class SecureTerminal(QPlainTextEdit):
     # trusted glyph on the tab bar, cleared when the tab is focused). Carries no
     # program text -- the marker is our own chrome, not a reflected title.
     bell_tab = pyqtSignal()
+    # output arrived on this tab; the window marks it (a calm static glyph) while it is
+    # a BACKGROUND tab, so "which tab produced output while I was elsewhere" is visible;
+    # cleared when the tab is focused. Fires per output chunk (the mark is idempotent).
+    activity = pyqtSignal()
     # a program in this tab asked to READ the clipboard (OSC 52 query) and the tab
     # has not yet decided; the window asks the user ONCE PER TAB (see osc_clipboard_read).
     clipboard_read_requested = pyqtSignal()
@@ -4199,6 +4203,10 @@ class SecureTerminal(QPlainTextEdit):
                 self._notifier.setEnabled(False)
             self.shell_exited.emit()
             return
+        # Real output arrived (the child exited above on empty). Signal it so the window
+        # can mark a BACKGROUND tab as having unseen output. Idempotent downstream, so
+        # firing per chunk is fine.
+        self.activity.emit()
         # output arriving is how a returning prompt looks from here, so it is the
         # cue to retry a re-export deferred by a pending line. No-ops (one flag
         # test) unless a mode switch is actually waiting.
