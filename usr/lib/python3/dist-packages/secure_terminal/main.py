@@ -4433,8 +4433,11 @@ class MainWindow(QMainWindow):
         path = session.tab_file(stem, self._tab_ids[term])
         try:
             session.ensure_state_dir()
-            # 0600 + O_NOFOLLOW, exactly as the matching Open action writes it: owner-only,
-            # and a planted symlink at the target fails the open rather than redirecting.
+            # 0600 (on CREATE) + O_NOFOLLOW, exactly as the matching Open action writes it;
+            # a planted symlink at the target fails the open rather than redirecting. The
+            # owner-only guarantee comes from ensure_state_dir's 0700 dir (+ the AppArmor
+            # confinement on these writes), not the per-file mode -- 0600 does not re-tighten
+            # a pre-existing looser file, but no other user can reach one inside the 0700 dir.
             fd = os.open(path,
                          os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
