@@ -348,7 +348,14 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         row = self.buffer.get(self.cursor.y)
         if row is not None and getattr(row, 'no_newline', False):
             row.no_newline = False
-        super().erase_in_line(how, *args, **kwargs)
+        # Forward ONLY `how`, like the sibling erase_in_display: stock pyte's
+        # erase_in_line(self, how=0, private=False) has just two slots, so
+        # forwarding the captured *args (a multi-param CSI, ESC[1;2;3K -> how=1,
+        # args=(2,3)) would TypeError out of feed() and drop the rest of the PTY
+        # chunk. A real terminal ignores the extra EL params; DECSEL (ESC[?K,
+        # private selective erase) collapses to a plain erase here, the same safe
+        # choice erase_in_display documents for DECSED.
+        super().erase_in_line(how)
 
     def erase_in_display(self, how=0, *args, private=False, **kwargs):
         # Ignore an out-of-spec selector, same as erase_in_line: stock
@@ -430,39 +437,54 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
 
 def _make_private_tolerant(base):
     """A private-CSI-tolerant wrapper: run pyte's base handler with its positional params,
-    drop the meaningless private= marker (and any stray kwargs), AND truncate excess params to
-    the handler's arity. A CSI carrying more numeric params than the handler accepts (a
-    non-private ESC[1;2A -> cursor_up, which takes one; ESC[1;2;3H -> cursor_position, two;
-    ESC[1;2@; ESC[1;2;3r) would else raise TypeError out of feed() and drop the rest of the PTY
-    chunk -- the same 'malformed CSI must not drop the chunk' failure the shim exists to close.
-    A real terminal ignores the extra params, so keep the leading ones the handler accepts."""
+    truncate excess params to the handler's arity, and forward the private= marker only to a
+    handler that actually accepts it (else drop it). A CSI carrying more numeric params than the
+    handler accepts (a non-private ESC[1;2A -> cursor_up, which takes one; ESC[1;2;3H ->
+    cursor_position, two; ESC[1;2@; ESC[1;2;3r; ESC[1;2c -> report_device_attributes, one) would
+    else raise TypeError out of feed() and drop the rest of the PTY chunk -- the same 'malformed
+    CSI must not drop the chunk' failure the shim exists to close. A real terminal ignores the
+    extra params, so keep the leading ones the handler accepts.
+
+    private= is meaningless to a plain movement/erase handler (cursor_up etc.) and forwarding it
+    would itself TypeError, so it is dropped there. A handler that DOES take private (an explicit
+    private= param, or a **kwargs catch-all like report_device_attributes) keeps it: a private DA
+    (ESC[?c) must still do nothing, not fall through to the primary-DA reply."""
     sig = inspect.signature(base)
-    if any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values()):
+    params_sig = sig.parameters
+    accepts_private = ('private' in params_sig
+                       or any(p.kind == p.VAR_KEYWORD for p in params_sig.values()))
+    if any(p.kind == p.VAR_POSITIONAL for p in params_sig.values()):
         maxpos = None                          # *args handler -> no cap
     else:
-        pos = [p for p in sig.parameters.values()
+        pos = [p for p in params_sig.values()
                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
         maxpos = max(0, len(pos) - 1)          # minus `self`
 
     def _wrapped(self, *params, private=False, **_ignored):
         if maxpos is not None and len(params) > maxpos:
             params = params[:maxpos]
+        if accepts_private:
+            return base(self, *params, private=private)
         return base(self, *params)
     return _wrapped
 
 
 def _install_private_tolerant_csi(cls):
-    # Wrap every pyte CSI handler that would TypeError on a private ("?"-prefixed)
-    # dispatch. Skip the ones pyte already made private-aware (set_mode/reset_mode via
-    # **kwargs, erase_in_line) and the ones this class overrides itself (which absorb
-    # private= on their own). Driven by pyte's OWN csi table + live signatures, so a
-    # future pyte that adds private= to a handler is skipped automatically.
+    # Wrap every pyte CSI handler that could TypeError on a private ("?"-prefixed) dispatch OR on
+    # a multi-parameter CSI (positional overflow). Skip ONLY the handlers that cannot suffer
+    # positional overflow -- those with *args/*modes (VAR_POSITIONAL: set_mode/reset_mode/
+    # select_graphic_rendition absorb any param count and keep their own private handling) -- and
+    # the ones this class overrides itself (erase_in_line/erase_in_display, which absorb private=
+    # on their own). A **kwargs catch-all is NOT enough to skip: it absorbs excess KEYWORD args
+    # but never excess POSITIONAL, so report_device_attributes(self, mode=0, **kwargs) still
+    # overflows on ESC[1;2c -- the wrapper truncates the extra positionals and forwards private=
+    # so the private-DA semantics survive. Driven by pyte's OWN csi table + live signatures.
     for name in set(pyte.Stream.csi.values()):
         if name in cls.__dict__:
             continue
         base = getattr(pyte.HistoryScreen, name)
         params = inspect.signature(base).parameters
-        if 'private' in params or any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        if any(p.kind == p.VAR_POSITIONAL for p in params.values()):
             continue
         setattr(cls, name, _make_private_tolerant(base))
 
@@ -539,7 +561,7 @@ from secure_terminal.sanitize import (
     MARK_KEY, WRAP_NL, _NO_NEWLINE_KEY, BOX,
     SPACE_MARK,
     WS_ANOMALY, whitespace_anomaly_cols,
-    render_output, render_cap_prefix,
+    render_output, render_cap_prefix, render_bounded_tail,
     wants_full_screen, leaves_full_screen, alt_screen_transitions, _safe_int,
     wants_screen_repaint, wants_clear, wants_line_clears,
     describe_codepoint, marking_class, marking_cp_for_cell, is_structural,
@@ -1291,6 +1313,11 @@ class SecureTerminal(QPlainTextEdit):
         # at a time; while active, terminal input is suspended.
         self._pending_paste = None
         self._pending_copy = None
+        # The ASCII 'stripped'-action form of the held copy, captured cp-aware at review
+        # time alongside _pending_copy (the unicode/preview form): the two differ only in
+        # Show mode, where a synthetic BOX collapses to '_' for the strip but stays its
+        # glyph for the unicode opt-in (see _export_selection_fragment).
+        self._pending_copy_strip = None
         self._review_active = False
         self.setUndoRedoEnabled(False)
         # Line-wrap is per display mode (_sync_wrap_mode, set once _mode/_tui are
@@ -1361,6 +1388,15 @@ class SecureTerminal(QPlainTextEdit):
         # each byte to an 8-char <U+XXXX>) froze the UI on a flood. This tail is
         # far more than a screenful, so what you can see is always re-rendered.
         self._RERENDER_TAIL = 131072
+        # A width-change reflow (full=True) replays the WHOLE retained _raw at the new
+        # column count. In an expanding mode (detail/reveal, 8-99x per char) the full
+        # 1M-source _raw could render to tens of millions of chars in one blocking
+        # GUI-thread call -- a whole-app freeze on an ordinary resize (maximize, panel
+        # toggle, monitor change). Bound that single synchronous render by RENDER length
+        # (render_bounded_tail), keeping the most recent scrollback. A one-shot debounced
+        # resize can afford ~4M rendered chars; far below the ~99M unbounded worst case,
+        # and >= a realistic detail scrollback (1M ASCII source == 1M render, fully kept).
+        self._REFLOW_RENDER_MAX = 4_000_000
 
         # optional ANSI colours (off by default); SGR parser state. Also set from
         # the ctor before the history render, for the same render-once reason.
@@ -1991,12 +2027,20 @@ class SecureTerminal(QPlainTextEdit):
             # would freeze the UI. A PREVIEW's _raw is already render-capped by
             # render_cap_prefix (bounded, kept from the HEAD), so it replays in FULL:
             # the tail limit would show the END, hiding the line 1 the review keeps.
-            # A width REFLOW (full=True) also replays in full: a debounced one-shot
-            # resize can afford it, and the tail sub-cap would silently DELETE older
-            # scrollback on every resize (the retained _raw is already bounded at
-            # _RAW_MAX, and the document caps at _scrollback blocks regardless).
-            _src = (self._raw if (self._preview or full)
-                    else tail_from_escape_boundary(self._raw, self._RERENDER_TAIL))
+            # A width REFLOW (full=True) replays in full in a NON-expanding mode (Box/
+            # Show/CLI, 1x: 1M source ~= 1M render, affordable) so no older scrollback is
+            # dropped on resize. In an EXPANDING mode (detail/reveal, 8-99x per char) the
+            # full replay would render up to ~99M chars in one blocking GUI-thread call, so
+            # bound it by RENDER length (render_bounded_tail keeps the most recent
+            # scrollback -- what the _scrollback-block-capped document shows anyway).
+            if self._preview:
+                _src = self._raw                  # already render-capped from the HEAD
+            elif full and self._mode in ('detail', 'reveal'):
+                _src = render_bounded_tail(self._raw, self._REFLOW_RENDER_MAX)
+            elif full:
+                _src = self._raw
+            else:
+                _src = tail_from_escape_boundary(self._raw, self._RERENDER_TAIL)
             self._feed_line(_src)
 
     def current_mode(self):
@@ -2376,7 +2420,17 @@ class SecureTerminal(QPlainTextEdit):
                 key = ('osc_clipboard_read'
                        if m.group(2).rstrip().endswith(b'?')
                        else 'osc_clipboard')
-            if not (self.tui_active() and self.osc_enabled(key)):
+            honored = self.tui_active() and self.osc_enabled(key)
+            if key == 'osc_clipboard_read' and self._clipboard_read is False:
+                # A tab that chose Deny (always) has _clipboard_read False, so
+                # _osc_clipboard_read refuses EVERY read at the enforcement gate -- the
+                # blanket feature toggle being ON (what osc_enabled reads) does NOT mean
+                # the read was honored. Advise, so a tab being hammered with blocked
+                # clipboard-read probes still surfaces the attempt instead of reading as
+                # a silent no-op. Granted (True) / undecided (None) / pending stay
+                # suppressed, as before -- only the explicit per-tab denial advises.
+                honored = False
+            if not honored:
                 if key not in emitted:
                     emitted.add(key)
                     self.osc_used.emit(key, code)
@@ -4516,6 +4570,14 @@ class SecureTerminal(QPlainTextEdit):
             s.history._replace(top=copy.copy(s.history.top),
                                bottom=copy.copy(s.history.bottom)),
             copy.copy(s.cursor))
+        # The snapshot above hid the scrollbar while _alt_screen was False, so the later
+        # alt paint no longer toggles the bar -- and the resize that reclaims the bar's
+        # column for the (wider, scrollback-free) alt canvas never fires. Reconcile the
+        # winsize to the alt geometry now, so a full-screen program launched from a
+        # scrolled-back shell gets the FULL width, not one column short. A no-op on a
+        # re-enter (already alt-width), so it does not revive the winsize/repaint loop.
+        if self._grid_mode():
+            self._sync_tui_size()
 
     def _alt_leave(self):
         """A full-screen program left the alternate screen: restore the primary
@@ -4989,6 +5051,7 @@ class SecureTerminal(QPlainTextEdit):
                 or self._pending_copy is not None):
             self._pending_paste = None
             self._pending_copy = None
+            self._pending_copy_strip = None
             self._review_active = False
             self.paste_review_resolved.emit()
         # SECURITY: a PENDING OSC-52 clipboard-read consent -- a dialog the exited program
@@ -5515,25 +5578,34 @@ class SecureTerminal(QPlainTextEdit):
             block = block.next()
         return ''.join(out)
 
-    def _export_selection_fragment(self, text, cp):
+    def _export_selection_fragment(self, text, cp, strip=False):
         """Map ONE selected run's display text to what leaves the widget, using its
         recorded SOURCE code point to tell a synthetic marker from a real glyph the
         program printed -- the distinction _export_ascii, a pure string map with no
         code-point context, cannot make.
 
         Outside Show mode _export_ascii is exact (every non-ASCII byte is a marker),
-        so defer to it. In Show mode a real U+2423 the child printed is kept as its
-        glyph (its cp IS 0x2423, matching transcript_text's guard); only the
-        SYNTHETIC SPACE_MARK -- our stand-in for a neutralized non-ASCII space, whose
-        cp is the SOURCE byte, not 0x2423 -- is mapped to '_'. BOX is left as-is in
-        Show, exactly as _export_ascii does, so a real U+25A1 is preserved too."""
+        so defer to it. In Show mode the SYNTHETIC SPACE_MARK -- our stand-in for a
+        neutralized non-ASCII space, whose cp is the SOURCE byte, not 0x2423 -- always
+        maps to '_' (it must never round-trip as its glyph or a plain space); a real
+        U+2423 the child printed (cp IS 0x2423) is kept.
+
+        `strip` (the ASCII copy paths: PRIMARY/drag + the review's 'stripped' action)
+        ALSO collapses a SYNTHETIC BOX (a neutralized invisible, cp != 0x25a1) to '_'.
+        A real U+25A1/U+2423 (cp == the glyph) is kept AS ITS GLYPH here and dropped by
+        the downstream sanitize_clipboard as ordinary non-ASCII -- so it is no longer
+        clobbered into a marker-look-alike '_' (the #5 marker/content collision). The
+        UNICODE opt-in path (strip=False) keeps the synthetic BOX as its visible glyph,
+        unchanged -- the user chose to copy real unicode."""
         if self._mode != 'show':
             return self._export_ascii(text)
         if SPACE_MARK in text and cp != 0x2423:
-            return text.replace(SPACE_MARK, '_')
+            text = text.replace(SPACE_MARK, '_')
+        if strip and BOX in text and cp != 0x25a1:
+            text = text.replace(BOX, '_')
         return text
 
-    def _selection_text(self):
+    def _selection_text(self, strip=False):
         """The current selection as it would leave the widget: soft-autowrapped
         rows (blocks _paint_line marks with the _BLK_WRAP_CONT bit) are joined so a line that
         wrapped at the terminal width copies as one line, like a real terminal --
@@ -5564,7 +5636,8 @@ class SecureTerminal(QPlainTextEdit):
                     seg = QTextCursor(doc)
                     seg.setPosition(lo)
                     seg.setPosition(hi, QTextCursor.MoveMode.KeepAnchor)
-                    parts.append(self._export_selection_fragment(seg.selectedText(), cp))
+                    parts.append(
+                        self._export_selection_fragment(seg.selectedText(), cp, strip))
             block = block.next()
         return ''.join(parts)
 
@@ -5581,7 +5654,7 @@ class SecureTerminal(QPlainTextEdit):
         # keeping a real glyph stays an explicit, reviewed choice. The display-aware
         # strip maps a Show-mode box / box-drawing glyph to an ASCII stand-in first, so
         # a selected box copies as '_' instead of collapsing to the surrounding spaces.
-        data.setText(sanitize_clipboard_display(self._selection_text()))
+        data.setText(sanitize_clipboard_display(self._selection_text(strip=True)))
         return data
 
     def copy(self):
@@ -5600,6 +5673,10 @@ class SecureTerminal(QPlainTextEdit):
         warn = self._copy_warn
         if warn == 'always' or (warn == 'unicode' and (has_unicode or has_control)):
             self._pending_copy = text
+            # Capture the ASCII 'stripped' form now too (selection is about to be frozen
+            # under review): it resolves a synthetic BOX to '_' cp-aware, so the later
+            # 'stripped' action need not guess from the cp-less preview text.
+            self._pending_copy_strip = self._selection_text(strip=True)
             self._review_active = True
             # no countdown for copy: it is not executed, so the anti-fat-finger
             # gate the paste review needs does not apply (delay 0).
@@ -5621,13 +5698,18 @@ class SecureTerminal(QPlainTextEdit):
         if not self._review_active:
             return
         text = self._pending_copy if edited is None else edited
+        # The 'stripped' action uses the cp-aware ASCII form (synthetic BOX already '_',
+        # a real U+25A1/U+2423 left as its glyph for sanitize_clipboard_display to drop);
+        # a user-EDITED buffer has no synthetic markers, so it is its own strip source.
+        strip_text = self._pending_copy_strip if edited is None else edited
         self._pending_copy = None
+        self._pending_copy_strip = None
         self._review_active = False
         self.paste_review_resolved.emit()
         if text is None or action == 'reject':
             return
         safe = (sanitize_clipboard_unicode(text) if action == 'unicode'
-                else sanitize_clipboard_display(text))
+                else sanitize_clipboard_display(strip_text))
         self._set_clipboard(safe)
 
     def _set_clipboard(self, text):

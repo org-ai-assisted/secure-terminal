@@ -9,6 +9,7 @@
 import functools
 import html
 import os
+import re
 import signal
 import sys
 import shlex
@@ -688,7 +689,13 @@ class _ToolTipFilter(QObject):
                 # the tab under the pointer, else the bar-level hint -- both via InfoTip.
                 idx = obj.tabAt(event.pos())
                 if idx >= 0:
-                    if obj.tabToolTip(idx):
+                    # A per-element tip (the trust lock / the untrusted line-2 band) wins
+                    # over the tab-level tip when the pointer is over that element.
+                    element = (obj.element_tooltip(event.pos())
+                               if hasattr(obj, 'element_tooltip') else None)
+                    if element:
+                        text = element
+                    elif obj.tabToolTip(idx):
                         text = obj.tabToolTip(idx)
                     # Anchor to the HOVERED tab's global rect, not the whole bar: else
                     # _place uses the bar's left edge (far left of the window), the tip
@@ -798,6 +805,32 @@ class FindBar(QWidget):
         super().keyPressEvent(event)
 
 
+## Line-2 title normalization (DISPLAY only). Runs on an ALREADY sanitize_title()'d
+## string (printable ASCII, escapes stripped) -- it is not a security sanitizer, so it
+## must never be the only thing between untrusted bytes and the screen. It strips the
+## noise a shell prompt bakes into its OSC title -- redundant with the trusted tab label
+## (cwd basename) and the prompt itself -- leaving the informative residue.
+_PTITLE_TTY = re.compile(r'\s*\[(?:pts|tty)/\w+\]\s*$')   # trailing tty tag (grml zsh)
+_PTITLE_HOST = re.compile(r'^[^\s@/]+@[^\s:/]+:\s*')       # user@host:  (shell-prompt prefix)
+_PTITLE_PATH = re.compile(r'^[~/][^\s(]*\s*')              # leading cwd path token
+
+
+def normalize_ptitle(text):
+    """Strip a shell prompt's noise from its OSC title: the trailing [pts/N] tty tag, the
+    leading user@host: prefix, and the leading cwd path -- all redundant with the trusted
+    tab label / prompt -- leaving the genuinely informative residue (grml zsh's running
+    ` (command)`, or an app's own title such as vim's `file (dir) - VIM`). A bare
+    parenthesised command is unwrapped. Empty result == the title carried nothing beyond
+    the prompt. The RAW title is kept elsewhere (tab model + hover), so no information is
+    lost -- this only decides what the narrow band SHOWS."""
+    s = _PTITLE_TTY.sub('', text or '').strip()
+    s = _PTITLE_HOST.sub('', s)
+    s = _PTITLE_PATH.sub('', s).strip()
+    if len(s) >= 2 and s[0] == '(' and s[-1] == ')':
+        s = s[1:-1].strip()
+    return s
+
+
 class SecureTabBar(QTabBar):
     """Two-line, trust-tiered tab bar.
 
@@ -825,7 +858,7 @@ class SecureTabBar(QTabBar):
     _ACCENT_W = 3            # left accent-bar width (px, pre-DPR)
     _PAD = 7                 # horizontal content padding
     _GLYPH = 13              # trust/caution/bell glyph box (px)
-    _LINE2_H = 16            # reserved height of the untrusted band
+    _LINE2_H = 19            # reserved height of the untrusted band (fits the larger title)
     _PULSE_TICKS = 6         # bounded pulse frames (~3 on/off cycles)
     _PULSE_MS = 90           # per-frame interval
 
@@ -919,6 +952,39 @@ class SecureTabBar(QTabBar):
                 'ptitle': m['ptitle'] if self._two_line else '',
                 'bell': m['bell'], 'accent': m['accent']}
 
+    def element_tooltip(self, pos):
+        """Tooltip for the specific tab element under `pos` (bar-local): the trust lock or
+        the untrusted line-2 title band, each explained separately. None -> the caller
+        falls back to the tab-level tooltip. The band tip also shows the FULL program title
+        (the band itself elides a long one)."""
+        idx = self.tabAt(pos)
+        if not (0 <= idx < self.count()):
+            return None
+        rect = self.tabRect(idx)
+        line1_h = rect.height() - (self._LINE2_H if self._two_line else 0)
+        lx = rect.left() + 2 + self._ACCENT_W + self._PAD
+        ly = rect.top() + (line1_h - self._GLYPH) // 2
+        if QRect(lx, ly, self._GLYPH, self._GLYPH).contains(pos):
+            return ('Trusted label: set by the app (your rename or the cwd), never by the '
+                    'running program, so terminal output cannot spoof it.')
+        if self._two_line:
+            band = QRect(rect.left(), rect.top() + line1_h + 1,
+                         rect.width(), self._LINE2_H - 1)
+            if band.contains(pos):
+                raw = self._model(idx)['ptitle']
+                base = ('Line 2: the window title the RUNNING PROGRAM set (untrusted). '
+                        'Quarantined here so it cannot pose as the trusted tab name.')
+                if not raw:
+                    return base
+                # show BOTH the normalized (what the band displays) and the raw title,
+                # so a hover reveals everything the display trimmed.
+                norm = normalize_ptitle(raw)
+                if norm == raw:
+                    return '%s\n\nTitle: %s' % (base, raw)
+                shown = norm if norm else '(blank -- the title was only the shell prompt)'
+                return '%s\n\nShown: %s\nFull: %s' % (base, shown, raw)
+        return None
+
     def _tick_pulse(self):
         any_left = False
         for i in range(self.count()):
@@ -944,6 +1010,24 @@ class SecureTabBar(QTabBar):
         if self._two_line:
             sz.setHeight(sz.height() + self._LINE2_H)
         return sz
+
+    def tabLayoutChange(self):
+        # Qt centres the close button in the FULL (two-line) tab height, dropping it onto
+        # the untrusted band -- too far down, and a smaller hit area. Re-centre it on LINE 1
+        # (its idiomatic single-line position) after every relayout.
+        super().tabLayoutChange()
+        self._place_close_buttons()
+
+    def _place_close_buttons(self):
+        if not self._two_line:
+            return
+        for i in range(self.count()):
+            btn = self.tabButton(i, QTabBar.ButtonPosition.RightSide)
+            if btn is None:
+                continue
+            r = self.tabRect(i)
+            line1_h = r.height() - self._LINE2_H
+            btn.move(btn.x(), r.top() + max(0, (line1_h - btn.height()) // 2))
 
     def paintEvent(self, event):
         sp = QStylePainter(self)
@@ -1028,7 +1112,15 @@ class SecureTabBar(QTabBar):
             # divider between the trusted line and the quarantine band
             painter.setPen(QPen(QColor(band_line), 1, Qt.PenStyle.DashLine))
             painter.drawLine(band.left() + 2, band.top(), band.right() - 2, band.top())
-            ptitle = m['ptitle']
+            # vertical separator at the tab's right edge: each tab's band reads as ITS OWN
+            # line 2, not one strip spanning every tab (the "applies to all tabs" report).
+            painter.setPen(QPen(QColor(band_line), 1))
+            painter.drawLine(band.right() - 1, band.top() + 2,
+                             band.right() - 1, band.bottom() - 1)
+            # DISPLAY the normalized residue (raw stays in the model + hover). Empty ==
+            # the title was pure prompt noise -> leave the band empty rather than echo the
+            # cwd the tab label already shows.
+            ptitle = normalize_ptitle(m['ptitle'])
             if ptitle:
                 bx = band.left() + 2 + self._ACCENT_W + self._PAD
                 by = band.top() + (band.height() - self._GLYPH) // 2
@@ -1037,14 +1129,17 @@ class SecureTabBar(QTabBar):
                 tx = bx + self._GLYPH
                 f2 = QFont(self.font())
                 f2.setItalic(True)
-                f2.setPointSizeF(max(6.0, self.font().pointSizeF() - 1.5))
+                # only slightly smaller than line 1 -- the older -1.5 was too small to read.
+                f2.setPointSizeF(max(7.0, self.font().pointSizeF() - 0.5))
                 painter.setFont(f2)
                 painter.setPen(QColor(caution))
                 # guillemets read the title as "a program's claim", not a fact.
                 wrapped = '%s%s%s' % (chr(0x00AB), ptitle, chr(0x00BB))
                 avail2 = max(0, band.right() - self._PAD - tx)
+                # ElideMiddle: the useful ends (an app's object at the front, a command's
+                # tail at the back) both survive a long title.
                 shown2 = QFontMetrics(f2).elidedText(
-                    wrapped, Qt.TextElideMode.ElideRight, avail2)
+                    wrapped, Qt.TextElideMode.ElideMiddle, avail2)
                 painter.drawText(QRect(tx, band.top(), avail2, band.height()),
                                  int(Qt.AlignmentFlag.AlignVCenter
                                      | Qt.AlignmentFlag.AlignLeft), shown2)
