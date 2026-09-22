@@ -815,18 +815,36 @@ _PTITLE_HOST = re.compile(r'^[^\s@/]+@[^\s:/]+:\s*')       # user@host:  (shell-
 _PTITLE_PATH = re.compile(r'^[~/][^\s(]*\s*')              # leading cwd path token
 
 
+def _one_paren_group(s):
+    """True only when s is a SINGLE parenthesised group -- '(cmd)', not '(a) b (c)'."""
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0 and i != len(s) - 1:
+                return False                  # closed before the end -> not one group
+    return depth == 0
+
+
 def normalize_ptitle(text):
-    """Strip a shell prompt's noise from its OSC title: the trailing [pts/N] tty tag, the
-    leading user@host: prefix, and the leading cwd path -- all redundant with the trusted
-    tab label / prompt -- leaving the genuinely informative residue (grml zsh's running
-    ` (command)`, or an app's own title such as vim's `file (dir) - VIM`). A bare
-    parenthesised command is unwrapped. Empty result == the title carried nothing beyond
-    the prompt. The RAW title is kept elsewhere (tab model + hover), so no information is
-    lost -- this only decides what the narrow band SHOWS."""
+    """Strip a shell prompt's noise from its OSC title -- the trailing [pts/N] tty tag, the
+    leading user@host: prefix, and the cwd path that FOLLOWS that prefix -- leaving the
+    informative residue (grml zsh's running ` (command)`, or an app's own title such as
+    vim's `file (dir) - VIM`). The RAW title is kept elsewhere (tab model + hover), so
+    nothing is lost -- this only decides what the narrow band SHOWS.
+
+    The cwd path is stripped ONLY inside a `user@host:` shell prompt, never from a plain
+    title: a leading `/path` in an app title (`/tmp/foo.py - VIM`) or a command
+    (`/bin/rm ...`) is content, not prompt noise."""
     s = _PTITLE_TTY.sub('', text or '').strip()
-    s = _PTITLE_HOST.sub('', s)
-    s = _PTITLE_PATH.sub('', s).strip()
-    if len(s) >= 2 and s[0] == '(' and s[-1] == ')':
+    host = _PTITLE_HOST.match(s)
+    if host:
+        s = _PTITLE_PATH.sub('', s[host.end():]).strip()
+    # unwrap ONLY a title that is entirely one parenthesised group (grml zsh's ` (cmd)`);
+    # never one that merely starts '(' and ends ')' (e.g. '(gdb) backtrace (full)').
+    if len(s) >= 2 and s[0] == '(' and s[-1] == ')' and _one_paren_group(s):
         s = s[1:-1].strip()
     return s
 
@@ -875,6 +893,11 @@ class SecureTabBar(QTabBar):
         self._pulse = QTimer(self)
         self._pulse.setInterval(self._PULSE_MS)
         self._pulse.timeout.connect(self._tick_pulse)
+        # setCurrentIndex re-lays-out the old + new current tab's close button WITHOUT
+        # firing tabLayoutChange, dropping those two buttons back to the full-height centre
+        # (onto the untrusted band, where a band click then hits the button). Re-place them
+        # on every current-tab change too.
+        self.currentChanged.connect(self._place_close_buttons)
 
     # -- per-tab model (stored in tabData, so it rides a drag-reorder) ---------
     # NB: Qt round-trips tabData through a QVariant, so tabData() returns a COPY --
@@ -943,8 +966,9 @@ class SecureTabBar(QTabBar):
 
     def tab_lines(self, index):
         """Structural view of a tab's content, for tests (no pixels): the trusted
-        line-1 label, the untrusted line-2 title actually shown ('' when hidden or
-        single-line), and whether a bell marker is set."""
+        line-1 label, the RAW untrusted line-2 program title ('' when hidden or
+        single-line -- this is the model value, NOT the normalized string the band paints;
+        normalize_ptitle decides the shown form), and whether a bell marker is set."""
         if not (0 <= index < self.count()):
             return {'label': '', 'ptitle': '', 'bell': False, 'accent': None}
         m = self._model(index)
@@ -968,7 +992,9 @@ class SecureTabBar(QTabBar):
             return ('Trusted label: set by the app (your rename or the cwd), never by the '
                     'running program, so terminal output cannot spoof it.')
         if self._two_line:
-            band = QRect(rect.left(), rect.top() + line1_h + 1,
+            # match the PAINTED band rect exactly (see _paint_content) so the hit area
+            # does not sit one pixel below what the eye sees.
+            band = QRect(rect.left(), rect.top() + line1_h,
                          rect.width(), self._LINE2_H - 1)
             if band.contains(pos):
                 raw = self._model(idx)['ptitle']
@@ -981,7 +1007,7 @@ class SecureTabBar(QTabBar):
                 norm = normalize_ptitle(raw)
                 if norm == raw:
                     return '%s\n\nTitle: %s' % (base, raw)
-                shown = norm if norm else '(blank -- the title was only the shell prompt)'
+                shown = norm if norm else '(nothing shown -- trimmed to prompt noise)'
                 return '%s\n\nShown: %s\nFull: %s' % (base, shown, raw)
         return None
 
