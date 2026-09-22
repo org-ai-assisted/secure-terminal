@@ -3152,13 +3152,20 @@ class SecureTerminal(QPlainTextEdit):
             self._grid_ws_fmt = fmt
         return fmt
 
-    @staticmethod
-    def _grid_space_is_visible(cell):
-        """A space you can SEE -- reverse video, or a non-default background -- is a
-        program-painted bar (nano's title bar, a status line, colour art), not hidden
-        padding, so it is never a whitespace anomaly. The pyte-grid twin of
-        sanitize._space_is_visible; reverse also makes a space visible here."""
-        return bool(cell.reverse) or cell.bg not in (None, 'default')
+    def _grid_space_is_visible(self, cell):
+        """A space you can SEE -- painted a background that DIFFERS from the terminal's
+        own background -- is a program bar (nano's title bar, a status line, colour
+        art), not hidden padding, so it is never a whitespace anomaly. Judged on the
+        EFFECTIVE painted format (via _grid_cell_format, the same path the cell renders
+        through), not the raw cell: with colours OFF the program bg is stripped, and a
+        bg set to the theme background paints as ordinary padding -- both must still be
+        dotted. Reverse video that swaps a distinct fg into the bg stays visible."""
+        brush = self._grid_cell_format(cell, ' ').background()
+        if brush.style() == Qt.BrushStyle.NoBrush:
+            return False                        # no distinct bg painted -> padding
+        theme_bg = THEMES.get(self._theme, THEMES['dark'])[0]
+        base_bg = self._osc_palette.get('bg', theme_bg)
+        return brush.color().name() != QColor(base_bg).name()
 
     def _grid_row_runs(self, row, columns):
         """The (text, format) runs one pyte row renders to, same-format cells

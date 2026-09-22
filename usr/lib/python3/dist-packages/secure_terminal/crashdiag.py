@@ -20,6 +20,7 @@ one unacceptable outcome.
 import datetime
 import faulthandler
 import os
+import stat
 import sys
 import traceback
 
@@ -34,7 +35,17 @@ def _open_append(path):
     # 0600 + O_NOFOLLOW, matching session's other durable diagnostic writers
     # (terminate-debug.txt, transcripts): a planted symlink cannot redirect the
     # write, and the log stays owner-only since a traceback can carry paths/argv.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    # O_NONBLOCK + a regular-file check: a planted FIFO at this path would else make
+    # O_WRONLY BLOCK until a reader opens it, hanging the launch forever (O_NOFOLLOW
+    # rejects only a symlink, not a FIFO). O_NONBLOCK is a no-op on a regular file.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+                 | os.O_NONBLOCK, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError('crash log is not a regular file')
+    except OSError:
+        os.close(fd)
+        raise
     return os.fdopen(fd, 'a', encoding='utf-8')
 
 
@@ -76,6 +87,13 @@ def write_note(log, kind, text):
     """Append a one-off note (e.g. a captured Qt Critical/Fatal message, which
     aborts the process right after) to the durable log. Best-effort."""
     _tee((log,), _banner(kind) + text)
+
+
+def echo_stderr(text, stream=None):
+    """Best-effort stderr echo of a Qt message line. A broken/closed stderr -- the
+    exact GUI case the durable log exists for -- must never raise out of the Qt
+    message handler, so this swallows the failure (the durable copy is written first)."""
+    _tee((stream if stream is not None else sys.stderr,), text + '\n')
 
 
 def qt_message_is_fatal(mode):

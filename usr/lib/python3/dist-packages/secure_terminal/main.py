@@ -1942,6 +1942,14 @@ class MainWindow(QMainWindow):
         # the wrapped label carries heightForWidth; floor at 1 so a degenerate width
         # still yields a positive inset (never a negative one that hides content).
         height = max(1, banner.heightForWidth(width))
+        # CLAMP so the zoom-scaled advisory can never occlude the terminal. Its font
+        # scales with zoom, so at a high zoom (or a short window) the wrapped banner
+        # grows taller than the viewport and the reserved inset blanks the output behind
+        # it. Cap it to HALF the content area below the tab strip, so at least half the
+        # terminal always shows; the banner clips (it stays dismissible, full text in the
+        # tooltip). Without this, "zoom in -> screen goes blank" (the reported bug).
+        avail = max(1, geo.bottom() - top)
+        height = min(height, max(1, avail // 2))
         banner.setGeometry(geo.left(), top, width, height)
         banner.raise_()
         # current() is normally live (the banner shows only for a tab that holds an
@@ -6977,13 +6985,14 @@ def _quiet_font_warnings():
     def handler(mode, context, message):
         if _is_font_noise(getattr(context, 'category', '') or '', message):
             return
-        sys.stderr.write(message + '\n')
         # A Qt Critical/Fatal (qFatal aborts right after this) is a crash cause;
-        # persist it beside the faulthandler/excepthook traces so a GUI launch's
-        # invisible stderr is not the only copy. Called unconditionally: the fatal
-        # and no-log-yet checks live in note_qt_message (a no-op otherwise).
+        # persist it to the durable log FIRST, so a broken/missing stderr -- the exact
+        # GUI case this log exists for -- cannot lose the record. The fatal and
+        # no-log-yet checks live in note_qt_message (a no-op otherwise), so this is
+        # called unconditionally. stderr is best-effort and must never raise out.
         crashdiag.note_qt_message(_CRASH_LOG[0] if _CRASH_LOG else None,
                                   mode, message)
+        crashdiag.echo_stderr(message)
     qInstallMessageHandler(handler)
 
 
