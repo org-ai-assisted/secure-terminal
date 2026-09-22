@@ -3148,6 +3148,14 @@ class SecureTerminal(QPlainTextEdit):
             self._grid_ws_fmt = fmt
         return fmt
 
+    @staticmethod
+    def _grid_space_is_visible(cell):
+        """A space you can SEE -- reverse video, or a non-default background -- is a
+        program-painted bar (nano's title bar, a status line, colour art), not hidden
+        padding, so it is never a whitespace anomaly. The pyte-grid twin of
+        sanitize._space_is_visible; reverse also makes a space visible here."""
+        return bool(cell.reverse) or cell.bg not in (None, 'default')
+
     def _grid_row_runs(self, row, columns):
         """The (text, format) runs one pyte row renders to, same-format cells
         coalesced. This IS both the row's render and its incremental signature:
@@ -3165,8 +3173,16 @@ class SecureTerminal(QPlainTextEdit):
         # spaces BETWEEN visible tokens is the real "hidden extra spacing" anomaly. Gated on the
         # risk-marking toggle, like the CLI path. A flagged space keeps its real space (copy-safe)
         # under the dot-flagged format; paintEvent draws the dot.
-        flagged = (whitespace_anomaly_cols(chars, flag_trailing=False, flag_leading=False)
-                   if self._markings else ())
+        # A styled space (reverse video / non-default bg) is a VISIBLE program-painted
+        # bar (nano's title bar, a status line), not hidden padding, so it must never be
+        # dotted -- mask it out of the char-only anomaly scan (the CLI path does the same
+        # via sanitize._space_is_visible). Only plain default-bg spaces stay candidates.
+        if self._markings:
+            scan = ['\x00' if chars[x] == ' ' and self._grid_space_is_visible(row[x])
+                    else chars[x] for x in range(columns)]
+            flagged = whitespace_anomaly_cols(scan, flag_trailing=False, flag_leading=False)
+        else:
+            flagged = ()
         runs = []
         run_text = ''
         run_fmt = None
