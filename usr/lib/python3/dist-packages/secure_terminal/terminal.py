@@ -4570,6 +4570,14 @@ class SecureTerminal(QPlainTextEdit):
             s.history._replace(top=copy.copy(s.history.top),
                                bottom=copy.copy(s.history.bottom)),
             copy.copy(s.cursor))
+        # The snapshot above hid the scrollbar while _alt_screen was False, so the later
+        # alt paint no longer toggles the bar -- and the resize that reclaims the bar's
+        # column for the (wider, scrollback-free) alt canvas never fires. Reconcile the
+        # winsize to the alt geometry now, so a full-screen program launched from a
+        # scrolled-back shell gets the FULL width, not one column short. A no-op on a
+        # re-enter (already alt-width), so it does not revive the winsize/repaint loop.
+        if self._grid_mode():
+            self._sync_tui_size()
 
     def _alt_leave(self):
         """A full-screen program left the alternate screen: restore the primary
