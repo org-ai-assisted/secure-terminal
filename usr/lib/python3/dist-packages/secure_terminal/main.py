@@ -1915,6 +1915,11 @@ class MainWindow(QMainWindow):
         if entry:
             self._style_banner(self.current_zoom_percent())
             self._banner_label.setText(entry[1])
+            # The full advisory on hover: at high zoom the banner height is clamped so
+            # it cannot occlude the terminal (see _position_banner), which can CLIP the
+            # wrapped text -- the tooltip keeps the whole security notice readable.
+            self._banner_label.setToolTip(entry[1])
+            self._banner.setToolTip(entry[1])
             self._banner.setVisible(True)
             self._position_banner()
         else:
@@ -6975,7 +6980,7 @@ def _is_font_noise(_category, message):
 
 # Set once crash diagnostics are wired (crashdiag.install); a one-element list so the
 # already-installed Qt message handler closure can tee later without a global rebind.
-_CRASH_LOG = []
+_CRASH_LOG: list = []
 
 
 def _quiet_font_warnings():

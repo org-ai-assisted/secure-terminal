@@ -3165,7 +3165,9 @@ class SecureTerminal(QPlainTextEdit):
             return False                        # no distinct bg painted -> padding
         theme_bg = THEMES.get(self._theme, THEMES['dark'])[0]
         base_bg = self._osc_palette.get('bg', theme_bg)
-        return brush.color().name() != QColor(base_bg).name()
+        # PERCEPTUAL, not exact: a bg a hair off the terminal background (e.g. #fffffe on
+        # a #ffffff theme) is indistinguishable from padding, so it must still be dotted.
+        return not too_close(_rgb(brush.color()), _rgb(QColor(base_bg)))
 
     def _grid_row_runs(self, row, columns):
         """The (text, format) runs one pyte row renders to, same-format cells
