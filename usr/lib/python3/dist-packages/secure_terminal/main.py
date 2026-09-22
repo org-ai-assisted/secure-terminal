@@ -9,6 +9,7 @@
 import functools
 import html
 import os
+import re
 import signal
 import sys
 import shlex
@@ -804,6 +805,32 @@ class FindBar(QWidget):
         super().keyPressEvent(event)
 
 
+## Line-2 title normalization (DISPLAY only). Runs on an ALREADY sanitize_title()'d
+## string (printable ASCII, escapes stripped) -- it is not a security sanitizer, so it
+## must never be the only thing between untrusted bytes and the screen. It strips the
+## noise a shell prompt bakes into its OSC title -- redundant with the trusted tab label
+## (cwd basename) and the prompt itself -- leaving the informative residue.
+_PTITLE_TTY = re.compile(r'\s*\[(?:pts|tty)/\w+\]\s*$')   # trailing tty tag (grml zsh)
+_PTITLE_HOST = re.compile(r'^[^\s@/]+@[^\s:/]+:\s*')       # user@host:  (shell-prompt prefix)
+_PTITLE_PATH = re.compile(r'^[~/][^\s(]*\s*')              # leading cwd path token
+
+
+def normalize_ptitle(text):
+    """Strip a shell prompt's noise from its OSC title: the trailing [pts/N] tty tag, the
+    leading user@host: prefix, and the leading cwd path -- all redundant with the trusted
+    tab label / prompt -- leaving the genuinely informative residue (grml zsh's running
+    ` (command)`, or an app's own title such as vim's `file (dir) - VIM`). A bare
+    parenthesised command is unwrapped. Empty result == the title carried nothing beyond
+    the prompt. The RAW title is kept elsewhere (tab model + hover), so no information is
+    lost -- this only decides what the narrow band SHOWS."""
+    s = _PTITLE_TTY.sub('', text or '').strip()
+    s = _PTITLE_HOST.sub('', s)
+    s = _PTITLE_PATH.sub('', s).strip()
+    if len(s) >= 2 and s[0] == '(' and s[-1] == ')':
+        s = s[1:-1].strip()
+    return s
+
+
 class SecureTabBar(QTabBar):
     """Two-line, trust-tiered tab bar.
 
@@ -944,10 +971,18 @@ class SecureTabBar(QTabBar):
             band = QRect(rect.left(), rect.top() + line1_h + 1,
                          rect.width(), self._LINE2_H - 1)
             if band.contains(pos):
-                title = self._model(idx)['ptitle']
+                raw = self._model(idx)['ptitle']
                 base = ('Line 2: the window title the RUNNING PROGRAM set (untrusted). '
                         'Quarantined here so it cannot pose as the trusted tab name.')
-                return '%s\n\nTitle: %s' % (base, title) if title else base
+                if not raw:
+                    return base
+                # show BOTH the normalized (what the band displays) and the raw title,
+                # so a hover reveals everything the display trimmed.
+                norm = normalize_ptitle(raw)
+                if norm == raw:
+                    return '%s\n\nTitle: %s' % (base, raw)
+                shown = norm if norm else '(blank -- the title was only the shell prompt)'
+                return '%s\n\nShown: %s\nFull: %s' % (base, shown, raw)
         return None
 
     def _tick_pulse(self):
@@ -1082,7 +1117,10 @@ class SecureTabBar(QTabBar):
             painter.setPen(QPen(QColor(band_line), 1))
             painter.drawLine(band.right() - 1, band.top() + 2,
                              band.right() - 1, band.bottom() - 1)
-            ptitle = m['ptitle']
+            # DISPLAY the normalized residue (raw stays in the model + hover). Empty ==
+            # the title was pure prompt noise -> leave the band empty rather than echo the
+            # cwd the tab label already shows.
+            ptitle = normalize_ptitle(m['ptitle'])
             if ptitle:
                 bx = band.left() + 2 + self._ACCENT_W + self._PAD
                 by = band.top() + (band.height() - self._GLYPH) // 2
@@ -1098,8 +1136,10 @@ class SecureTabBar(QTabBar):
                 # guillemets read the title as "a program's claim", not a fact.
                 wrapped = '%s%s%s' % (chr(0x00AB), ptitle, chr(0x00BB))
                 avail2 = max(0, band.right() - self._PAD - tx)
+                # ElideMiddle: the useful ends (an app's object at the front, a command's
+                # tail at the back) both survive a long title.
                 shown2 = QFontMetrics(f2).elidedText(
-                    wrapped, Qt.TextElideMode.ElideRight, avail2)
+                    wrapped, Qt.TextElideMode.ElideMiddle, avail2)
                 painter.drawText(QRect(tx, band.top(), avail2, band.height()),
                                  int(Qt.AlignmentFlag.AlignVCenter
                                      | Qt.AlignmentFlag.AlignLeft), shown2)
