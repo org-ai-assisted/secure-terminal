@@ -1549,6 +1549,10 @@ class SecureTerminal(QPlainTextEdit):
         # so its bottom row (e.g. tmux's status bar) is not pushed below the
         # viewport and no spurious scrollbar appears.
         self._alt_view = False
+        # True only for the duration of _alt_enter's transient snapshot render: forces the
+        # vertical scrollbar OFF so that render cannot flicker the bar (and thus the child
+        # winsize) -- see _alt_enter and _apply_vscroll_policy.
+        self._alt_snapshotting = False
         # TUI auto-follow intent: pin the view to the newest output ONLY while the user is at
         # the very bottom. A per-frame value-vs-maximum test (with a 2-line tolerance) mistook a
         # 1-2 line wheel scroll for "still at bottom" and yanked the view back every frame (the
@@ -2239,9 +2243,14 @@ class SecureTerminal(QPlainTextEdit):
         """A fixed canvas (see _grid_fixed_canvas) must NEVER show a vertical scrollbar --
         the wheel is sent to the child as arrow keys, not a Qt scroll (the vertical analog
         of the grid horizontal-bar suppression above). A primary grid WITH real scrollback
-        keeps AsNeeded so that history stays reachable."""
+        keeps AsNeeded so that history stays reachable.
+
+        _alt_snapshotting forces OFF too: _alt_enter's transient snapshot render is a
+        non-alt canvas that would else show the AsNeeded bar and flicker the child winsize
+        (see _alt_enter)."""
         self.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if self._grid_fixed_canvas()
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            if (self._grid_fixed_canvas() or self._alt_snapshotting)
             else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
     def _sync_display(self):
@@ -4477,13 +4486,29 @@ class SecureTerminal(QPlainTextEdit):
         # this read, and _render_tui_body's alt branch renders ONLY the live grid and
         # _reset_grid_view()s away the carried-in scrollback -- which would drop the
         # pre-existing history from the frozen primary (keeping only the visible rows).
+        # This forced primary render dirties the live document (primary content, incl.
+        # scrollback history) and, via _render_tui_body's else branch, leaves _alt_view
+        # False. Two deliberate points, both fixing the reported viewport "jump" when a
+        # full-screen program RE-ENTERS the alt screen -- nano's rmcup+smcup on a
+        # SIGWINCH/resize: ?1049l then ?1049h in one read, no render between, so _alt_leave
+        # left _alt_view True:
+        #  - Restore ONLY _alt_screen, never _alt_view. Leaving _alt_view False makes the
+        #    next alt render _reset_grid_view() this primary content away; restoring a
+        #    pre-existing True skips that reset and STACKS the grid under the leftover
+        #    scrollback (blockCount > grid rows -> a frame pushed off the top-pin it fights).
+        #  - _alt_snapshotting keeps the vscrollbar OFF for this render. A shown AsNeeded bar
+        #    narrows the viewport -> resizeEvent -> new child winsize -> SIGWINCH -> the
+        #    program repaints (re-enters here) -> the bar toggles again: a non-stop
+        #    winsize/repaint loop.
         if self._grid_mode():
-            _was_alt, _was_view = self._alt_screen, self._alt_view
+            _was_alt = self._alt_screen
             self._alt_screen = False
+            self._alt_snapshotting = True
             try:
                 self._render_tui()
             finally:
-                self._alt_screen, self._alt_view = _was_alt, _was_view
+                self._alt_screen = _was_alt
+                self._alt_snapshotting = False
         self._alt_primary_text = self._walk_document_text()
         s = self._screen
         self._alt_saved = (
