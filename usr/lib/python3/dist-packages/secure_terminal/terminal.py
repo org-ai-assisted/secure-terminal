@@ -2086,23 +2086,27 @@ class SecureTerminal(QPlainTextEdit):
                 _src = self._raw
             else:
                 _src = tail_from_escape_boundary(self._raw, self._RERENDER_TAIL)
-            # Replay in the SAME <=_PTY_READ_MAX pieces the live reader delivers, so each
-            # feed_line_edits call gets its OWN per-call work budget. A single whole-buffer
-            # feed would spend that budget on early cursor pads and then SKIP later CSI-K
-            # erases -- cleared text (a secret) would reappear on a reflow / mode-toggle,
-            # diverging from the live path that had erased it. split_trailing_escape holds a
-            # CSI split across a piece edge (this replay path does not run feed_chunk_carry),
-            # which also aligns the piece boundaries with the live feed. Paint is deferred
-            # and flushed once at the end so the rebuild is a single repaint.
-            _carry = ''
+            # Replay in the SAME <=_PTY_READ_MAX pieces the live reader delivers, through the
+            # SAME feed_chunk_carry escape handler, so each feed_line_edits call gets its OWN
+            # per-call anti-flood work budget. A single whole-buffer feed would spend that
+            # budget on early cursor pads then SKIP later CSI-K erases -- cleared text (a
+            # secret) would reappear on a reflow / mode-toggle, diverging from the live path
+            # that had erased it. feed_chunk_carry (NOT split_trailing_escape, whose cap drops
+            # an over-cap incomplete escape and leaks its body as text) carries an escape
+            # split across a piece edge and switches to an O(1) discard state past the cap, so
+            # an unterminated/over-long escape retained UNSTRIPPED in _raw (the TUI-mode store)
+            # never leaks on a CLI re-render. Local carry state -- never self._esc_carry (the
+            # live-ingest state). Paint deferred, flushed once so the rebuild is one repaint.
+            _carry, _drop, _dropped = '', '', 0
             while _src:
-                if len(_src) <= self._PTY_READ_MAX:
-                    _piece, _src = _carry + _src, ''   # last piece: nothing left to rejoin a split
-                else:
-                    _piece = _carry + _src[:self._PTY_READ_MAX]
-                    _src = _src[self._PTY_READ_MAX:]
-                    _piece, _carry = split_trailing_escape(_piece)   # hold a CSI split at the edge
-                self._feed_line(_piece, defer=True)
+                _chunk, _src = _src[:self._PTY_READ_MAX], _src[self._PTY_READ_MAX:]
+                _text, _carry, _drop, _dropped = feed_chunk_carry(_chunk, _carry, _drop, _dropped)
+                self._feed_line(_text, defer=True)
+            if _carry:
+                # Flush a still-incomplete trailing escape (feed_line_edits strips the dangling
+                # introducer, as the child-exit path does); '' when nothing is held or it was
+                # discarded over-cap.
+                self._feed_line(_carry, defer=True)
             self._flush_paint()
 
     def current_mode(self):
