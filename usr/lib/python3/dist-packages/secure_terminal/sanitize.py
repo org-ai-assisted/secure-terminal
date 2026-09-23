@@ -378,8 +378,11 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
         g = carry + text
         if len(g) >= 2 and g[1] in _STRING_INTRO and len(g) > cap:
             return '', '', g[1], len(g)      # string over cap -> discard state
-        if len(g) <= cap or len(g) == 1:
+        if len(g) <= cap or len(g) == 1 or (len(g) == 2 and g[1] in 'NO'):
             return '', g, '', dropped        # still short -> hold the whole sequence
+        # SS2/SS3 clause kept parallel with the general path below; DEFENSIVE here -- this fast
+        # path is entered only when _carry_still_open(carry, text) is True, which returns False
+        # for an SS2/SS3 carry, so g[1] in 'NO' cannot arise. No behaviour change.
         return '', '', ('[' if g[1] == '[' else '\x1b'), len(g)   # non-string over cap
     text = carry + text
     carry = ''
@@ -428,13 +431,19 @@ def feed_chunk_carry(text, carry, drop, dropped=0, cap=4096):
             drop = g[1]                 # too long to hold -> swallow to terminator
             dropped = len(g)
             text = text[:m.start()]
-        elif len(g) <= cap or len(g) == 1:
+        elif len(g) <= cap or len(g) == 1 or (len(g) == 2 and g[1] in 'NO'):
             # short incomplete escape -> hold for next chunk. A LONE trailing ESC (len 1) is
             # held UNCONDITIONALLY, even under a tiny cap (cap <= 0): one byte can never be a
             # DoS, and its introducer has not arrived yet, so guessing a discard TYPE now would
             # mis-classify a real CSI/OSC as generic-ESC -- whose discard then eats the
             # introducer's second byte as a "final byte" and LEAKS the body as literal text.
             # Holding defers the type decision to the next chunk, where the introducer is known.
+            # A 2-byte SS2/SS3 (ESC N / ESC O) awaiting its ONE shifted byte is held for the same
+            # reason: under a tiny cap (0/1) the len(g)<=cap test fails, so without this clause it
+            # would fall to the generic-ESC discard below and eat the next chunk's first graphic
+            # byte as SS2/SS3's shifted glyph -- the same introducer-byte leak the lone-ESC hold
+            # prevents. At the default cap (4096) len(g)=2<=cap already holds, so this is a no-op
+            # there (no behaviour change).
             carry = g
             text = text[:m.start()]
         else:

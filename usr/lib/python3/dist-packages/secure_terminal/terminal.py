@@ -861,39 +861,40 @@ def _alt_transitions_bytes(data):
     for m in _ALT_CSI_RE_BYTES.finditer(data):
         if _ALT_MODES_BYTES & {_safe_int(p.decode('ascii')) for p in m.group(1).split(b';') if p}:
             yield (m.end(), 'enter' if m.group(2) == b'h' else 'leave')
-# longest alt-screen marker, so a tail of (len-1) carried between reads reunites a
-# marker split across an os.read() boundary (F6).
-_ALT_MARKER_MAX_BYTES = max(len(m) for m in _ALT_ENTER_BYTES + _ALT_LEAVE_BYTES)
-# The single-marker length also bounds the str carry tail (the markers are ASCII, so char
-# length == byte length); a marker split across an os.read() boundary is reunited by carrying
-# the last (_ALT_MARKER_MAX - 1) chars of the joined probe.
-_ALT_MARKER_MAX = _ALT_MARKER_MAX_BYTES
+# A marker SPLIT across an os.read() boundary is reunited by carrying its incomplete HEAD to
+# the next read, so _alt_transitions_bytes / alt_screen_transitions then see the WHOLE marker
+# and fire the snapshot / flag at the right point. The carried head is a trailing INCOMPLETE
+# private-mode CSI (ESC / ESC[ / ESC[? / ESC[?<params>, no final byte yet), bounded by
+# _ALT_PARTIAL_MAX -- long enough for every alt-screen and bracketed-paste marker INCLUDING the
+# combined (ESC[?47;1049h) and numeric-equivalent (ESC[?01049h) forms, so the byte-feed carry
+# and the str text-scan carry recognize the SAME split markers and cannot disagree. A run longer
+# than the bound is not a legit marker and is NOT held (fail-safe: the frame goes un-snapshotted,
+# bounded, never a leak). A COMPLETE marker (final h/l already present) does NOT match, so its
+# snapshot/restore is never delayed -- the whole point of feeding.
+_ALT_PARTIAL_MAX = 64
+_ALT_PARTIAL_RE_BYTES = re.compile(rb'\x1b(?:\[(?:\?[0-9;]*)?)?\Z')
+_ALT_PARTIAL_RE_STR = re.compile(r'\x1b(?:\[(?:\?[0-9;]*)?)?\Z')
 
 
 def _alt_partial_tail(data):
-    """Length of the tail of `data` that is a PROPER prefix of an alt-screen marker,
-    i.e. it may be the START of a marker split across an os.read() boundary. 0 when
-    the tail is not a partial marker (so a COMPLETE marker at the end is not held back
-    -- that would delay its snapshot/restore, which is the whole point of feeding).
-    Reunites the CANONICAL single-marker forms only. A COMBINED (ESC[?1047;1049h) or a
-    numeric-equivalent (ESC[?01049h) form that is ALSO split at this exact read boundary
-    is not carried, so the snapshot machinery misses it -- a KNOWN, pre-existing residual:
-    _alt_transitions_bytes detects those forms in one read, but this split-read carry (and
-    its str sibling _alt_scan_carry) recognize only the literal single markers. Fail-safe,
-    not a leak: a frame merely goes un-snapshotted (bounded by the scrollback cap and
-    _ALT_TRANSITIONS_MAX). Closing it fully means a bounded partial-private-CSI carry across
-    both the bytes and str paths; deferred as disproportionate for a rendering hint."""
-    # Also carry a split PROMPT_START (\x1b[?2004h): the TUI feed path holds this tail
-    # back so _feed_prompt_aware sees the WHOLE marker next read and injects its leftover-
-    # SGR reset -- else a boundary split lets a finished program's colour bleed into the
-    # prompt (the CLI path is already covered by feed_chunk_carry).
-    markers = _ALT_ENTER_BYTES + _ALT_LEAVE_BYTES + (_PROMPT_START_BYTES,)
-    maxlen = max(_ALT_MARKER_MAX_BYTES, len(_PROMPT_START_BYTES))
-    for k in range(min(maxlen - 1, len(data)), 0, -1):
-        tail = data[-k:]
-        if any(len(tail) < len(m) and m.startswith(tail) for m in markers):
-            return k
-    return 0
+    """Length of the trailing incomplete private-mode CSI in `data` (bytes) -- the possible
+    START of an alt-screen or bracketed-paste (PROMPT_START) marker split across an os.read()
+    boundary -- else 0. Held back so the WHOLE marker is seen next read: _alt_transitions_bytes
+    fires _alt_enter/_alt_leave at the right point and _feed_prompt_aware sees a split
+    PROMPT_START whole. Recognizes the combined (ESC[?47;1049h) and numeric-equivalent
+    (ESC[?01049h) forms, matching _alt_transitions_bytes' in-read parser and the str sibling
+    _alt_scan_partial_tail so the byte-feed and text-scan paths AGREE. Bounded by
+    _ALT_PARTIAL_MAX; a COMPLETE marker is not matched (its snapshot must not be delayed)."""
+    m = _ALT_PARTIAL_RE_BYTES.search(data[-_ALT_PARTIAL_MAX:])
+    return len(m.group()) if m else 0
+
+
+def _alt_scan_partial_tail(text):
+    """str twin of _alt_partial_tail: length of the trailing incomplete private-mode CSI in
+    `text`, so the CLI-mode alt-screen text scan carries the SAME split-marker head the
+    byte-feed path does -- the two must not disagree on a combined/numeric split marker."""
+    m = _ALT_PARTIAL_RE_STR.search(text[-_ALT_PARTIAL_MAX:])
+    return len(m.group()) if m else 0
 # Synchronized output (DECSET private mode 2026): a program brackets a screen
 # update so the terminal shows the completed frame, never a half-drawn one. It is
 # a SET-mode with no reply -- purely a rendering hint -- so it is safe to honour
@@ -1106,7 +1107,10 @@ def sound_file_allowed(path):
         return None
     try:
         real = os.path.realpath(path)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: an embedded NUL (or a lone surrogate) in a persisted/hand-edited
+        # bell_sound reaches os.lstat inside realpath -- disallow it (fall back to the
+        # system beep) rather than crashing the caller.
         return None
     if not os.path.isfile(real):
         return None
@@ -1636,7 +1640,7 @@ class SecureTerminal(QPlainTextEdit):
         self._last_click_ts = 0.0
         self._last_click_pos = None
         self._select_mode = 'char'    # 'char' | 'word' | 'line'
-        self._sel_anchor = None       # (start, end) doc positions the drag extends from
+        self._sel_anchor = None       # (start, end) live QTextCursors the drag extends from
         # QTextCursor at the last plain (no-shift) left click. A later Shift+click extends
         # the selection FROM here (konsole parity), not from the text cursor -- which the
         # render pins to the output cursor at the document bottom, so Qt's default extend
@@ -3134,8 +3138,15 @@ class SecureTerminal(QPlainTextEdit):
                     fmt.setBackground(QColor(spec['bg']))
             else:
                 # Pass the EFFECTIVE structural (Show-only): a strict-mode placeholder is
-                # not displayed as its glyph, so it must keep the contrast guard.
-                fmt = QTextCharFormat(self._pyte_format(cell, structural))   # program SGR
+                # not displayed as its glyph, so it must keep the contrast guard. Gate the
+                # program's ANSI colour by _effective_colors() exactly as the plain-cell main
+                # path above: colours=false strips fg/bg/reverse (keeps bold/underscore shape)
+                # so a structural glyph or a markings-off cell cannot show PROGRAM colour. The
+                # risk-class branch above (unicode/control tints) is independent of this and
+                # stays coloured. _rerender clears _grid_mark_cache on a colours toggle.
+                pcell = cell if self._effective_colors() else cell._replace(
+                    fg='default', bg='default', reverse=False)
+                fmt = QTextCharFormat(self._pyte_format(pcell, structural))   # program SGR
             fmt.setProperty(_CP_PROP, cp)
             return _cache_bounded(self._grid_mark_cache, key, fmt)
         return fmt
@@ -4293,13 +4304,14 @@ class SecureTerminal(QPlainTextEdit):
         # Scan a tail-carried probe so an alt-screen marker split across an os.read()
         # boundary is still seen (as the sync-2026 scan below does). F6.
         alt_probe = self._alt_scan_carry + text
-        # Carry the tail of the JOINED probe, not of this chunk: a marker split
-        # across three or more reads otherwise loses its introducer. Reads
-        # "\x1b[?1", "04", "9h" leave carry "\x1b[?1", then carry "04" -- the ESC
-        # dropped -- so the final probe "049h" matches nothing and the alt screen
-        # goes unnoticed. (The TUI feed carry, _alt_partial_tail, already slices
-        # the joined buffer; the two must not disagree.)
-        self._alt_scan_carry = alt_probe[-(_ALT_MARKER_MAX - 1):]
+        # Carry the incomplete-private-CSI tail of the JOINED probe (the str twin of the
+        # TUI feed carry, _alt_partial_tail): slicing the joined buffer keeps the introducer
+        # of a marker split across three or more reads ("\x1b[?1","04","9h" -> carry
+        # "\x1b[?1" then "\x1b[?104"), and using the SAME incomplete-CSI rule as the byte
+        # path means the two agree on a combined/numeric split marker (ESC[?47;1049h,
+        # ESC[?01049h). A COMPLETE marker is not carried, so it is scanned once, not re-fired.
+        _k = _alt_scan_partial_tail(alt_probe)
+        self._alt_scan_carry = alt_probe[len(alt_probe) - _k:] if _k else ''
         entered = wants_full_screen(alt_probe)
         left = leaves_full_screen(alt_probe)
         if entered or left:
@@ -7103,7 +7115,15 @@ class SecureTerminal(QPlainTextEdit):
         cur.setPosition(a)
         cur.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
         self.setTextCursor(cur)
-        self._sel_anchor = (a, b)
+        # Store the anchor RANGE as a pair of LIVE QTextCursors, not raw ints: a fast
+        # producer evicting head blocks past maximumBlockCount shifts every doc position,
+        # so raw ints would go stale and a later extend-drag would copy the wrong span. Qt
+        # keeps a QTextCursor's position valid across such trims (as _shift_click_anchor does).
+        ca = self.textCursor()
+        ca.setPosition(a)
+        cb = self.textCursor()
+        cb.setPosition(b)
+        self._sel_anchor = (ca, cb)
         self._select_mode = mode
         # setTextCursor -> ensureCursorVisible jumps the hbar to the word's end; pin the
         # left margin back (as the triple-click and drag paths do).
@@ -7126,7 +7146,8 @@ class SecureTerminal(QPlainTextEdit):
         scrolls to follow the drag upward as well as downward."""
         if self._sel_anchor is None:
             return
-        a, b = self._sel_anchor
+        ca, cb = self._sel_anchor
+        a, b = ca.position(), cb.position()   # re-read live: valid across scrollback eviction
         if self._select_mode == 'line':
             unit = self._line_range_at(point)
         else:
