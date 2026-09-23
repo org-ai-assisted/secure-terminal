@@ -214,16 +214,32 @@ def save(tabs, window=None, active=None):
         ensure_state_dir()
         index = []
         current = set()
-        for position, tab in enumerate(tabs):
+        # Reserve every VALID uid first: a real uid keys its own tab-<uid>.log and load()
+        # reads it back by that exact name, so it must never be reassigned. The app always
+        # supplies a valid, unique uid (_session_tabs), so that path is unchanged. A tab
+        # lacking a valid uid (any other caller) then gets the next free key that collides
+        # with NO real uid and no earlier fallback -- else its log would clobber a real tab's
+        # scrollback. load() has the symmetric anti-aliasing (seen-set); save() must not
+        # create the alias in the first place. Keeps the "Never raises" contract.
+        reserved = {tab.get('uid') for tab in tabs if _valid_uid(tab.get('uid'))}
+        next_fallback = 0
+        for tab in tabs:
             entry = {key: value for key, value in tab.items() if key != 'text'}
-            # The app always supplies a valid uid (_session_tabs); fall back to the
-            # list position for any other caller so save() keeps its "Never raises"
-            # contract (a bare tab dict must not KeyError on quit).
             uid = tab.get('uid')
-            uid = uid if _valid_uid(uid) else position
-            current.add(uid)
-            _write_atomic(_log_path(uid), tab.get('text', ''))
+            if _valid_uid(uid):
+                key = uid
+            else:
+                while next_fallback in reserved or next_fallback in current:
+                    next_fallback += 1
+                key = next_fallback
             index.append(entry)
+            if key in current:
+                # A DUPLICATE valid uid (a crafted/legacy index): the first occurrence
+                # already owns tab-<uid>.log; do not clobber it. load() restores this
+                # duplicate as an empty tab, so matching that here loses nothing.
+                continue
+            current.add(key)
+            _write_atomic(_log_path(key), tab.get('text', ''))
         # Drop log files whose tab is no longer part of the session (a closed tab,
         # or leftovers from a previous, larger session).
         for stale in _log_indices():
