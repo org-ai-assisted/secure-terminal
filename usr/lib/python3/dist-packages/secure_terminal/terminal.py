@@ -1416,6 +1416,13 @@ class SecureTerminal(QPlainTextEdit):
         # resize can afford ~4M rendered chars; far below the ~99M unbounded worst case,
         # and >= a realistic detail scrollback (1M ASCII source == 1M render, fully kept).
         self._REFLOW_RENDER_MAX = 4_000_000
+        # Max bytes per pty os.read -- AND the size the reflow / mode-toggle replay
+        # re-chunks the retained buffer into, so a one-shot replay feeds the line
+        # renderer in the SAME pieces the live reader does. feed_line_edits' anti-flood
+        # work budget is per-CALL: coupled on purpose, because a replay chunked
+        # differently from the live read would exhaust that budget on early cursor pads
+        # and then SKIP later CSI-K erases, resurrecting cleared text on a resize.
+        self._PTY_READ_MAX = 65536
 
         # optional ANSI colours (off by default); SGR parser state. Also set from
         # the ctor before the history render, for the same render-once reason.
@@ -1595,6 +1602,12 @@ class SecureTerminal(QPlainTextEdit):
         self._mouse_modes = set()
         self._mouse_scan_carry = ''   # incomplete escape carried across a read split
         self._bracket_had_fg = False  # last-seen fg-program state while DEC 2004 was set
+        # (fg_pgrp, /proc exe) of the program that armed DEC 2004, captured on the bit's
+        # rising edge; None when 2004 is off. An in-place exec keeps the pgid (no fg
+        # transition clears 2004), but the pgid leader's exe flips -- so a mismatch here at
+        # paste time means a successor that never armed bracketed paste, and the paste is
+        # force-reviewed rather than trusted as bracketed (_bracketed_paste_active).
+        self._bracket_owner = None
         self._wheel_accum_x = 0       # horizontal wheel delta (vertical: _wheel_accum)
         self._mouse_report_btns = set()  # Qt buttons whose reported press awaits release
         self._mouse_report_cell = None  # last cell reported for motion (coalesce 1003)
@@ -2073,7 +2086,24 @@ class SecureTerminal(QPlainTextEdit):
                 _src = self._raw
             else:
                 _src = tail_from_escape_boundary(self._raw, self._RERENDER_TAIL)
-            self._feed_line(_src)
+            # Replay in the SAME <=_PTY_READ_MAX pieces the live reader delivers, so each
+            # feed_line_edits call gets its OWN per-call work budget. A single whole-buffer
+            # feed would spend that budget on early cursor pads and then SKIP later CSI-K
+            # erases -- cleared text (a secret) would reappear on a reflow / mode-toggle,
+            # diverging from the live path that had erased it. split_trailing_escape holds a
+            # CSI split across a piece edge (this replay path does not run feed_chunk_carry),
+            # which also aligns the piece boundaries with the live feed. Paint is deferred
+            # and flushed once at the end so the rebuild is a single repaint.
+            _carry = ''
+            while _src:
+                if len(_src) <= self._PTY_READ_MAX:
+                    _piece, _src = _carry + _src, ''   # last piece: nothing left to rejoin a split
+                else:
+                    _piece = _carry + _src[:self._PTY_READ_MAX]
+                    _src = _src[self._PTY_READ_MAX:]
+                    _piece, _carry = split_trailing_escape(_piece)   # hold a CSI split at the edge
+                self._feed_line(_piece, defer=True)
+            self._flush_paint()
 
     def current_mode(self):
         return self._mode
@@ -2817,11 +2847,15 @@ class SecureTerminal(QPlainTextEdit):
         cols, rows = self._tui_grid_size()
         self._screen = _SafeHistoryScreen(cols, rows,
                                           history=self._history_size(), ratio=0.5)
-        self._stream = _Utf8CharsetByteStream(self._screen)
-        # Route pyte's BEL to the tab's bell policy. pyte tracks OSC state across
-        # feeds, so a BEL that merely terminates a (possibly split) OSC title is
-        # consumed as the terminator and never reaches here -- only a real bell does.
+        # Route pyte's BEL to the tab's bell policy. MUST be set BEFORE the Stream
+        # below: pyte's parser binds the screen's event handlers BY VALUE at attach
+        # time (Stream construction), so a .bell assigned afterward would never be
+        # dispatched for this screen -- the first TUI screen's bell would be dead.
+        # pyte tracks OSC state across feeds, so a BEL that merely terminates a
+        # (possibly split) OSC title is consumed as the terminator and never reaches
+        # here -- only a real bell does.
         self._screen.bell = self._pyte_bell
+        self._stream = _Utf8CharsetByteStream(self._screen)
         self._set_winsize(cols, rows)
         self._reset_grid_view()
 
@@ -4235,7 +4269,7 @@ class SecureTerminal(QPlainTextEdit):
             # drained; os.read(None) would TypeError (uncaught below).
             return
         try:
-            data = os.read(fd, 65536)
+            data = os.read(fd, self._PTY_READ_MAX)
         except BlockingIOError:
             return                        # nothing ready yet (non-blocking fd)
         except OSError:
@@ -4422,6 +4456,22 @@ class SecureTerminal(QPlainTextEdit):
                 self._alt_view = False
                 self._alt_owner_pgrp = None
             self._reset_vt_to_prompt_baseline()
+
+        # Track WHO armed bracketed paste (DEC 2004) now that this chunk (and any exit
+        # reset above) is fully applied. On the bit's RISING edge, snapshot the foreground
+        # pgid leader's /proc exe -- an unforgeable identity (see _read_exe). An in-place
+        # exec of that program keeps the pgid, so no fg transition ever clears 2004, but the
+        # exe flips: the mismatch is what _bracketed_paste_active checks so a successor that
+        # never asked for bracketed paste cannot inherit the trust. /proc is read only on the
+        # rising edge (rare); a bare re-send while already armed keeps the original owner.
+        if self._screen is not None:
+            if _BRACKETED_PASTE_MODE in self._screen.mode:
+                if self._bracket_owner is None:
+                    _bpg = self._foreground_pgrp()
+                    self._bracket_owner = ((_bpg, self._read_exe(_bpg))
+                                           if _bpg is not None else None)
+            else:
+                self._bracket_owner = None
 
         # Retain the raw output in BOTH modes -- for a mode re-render (TUI->CLI)
         # and for seeding the TUI grid (CLI->TUI) -- so neither switch loses output.
@@ -5256,6 +5306,7 @@ class SecureTerminal(QPlainTextEdit):
         # baseline; the buffer + scrollback are untouched.
         self._reset_vt_to_prompt_baseline()
         self._bracket_had_fg = False
+        self._bracket_owner = None       # 2004 cleared above; drop its stale owner too
         self._sync_update = False
         self._line_dirty = False
         # SECURITY: a held multi-line paste for the EXITED program's shell must not
@@ -7375,10 +7426,24 @@ class SecureTerminal(QPlainTextEdit):
         check closes the single-read crash window it cannot observe (the program's ?2004h
         and its death coalesced into one read, so no edge was ever seen). A bare shell
         prompt is therefore force-reviewed, never trusted -- consistent with the
-        review-every-multiline-paste model."""
-        return (self.tui_active() and self.has_foreground_program()
+        review-every-multiline-paste model.
+
+        Requiring the LIVE foreground owner to be the SAME program that armed 2004 closes
+        the in-place-exec bypass: an `exec` keeps the pgid (so has_foreground_program stays
+        True and no fg transition clears 2004), but the pgid leader's /proc exe flips to a
+        successor that never asked for bracketed paste. _bracket_owner snapshots (pgrp, exe)
+        at the arming edge; a mismatch now -- or an unknown owner -- force-reviews the paste.
+        A successor that CLEARS then re-arms 2004 (its own ?2004l/?2004h) re-owns the bit and
+        is trusted again; one that keeps A's sticky bit is not."""
+        if not (self.tui_active() and self.has_foreground_program()
                 and self._screen is not None
-                and _BRACKETED_PASTE_MODE in getattr(self._screen, 'mode', ()))
+                and _BRACKETED_PASTE_MODE in getattr(self._screen, 'mode', ())):
+            return False
+        owner = self._bracket_owner
+        if owner is None:
+            return False
+        pgrp = self._foreground_pgrp()
+        return owner == (pgrp, self._read_exe(pgrp))
 
     def insertFromMimeData(self, source):
         if self._review_active:
