@@ -505,6 +505,7 @@ class InfoTip(QLabel):
         self._zoom = max(50, min(400, zoom))
         self._apply_tip_font()
         self._place(widget, at_rect)
+        self._place_over_modal()
         self.show()
         # A frameless stay-on-top tool window can still be painted under a modal
         # dialog or a menu popup that opened after it; raise it so it floats above
@@ -593,6 +594,24 @@ class InfoTip(QLabel):
             else QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
         screen = widget.screen() or QApplication.primaryScreen()
         self.move(self._placement(rect, self.size(), screen.availableGeometry(), self._GAP))
+
+    def _place_over_modal(self):
+        """A modal dialog (Global settings / About / ...) is run application-modal via
+        QDialog.exec(), which blocks mouse input to every top-level window that is not
+        the dialog or a transient child of it. This tip is a tool window kept parented
+        (for a stable lifetime) to the MAIN window, so over a modal dialog it showed but
+        refused text selection -- the reported un-copyable settings tooltip. Point its
+        window's TRANSIENT parent at the active modal widget (QObject ownership
+        unchanged, so the shared tip is not destroyed when the dialog closes) so Qt's
+        isWindowBlocked walk reaches the modal window and stops blocking its input.
+        Falls back to the main-window parent when nothing is modal, resetting it after a
+        dialog closes."""
+        modal = QApplication.activeModalWidget()
+        anchor = modal if modal is not None else self.parentWidget()
+        self.winId()                      # force the native window to exist (needs a handle)
+        target = anchor.window().windowHandle()
+        if target is not None:            # the main window may be unshown in the fallback
+            self.windowHandle().setTransientParent(target)
 
     def _check_pointer(self):
         pos = QCursor.pos()
