@@ -2853,6 +2853,10 @@ class MainWindow(QMainWindow):
         tid = self._tab_ids.get(term)
         if tid is not None:      # show id 0 too (add() would skip a falsy value)
             rows.append('tab id: %s' % html.escape(str(tid)))
+        # The instance group this window belongs to (its ctl socket + isolated on-disk
+        # state subtree); shown on every tab so hovering identifies the group at a glance.
+        # Label spelled with a space (not a hyphen) to match the tab-tooltip field-name shape.
+        add('instance group', self._instance_group)
         add('name', self._user_titles.get(term))
         add('program', self._prog_titles.get(term))
         add('command', _command_display(term._command) or '(login shell)')
