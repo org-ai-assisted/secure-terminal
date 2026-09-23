@@ -4016,6 +4016,33 @@ class SecureTerminal(QPlainTextEdit):
         return 'xterm-256color', tdir
 
     # -- child process over a pseudo-terminal ---------------------------------
+    # A normal exec answers in microseconds (the child execs, or on failure writes one byte
+    # then _exit). Only a pre-exec os.chdir into a dead/hung mount -- a session-restored,
+    # user-editable cwd on an unresponsive NFS/automount -- stalls the handshake, and it
+    # stalls UNINTERRUPTIBLY in the child. Bound the parent's wait so that never freezes the
+    # Qt main thread: generous vs any live spawn, short vs a human's patience.
+    _EXEC_HANDSHAKE_TIMEOUT = 5.0
+
+    def _await_exec(self, exec_r, pid):
+        """Read the child's exec-detection handshake with a BOUNDED wait, so a child wedged
+        in a pre-exec os.chdir (a restored cwd on a dead mount) cannot freeze the Qt main
+        thread. Returns True when the tab must fail closed -- the exec FAILED (child wrote a
+        byte) OR the child WEDGED before exec (the select timeout fired) -- and False on a
+        clean exec (the CLOEXEC pipe closed -> EOF). A wedged child is SIGKILLed (best
+        effort: a D-state child dies the instant its blocked syscall returns, before it can
+        exec) and left in _LIVE_PTY_PIDS for the SIGCHLD reaper, so no late-waking shell
+        surprises the failed tab. Reachability CANNOT be predicted ahead of the chdir
+        (os.stat uses AT_NO_AUTOMOUNT so it disagrees with chdir on an automount, and any
+        path can be swapped after a probe), so bound the WAIT rather than guess."""
+        ready, _, _ = select.select([exec_r], [], [], self._EXEC_HANDSHAKE_TIMEOUT)
+        if not ready:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass    # already gone / unkillable -> the SIGCHLD reaper still evicts it
+            return True
+        return bool(os.read(exec_r, 1))
+
     def _start(self, command, keep_screen=False):
         term, terminfo_dir = self._child_term()
         # Parse in the PARENT so a malformed / whitespace-degenerate command (argv is
@@ -4132,11 +4159,13 @@ class SecureTerminal(QPlainTextEdit):
         if cg_fd is not None:
             os.close(cg_fd)
         # Parent: the write end is the child's; a successful exec closes it (CLOEXEC) ->
-        # read EOF; a failed exec writes one byte -> read it. The read blocks only until
-        # the child execs (immediate), matching subprocess's exec-failure handshake.
+        # read EOF; a failed exec writes one byte -> read it. BOUNDED (see _await_exec): a
+        # child wedged in a pre-exec os.chdir on a dead mount would otherwise block this read
+        # on the Qt main thread forever, freezing the whole app; on timeout the wedged child
+        # is killed and the tab fails closed instead.
         os.close(exec_w)
         try:
-            self._command_exec_failed = bool(os.read(exec_r, 1))
+            self._command_exec_failed = self._await_exec(exec_r, pid)
         finally:
             os.close(exec_r)
         # Baseline the child's /proc exe now that the exec has succeeded: this is the real
