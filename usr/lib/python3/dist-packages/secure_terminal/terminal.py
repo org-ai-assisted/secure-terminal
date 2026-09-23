@@ -4016,6 +4016,41 @@ class SecureTerminal(QPlainTextEdit):
         return 'xterm-256color', tdir
 
     # -- child process over a pseudo-terminal ---------------------------------
+    # A normal exec answers in microseconds (the child execs, or on failure writes one byte
+    # then _exit). Only a pre-exec os.chdir into a dead/hung mount -- a session-restored,
+    # user-editable cwd on an unresponsive NFS/automount -- stalls the handshake, and it
+    # stalls UNINTERRUPTIBLY in the child. Bound the parent's wait so that never freezes the
+    # Qt main thread: generous vs any live spawn, short vs a human's patience.
+    _EXEC_HANDSHAKE_TIMEOUT = 5.0
+
+    @staticmethod
+    def _poll_ready(fd, events, timeout_s):
+        """poll() one fd for `events` up to timeout_s; True if ready, False on timeout.
+        poll(), NOT select(): an fd at/above FD_SETSIZE (1024, reachable with many tabs
+        open) makes select() raise ValueError, but poll() handles any fd."""
+        poller = select.poll()
+        poller.register(fd, events)
+        return bool(poller.poll(timeout_s * 1000))                 # poll() timeout is in ms
+
+    def _await_exec(self, exec_r, pid):
+        """Read the child's exec-detection handshake with a BOUNDED wait, so a child wedged
+        in a pre-exec os.chdir (a restored cwd on a dead mount) cannot freeze the Qt main
+        thread. Returns True when the tab must fail closed -- the exec FAILED (child wrote a
+        byte) OR the child WEDGED before exec (the poll timeout fired) -- and False on a
+        clean exec (the CLOEXEC pipe closed -> EOF). A wedged child is SIGKILLed (best
+        effort: a D-state child dies the instant its blocked syscall returns, before it can
+        exec) and left in _LIVE_PTY_PIDS for the SIGCHLD reaper, so no late-waking shell
+        surprises the failed tab. Reachability CANNOT be predicted ahead of the chdir
+        (os.stat uses AT_NO_AUTOMOUNT so it disagrees with chdir on an automount, and any
+        path can be swapped after a probe), so bound the WAIT rather than guess."""
+        if not self._poll_ready(exec_r, select.POLLIN, self._EXEC_HANDSHAKE_TIMEOUT):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass    # already gone / unkillable -> the SIGCHLD reaper still evicts it
+            return True
+        return bool(os.read(exec_r, 1))
+
     def _start(self, command, keep_screen=False):
         term, terminfo_dir = self._child_term()
         # Parse in the PARENT so a malformed / whitespace-degenerate command (argv is
@@ -4132,11 +4167,13 @@ class SecureTerminal(QPlainTextEdit):
         if cg_fd is not None:
             os.close(cg_fd)
         # Parent: the write end is the child's; a successful exec closes it (CLOEXEC) ->
-        # read EOF; a failed exec writes one byte -> read it. The read blocks only until
-        # the child execs (immediate), matching subprocess's exec-failure handshake.
+        # read EOF; a failed exec writes one byte -> read it. BOUNDED (see _await_exec): a
+        # child wedged in a pre-exec os.chdir on a dead mount would otherwise block this read
+        # on the Qt main thread forever, freezing the whole app; on timeout the wedged child
+        # is killed and the tab fails closed instead.
         os.close(exec_w)
         try:
-            self._command_exec_failed = bool(os.read(exec_r, 1))
+            self._command_exec_failed = self._await_exec(exec_r, pid)
         finally:
             os.close(exec_r)
         # Baseline the child's /proc exe now that the exec has succeeded: this is the real
@@ -4339,7 +4376,18 @@ class SecureTerminal(QPlainTextEdit):
             k = _alt_partial_tail(feed)         # hold back ONLY a split-marker tail
             self._alt_feed_carry = feed[len(feed) - k:] if k else b''
             stream = feed[:len(feed) - k] if k else feed
-            self._feed_prompt_aware(stream)
+            if self._feed_prompt_aware(stream):
+                # ONLY when this read hit the _ALT_TRANSITIONS_MAX cap: past the cap the
+                # snapshot machine STOPPED mutating while the flag's scan ran unbounded, so a
+                # >cap flood strands the flag vs _alt_saved -- flag False + a held snapshot
+                # wedges the next genuine _alt_enter's nesting guard (its primary is never
+                # snapshotted, the stale one is restored on exit -- corrupt scrollback) and is
+                # skipped by the exited-owner cleanup below; flag True + no snapshot arms alt
+                # rendering/mouse with nothing to restore. Bind the flag to the authoritative
+                # machine state. NOT on a normal read: there the scan resolves combined/numeric
+                # split markers (ESC[?47;1049h, ESC[?01049h) the byte-feed carry misses, so the
+                # scan flag is the better source and must not be clobbered.
+                self._alt_screen = self._alt_saved is not None
         else:
             self._alt_feed_carry = b''          # CLI mode does not stream-feed; drop any tail
         if sync_end:
@@ -4485,12 +4533,12 @@ class SecureTerminal(QPlainTextEdit):
         line already filled the width (pyte wraps the prompt itself), and in the zsh
         order where the marker trails the prompt (nothing printable follows) -- the
         same guard the CLI uses. Feeding per prompt segment keeps _alt_saved and the
-        cursor current at each boundary (unlike a blanket replace)."""
+        cursor current at each boundary (unlike a blanket replace). Returns True iff any
+        feed hit the alt-transition cap (see _feed_stream)."""
         if _PROMPT_START_BYTES not in stream:
-            self._feed_stream(stream)
-            return
+            return self._feed_stream(stream)
         parts = stream.split(_PROMPT_START_BYTES)
-        self._feed_stream(parts[0])
+        capped = self._feed_stream(parts[0])
         for part in parts[1:]:
             prefix = _SGR_RESET_BYTES
             scr = self._screen
@@ -4506,7 +4554,8 @@ class SecureTerminal(QPlainTextEdit):
                 scr.buffer[y].no_newline = True
                 scr.dirty.add(y)
                 prefix = b'\r\n' + prefix
-            self._feed_stream(prefix + _PROMPT_START_BYTES + part)
+            capped = self._feed_stream(prefix + _PROMPT_START_BYTES + part) or capped
+        return capped
 
     def _feed_stream(self, data):
         """Feed bytes to pyte, handling alternate-screen enter/leave INLINE so the
@@ -4514,11 +4563,14 @@ class SecureTerminal(QPlainTextEdit):
         used for live output AND the seed replay, so bytes after a leave (the
         shell's next prompt) land on the RESTORED primary, and a full-screen
         program's frames never pollute the scrollback -- pyte itself has no alt
-        buffer."""
+        buffer. Returns True iff the per-read transition CAP was hit (a >cap flood), so
+        the caller can reconcile the alt-screen flag to the machine; a normal read returns
+        False and leaves the flag's scan result intact."""
         if self._stream is None:
-            return
+            return False
         pos = 0
         transitions = 0
+        capped = False
         # Each enter/leave snapshots or clears the whole screen (pyte has no alt buffer). A
         # process flooding alternating ?1049h/?1049l in one read could otherwise force thousands
         # of full-screen deepcopies and freeze the GUI, so bound the snapshot/restore work per
@@ -4526,6 +4578,7 @@ class SecureTerminal(QPlainTextEdit):
         # own frame). _alt_transitions_bytes is a SINGLE regex pass -> O(n), not a scan-DoS.
         for (end, kind) in _alt_transitions_bytes(data):
             if transitions >= self._ALT_TRANSITIONS_MAX:
+                capped = True                        # more transitions than we snapshot/restore
                 break
             self._feed_bytes(data[pos:end])          # up to and incl. the alt-screen CSI
             if kind == 'enter':
@@ -4535,6 +4588,7 @@ class SecureTerminal(QPlainTextEdit):
             transitions += 1
             pos = end
         self._feed_bytes(data[pos:])                 # the remainder (or the whole chunk)
+        return capped
 
     def _feed_bytes(self, chunk):
         """Feed one segment to the pyte parser, containing any error -- pyte parses
@@ -5856,7 +5910,7 @@ class SecureTerminal(QPlainTextEdit):
             except BlockingIOError:
                 if time.monotonic() > deadline:
                     break
-                select.select([], [self._fd], [], 0.05)
+                self._poll_ready(self._fd, select.POLLOUT, 0.05)   # wait until writable
             except OSError:
                 break           # child gone / pty closed -> the unwritten tail is dropped
         return total - len(view)
