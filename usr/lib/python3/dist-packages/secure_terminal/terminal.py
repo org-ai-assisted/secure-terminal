@@ -4340,6 +4340,18 @@ class SecureTerminal(QPlainTextEdit):
             self._alt_feed_carry = feed[len(feed) - k:] if k else b''
             stream = feed[:len(feed) - k] if k else feed
             self._feed_prompt_aware(stream)
+            # Reconcile the flag to the snapshot machine's ACTUAL state. _alt_screen was
+            # pre-set (above) from the LAST transition in the whole read so the enter/leave
+            # renders during the feed see the right mode -- but _feed_stream caps
+            # snapshot/restore at _ALT_TRANSITIONS_MAX per read and feeds the remainder as
+            # ordinary bytes (no _alt_enter/_alt_leave). Past the cap the last-wins flag and
+            # the machine (_alt_saved) DISAGREE on a >cap-transition flood: flag False + a
+            # held snapshot wedges the next genuine _alt_enter's nesting guard (its primary is
+            # never snapshotted, the stale one is restored on exit -- corrupt scrollback) and
+            # is skipped by the exited-owner cleanup below; flag True + no snapshot arms alt
+            # rendering/mouse with nothing to restore. _alt_saved is the authoritative alt
+            # state, so bind the flag to it once the read is fully fed.
+            self._alt_screen = self._alt_saved is not None
         else:
             self._alt_feed_carry = b''          # CLI mode does not stream-feed; drop any tail
         if sync_end:
