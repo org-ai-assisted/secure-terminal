@@ -4239,6 +4239,12 @@ class SecureTerminal(QPlainTextEdit):
                                  else self._pid_start_time(pid))
         SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
         self._fd = fd
+        # Close-on-exec: pty.fork()'s master fd is INHERITABLE by default, so a LATER tab's
+        # forked shell would inherit THIS tab's pty master -- a program in that tab could then
+        # scan /proc/self/fd and read another tab's output or inject keystrokes into it, a
+        # cross-tab isolation break. set_inheritable(False) sets FD_CLOEXEC so a subsequent
+        # execvp drops it. (The exec-detection pipe + cgroup fd are already close-on-exec.)
+        os.set_inheritable(fd, False)
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         self._notifier = QSocketNotifier(fd, QSocketNotifier.Type.Read, self)
