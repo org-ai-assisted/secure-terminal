@@ -1258,6 +1258,10 @@ class SecureTerminal(QPlainTextEdit):
     # trusted glyph on the tab bar, cleared when the tab is focused). Carries no
     # program text -- the marker is our own chrome, not a reflected title.
     bell_tab = pyqtSignal()
+    # output arrived on this tab; the window marks it (a calm static glyph) while it is
+    # a BACKGROUND tab, so "which tab produced output while I was elsewhere" is visible;
+    # cleared when the tab is focused. Fires per output chunk (the mark is idempotent).
+    activity = pyqtSignal()
     # a program in this tab asked to READ the clipboard (OSC 52 query) and the tab
     # has not yet decided; the window asks the user ONCE PER TAB (see osc_clipboard_read).
     clipboard_read_requested = pyqtSignal()
@@ -3148,6 +3152,23 @@ class SecureTerminal(QPlainTextEdit):
             self._grid_ws_fmt = fmt
         return fmt
 
+    def _grid_space_is_visible(self, cell):
+        """A space you can SEE -- painted a background that DIFFERS from the terminal's
+        own background -- is a program bar (nano's title bar, a status line, colour
+        art), not hidden padding, so it is never a whitespace anomaly. Judged on the
+        EFFECTIVE painted format (via _grid_cell_format, the same path the cell renders
+        through), not the raw cell: with colours OFF the program bg is stripped, and a
+        bg set to the theme background paints as ordinary padding -- both must still be
+        dotted. Reverse video that swaps a distinct fg into the bg stays visible."""
+        brush = self._grid_cell_format(cell, ' ').background()
+        if brush.style() == Qt.BrushStyle.NoBrush:
+            return False                        # no distinct bg painted -> padding
+        theme_bg = THEMES.get(self._theme, THEMES['dark'])[0]
+        base_bg = self._osc_palette.get('bg', theme_bg)
+        # PERCEPTUAL, not exact: a bg a hair off the terminal background (e.g. #fffffe on
+        # a #ffffff theme) is indistinguishable from padding, so it must still be dotted.
+        return not too_close(_rgb(brush.color()), _rgb(QColor(base_bg)))
+
     def _grid_row_runs(self, row, columns):
         """The (text, format) runs one pyte row renders to, same-format cells
         coalesced. This IS both the row's render and its incremental signature:
@@ -3165,8 +3186,16 @@ class SecureTerminal(QPlainTextEdit):
         # spaces BETWEEN visible tokens is the real "hidden extra spacing" anomaly. Gated on the
         # risk-marking toggle, like the CLI path. A flagged space keeps its real space (copy-safe)
         # under the dot-flagged format; paintEvent draws the dot.
-        flagged = (whitespace_anomaly_cols(chars, flag_trailing=False, flag_leading=False)
-                   if self._markings else ())
+        # A styled space (reverse video / non-default bg) is a VISIBLE program-painted
+        # bar (nano's title bar, a status line), not hidden padding, so it must never be
+        # dotted -- mask it out of the char-only anomaly scan (the CLI path does the same
+        # via sanitize._space_is_visible). Only plain default-bg spaces stay candidates.
+        if self._markings:
+            scan = ['\x00' if chars[x] == ' ' and self._grid_space_is_visible(row[x])
+                    else chars[x] for x in range(columns)]
+            flagged = whitespace_anomaly_cols(scan, flag_trailing=False, flag_leading=False)
+        else:
+            flagged = ()
         runs = []
         run_text = ''
         run_fmt = None
@@ -4183,6 +4212,10 @@ class SecureTerminal(QPlainTextEdit):
                 self._notifier.setEnabled(False)
             self.shell_exited.emit()
             return
+        # Real output arrived (the child exited above on empty). Signal it so the window
+        # can mark a BACKGROUND tab as having unseen output. Idempotent downstream, so
+        # firing per chunk is fine.
+        self.activity.emit()
         # output arriving is how a returning prompt looks from here, so it is the
         # cue to retry a re-export deferred by a pending line. No-ops (one flag
         # test) unless a mode switch is actually waiting.

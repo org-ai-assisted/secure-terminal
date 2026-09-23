@@ -121,6 +121,22 @@ def _state_dir():
     return os.path.join(_instances_root(), _INSTANCE_GROUP)
 
 
+def ensure_instances_root():
+    """Create the state ROOT (parent of every group subtree) owner-only. The crash
+    log lives here, at one fixed path, so it is found regardless of instance group
+    or the throwaway-vs-named decision a window makes later. Fully best-effort (it
+    only backs a diagnostic): a create/chmod failure must never abort a launch.
+    Returns the path regardless."""
+    root = _instances_root()
+    try:
+        _makedirs_private(root)
+        os.chmod(root, 0o700)
+    except OSError:
+        pass                # best-effort: the crash log is only a diagnostic, so a
+                            # create/chmod failure must never abort the launch
+    return root
+
+
 def ensure_state_dir():
     """Create the state dir owner-only (0o700) and enforce that mode even on a
     PRE-EXISTING dir. It holds sensitive terminal history (transcripts, scrollback,

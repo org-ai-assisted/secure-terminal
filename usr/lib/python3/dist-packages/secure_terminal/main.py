@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
     QToolTip, QStyle, QStylePainter, QStyleOptionTab,
 )
 
-from secure_terminal import settings, session, ipc, resource_isolation
+from secure_terminal import settings, session, ipc, resource_isolation, crashdiag
 from secure_terminal.sanitize import (
     OSC_FEATURES, OSC_FEATURE_BY_KEY, OSC_NOTICE_DEFAULT_OFF,
     osc_code_description, sanitize_title)
@@ -903,7 +903,8 @@ class SecureTabBar(QTabBar):
     # NB: Qt round-trips tabData through a QVariant, so tabData() returns a COPY --
     # a returned dict cannot be mutated in place. Every setter reads a copy, updates
     # it, and writes it back with setTabData (which Qt migrates with the tab on move).
-    _DEFAULT_MODEL = {'accent': None, 'ptitle': '', 'bell': False, 'pulse': 0}
+    _DEFAULT_MODEL = {'accent': None, 'ptitle': '', 'bell': False, 'pulse': 0,
+                      'activity': False}
 
     def _model(self, index):
         m = self.tabData(index)
@@ -964,17 +965,44 @@ class SecureTabBar(QTabBar):
     def has_bell(self, index):
         return bool(0 <= index < self.count() and self._model(index)['bell'])
 
+    def mark_activity(self, index):
+        """Mark a BACKGROUND tab that produced output since it was last viewed: a calm
+        STATIC glyph (no pulse -- distinct from the bell's attention pulse), cleared when
+        the tab is focused. Idempotent: fired per output chunk, so once set it repaints
+        nothing (a busy background tab must not drive a repaint per read)."""
+        if not (0 <= index < self.count()):
+            return
+        m = self._model(index)
+        if m['activity']:
+            return
+        m['activity'] = True
+        self.setTabData(index, m)
+        self.update()
+
+    def clear_activity(self, index):
+        if 0 <= index < self.count():
+            m = self._model(index)
+            if not m['activity']:
+                return
+            m['activity'] = False
+            self.setTabData(index, m)
+            self.update()
+
+    def has_activity(self, index):
+        return bool(0 <= index < self.count() and self._model(index)['activity'])
+
     def tab_lines(self, index):
         """Structural view of a tab's content, for tests (no pixels): the trusted
         line-1 label, the RAW untrusted line-2 program title ('' when hidden or
         single-line -- this is the model value, NOT the normalized string the band paints;
         normalize_ptitle decides the shown form), and whether a bell marker is set."""
         if not (0 <= index < self.count()):
-            return {'label': '', 'ptitle': '', 'bell': False, 'accent': None}
+            return {'label': '', 'ptitle': '', 'bell': False, 'accent': None,
+                    'activity': False}
         m = self._model(index)
         return {'label': self.tabText(index),
                 'ptitle': m['ptitle'] if self._two_line else '',
-                'bell': m['bell'], 'accent': m['accent']}
+                'bell': m['bell'], 'accent': m['accent'], 'activity': m['activity']}
 
     def element_tooltip(self, pos):
         """Tooltip for the specific tab element under `pos` (bar-local): the trust lock or
@@ -1114,6 +1142,13 @@ class SecureTabBar(QTabBar):
             self._draw_bell(painter, QRect(bx, gy, self._GLYPH, self._GLYPH),
                             QColor(bell_c))
             right = bx - 4
+        # activity marker: a calm static dot, LEFT of the bell (if any). Muted, so an
+        # unfocused tab that merely produced output reads quieter than one that rang.
+        if m['activity']:
+            ax = right - self._GLYPH
+            self._draw_activity(painter, QRect(ax, gy, self._GLYPH, self._GLYPH),
+                                QColor(muted))
+            right = ax - 4
 
         # trusted line-1 text: "N label" (semibold, full contrast)
         f1 = QFont(self.font())
@@ -1208,6 +1243,20 @@ class SecureTabBar(QTabBar):
         painter.drawPath(path)
         painter.drawEllipse(QRectF(box.left() + w * 0.40, box.top() + h * 0.70,
                                    w * 0.20, h * 0.18))
+        painter.restore()
+
+    @staticmethod
+    def _draw_activity(painter, box, color):
+        """A small filled dot: this tab produced output while unfocused. Distinct in
+        SHAPE from the bell (a filled disc, not a bell), so the two states read apart
+        without relying on colour (accessible / colour-blind safe)."""
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(color))
+        w, h = box.width(), box.height()
+        d = min(w, h) * 0.42
+        painter.drawEllipse(QRectF(box.left() + (w - d) / 2.0,
+                                   box.top() + (h - d) / 2.0, d, d))
         painter.restore()
 
     @staticmethod
@@ -1866,6 +1915,11 @@ class MainWindow(QMainWindow):
         if entry:
             self._style_banner(self.current_zoom_percent())
             self._banner_label.setText(entry[1])
+            # The full advisory on hover: at high zoom the banner height is clamped so
+            # it cannot occlude the terminal (see _position_banner), which can CLIP the
+            # wrapped text -- the tooltip keeps the whole security notice readable.
+            self._banner_label.setToolTip(entry[1])
+            self._banner.setToolTip(entry[1])
             self._banner.setVisible(True)
             self._position_banner()
         else:
@@ -1893,6 +1947,14 @@ class MainWindow(QMainWindow):
         # the wrapped label carries heightForWidth; floor at 1 so a degenerate width
         # still yields a positive inset (never a negative one that hides content).
         height = max(1, banner.heightForWidth(width))
+        # CLAMP so the zoom-scaled advisory can never occlude the terminal. Its font
+        # scales with zoom, so at a high zoom (or a short window) the wrapped banner
+        # grows taller than the viewport and the reserved inset blanks the output behind
+        # it. Cap it to HALF the content area below the tab strip, so at least half the
+        # terminal always shows; the banner clips (it stays dismissible, full text in the
+        # tooltip). Without this, "zoom in -> screen goes blank" (the reported bug).
+        avail = max(1, geo.bottom() - top)
+        height = min(height, max(1, avail // 2))
         banner.setGeometry(geo.left(), top, width, height)
         banner.raise_()
         # current() is normally live (the banner shows only for a tab that holds an
@@ -3366,10 +3428,12 @@ class MainWindow(QMainWindow):
 
     def _sync_chrome_to_tab(self, *_args):
         self._update_render_active()        # foreground tab renders fast, others slow
-        # focusing a tab clears its pending bell marker (you are now looking at it)
+        # focusing a tab clears its pending bell + activity markers (you are now looking
+        # at it, so its unseen-output / bell state is now seen)
         idx = self.tabs.currentIndex()
         if idx >= 0:
             self.tabs.tabBar().clear_bell(idx)
+            self.tabs.tabBar().clear_activity(idx)
         term = self.current()
         if not isinstance(term, SecureTerminal):
             return                          # a restore placeholder is transiently current
@@ -4052,6 +4116,17 @@ class MainWindow(QMainWindow):
     def _connect_bell_tray(self, term):
         term.bell_tray.connect(lambda label: self._on_bell_tray(term, label))
         term.bell_tab.connect(lambda: self._on_bell_tab(term))
+        term.activity.connect(lambda: self._on_activity(term))
+
+    def _on_activity(self, term):
+        """Output arrived on a tab. Mark it ONLY while it is a BACKGROUND tab -- the
+        focused tab needs no 'unseen output' marker. Fires per output chunk, so
+        mark_activity is idempotent (no repaint once set)."""
+        if term is self.current():
+            return
+        index = self.tabs.indexOf(term)
+        if index >= 0:
+            self.tabs.tabBar().mark_activity(index)
 
     def _on_bell_tab(self, term):
         """A bell rang with the 'tab' channel on: mark the tab (a trusted glyph +
@@ -6903,14 +6978,26 @@ def _is_font_noise(_category, message):
     return 'OpenType support missing' in message
 
 
+# Set once crash diagnostics are wired (crashdiag.install); a one-element list so the
+# already-installed Qt message handler closure can tee later without a global rebind.
+_CRASH_LOG: list = []
+
+
 def _quiet_font_warnings():
     """Drop the font-shaping warnings (see _is_font_noise) and pass everything
     else through. They are emitted straight to the message handler and ignore
     QT_LOGGING_RULES, so a handler is the only thing that catches them."""
-    def handler(_mode, context, message):
+    def handler(mode, context, message):
         if _is_font_noise(getattr(context, 'category', '') or '', message):
             return
-        sys.stderr.write(message + '\n')
+        # A Qt Critical/Fatal (qFatal aborts right after this) is a crash cause;
+        # persist it to the durable log FIRST, so a broken/missing stderr -- the exact
+        # GUI case this log exists for -- cannot lose the record. The fatal and
+        # no-log-yet checks live in note_qt_message (a no-op otherwise), so this is
+        # called unconditionally. stderr is best-effort and must never raise out.
+        crashdiag.note_qt_message(_CRASH_LOG[0] if _CRASH_LOG else None,
+                                  mode, message)
+        crashdiag.echo_stderr(message)
     qInstallMessageHandler(handler)
 
 
@@ -7506,6 +7593,14 @@ def main(cg_base=None):
     # See CANARY_TOKEN.
     if launch.test_canary:
         return _test_canary()
+
+    # Durable crash diagnostics BEFORE any window work. A GUI launch has no visible
+    # stderr, so a Python exception escaping a Qt slot (PyQt aborts after excepthook)
+    # or a native fault (SIGSEGV/SIGABRT from Qt's C++ layer, e.g. a bad paint at
+    # extreme zoom) would else vanish with no trace. Tee both to a fixed crash.log
+    # under the state root and to stderr. Best-effort throughout (never blocks a
+    # launch); the Qt message handler installed above tees a captured qFatal too.
+    _CRASH_LOG[:] = [crashdiag.install_best_effort(session.ensure_instances_root())]
 
     # New INDEPENDENT instance per launch (konsole/qterminal model): every launch
     # opens its own window+process. Reuse is opt-IN via --reuse, which hands the
