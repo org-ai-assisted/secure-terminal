@@ -96,6 +96,11 @@ ANSI_PALETTE = [
 #               a homoglyph reads as its identity, not just a number (default, safe).
 DISPLAY_MODES = ('box', 'show', 'reveal', 'detail')
 
+# line-editing levels (see feed_line_edits and the `line_editing` entry in 30_defaults.conf).
+# 'full' = honour the line-local CSI edits + CR/BS; 'read-safe' = strip the CSI edits, CR/BS
+# still act; 'append-only' = also neutralize CR/BS so the current line can never be overwritten.
+LINE_EDITING_MODES = ('full', 'read-safe', 'append-only')
+
 # The GUI DISPLAYS a neutralized byte as this box (U+25A1 WHITE SQUARE) instead of
 # a bare '_', so it is easy to spot and read; the widget maps it back to ASCII '_'
 # on copy and on any text export, so everything you copy or save stays pure ASCII.
@@ -957,6 +962,16 @@ PROMPT_START = '\x1b[?2004h'
 _NO_NEWLINE_STATE = (('_no_newline', True),)
 _NO_NEWLINE_MARK = (' ', _NO_NEWLINE_STATE)
 
+# append-only line editing: a neutralized in-line redraw (a \r that would return to column 0
+# to overwrite, or a \b that would move left) flags its line with ONE marker cell, exactly like
+# the no-trailing-newline marker above and for the same reasons -- an unforgeable, non-SGR state
+# key (parse_sgr never emits it) that cells_to_runs suppresses to a zero-text run, so a program
+# can neither forge nor copy it. The widget keys on it to paint the left-gutter "redraw
+# attempted" glyph, so the overwrite ATTEMPT is visible evidence while nothing already written is
+# actually rewritten.
+_REDRAW_STATE = (('_redraw', True),)
+_REDRAW_MARK = (' ', _REDRAW_STATE)
+
 
 def _printable_follows(raw, i):
     """True if raw[i:] still holds printable text (past any escape sequences and
@@ -1117,7 +1132,7 @@ def _is_mark(ch):
 _SAFE_RUN_RE = regex.compile(r'[^\x07\x08\n\r\x1b\u0300-\U0010ffff]+')
 
 
-def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
+def feed_line_edits(cells, col, sgr, raw, max_line=0, line_editing='full'):
     """Advance the current line's LOGICAL cell buffer by one raw output chunk.
 
     A cell is (source_char, sgr_state) -- one SOURCE character, whatever its later
@@ -1125,21 +1140,28 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
     shell's cursor/erase ops act on characters, not on the rendering. This is what
     makes backspacing over a badge delete the whole badge. Pure and testable.
 
-    Honors \r, \b, \n and, when `line_edits` is true (the default), the line-local
-    CSI ops (see _LINE_CSI_RE); folds SGR into
-    `sgr` (so colour survives a redraw); strips every other escape and treats a
-    stray control byte as an overwrite cell (rendered as the box placeholder
-    later). Returns
-    (completed, cells, col, sgr, wraps): cell-lists finished by a newline or an
-    autowrap, plus the new current buffer, cursor column, SGR state, and a bool
-    per completed line -- True where the line ended by a soft autowrap (so the
-    widget can join the wrapped rows on copy). max_line (>0) autowraps.
+    `line_editing` selects one of three levels (see the `line_editing` entry in
+    30_defaults.conf); it folds SGR into `sgr` (so colour survives a redraw), strips every
+    other escape, and treats a stray control byte as an overwrite cell (rendered as the box
+    placeholder later). Returns (completed, cells, col, sgr, wraps): cell-lists finished by a
+    newline or an autowrap, plus the new current buffer, cursor column, SGR state, and a bool
+    per completed line -- True where the line ended by a soft autowrap (so the widget can join
+    the wrapped rows on copy). max_line (>0) autowraps.
 
-    line_edits=False (what the setting is for: see the `line_edits` entry in
-    30_defaults.conf) still CONSUMES the CSI ops -- they fall through to the
-    generic escape strip, so no `[3G` garbage is displayed -- but they no longer
-    move the cursor or erase. \r and \b are deliberately NOT covered: they are raw
-    control bytes the local caret echo and the kernel line discipline depend on."""
+    - 'full' (default): honors the line-local CSI ops (see _LINE_CSI_RE) plus \r, \b, \n, so a
+      shell's line editor (tab completion, Ctrl+R, an in-place progress bar) redraws the current
+      line as usual.
+    - 'read-safe': the CSI ops are CONSUMED but inert -- they fall through to the generic escape
+      strip (no `[3G` garbage) and no longer move the cursor or erase. \r and \b STILL act (raw
+      control bytes the local caret echo and kernel line discipline depend on), so the current
+      line can still be redrawn via them -- append-only against ESCAPES, not every byte.
+    - 'append-only': as read-safe, and additionally \r and \b are neutralized so the current line
+      can NEVER be overwritten. \r completes the line (a hard break: each redraw frame kept on its
+      own line); \b is dropped (the cursor never moves left). Either flags its line with one
+      suppressed _REDRAW_MARK cell, so the widget paints the left-gutter "redraw attempted" glyph
+      -- the overwrite ATTEMPT stays visible while nothing already written is rewritten. (A \b as
+      the final byte of a read whose line continues into the next read loses the cosmetic mark;
+      the containment -- col never moves left -- always holds.)"""
     completed = []
     wraps = []                            # parallel to completed: True == autowrap
     cells = list(cells)
@@ -1151,6 +1173,19 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
     # _LINE_WORK_BUDGET). Spent by C/G blank-pads and K erases; once 0, pads clamp and
     # erases skip, so a re-pad flood cannot spin. A fresh budget per call (per PTY read).
     work_left = _LINE_WORK_BUDGET
+    # append-only: set when a \r/\b on the CURRENT line was neutralized, so the line gets one
+    # _REDRAW_MARK when it completes (drives the left-gutter "redraw attempted" glyph).
+    redraw_pending = False
+
+    def _flush(soft):
+        nonlocal cells, col, redraw_pending
+        if redraw_pending:
+            cells.append(_REDRAW_MARK)
+            redraw_pending = False
+        completed.append(cells)
+        wraps.append(soft)
+        cells, col = [], 0
+
     i, n = 0, len(raw)
     while i < n:
         # Fast path: store a whole run of ordinary characters (see _SAFE_RUN_RE) in one slice
@@ -1170,9 +1205,7 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
             while i < run_end:
                 if max_line and col >= max_line:
                     # deferred autowrap: a filled line wraps before the next char lands
-                    completed.append(cells)
-                    wraps.append(True)
-                    cells, col = [], 0
+                    _flush(True)
                 take = run_end - i
                 if max_line:
                     avail = max_line - col
@@ -1189,11 +1222,11 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
             continue
         ch = raw[i]
         if ch == '\x1b':
-            # When line editing is off, do NOT match here: control falls through to
-            # the generic ANSI_RE strip below, which consumes the same bytes and
-            # displays nothing. That is the append-only behaviour, with no leftover
-            # partial sequence on screen.
-            m = _LINE_CSI_RE.match(raw, i) if line_edits else None
+            # Only 'full' honors the line-local edits. In read-safe/append-only, do NOT
+            # match here: control falls through to the generic ANSI_RE strip below, which
+            # consumes the same bytes and displays nothing -- so no leftover partial
+            # sequence on screen and the edit has no cursor/erase effect.
+            m = _LINE_CSI_RE.match(raw, i) if line_editing == 'full' else None
             if m:
                 num = _safe_int(m.group(1), None) if m.group(1) else None
                 op = m.group(2)
@@ -1276,6 +1309,9 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
                     # of the command's output. The cell is suppressed on render (see
                     # cells_to_runs) -- unforgeable and copy-safe -- and drives the
                     # left-gutter glyph instead of inline text.
+                    if redraw_pending:
+                        cells.append(_REDRAW_MARK)   # a neutralized redraw on this flushed line
+                        redraw_pending = False
                     cells.append(_NO_NEWLINE_MARK)
                     completed.append(cells)
                     # A line filled to the width is in the pending-wrap state, so
@@ -1294,13 +1330,22 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
             i += 1                                      # lone/unknown ESC: drop
             continue
         if ch == '\n':
-            completed.append(cells)
-            wraps.append(False)                     # a real line break, not a wrap
-            cells, col = [], 0
+            _flush(False)                           # a real line break, not a wrap
         elif ch == '\r':
-            col = 0
+            if line_editing == 'append-only':
+                # A CR would return to column 0 to OVERWRITE the line. Neutralize it as a
+                # hard line break (each redraw frame kept on its own line) + flag the line;
+                # the cursor never moves left, so nothing already written is rewritten.
+                redraw_pending = True
+                _flush(False)
+            else:
+                col = 0
         elif ch == '\x08':
-            if col > 0:
+            if line_editing == 'append-only':
+                # A backspace would move left to overwrite. Drop it (cursor stays) and flag
+                # the line; the marker lands when the line completes.
+                redraw_pending = True
+            elif col > 0:
                 col -= 1
         elif ch == '\x07':
             # BEL is cursor-neutral on every real terminal: it rings the bell
@@ -1317,9 +1362,7 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_edits=True):
             # cancels the pending wrap, so width-sized output + a \n or \r is not
             # split with a spurious blank line.
             if max_line and col >= max_line:
-                completed.append(cells)
-                wraps.append(True)                  # a soft autowrap continuation
-                cells, col = [], 0
+                _flush(True)                        # a soft autowrap continuation
             # Bound a Zalgo flood at the CELL level (after escape stripping): a base
             # plus thousands of combining marks is one grapheme cluster the text
             # engine reshapes in O(n^2), freezing the GUI. Capping here (not on the
@@ -1715,7 +1758,7 @@ def _ws_anomaly_cols_for_cells(cellline, flag_trailing=True):
     (_NO_NEWLINE_MARK, a synthetic ' ' cell) is treated as a space so a REAL trailing space
     just before it is still caught -- its own column never paints a dot (cells_to_runs
     handles the marker cell first)."""
-    chars = [' ' if key == _NO_NEWLINE_STATE else (c if c == ' ' else '\x00')
+    chars = [' ' if key in (_NO_NEWLINE_STATE, _REDRAW_STATE) else (c if c == ' ' else '\x00')
              for c, key in cellline]
     return whitespace_anomaly_cols(chars, flag_trailing)
 
@@ -1725,6 +1768,11 @@ def _ws_anomaly_cols_for_cells(cellline, flag_trailing=True):
 # (unforgeable + copy-safe); the widget keys on it to paint the left-gutter glyph on that
 # line. A general per-line annotation channel (future: neutralized-escape, OSC-activity).
 _NO_NEWLINE_KEY = '\x00nonl'
+
+# sentinel key for the append-only redraw marker cell (_REDRAW_MARK); cells_to_runs emits it as
+# a zero-text run the widget paints as the left-gutter "redraw attempted" glyph. Same channel
+# family as _NO_NEWLINE_KEY.
+_REDRAW_KEY = '\x00redraw'
 
 # Beyond this many runs, stop per-character marking colour so a flood of
 # alternating safe/marking characters re-coalesces into a few plain runs instead
@@ -1818,6 +1866,10 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
                 # (so it is neither shown nor copyable) whose key the widget recognizes
                 # to paint the left-gutter glyph. Program SGR can never produce this key.
                 add('', _NO_NEWLINE_KEY)
+            elif key == _REDRAW_STATE:
+                # Internal append-only redraw marker: same zero-text run channel, its own
+                # key drives the left-gutter "redraw attempted" glyph. Unforgeable SGR key.
+                add('', _REDRAW_KEY)
             elif col in flagged and not _space_is_visible(key):
                 # invisible padding: keep the real space, paint the dot.
                 add(ch, (MARK_KEY, WS_ANOMALY, 0x20))

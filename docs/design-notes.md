@@ -53,10 +53,12 @@ source of truth for behaviour.
   scrolled past). Scope, per the previous point: the line currently being written
   is not covered -- horizontal moves and erase-in-line redraw it, exactly as `\r`
   does, so its earlier content is lost. A once-per-tab notice explains the
-  whole-screen no-op rather than letting it read as broken. The `line_edits`
-  setting (default true) turns the four ops off for anyone who wants the stricter
-  guarantee; it is admin-lockable like the other display keys. What the ops are
-  for and what turning them off costs: the `line_edits` entry in
+  whole-screen no-op rather than letting it read as broken. The `line_editing`
+  setting (default `full`) offers `read-safe` (drop the four ops) and `append-only`
+  (also neutralize CR/backspace, so the current line cannot be overwritten -- each
+  neutralized redraw flagged in the left gutter) for anyone who wants the stricter
+  guarantee; it is admin-lockable like the other display keys. What the ops are for
+  and what each level costs: the `line_editing` entry in
   `usr/lib/secure-terminal.d/30_defaults.conf` (the single authoritative copy).
 
 ## Mouse reporting (konsole/xterm parity)

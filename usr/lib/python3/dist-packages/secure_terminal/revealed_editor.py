@@ -217,10 +217,10 @@ class RevealedEditor(QPlainTextEdit):
     # -- rendering ------------------------------------------------------------
     def _build(self, text):
         """(completed cell-lines, current cell-line) for `text` -- the SAME cell
-        construction the terminal uses, so the box renders identically. line_edits
-        off: the box content carries no escape/CSI to honour."""
+        construction the terminal uses, so the box renders identically. 'read-safe':
+        the box content carries no escape/CSI to honour (CR/BS act as before)."""
         completed, current, _col, _sgr, _wraps = feed_line_edits(
-            [], 0, dict(_DEF_SGR), text, 0, False)
+            [], 0, dict(_DEF_SGR), text, 0, 'read-safe')
         return completed, current
 
     def _format(self, key):

@@ -565,7 +565,7 @@ from secure_terminal.sanitize import (
     ensure_utf8_ctype,
     sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, display_len,
-    MARK_KEY, WRAP_NL, _NO_NEWLINE_KEY, BOX,
+    MARK_KEY, WRAP_NL, _NO_NEWLINE_KEY, _REDRAW_KEY, LINE_EDITING_MODES, BOX,
     SPACE_MARK,
     WS_ANOMALY, whitespace_anomaly_cols,
     render_output, render_cap_prefix, render_bounded_tail,
@@ -649,6 +649,7 @@ _WS_DOT_GLYPH = chr(0x00B7)   # MIDDLE DOT
 # is -1, so read through _blk_flags (which floors it to 0) before masking.
 _BLK_WRAP_CONT = 1     # soft-autowrap continuation: copy joins it onto the previous row
 _BLK_NO_NEWLINE = 2    # the command output on this line ended without a trailing newline
+_BLK_REDRAW = 4        # append-only: a \r/\b redraw of this line was neutralized
 
 # Sentinel format appended by _grid_row_runs to a TUI row whose pyte row carries the
 # no_newline flag. It rides the row SIGNATURE (so a pure-flag change re-renders the row)
@@ -1242,6 +1243,10 @@ class SecureTerminal(QPlainTextEdit):
     # injected into the document: injected text is unfaithful -- it could be
     # selected and copied into a transcript as if a program printed it.
     advise_signal = pyqtSignal(str)
+    # The alternate screen was entered or left (a full-screen program took over the
+    # visible screen, or gave it back). The window reflects it in the security indicator
+    # so the user can see the containment state changed. Emitted only on a real transition.
+    alt_screen_changed = pyqtSignal()
     # A pasted text needs review before it may reach the shell: (raw, countdown
     # seconds). The window shows the in-window review bar; the paste is held and
     # input suspended until dispatch_pending_paste resolves it. resolved fires when
@@ -1290,7 +1295,7 @@ class SecureTerminal(QPlainTextEdit):
 
     def __init__(self, parent=None, command=None, tui=False, history='',
                  preview=False, cwd=None, mode='detail', colors=False,
-                 markings=True, line_edits=True, show_command=False,
+                 markings=True, line_editing='full', show_command=False,
                  theme='light', cg_path=None, initial_grid=None):
         super().__init__(parent)
         # Deterministic screenshot mode (SECURE_TERMINAL_SHOT=1, a startup capture
@@ -1446,12 +1451,11 @@ class SecureTerminal(QPlainTextEdit):
         # the ctor before the history render, for the same render-once reason.
         self._colors = bool(colors)
         self._markings = bool(markings)   # colour the box / badge by risk class
-        # Whether the line-local cursor/erase escapes a shell's line editor emits
-        # are honored (see the `line_edits` entry in 30_defaults.conf). Set from the
-        # ctor before the history render, for the same render-once reason as
-        # colours -- and, unlike an apply_line_edits() call after construction, in
-        # time for the fork, so the child gets the matching terminfo entry.
-        self._line_edits = bool(line_edits)
+        # Line-editing level -- full / read-safe / append-only (see the `line_editing` entry
+        # in 30_defaults.conf). Set from the ctor before the history render, for the same
+        # render-once reason as colours -- and, unlike an apply_line_editing() call after
+        # construction, in time for the fork, so the child gets the matching terminfo entry.
+        self._line_editing = line_editing if line_editing in LINE_EDITING_MODES else 'full'
         self._sgr_reset()
 
         # Scrollback limit in lines. Default to a bounded window (like every
@@ -2737,6 +2741,14 @@ class SecureTerminal(QPlainTextEdit):
             return data.no_newline
         return bool(_blk_flags(block) & _BLK_NO_NEWLINE)
 
+    def _block_redraw(self, block):
+        """True if `block`'s line carries the append-only redraw-neutralized annotation
+        (a \\r/\\b that would have overwritten it was dropped). CLI line mode only -- a TUI
+        grid block never sets it. Unforgeable + copy-safe, like the no-newline channel."""
+        if isinstance(block.userData(), _GridRow):
+            return False
+        return bool(_blk_flags(block) & _BLK_REDRAW)
+
     def _gutter_blocks(self):
         """Yield (block, top_y, bottom_y) for each visible block, in gutter/viewport
         coordinates."""
@@ -2772,8 +2784,14 @@ class SecureTerminal(QPlainTextEdit):
         painter.fillRect(event.rect(), self.palette().color(QPalette.ColorRole.Base))
         fg = self.palette().color(QPalette.ColorRole.Text)
         fg.setAlpha(150)                          # muted: a note, not program output
+        redraw_col = self._redraw_glyph_color()
         for block, top, _bottom in self._gutter_blocks():
-            if self._block_no_newline(block):
+            # One glyph per line; the append-only redraw marker (a security event) takes
+            # precedence over no-trailing-newline on the rare line carrying both.
+            if self._block_redraw(block):
+                self._draw_redraw_glyph(
+                    painter, self._block_last_line_center(block, top), redraw_col)
+            elif self._block_no_newline(block):
                 self._draw_no_newline_glyph(
                     painter, self._block_last_line_center(block, top), fg)
         painter.end()
@@ -2793,6 +2811,31 @@ class SecureTerminal(QPlainTextEdit):
         painter.drawLine(cx - a, mid + a, cx, mid)             # arrowhead
         painter.drawLine(cx - a, mid + a, cx, mid + 2 * a)
 
+    def _redraw_glyph_color(self):
+        """Control-risk-class tint for the append-only redraw marker (a neutralized \\r/\\b is
+        a control byte). A fixed blue reads on both light and dark; this is chrome, not
+        per-cell paint, so it does not go through the theme marking map."""
+        c = QColor(0x4a, 0x90, 0xd9)               # control-class blue
+        c.setAlpha(210)
+        return c
+
+    def _draw_redraw_glyph(self, painter, mid, color):
+        """A small circular arrow (a 'redraw' loop) centred at `mid`: a program tried to
+        redraw/overwrite this line and append-only neutralized it, so the line only grew."""
+        cx = self._gutter_width_px() // 2
+        h = self.fontMetrics().height()
+        r = max(2, h // 5)
+        pen = QPen(color)
+        pen.setWidth(max(1, h // 12))
+        painter.setPen(pen)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # a C-shaped loop with a ~60deg gap at the upper right, and a small arrowhead at
+        # the gap -- reads as a return/redraw arrow at any font size.
+        painter.drawArc(cx - r, mid - r, 2 * r, 2 * r, 60 * 16, 300 * 16)
+        tip_x, tip_y = cx + r, mid - r // 2
+        painter.drawLine(tip_x, tip_y, tip_x - max(2, r // 2), tip_y - max(1, r // 2))
+        painter.drawLine(tip_x, tip_y, tip_x + max(1, r // 3), tip_y - max(2, r // 2))
+
     def _block_at_gutter_y(self, y):
         """The visible block whose row contains gutter-local y, or None. Half-open [top, bottom)
         so the shared boundary pixel (block N's int(bottom) == block N+1's int(top) when the line
@@ -2807,10 +2850,14 @@ class SecureTerminal(QPlainTextEdit):
         """Show the tooltip when the pointer is over a marked line's glyph."""
         y = event.position().toPoint().y()
         block = self._block_at_gutter_y(y)
-        if block is not None and self._block_no_newline(block):
+        gutter = getattr(self, '_gutter', self)
+        if block is not None and self._block_redraw(block):
             QToolTip.showText(event.globalPosition().toPoint(),
-                              'This line has no trailing newline',
-                              getattr(self, '_gutter', self))
+                              'Append-only: a redraw of this line was neutralized '
+                              '(a program tried to overwrite it)', gutter)
+        elif block is not None and self._block_no_newline(block):
+            QToolTip.showText(event.globalPosition().toPoint(),
+                              'This line has no trailing newline', gutter)
         else:
             QToolTip.hideText()
 
@@ -3676,33 +3723,39 @@ class SecureTerminal(QPlainTextEdit):
         return self._colors
 
     # -- line-local editing escapes ------------------------------------------
-    def apply_line_edits(self, enabled):
-        """Honour (or drop) the four line-local editing escapes. See the
-        `line_edits` entry in `30_defaults.conf` for what they are for.
+    def apply_line_editing(self, value):
+        """Switch the line-editing level (full / read-safe / append-only). See the
+        `line_editing` entry in `30_defaults.conf` for what each level is for.
 
-        The RENDERER change alone is not the whole setting: the child shell must
-        also stop EMITTING redraws the renderer would now drop on the floor, or a
-        completion reprints mangled instead of degrading to a plain append. So the
-        matching terminfo entry is re-advertised to the running shell, exactly as a
-        CLI/TUI switch does -- same reachability guard: only a login-shell CLI tab
-        sitting at its prompt can be re-exported into, since the `export TERM=...`
-        is typed input and any other target would receive it as data."""
-        if bool(enabled) == self._line_edits:
+        The RENDERER change alone is not the whole setting: the child shell must also stop
+        EMITTING redraws the renderer would now drop on the floor, or a completion reprints
+        mangled instead of degrading to a plain append. So the matching terminfo entry is
+        re-advertised to the running shell -- but ONLY when the entry actually changes (full
+        uses `secure-terminal`; read-safe and append-only both use `secure-terminal-noedit`,
+        so switching between those two is a display-only change). Same reachability guard as a
+        CLI/TUI switch: only a login-shell CLI tab sitting at its prompt can be re-exported
+        into, since `export TERM=...` is typed input and any other target gets it as data."""
+        if value not in LINE_EDITING_MODES:
+            value = 'full'
+        if value == self._line_editing:
             return
-        self._line_edits = bool(enabled)
+        term_changed = (value == 'full') != (self._line_editing == 'full')
+        self._line_editing = value
         self._rerender()      # replay the retained output under the new rule
+        if not term_changed:
+            return            # read-safe <-> append-only: same terminfo, display only
         if self._preview or self._tui or self._pid is None or self._command is not None:
             return
         if self.has_foreground_program():
             self._advise('Line editing changed for the display only: a program is '
                          'running and owns the terminal, so the shell was not told '
-                         'about it. Toggle it again at a shell prompt (or open a '
+                         'about it. Change it again at a shell prompt (or open a '
                          'new tab) to update the shell too.')
             return
         self._reexport_term()
 
-    def line_edits_enabled(self):
-        return self._line_edits
+    def line_editing(self):
+        return self._line_editing
 
     def _effective_colors(self):
         return self._colors and colors_allowed()
@@ -4095,11 +4148,11 @@ class SecureTerminal(QPlainTextEdit):
           no alternate screen. A program then LISTS completions plainly and never
           draws an in-place menu or full screen that line mode would strip into
           garbage. Falls back to xterm-256color if the entry does not resolve.
-        - CLI mode with line_edits off -> `secure-terminal-noedit`, which also
-          cancels el/el1/cuf/cuf1/cub/hpa. Those four ops are STRIPPED in that
-          setting, so advertising them would have the shell emit redraws we drop on
-          the floor. cub1 (\b) stays advertised: it is a raw control byte, honoured
-          either way.
+        - CLI mode, read-safe or append-only -> `secure-terminal-noedit`, which also
+          cancels el/el1/cuf/cuf1/cub/hpa. Those four ops are STRIPPED in both levels,
+          so advertising them would have the shell emit redraws we drop on the floor.
+          cub1 (\b) stays advertised: it is a raw control byte (honoured in read-safe;
+          neutralized display-side in append-only, which terminfo cannot express).
         - TUI mode -> xterm-256color, so full-screen programs (and ssh) work.
 
         The terminfo DIR is returned in BOTH modes (so TERMINFO_DIRS always resolves
@@ -4110,7 +4163,7 @@ class SecureTerminal(QPlainTextEdit):
         -- line mode strips every escape regardless."""
         tdir = cli_terminfo_dir()
         if not self._tui and tdir:
-            if self._line_edits:
+            if self._line_editing == 'full':
                 return 'secure-terminal', tdir
             return 'secure-terminal-noedit', tdir
         return 'xterm-256color', tdir
@@ -4363,11 +4416,25 @@ class SecureTerminal(QPlainTextEdit):
                 self._make_screen()
 
     def _on_readable(self):
+        # A full-screen program can enter/leave the alternate screen during this read
+        # (the _alt_screen flips inside _read_and_render). Snapshot around it and emit on a
+        # real transition so the window can refresh the alt-state indicator live -- one site
+        # here, rather than every _alt_screen assignment.
+        _was_alt = self._alt_screen
         self._read_and_render()
+        if self._alt_screen != _was_alt:
+            self.alt_screen_changed.emit()
         # Refresh the live transcript file after output settles (debounced). No-op unless
         # SECURE_TERMINAL_TRANSCRIPT_FILE is configured.
         if self._transcript_file:
             self._transcript_timer.start()
+
+    def alt_active(self):
+        """True while a full-screen program holds the alternate screen in a TUI tab: the
+        visible screen is that program's to repaint and the primary scrollback is hidden
+        and frozen behind it. Gated on tui_active() -- _alt_screen alone is output-armed
+        (see _child_raw_mode / the OSC gate), so it is meaningful only in TUI mode."""
+        return self._alt_screen and self.tui_active()
 
     def _read_and_render(self):
         fd = self._fd
@@ -4658,16 +4725,16 @@ class SecureTerminal(QPlainTextEdit):
                          'interface, or a completion menu or progress display that '
                          'repaints -- which the safe CLI mode cannot show. Turn on '
                          'TUI mode to see it.')
-        # With line editing OFF the child runs under `secure-terminal-noedit`,
+        # In read-safe / append-only the child runs under `secure-terminal-noedit`,
         # which cancels el/el1 on top of the base entry's cup/cuu/smcup -- so
         # every escape-based detector above is structurally dead: a curses program
         # emits no alternate screen, no cursor motion and no EL burst, and the
         # advisory would never fire at all. Fall back to a terminfo-independent
         # signal: the pty in raw mode with a program (not the shell's own line
         # editor) in the foreground means that program is driving the screen
-        # itself. Used only in that setting, so an ordinary readline REPL in the
-        # normal CLI mode -- which line editing renders fine -- is not nagged.
-        elif (not self._tui_hint_shown and not self._line_edits
+        # itself. Used only outside 'full', so an ordinary readline REPL in full
+        # CLI mode -- which line editing renders fine -- is not nagged.
+        elif (not self._tui_hint_shown and self._line_editing != 'full'
                 and self.has_foreground_program() and self._child_raw_mode()):
             self._tui_hint_shown = True
             self._advise('This program has taken over the keyboard and is drawing '
@@ -5541,7 +5608,7 @@ class SecureTerminal(QPlainTextEdit):
         wrap = self._cols if 8 <= self._cols <= self._MAX_LINE else self._MAX_LINE
         completed, self._line_cells, self._line_col, self._sgr, wraps = \
             feed_line_edits(self._line_cells, self._line_col, self._sgr, text,
-                            wrap, self._line_edits)
+                            wrap, self._line_editing)
         # Drop a wrapped line's trailing all-blank fill rows so a shell's prompt padding,
         # re-wrapped narrower on a reflow, does not scatter phantom blank rows (task 6).
         # Post-overwrite + trailing-only, so a wiped line stays wiped and mid-line blanks
@@ -5624,6 +5691,11 @@ class SecureTerminal(QPlainTextEdit):
                 # paints its glyph. OR-in, so a wrapped last row keeps its cont bit.
                 blk = edit.block()
                 blk.setUserState(_blk_flags(blk) | _BLK_NO_NEWLINE)
+            elif key == _REDRAW_KEY:
+                # append-only redraw marker: same zero-text channel; annotates this
+                # block so the left gutter paints the "redraw attempted" glyph.
+                blk = edit.block()
+                blk.setUserState(_blk_flags(blk) | _BLK_REDRAW)
             else:
                 # A whitespace-only run has no fg ink to protect, so keep the
                 # program's background (the fg-vs-bg guard would otherwise drop a

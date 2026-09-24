@@ -49,10 +49,13 @@ It does nothing about the programs you deliberately run.
   its own current line, exactly as a carriage return already does -- so a forged
   status line *can* overwrite itself before you read it, the same way a progress
   bar does. Those four ops are what **tab completion** needs: Tab makes the shell
-  rewrite the line you are typing in place. If you would rather not have even
-  that, **View -> Line editing** (or `line_edits=false`) turns them off -- see the
-  `line_edits` entry in `usr/lib/secure-terminal.d/30_defaults.conf` for what you
-  gain and what it costs.
+  rewrite the line you are typing in place. The **Line editing** setting
+  (Settings -> Text rendering) chooses how much of the current line a program may
+  redraw: `full` (the default), `read-safe` (drop the four escapes; carriage return
+  and backspace still act), or `append-only` (also neutralize those, so the current
+  line can never be overwritten -- each neutralized redraw is flagged in the left
+  gutter). See the `line_editing` entry in
+  `usr/lib/secure-terminal.d/30_defaults.conf` for what each gains and costs.
 - **Sanitized paste, with a review.** When a paste contains unicode or control
   characters, a review bar opens inside the window and holds the paste before it
   reaches the shell. The paste opens FULLY REVEALED in one editable box -- nothing
