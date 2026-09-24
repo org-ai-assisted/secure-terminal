@@ -1923,12 +1923,15 @@ class SecureTerminal(QPlainTextEdit):
         self._line_fmt_cache = {}     # and the line-mode SGR format cache
         self._grid_mark_cache = {}    # and the grid risk-class marking formats
         self._row_sig_cache = {}      # so cached grid rows re-render in the new theme
-        if self._grid_mode():
+        if self._grid_mode() and self._screen is not None:
             # Repaint the grid (it owns the screen). Rebuild the WHOLE view, not just the
             # live tail: rows already promoted into permanent scrollback keep the format
             # baked in at promotion time and a cache clear does not touch them, so a bare
             # _render_tui() would leave scrollback in the OLD theme. Mirror the markings
-            # path (_rerender's grid branch).
+            # path (_rerender's grid branch). Guarded on _screen: a tui tab whose screen is
+            # not made yet (a preview, or pre-first-show) would else _reset_grid_view() (clear
+            # the doc) and _render_tui() no-op on the None screen, WIPING the seeded content;
+            # fall through to the CLI replay below, which rebuilds it from _raw.
             self._reset_grid_view()
             self._render_tui()
         elif changed and getattr(self, '_paint_timer', None) is not None:
@@ -2100,13 +2103,16 @@ class SecureTerminal(QPlainTextEdit):
         self._paint_pending = []
         self._paint_pending_wraps = []
         self._paint_dirty = False
-        if self._grid_mode():
+        if self._grid_mode() and self._screen is not None:
             # A theme / markings / colour toggle changes how EVERY cell formats, but a bare
             # _render_tui() reconciles only the LIVE grid -- rows already promoted into
             # permanent scrollback keep the format baked in at promotion time and never
             # repaint (the CLI branch below rebuilds from _raw for exactly this reason).
             # Reset the grid view so the whole retained grid + history is rebuilt under the
             # new format, bounded by pyte's own history cap (as apply_scrollback is).
+            # Guarded on _screen: a tui tab with no screen yet (a preview, or pre-first-show)
+            # would else clear the doc and _render_tui() no-op on the None screen, wiping the
+            # seeded content; fall through to the CLI replay below, which rebuilds it from _raw.
             self._reset_grid_view()
             self._render_tui()
             return
