@@ -84,7 +84,7 @@ TUI_TOOLTIP = (
 # <U+XXXX NAME>) need a flowing line layout. TUI mode's fixed pyte grid has one
 # cell per character and cannot grow one, so they would fall back to Box while the
 # toolbar still highlighted them -- a control that lies about what is on screen.
-_INLINE_MODES = ('reveal', 'detail')
+_INLINE_MODES = ('reveal', 'detail', 'codepoints')
 
 # Passive banner shown once (dismissable, and switchable off via tui_autobox_notice)
 # when entering TUI auto-switches Reveal/Detail to Box. Box still marks every
@@ -5765,7 +5765,7 @@ class MainWindow(QMainWindow):
     _COMMAND_HELP = (
         'Slash commands (the leading / is optional):\n\n'
         '  /theme dark|light\n'
-        '  /mode box|show|reveal|detail\n'
+        '  /mode codepoints|box|show|reveal|detail\n'
         '  /colors on|off\n'
         '  /tui on|off\n'
         '  /title on|off\n'
@@ -5967,14 +5967,16 @@ class MainWindow(QMainWindow):
 
         rendering = _section('Text rendering')
         mode = QComboBox()
-        for label, key in (('Box', 'box'), ('Reveal unicode', 'reveal'),
+        for label, key in (('Codepoints (every char <U+XXXX>)', 'codepoints'),
+                           ('Box', 'box'), ('Reveal unicode', 'reveal'),
                            ('Detail (named)', 'detail'), ('Show unicode', 'show')):
             mode.addItem(label, key)
         mode.setCurrentIndex(mode.findData(self._default_mode))
         _tip_row(rendering, 'Unicode', mode,
-                 'How non-ASCII characters are shown: Box (a safe placeholder), '
-                 'Reveal (the codepoint), Detail (the named codepoint), or Show '
-                 '(the real glyph, tinted by risk class).')
+                 'How characters are shown: Codepoints (EVERY character, even ASCII, as its '
+                 '<U+XXXX> badge -- a cat -v/hexdump audit view; CLI mode, boxes in TUI), Box '
+                 '(a safe placeholder), Reveal (the codepoint), Detail (the named codepoint), '
+                 'or Show (the real glyph, tinted by risk class).')
 
         colors = QCheckBox()
         colors.setChecked(self._default_colors)

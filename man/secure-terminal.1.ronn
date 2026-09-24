@@ -23,10 +23,12 @@ out of, without worrying about invisible characters, bidi overrides or escape
 sequences. Its default display mode, `detail`, is printable ASCII: a non-ASCII
 character is NAMED inline as `<U+XXXX NAME>` rather than drawn, so a look-alike
 reads as its identity. The other modes trade that differently -- `reveal` shortens
-the badge to the codepoint, `box` replaces the character with one coloured
-placeholder glyph, and `show` renders a printable glyph as itself (tinted by risk
-class), which is the one mode that puts real non-ASCII on screen. What holds in
-EVERY mode is that no invisible, bidi or control character reaches you unmarked.
+the badge to the codepoint, `codepoints` badges EVERY character including printable
+ASCII (a cat -v/hexdump audit view; CLI mode, boxes in TUI), `box` replaces the
+character with one coloured placeholder glyph, and `show` renders a printable glyph
+as itself (tinted by risk class), which is the one mode that puts real non-ASCII on
+screen. What holds in EVERY mode is that no invisible, bidi or control character
+reaches you unmarked.
 
 It runs no escape-sequence parser on program output beyond safe colour and four
 line-local edits within the line being written, so a pasted or printed lie cannot

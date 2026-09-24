@@ -2125,7 +2125,7 @@ class SecureTerminal(QPlainTextEdit):
             # scrollback -- what the _scrollback-block-capped document shows anyway).
             if self._preview:
                 _src = self._raw                  # already render-capped from the HEAD
-            elif full and self._mode in ('detail', 'reveal'):
+            elif full and self._mode in ('detail', 'reveal', 'codepoints'):
                 _src = render_bounded_tail(self._raw, self._REFLOW_RENDER_MAX)
             elif full:
                 _src = self._raw
@@ -2365,7 +2365,7 @@ class SecureTerminal(QPlainTextEdit):
         # (apply_tui before _make_screen), and it IS still a grid.
         is_grid = self._grid_mode() and not getattr(self, '_preview', False)
         wrap = (not is_grid
-                and self._mode in ('detail', 'reveal'))
+                and self._mode in ('detail', 'reveal', 'codepoints'))
         self.setLineWrapMode(
             QPlainTextEdit.LineWrapMode.WidgetWidth if wrap
             else QPlainTextEdit.LineWrapMode.NoWrap)

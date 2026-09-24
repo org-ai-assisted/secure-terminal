@@ -120,7 +120,10 @@ The safety model above does not cost you the usual conveniences:
   wears a louder colour than honest foreign text, and the invisible, bidi and
   control classes (which have no visible glyph) still show as a coloured placeholder.
   Reveal shows every non-ASCII character as a `<U+XXXX>` badge to inspect exactly
-  what is there. Escapes are stripped in every mode.
+  what is there. Codepoints goes further, badging EVERY character (printable ASCII
+  included) as `<U+XXXX>` -- a cat -v/hexdump audit view for a suspicious line, in
+  CLI mode; a TUI tab boxes it, since a badge cannot fit a fixed grid cell. Escapes
+  are stripped in every mode.
 - **Save transcript** (File menu, `Ctrl+Shift+S`). Writes the current tab's
   scrollback to a file. Because the buffer is already sanitized plain ASCII, the
   saved file is safe to open anywhere, unlike a normal terminal's raw log.
