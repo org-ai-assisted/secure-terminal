@@ -7498,7 +7498,12 @@ class SecureTerminal(QPlainTextEdit):
         if owner is None:
             return False
         pgrp = self._foreground_pgrp()
-        return owner == (pgrp, self._read_exe(pgrp))
+        # The fg pgrp can vanish between has_foreground_program()'s tcgetpgrp and this one
+        # (the program exits as the paste lands): pgrp is then None, and _read_exe(None)
+        # would raise TypeError ('/proc/%d/exe' % None), propagating uncaught out of the
+        # paste dispatch. A None owner cannot be confirmed -- force-review (the safe
+        # default), matching the None-guard the arming edge already applies.
+        return pgrp is not None and owner == (pgrp, self._read_exe(pgrp))
 
     def insertFromMimeData(self, source):
         if self._review_active:
