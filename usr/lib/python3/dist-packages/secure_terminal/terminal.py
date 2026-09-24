@@ -793,7 +793,12 @@ _OSC_TERMINATED = re.compile(rb'\x07|\x1b\\')
 # scanning to end-of-buffer for every unclosed OSC 8 opener a hostile stream plants
 # (~1s per 64KB), a main-thread DoS. A real hyperlink label is short; a longer one just
 # does not get the phishing-notice treatment (the sequence is still stripped by ANSI_RE).
-_OSC8 = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)'
+# URI group is `+` (non-empty), matching _OSC8_OPEN's discipline below: an empty-URI OSC 8
+# is a spec-legal CLOSER (ESC]8;;BEL), never an opener. With `*` a bare closer matched as an
+# opener with an empty URI, and the lazy text group then swallowed a following REAL opener --
+# so a `ESC]8;;BEL` planted before a phishing link (display text != target) silently bypassed
+# the anti-phishing notice. `+` cannot match the empty-URI closer, so the real link is caught.
+_OSC8 = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]+)(?:\x07|\x1b\\)'
                    rb'(.{0,8192}?)\x1b\]8;;(?:\x07|\x1b\\)', re.DOTALL)
 # An OSC 8 hyperlink is TWO separately-terminated OSCs (opener ESC]8;;<uri>BEL + text,
 # then closer ESC]8;;BEL). When the opener+text lands in one read and the closer in the
@@ -1612,6 +1617,8 @@ class SecureTerminal(QPlainTextEdit):
         # characters, not on a reveal badge's multi-column rendering.
         self._line_cells = []
         self._line_col = 0
+        self._line_redraw = False      # append-only: neutralized redraw pending on the current line
+        self._cr_pending = False       # append-only: bare \r held on the read boundary (\r\n detect)
         self._line_fmt_cache = {}     # sgr_key -> QTextCharFormat (line mode)
         # show the "this program wants TUI mode" advisory at most once per
         # full-screen program, so one that redraws every second does not spam it.
@@ -1887,6 +1894,8 @@ class SecureTerminal(QPlainTextEdit):
         self._out_cursor = None
         self._line_cells = []
         self._line_col = 0
+        self._line_redraw = False
+        self._cr_pending = False
         self._line_fmt_cache = {}
         self._sgr_reset()
         self._mode = mode if mode in DISPLAY_MODES else 'detail'
@@ -2110,6 +2119,8 @@ class SecureTerminal(QPlainTextEdit):
         self._out_cursor = None
         self._line_cells = []
         self._line_col = 0
+        self._line_redraw = False
+        self._cr_pending = False
         self._sgr_reset()                 # replay SGR colours from a clean slate
         if self._raw:
             # Live output is uncapped, so a mode toggle after a flood replays only the
@@ -2854,18 +2865,24 @@ class SecureTerminal(QPlainTextEdit):
                 return block
         return None
 
+    def _gutter_tooltip(self, block):
+        """The gutter tooltip text for `block`, or '' when the row carries no marker.
+        A pure seam so the tooltip CONTENT is testable directly, without synthesizing a
+        hover event and reading it back off QToolTip."""
+        if block is not None and self._block_redraw(block):
+            return ('Append-only: a redraw of this line was neutralized '
+                    '(a program tried to overwrite it)')
+        if block is not None and self._block_no_newline(block):
+            return 'This line has no trailing newline'
+        return ''
+
     def _gutter_hover(self, event):
         """Show the tooltip when the pointer is over a marked line's glyph."""
-        y = event.position().toPoint().y()
-        block = self._block_at_gutter_y(y)
+        block = self._block_at_gutter_y(event.position().toPoint().y())
+        text = self._gutter_tooltip(block)
         gutter = getattr(self, '_gutter', self)
-        if block is not None and self._block_redraw(block):
-            QToolTip.showText(event.globalPosition().toPoint(),
-                              'Append-only: a redraw of this line was neutralized '
-                              '(a program tried to overwrite it)', gutter)
-        elif block is not None and self._block_no_newline(block):
-            QToolTip.showText(event.globalPosition().toPoint(),
-                              'This line has no trailing newline', gutter)
+        if text:
+            QToolTip.showText(event.globalPosition().toPoint(), text, gutter)
         else:
             QToolTip.hideText()
 
@@ -5482,6 +5499,7 @@ class SecureTerminal(QPlainTextEdit):
         # primary screen (a build log, `-- cat file`) needs no restore -- its output is
         # already on the screen kept below via keep_screen. Done BEFORE the stream-state
         # reset clears _alt_saved.
+        _was_alt = self._alt_screen        # emit alt_screen_changed at the end if this clears it
         if self._alt_screen:
             self._alt_leave()
         # Reset the half-parsed per-child stream state so the new shell's very first
@@ -5554,6 +5572,11 @@ class SecureTerminal(QPlainTextEdit):
             # append the banner below it, then fork (which does not clear that document).
             self._append(_banner)
             self._start(None)
+        # The alt screen was dropped above but only _on_readable emits on a live flip, so
+        # notify the UI here too -- else the security indicator keeps reading "TUI (alt)"
+        # after a program that exited while still on the alternate screen is restarted.
+        if _was_alt and not self._alt_screen:
+            self.alt_screen_changed.emit()
         return True
 
     def _append(self, text):
@@ -5613,10 +5636,22 @@ class SecureTerminal(QPlainTextEdit):
         # capped so a pathological newline-free flood still bounds each block).
         if self._shot:
             defer = False        # shot mode: paint NOW so the capture is byte-stable
+        # Collapse the ONLCR \r\n (the pty encodes an ordinary newline as \r\n) to a plain \n so
+        # append-only does not read the \r as a return-to-column-0 overwrite -- routine output would
+        # otherwise double-space and every line would get a false "redraw attempted" gutter mark. A
+        # bare \r (an in-place progress bar) is left intact; a \r split across the read boundary is
+        # held in self._cr_pending and rejoined with its \n on the next chunk. Mode-agnostic: full/
+        # read-safe already treat \r\n as a newline (the \r resets the column right before the \n).
+        if self._cr_pending:
+            text = '\r' + text
+        self._cr_pending = text.endswith('\r')
+        if self._cr_pending:
+            text = text[:-1]
+        text = text.replace('\r\n', '\n')
         wrap = self._cols if 8 <= self._cols <= self._MAX_LINE else self._MAX_LINE
-        completed, self._line_cells, self._line_col, self._sgr, wraps = \
+        completed, self._line_cells, self._line_col, self._sgr, wraps, self._line_redraw = \
             feed_line_edits(self._line_cells, self._line_col, self._sgr, text,
-                            wrap, self._line_editing)
+                            wrap, self._line_editing, self._line_redraw)
         # Drop a wrapped line's trailing all-blank fill rows so a shell's prompt padding,
         # re-wrapped narrower on a reflow, does not scatter phantom blank rows (task 6).
         # Post-overwrite + trailing-only, so a wiped line stays wiped and mid-line blanks

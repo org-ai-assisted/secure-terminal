@@ -1146,7 +1146,8 @@ def _is_mark(ch):
 _SAFE_RUN_RE = regex.compile(r'[^\x07\x08\n\r\x1b\u0300-\U0010ffff]+')
 
 
-def feed_line_edits(cells, col, sgr, raw, max_line=0, line_editing='full'):
+def feed_line_edits(cells, col, sgr, raw, max_line=0, line_editing='full',
+                    redraw_pending=False):
     """Advance the current line's LOGICAL cell buffer by one raw output chunk.
 
     A cell is (source_char, sgr_state) -- one SOURCE character, whatever its later
@@ -1157,10 +1158,13 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_editing='full'):
     `line_editing` selects one of three levels (see the `line_editing` entry in
     30_defaults.conf); it folds SGR into `sgr` (so colour survives a redraw), strips every
     other escape, and treats a stray control byte as an overwrite cell (rendered as the box
-    placeholder later). Returns (completed, cells, col, sgr, wraps): cell-lists finished by a
-    newline or an autowrap, plus the new current buffer, cursor column, SGR state, and a bool
-    per completed line -- True where the line ended by a soft autowrap (so the widget can join
-    the wrapped rows on copy). max_line (>0) autowraps.
+    placeholder later). Returns (completed, cells, col, sgr, wraps, redraw_pending): cell-lists
+    finished by a newline or an autowrap, plus the new current buffer, cursor column, SGR state, and
+    a bool per completed line -- True where the line ended by a soft autowrap (so the widget can join
+    the wrapped rows on copy). max_line (>0) autowraps. The trailing `redraw_pending` is append-only
+    carry state (a neutralized redraw on the in-progress line); feed it back in on the next call,
+    exactly like cells/col/sgr, so a \b that ends one read still flags its line when it completes in
+    the next.
 
     - 'full' (default): honors the line-local CSI ops (see _LINE_CSI_RE) plus \r, \b, \n, so a
       shell's line editor (tab completion, Ctrl+R, an in-place progress bar) redraws the current
@@ -1173,9 +1177,11 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_editing='full'):
       can NEVER be overwritten. \r completes the line (a hard break: each redraw frame kept on its
       own line); \b is dropped (the cursor never moves left). Either flags its line with one
       suppressed _REDRAW_MARK cell, so the widget paints the left-gutter "redraw attempted" glyph
-      -- the overwrite ATTEMPT stays visible while nothing already written is rewritten. (A \b as
-      the final byte of a read whose line continues into the next read loses the cosmetic mark;
-      the containment -- col never moves left -- always holds.)"""
+      -- the overwrite ATTEMPT stays visible while nothing already written is rewritten. The flag
+      rides in `redraw_pending`, so a \b that ends one read and a line that continues into the next
+      is still flagged. The ONLCR \r\n encoding of an ordinary newline is NOT an overwrite; the
+      caller (SecureTerminal._feed_line) collapses it to one plain break before this, so a bare \r
+      that reaches here is only ever a genuine return-to-column-0 redraw."""
     completed = []
     wraps = []                            # parallel to completed: True == autowrap
     cells = list(cells)
@@ -1187,9 +1193,11 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_editing='full'):
     # _LINE_WORK_BUDGET). Spent by C/G blank-pads and K erases; once 0, pads clamp and
     # erases skip, so a re-pad flood cannot spin. A fresh budget per call (per PTY read).
     work_left = _LINE_WORK_BUDGET
-    # append-only: set when a \r/\b on the CURRENT line was neutralized, so the line gets one
-    # _REDRAW_MARK when it completes (drives the left-gutter "redraw attempted" glyph).
-    redraw_pending = False
+    # append-only: `redraw_pending` (threaded across calls, like cells/col) is set when a \r/\b on the
+    # CURRENT line was neutralized, so the line gets one _REDRAW_MARK when it completes (the
+    # left-gutter "redraw attempted" glyph). Threading it means a \b that ends one read and a line
+    # that continues into the next is still flagged. The caller collapses the ONLCR \r\n newline
+    # BEFORE this (see SecureTerminal._feed_line), so a bare \r here is only ever a genuine overwrite.
 
     def _flush(soft):
         nonlocal cells, col, redraw_pending
@@ -1411,7 +1419,7 @@ def feed_line_edits(cells, col, sgr, raw, max_line=0, line_editing='full'):
                 cells.append((ch, state))
             col += 1
         i += 1
-    return completed, cells, col, sgr, wraps
+    return completed, cells, col, sgr, wraps, redraw_pending
 
 
 # Non-ASCII code points that are CONFUSABLE with a printable ASCII character --
