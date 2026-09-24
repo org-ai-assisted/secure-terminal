@@ -5636,18 +5636,20 @@ class SecureTerminal(QPlainTextEdit):
         # capped so a pathological newline-free flood still bounds each block).
         if self._shot:
             defer = False        # shot mode: paint NOW so the capture is byte-stable
-        # Collapse the ONLCR \r\n (the pty encodes an ordinary newline as \r\n) to a plain \n so
-        # append-only does not read the \r as a return-to-column-0 overwrite -- routine output would
-        # otherwise double-space and every line would get a false "redraw attempted" gutter mark. A
-        # bare \r (an in-place progress bar) is left intact; a \r split across the read boundary is
-        # held in self._cr_pending and rejoined with its \n on the next chunk. Mode-agnostic: full/
-        # read-safe already treat \r\n as a newline (the \r resets the column right before the \n).
-        if self._cr_pending:
-            text = '\r' + text
-        self._cr_pending = text.endswith('\r')
-        if self._cr_pending:
-            text = text[:-1]
-        text = text.replace('\r\n', '\n')
+        # APPEND-ONLY ONLY: collapse the ONLCR \r\n (the pty encodes an ordinary newline as \r\n)
+        # to a plain \n so append-only does not read the \r as a return-to-column-0 overwrite --
+        # routine output would otherwise double-space and every line would get a false "redraw
+        # attempted" gutter mark. A bare \r (an in-place progress bar) is left intact; a \r split
+        # across the read boundary is held in self._cr_pending and rejoined with its \n next chunk.
+        # full/read-safe are left byte-identical to the raw stream: they already handle \r\n
+        # correctly (the \r resets the column, the \n flushes), so there is nothing to fix there.
+        if self._line_editing == 'append-only':
+            if self._cr_pending:
+                text = '\r' + text
+            self._cr_pending = text.endswith('\r')
+            if self._cr_pending:
+                text = text[:-1]
+            text = text.replace('\r\n', '\n')
         wrap = self._cols if 8 <= self._cols <= self._MAX_LINE else self._MAX_LINE
         completed, self._line_cells, self._line_col, self._sgr, wraps, self._line_redraw = \
             feed_line_edits(self._line_cells, self._line_col, self._sgr, text,

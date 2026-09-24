@@ -38,13 +38,14 @@ _SAFE = frozenset(_HONORED | set(range(0x20, 0x7F)))
 def TestOneInput(data):
     fdp = atheris.FuzzedDataProvider(data)
     max_line = fdp.ConsumeIntInRange(0, 256)   # 0 = unbounded; >0 = width bound
-    # Both settings share every invariant below: with line editing off the CSI ops
-    # are consumed but inert (append-only), which must not weaken any of them.
-    line_edits = bool(fdp.ConsumeIntInRange(0, 1))
+    # Every level shares the invariants below: read-safe/append-only consume the CSI ops
+    # but keep them inert, and append-only additionally neutralizes \r/\b -- none of which
+    # may weaken containment. Exercise all three.
+    line_editing = ('full', 'read-safe', 'append-only')[fdp.ConsumeIntInRange(0, 2)]
     text = fdp.ConsumeUnicodeNoSurrogates(2 ** 18)
 
-    comp, cells, col, sgr, _wraps = feed_line_edits([], 0, {}, text, max_line,
-                                                    line_edits)
+    comp, cells, col, sgr, _wraps, _redraw = feed_line_edits([], 0, {}, text, max_line,
+                                                             line_editing)
     if not 0 <= col <= len(cells):
         raise RuntimeError(
             "feed_line_edits cursor {0} out of [0,{1}]: input={2!r}".format(
@@ -75,8 +76,9 @@ def TestOneInput(data):
         raise RuntimeError(
             "cells_display_col negative: input={0!r}".format(text))
 
-    ## Feeding the resulting state again must not raise.
-    feed_line_edits(cells, col, sgr, text, max_line, line_edits)
+    ## Feeding the resulting state again must not raise; carry redraw_pending as the
+    ## live reader does, so the re-feed continues the same append-only line state.
+    feed_line_edits(cells, col, sgr, text, max_line, line_editing, _redraw)
 
 
 def main():
