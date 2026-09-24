@@ -76,8 +76,9 @@ def TestOneInput(data):
         raise RuntimeError(
             "cells_display_col negative: input={0!r}".format(text))
 
-    ## Feeding the resulting state again must not raise.
-    feed_line_edits(cells, col, sgr, text, max_line, line_editing)
+    ## Feeding the resulting state again must not raise; carry redraw_pending as the
+    ## live reader does, so the re-feed continues the same append-only line state.
+    feed_line_edits(cells, col, sgr, text, max_line, line_editing, _redraw)
 
 
 def main():
