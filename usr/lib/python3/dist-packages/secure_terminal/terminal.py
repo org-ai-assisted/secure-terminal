@@ -766,6 +766,12 @@ _OSC_CLIP_MAX = 64 * 1024        # cap a clipboard payload; no unbounded writes
 # clipboard is REPORTED once per tab.
 _CLIP_FLOOD_WINDOW = 2.0
 _CLIP_FLOOD_COUNT = 12
+# OSC 52 clipboard-READ consent flood: each un-granted read query opens a BLOCKING modal
+# consent dialog, so a flood freezes the UI behind thousands of dialogs and coerces the user
+# toward "Always" just to escape. Bound the prompts tighter than writes (a read is modal, not
+# silent): past this many in the window, auto-DENY the excess (never a reply -> no exfiltration)
+# and advise once.
+_CLIP_READ_FLOOD_COUNT = 4
 # Whether an OSC body (the bytes after its "\x1b]") contains a terminator (BEL or
 # ST). Used to decide if a trailing OSC introducer is incomplete and must be held
 # back and prepended to the next read, so a sequence split across PTY reads (a
@@ -1285,7 +1291,7 @@ class SecureTerminal(QPlainTextEdit):
     def __init__(self, parent=None, command=None, tui=False, history='',
                  preview=False, cwd=None, mode='detail', colors=False,
                  markings=True, line_edits=True, show_command=False,
-                 theme='light', cg_path=None):
+                 theme='light', cg_path=None, initial_grid=None):
         super().__init__(parent)
         # Deterministic screenshot mode (SECURE_TERMINAL_SHOT=1, a startup capture
         # MODE -- never a persisted per-tab setting): hide the caret and render the
@@ -1579,6 +1585,8 @@ class SecureTerminal(QPlainTextEdit):
         self._last_clip_read = 0.0
         self._clip_write_times = []   # OSC 52 write monotonic timestamps (flood detection)
         self._clip_flood_advised = False   # the flood notice fires once per tab
+        self._clip_read_times = []    # OSC 52 read-consent prompt timestamps (flood detection)
+        self._clip_read_flood_advised = False   # the read-flood notice fires once per tab
         self._seeding = False         # True while replaying _raw into pyte (no bell)
         self._last_title = ''
         self._reported_cwd = ''       # OSC 7 working directory, when osc_cwd is on
@@ -1779,6 +1787,10 @@ class SecureTerminal(QPlainTextEdit):
         self._reflow_timer = QTimer(self)
         self._reflow_timer.setSingleShot(True)
         self._reflow_timer.timeout.connect(self._reflow)
+        # Grace before a SIGTERM'd foreground group is SIGKILLed (see _terminate_pgrp). The
+        # timer is created there, parented to self, and stopped in shutdown().
+        self._SURVIVOR_GRACE_MS = 2000
+        self._survivor_timer = None
 
         # restored scrollback from a previous session, shown as history above
         # the fresh shell (line mode; a TUI tab repaints over it on first draw).
@@ -1801,6 +1813,11 @@ class SecureTerminal(QPlainTextEdit):
         self._notifier = None
         self._fd = None
         self._pid = None
+        # Deferred spawn: the fork+exec waits for the widget's first real geometry so the
+        # PTY is sized to the FINAL grid before the child renders (see _spawn_child /
+        # resizeEvent). A test passes initial_grid to spawn eagerly at a known grid.
+        self._spawn_pending = False
+        self._spawn_command = None
         if self._preview:
             # No child, no keyboard: a read-only rendering surface only.
             self.setReadOnly(True)
@@ -1818,13 +1835,17 @@ class SecureTerminal(QPlainTextEdit):
             self._raw += banner
             self._cap_raw()
             self._append(banner)
-        self._start(command)
-        if self._tui:
-            # A tab that STARTS in TUI must enter the grid view properly (seed the
-            # pyte screen from any restored scrollback, set _grid_shown and the
-            # scrollbar), or the first output would clear the history unseeded and a
-            # later switch to CLI would not rebuild the line document.
-            self._sync_display()
+        # Defer the fork+exec until the widget has real geometry, then size the PTY to the
+        # final grid BEFORE the child exec's (see _spawn_child) -- so the shell draws its
+        # first prompt at the final width and there is never a corrective startup SIGWINCH
+        # (the duplicate-prompt race; st/VTE/xterm/kitty all size before the child renders).
+        # A test passes initial_grid=(cols, rows) to spawn eagerly at a known grid (the
+        # suite reads a live child before any show); production spawns on the first
+        # resizeEvent/showEvent.
+        self._spawn_command = command
+        self._spawn_pending = True
+        if initial_grid is not None:
+            self._spawn_child(grid=initial_grid)
 
     def render_preview(self, text, mode='detail', markings=True):
         """Render `text` as a static, read-only preview in the chosen display mode,
@@ -4130,7 +4151,21 @@ class SecureTerminal(QPlainTextEdit):
             return True
         return bool(os.read(exec_r, 1))
 
-    def _start(self, command, keep_screen=False):
+    def _spawn_child(self, grid=None):
+        """Fork+exec the deferred child, sized to `grid` before it exec's. Fired by the
+        first real geometry (resizeEvent/showEvent) or eagerly from the ctor when a test
+        passes initial_grid. Every caller gates on `_spawn_pending` (so the several
+        resizeEvents a show/maximize fires spawn only one child); it is cleared here."""
+        self._spawn_pending = False
+        self._start(self._spawn_command, grid=grid)
+        if self._tui:
+            # A tab that STARTS in TUI must enter the grid view (seed the pyte screen from
+            # any restored scrollback, set _grid_shown and the scrollbar) or the first
+            # output would clear the history unseeded and a later switch to CLI would not
+            # rebuild the line document.
+            self._sync_display()
+
+    def _start(self, command, keep_screen=False, grid=None):
         term, terminfo_dir = self._child_term()
         # Parse in the PARENT so a malformed / whitespace-degenerate command (argv is
         # None) is known here, on EVERY path (CLI, IPC, GUI new-tab, session restore):
@@ -4151,6 +4186,13 @@ class SecureTerminal(QPlainTextEdit):
         # the child, and a successful execvp() closes exec_w for us -- exactly what the
         # handshake needs.
         exec_r, exec_w = os.pipe()
+        # Go-pipe barrier (parent -> child): the child blocks on this AFTER joining the
+        # cgroup and BEFORE it exec's, so the parent can set the PTY winsize to the final
+        # grid FIRST. The shell then draws its first prompt at the real width and there is
+        # no corrective startup SIGWINCH (the duplicate-prompt race). The parent closes the
+        # write end to release the child (EOF = go); a parent that dies first also closes
+        # it, so the child never wedges. os.pipe() fds are close-on-exec (PEP 446).
+        go_r, go_w = os.pipe()
         # Write end of the tab's cgroup.procs (None when isolation is off). The CHILD
         # writes its own pid here first thing, before it can fork, so a fork bomb is
         # bounded to the tab from birth. O_CLOEXEC drops it on a successful execvp.
@@ -4163,6 +4205,8 @@ class SecureTerminal(QPlainTextEdit):
         except BaseException:
             os.close(exec_r)
             os.close(exec_w)
+            os.close(go_r)
+            os.close(go_w)
             if cg_fd is not None:
                 os.close(cg_fd)
             raise
@@ -4175,6 +4219,16 @@ class SecureTerminal(QPlainTextEdit):
             # descendant are limited from the start; best-effort, never blocks exec.
             if cg_fd is not None:
                 resource_isolation.place_pid(cg_fd, os.getpid())
+            # Barrier: wait for the parent to size the PTY before exec'ing, so this child is
+            # born at the final width (see the go-pipe above). Close our write copy first or
+            # the read never sees EOF; then read until EOF (parent closed ITS write end).
+            os.close(go_w)
+            try:
+                while os.read(go_r, 1):
+                    pass
+            except OSError:
+                pass
+            os.close(go_r)
             os.environ['TERM'] = term
             if terminfo_dir:
                 # prepend our dir; a trailing empty entry keeps the system defaults
@@ -4245,6 +4299,19 @@ class SecureTerminal(QPlainTextEdit):
         # so it does not leak one fd per spawn (restart_as_shell re-opens it each time).
         if cg_fd is not None:
             os.close(cg_fd)
+        os.close(go_r)          # parent's read copy; the child holds the other read end
+        self._fd = fd           # _set_winsize (and the reader below) need the master fd
+        # Size the PTY to the FINAL grid BEFORE releasing the child to exec, so the shell
+        # (or a full-screen program) is born at the real width and there is no corrective
+        # startup SIGWINCH / zsh reprint (the duplicate-prompt race), nor a raceful 0x0 for a
+        # TUI child before _make_screen sizes it below. grid is the caller's real geometry
+        # (initial_grid, or the first sizing); None on restart_as_shell, where the shown
+        # widget's current grid is right. For a deferred TUI spawn grid == _tui_grid_size(),
+        # so _make_screen re-applies the SAME size (a no-op) with no window at 0x0.
+        grid = grid if grid is not None else (
+            self._tui_grid_size() if self._tui else self._grid_size())
+        self._set_winsize(*grid)
+        os.close(go_w)          # release the child -> it chdir/execvp's at the sized grid
         # Parent: the write end is the child's; a successful exec closes it (CLOEXEC) ->
         # read EOF; a failed exec writes one byte -> read it. BOUNDED (see _await_exec): a
         # child wedged in a pre-exec os.chdir on a dead mount would otherwise block this read
@@ -4268,7 +4335,7 @@ class SecureTerminal(QPlainTextEdit):
         self._spawn_starttime = (None if self._command_exec_failed
                                  else self._pid_start_time(pid))
         SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
-        self._fd = fd
+        # self._fd was set right after fork (the winsize barrier needs it before release).
         # Close-on-exec: pty.fork()'s master fd is INHERITABLE by default, so a LATER tab's
         # forked shell would inherit THIS tab's pty master -- a program in that tab could then
         # scan /proc/self/fd and read another tab's output or inject keystrokes into it, a
@@ -4283,10 +4350,10 @@ class SecureTerminal(QPlainTextEdit):
             if keep_screen and self._screen is not None:
                 # restart_as_shell: preserve the exited program's primary buffer +
                 # scrollback for the new shell. A fresh _make_screen would clear() the
-                # document. Rebind only the parser to the surviving screen and re-apply
-                # the winsize to the NEW pty.
+                # document. Rebind only the parser to the surviving screen; the NEW pty was
+                # already sized to `grid` (the current geometry) before the child was
+                # released above, so no separate winsize is needed here.
                 self._stream = _Utf8CharsetByteStream(self._screen)
-                self._set_winsize(*self._tui_grid_size())
                 # SECURITY: the reused screen carries the EXITED program's DEC modes,
                 # scroll region, hidden cursor and charset -- a fresh _make_screen would
                 # not. restart_as_shell has already baselined them via
@@ -5028,6 +5095,20 @@ class SecureTerminal(QPlainTextEdit):
             if self._clipboard_read_always:
                 self._reply_clipboard()             # global always-allow, no prompt
             else:
+                now = time.monotonic()
+                self._clip_read_times = [t for t in self._clip_read_times
+                                         if now - t < _CLIP_FLOOD_WINDOW]
+                self._clip_read_times.append(now)
+                if len(self._clip_read_times) > _CLIP_READ_FLOOD_COUNT:
+                    # Flood: opening one modal per query would freeze the UI and pressure
+                    # the user toward "Always". Auto-DENY the excess (return -> NO reply, so
+                    # no exfiltration) and advise once; prompting resumes once the burst ends.
+                    if not self._clip_read_flood_advised:
+                        self._clip_read_flood_advised = True
+                        self._advise("A program is rapidly querying the clipboard (OSC 52 "
+                                     "read). The extra requests were denied; turn off System "
+                                     "clipboard (read) in View if this continues.")
+                    return
                 self._clipboard_read = 'pending'    # ask once; ignore repeats
                 # The connected slot opens a MODAL consent dialog (a nested Qt event loop).
                 # Disable this tab's pty notifier across the emit so a child write DURING the
@@ -5234,6 +5315,9 @@ class SecureTerminal(QPlainTextEdit):
         pty machinery is torn down inside the event loop, not during teardown."""
         self._render_timer.stop()          # no pending paint fires into teardown
         self._blink_timer.stop()           # nor a cursor-blink paint into teardown
+        if self._survivor_timer is not None:
+            self._survivor_timer.stop()    # a pending grace-SIGKILL must not fire post-close
+
         if self._transcript_file:
             self._transcript_timer.stop()  # a closing tab must not write its transcript
             #                                AFTER it leaves the tab bar -- that late write
@@ -6255,19 +6339,27 @@ class SecureTerminal(QPlainTextEdit):
         terminate), (False, errno) if the SIGTERM raised, (True, None) on a delivered SIGTERM."""
         if pgrp is None:
             return (False, None)
+        # Capture the group LEADER's start-time BEFORE the SIGTERM (the leader's pid == the
+        # pgid), so the deferred SIGKILL can confirm the SAME group is still there. Sampling
+        # it AFTER the kill leaves a window where the SIGTERM'd leader exits and its pgid is
+        # reused by an unrelated process (a real race, amplified by our own pty.fork() cadence
+        # when a tab is closed and another opened) -- leader_start would then record the
+        # STRANGER, and the identity-gated recheck at fire time would SIGKILL it. Sample first.
+        leader_start = self._pid_start_time(pgrp)
         try:
             os.killpg(pgrp, signal.SIGTERM)
         except OSError as exc:
             return (False, exc.errno)
-        # Capture the group LEADER's start-time NOW (the leader's pid == the pgid), so the
-        # deferred SIGKILL can confirm the SAME group is still there. os.killpg(pgrp, 0) alone
-        # checks only that SOMETHING is in the group -- after the SIGTERM'd job exits inside the
-        # grace window its pgid can be reused by an unrelated process (a real race, amplified by
-        # our own pty.fork() cadence when a tab is closed and another opened), and a blind
-        # SIGKILL would then kill that stranger. The recheck at fire time gates on identity.
-        leader_start = self._pid_start_time(pgrp)
-        QTimer.singleShot(
-            2000, lambda: self._kill_pgrp_survivor(pgrp, leader_start))
+        # PARENT the grace timer to self so it is destroyed with the widget: a bare
+        # QTimer.singleShot survives a tab close and, ~2s later, fires its lambda against the
+        # deleteLater'd C/C++ object -> RuntimeError -> the WHOLE app aborts (as main.py's
+        # _tab_is_live guard documents for the same class). shutdown() also stops it, so the
+        # close_tab path (shutdown + deleteLater) cancels it deterministically.
+        self._survivor_timer = QTimer(self)
+        self._survivor_timer.setSingleShot(True)
+        self._survivor_timer.timeout.connect(
+            lambda: self._kill_pgrp_survivor(pgrp, leader_start))
+        self._survivor_timer.start(self._SURVIVOR_GRACE_MS)
         return (True, None)
 
     def _kill_pgrp_survivor(self, pgrp, leader_start):
@@ -6501,9 +6593,12 @@ class SecureTerminal(QPlainTextEdit):
                     # submit the line exactly like Enter, so reset the line state --
                     # else a stale dirty flag would poison the next prompt. Like Enter,
                     # accept-line never advances a held paste (only a paste gesture does).
-                    self._line_buffer = ''
-                    self._line_dirty = False
-                    self._write(meta + bytes([byte]))
+                    # Reset ONLY when the byte is fully delivered: a short _write (wedged
+                    # child) leaves the line UNSENT, so _line_pending() must keep deferring
+                    # a re-export that would otherwise auto-submit the retained line (#34).
+                    if self._write(meta + bytes([byte])) >= len(meta) + 1:
+                        self._line_buffer = ''
+                        self._line_dirty = False
                     return
                 self._write(meta + bytes([byte]))
                 if key == Qt.Key.Key_C:
@@ -6546,13 +6641,16 @@ class SecureTerminal(QPlainTextEdit):
         # Ctrl+Shift menu chord): Ctrl+Shift+Return/Backspace/Tab must NOT send a raw byte
         # to the program -- they fall through so a window shortcut (or nothing) handles them.
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (ctrl and shift):
-            # Enter submits the line: reset the mirror state, then send CR. Enter NEVER
-            # advances a held multi-line paste -- the next line is inserted only by an
+            # Enter submits the line: send CR, then reset the mirror ONLY when it was fully
+            # delivered. A dropped CR (a wedged/slow child -> _write short) leaves the line
+            # unsent at the prompt, so _line_pending() must keep deferring a re-export that
+            # would otherwise be typed onto -- and submit -- the retained line (#34). Enter
+            # NEVER advances a held multi-line paste -- the next line is inserted only by an
             # explicit paste gesture at an idle prompt (see _insert_next_staged), so a
             # line reviewed for this shell cannot ride the Enter that launched a program.
-            self._line_buffer = ''
-            self._line_dirty = False
-            self._write(alt_esc + b'\r')
+            if self._write(alt_esc + b'\r') >= len(alt_esc) + 1:
+                self._line_buffer = ''
+                self._line_dirty = False
             return
         if key == Qt.Key.Key_Backspace and not (ctrl and shift):
             if alt_esc:
@@ -6673,18 +6771,11 @@ class SecureTerminal(QPlainTextEdit):
                 or (ctrl and not shift and key in (Qt.Key.Key_J, Qt.Key.Key_M)))
         submit_or_discard = accept_line or (
                 ctrl and not shift and key in (Qt.Key.Key_C, Qt.Key.Key_U))
-        if submit_or_discard:
-            self._line_buffer = ''
-            # accept-line and Ctrl+C settle the line, so the flag clears. Ctrl+U does
-            # NOT: its reach is cursor-dependent (untracked), so a survivor must keep
-            # _line_pending() deferring the re-export -- same reason as the CLI path.
-            if not (ctrl and key == Qt.Key.Key_U):
-                self._line_dirty = False
-            if ctrl and key == Qt.Key.Key_C:
-                # SIGINT abandons a held multi-line paste, exactly as the CLI-mode Ctrl+C
-                # path does -- else a stale staged line leaks into a later paste gesture.
-                # Only Ctrl+C clears it; accept-line and Ctrl+U do not.
-                self._staged_paste = []
+        if submit_or_discard and ctrl and key == Qt.Key.Key_C:
+            # SIGINT abandons a held multi-line paste, exactly as the CLI-mode Ctrl+C path
+            # does -- else a stale staged line leaks into a later paste gesture. The LINE
+            # mirror is settled after the byte is delivered (below), not here.
+            self._staged_paste = []
 
         seq = SecureTerminal._TUI_KEYS.get(key)
         text = event.text()
@@ -6730,11 +6821,27 @@ class SecureTerminal(QPlainTextEdit):
         # canvas (alt screen) still top-pins in _render_tui_body regardless, so this
         # only affects a primary grid with real scrollback.
         self._tui_follow = True
-        self._write(out)
+        wrote = self._write(out)
+        if submit_or_discard and wrote >= len(out):
+            # accept-line / Ctrl+C / Ctrl+U settle-or-discard the line -- clear the mirror
+            # ONLY when the byte was fully delivered, so a dropped write (a wedged child)
+            # cannot falsely clear _line_pending() and let a later re-export be typed onto,
+            # and submit, the still-resident line (#34). Ctrl+U keeps _line_dirty: its reach
+            # is cursor-dependent (untracked), so a survivor must keep deferring the re-export.
+            self._line_buffer = ''
+            if not (ctrl and key == Qt.Key.Key_U):
+                self._line_dirty = False
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._position_gutter()
+        if getattr(self, '_spawn_pending', False):
+            # First real geometry: fork+exec the child NOW, sized to this grid, so the
+            # shell draws its first prompt at the final width (no corrective SIGWINCH). A
+            # later WM resize is then an ordinary width change (old_cols != 0) that the
+            # reflow below rebuilds cleanly -- the race only ever hit the pre-geometry fork.
+            self._spawn_child(grid=(self._tui_grid_size() if self._tui else self._grid_size()))
+            return
         if self.tui_active() or (self._alt_screen and self._screen is not None):
             # TUI mode, or a full-screen program held in the background while in
             # line mode: keep the pyte screen and the pty at the (scrollbar-
@@ -7045,6 +7152,11 @@ class SecureTerminal(QPlainTextEdit):
         # hidden), which hideEvent's timer stop would otherwise leave dead.
         super().showEvent(event)
         self._restart_blink()
+        if getattr(self, '_spawn_pending', False):
+            # Fallback trigger: a tab shown without a preceding resizeEvent (its size did
+            # not change from the layout default) still spawns here, at the shown grid. If
+            # resizeEvent already fired, _spawn_pending is clear and this is a no-op.
+            self._spawn_child(grid=(self._tui_grid_size() if self._tui else self._grid_size()))
 
     def paintEvent(self, event):
         super().paintEvent(event)

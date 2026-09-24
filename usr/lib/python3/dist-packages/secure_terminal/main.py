@@ -1799,7 +1799,40 @@ class MainWindow(QMainWindow):
         self._renumber_tabs()          # number a tab that got no auto-colour too
         self._sync_chrome_to_tab()
         term.setFocus()
+        # A tab added while the window is already shown must START its child now, at the
+        # shared content grid: a hidden QTabWidget page receives neither showEvent nor
+        # resizeEvent, so a background / -e / deferred-restore tab would otherwise never
+        # spawn until the user selected it. At startup (before show) this is skipped;
+        # showEvent runs the same sweep once the window has geometry.
+        if self.isVisible():
+            self._spawn_pending_tabs()
         return index
+
+    def _spawn_pending_tabs(self):
+        """Start every tab whose child has not spawned yet, at the shared tab-widget
+        content grid. The deferred-spawn design (terminal.py) waits for a tab's first real
+        geometry so the PTY is sized before the shell's first prompt; a HIDDEN page never
+        gets that event, so a background tab is spawned here instead. All tabs share the
+        content area, so the visible tab's grid is the correct size for every one."""
+        cur = self.current()
+        if not isinstance(cur, SecureTerminal):
+            return
+        if getattr(cur, '_spawn_pending', False):
+            cur._spawn_child(grid=(cur._tui_grid_size() if cur._tui else cur._grid_size()))
+        ref = (cur._cols, cur._rows) if cur._cols else None
+        if ref is None:
+            return                     # geometry not settled yet; a later sweep will catch it
+        for i in range(self.tabs.count()):
+            term = self.tabs.widget(i)
+            if isinstance(term, SecureTerminal) and getattr(term, '_spawn_pending', False):
+                term._spawn_child(grid=ref)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Spawn any deferred tab now that the window has geometry. Deferred to the next
+        # event-loop turn so the visible tab has laid out (its own show/resize spawns it)
+        # and its grid is the reference for the hidden pages.
+        QTimer.singleShot(0, self._spawn_pending_tabs)
 
     def _make_banner(self, parent):
         """A dismissible, yellowish advisory banner floated as a top overlay over the
