@@ -94,7 +94,7 @@ ANSI_PALETTE = [
 #   'detail' -- like reveal but verbose: <U+XXXX NAME>, the codepoint plus its
 #               official Unicode name inline (what `unicode-show` annotates), so
 #               a homoglyph reads as its identity, not just a number (default, safe).
-DISPLAY_MODES = ('box', 'show', 'reveal', 'detail')
+DISPLAY_MODES = ('box', 'show', 'reveal', 'detail', 'codepoints')
 
 # line-editing levels (see feed_line_edits and the `line_editing` entry in 30_defaults.conf).
 # 'full' = honour the line-local CSI edits + CR/BS; 'read-safe' = strip the CSI edits, CR/BS
@@ -604,6 +604,19 @@ def render_output(text, mode='detail'):
     out = []
     for ch in text:
         cp = ord(ch)
+        if mode == 'codepoints':
+            # Most-explicit mode: EVERY character (printable ASCII included) becomes its
+            # <U+XXXX> badge, so nothing can pose as anything -- a live cat -v / hexdump for
+            # auditing a suspicious line. Tab and newline pass through as STRUCTURE (keep the
+            # per-line, aligned layout readable); BEL is a signal, dropped like every other
+            # mode. This is `reveal` generalized to all code points -- inert ASCII output.
+            if cp in (0x09, 0x0A):
+                out.append(ch)
+            elif cp == 0x07:
+                continue
+            else:
+                out.append('<U+%04X>' % cp)
+            continue
         if cp in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= cp <= 0x7E:
             out.append(ch)
         elif cp == 0x07:
@@ -1087,8 +1100,9 @@ def _cell_display(ch, mode):
     # Fast path: render_output returns 0x20-0x7E and the four line-local control bytes
     # (BS/TAB/LF/CR) VERBATIM, ahead of any mode branch, so a single such cell is its own display
     # in every mode. Returning it directly is behaviour-identical and skips the per-cell regex /
-    # loop overhead for the overwhelmingly common case (plain text).
-    if len(ch) == 1:
+    # loop overhead for the overwhelmingly common case (plain text). EXCEPT codepoints, which
+    # badges even printable ASCII -- it must go through render_output.
+    if len(ch) == 1 and mode != 'codepoints':
         cp = ord(ch)
         if 0x20 <= cp <= 0x7E or cp in (0x08, 0x09, 0x0A, 0x0D):
             return ch
