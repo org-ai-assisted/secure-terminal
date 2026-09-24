@@ -404,6 +404,11 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         # SILENTLY DROPPED, leaving stale text (the nano/paste corruption).
         if self._reject_scroll(private, args):
             return
+        # SU/SD are fork-added CSI handlers absent from pyte's Stream.events, so
+        # HistoryScreen.__getattribute__ never wraps them with before_event. Snap the
+        # view to the live bottom explicitly -- else scrolling a region while paged into
+        # history mutates the live buffer under a stale frame (history/live divergence).
+        self.before_event('scroll_up')
         count = count or 1
         top, bottom = self._scroll_margins()
         count = min(count, bottom - top + 1)
@@ -419,6 +424,9 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         # the top; cursor unchanged (unlike insert_lines). See scroll_up.
         if self._reject_scroll(private, args):
             return
+        # See scroll_up: SU/SD skip pyte's before_event wrapper, so snap the view to the
+        # live bottom before mutating, else a paged-in-history view diverges from the buffer.
+        self.before_event('scroll_down')
         count = count or 1
         top, bottom = self._scroll_margins()
         count = min(count, bottom - top + 1)
