@@ -69,6 +69,7 @@ import pty
 import re
 import copy
 import select
+import shutil
 import subprocess
 import tempfile
 import time
@@ -1064,28 +1065,39 @@ def cli_terminfo_dir():
             # guard against a poisoned entry handed to the child via TERMINFO_DIRS.
             os.makedirs(cache, mode=0o700, exist_ok=True)
             # tic -o opens its output path with NO O_NOFOLLOW, so a symlink planted at the
-            # compiled-entry path (or the 's/' subdir) by anyone who can write a poisoned
-            # cache dir would be FOLLOWED and the target file clobbered with terminfo bytes
-            # on EVERY launch. _fresh() already refused to TRUST such an entry; remove a
-            # symlinked / foreign-owned entry here so tic writes a fresh regular file instead
-            # of writing through the link.
-            tdir = os.path.join(cache, 's')
-            if os.path.islink(tdir):
-                try:
+            # compiled-entry path (or the 's/' subdir) by anyone who can write into the
+            # cache dir would be FOLLOWED and its target file clobbered with terminfo bytes
+            # on every launch. Compile into a FRESH private staging dir just made inside the
+            # (0700, owned) cache -- no attacker can have pre-planted a symlink there -- then
+            # MOVE each entry into place with os.replace relative to O_NOFOLLOW directory
+            # FDs, so neither the 's/' traversal nor the final component can be redirected
+            # through a swapped-in symlink. _fresh() (O_NOFOLLOW + owner) stays the read gate.
+            names = ('secure-terminal', 'secure-terminal-noedit')
+            stage = tempfile.mkdtemp(dir=cache, prefix='.tic-')
+            try:
+                subprocess.run(['tic', '-x', '-o', stage, src],
+                               check=True, capture_output=True, timeout=15)
+                # A real 's/' subdir under our cache, never a symlink swapped in for it.
+                tdir = os.path.join(cache, 's')
+                if os.path.islink(tdir) or (os.path.exists(tdir)
+                                            and not os.path.isdir(tdir)):
                     os.unlink(tdir)
-                except OSError:  # pragma: no cover - defensive
-                    pass
-            for _name in ('secure-terminal', 'secure-terminal-noedit'):
-                _entry = os.path.join(tdir, _name)
+                os.makedirs(tdir, mode=0o700, exist_ok=True)
+                sfd = os.open(os.path.join(stage, 's'),
+                              os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try:
-                    if os.path.islink(_entry) or (
-                            os.path.exists(_entry)
-                            and os.lstat(_entry).st_uid not in (0, os.getuid())):
-                        os.unlink(_entry)
-                except OSError:  # pragma: no cover - defensive
-                    pass
-            subprocess.run(['tic', '-x', '-o', cache, src],
-                           check=True, capture_output=True, timeout=15)
+                    dfd = os.open(tdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        for _name in names:
+                            # Atomic rename via dir FDs: the entry a co-located attacker
+                            # cannot redirect (O_NOFOLLOW opened the real 's/' dir).
+                            os.replace(_name, _name, src_dir_fd=sfd, dst_dir_fd=dfd)
+                    finally:
+                        os.close(dfd)
+                finally:
+                    os.close(sfd)
+            finally:
+                shutil.rmtree(stage, ignore_errors=True)
             # the same both-entries test: a tic that produced only one of them is
             # not a usable result, because _child_term may ask for either.
             if _fresh(cache):
@@ -3529,6 +3541,21 @@ class SecureTerminal(QPlainTextEdit):
         seen = {id(r) for r in self._top_rows}
         return [r for r in current if id(r) not in seen]
 
+    @staticmethod
+    def _history_render_width(row, columns):
+        """Render width for a scrolled-off HISTORY row: max(current columns, the row's
+        own written extent). pyte's Screen.resize truncates only the LIVE buffer, never
+        history.top, so a history row keeps the width it was written at. A shrink then a
+        full-document rebuild (a theme / mode / colour / markings toggle, apply_scrollback,
+        an alt-screen enter+leave, or a keep_screen restart -- all of which redraw
+        scrollback from pyte's history via _reset_grid_view) would render each history row
+        at the SMALLER screen.columns and silently DROP the off-screen-right content pyte
+        still holds. Expanding to the row's own extent preserves it (reachable by horizontal
+        scroll, as a real no-reflow terminal keeps it). For the common case (extent <=
+        columns) this equals columns, so a promoted live row and a rebuilt one stay
+        byte-identical (the incremental-vs-rebuild equivalence invariant)."""
+        return max(columns, max(row.keys(), default=-1) + 1)
+
     def _append_scrollback(self, screen):
         """Append the newly scrolled-off history rows (identified by object, so
         only the new tail is rendered) at the end of the document."""
@@ -3541,7 +3568,10 @@ class SecureTerminal(QPlainTextEdit):
             for row in new_rows:
                 if have:
                     cur.insertText('\n')
-                self._insert_grid_row(cur, row, screen.columns)
+                # A history row wider than the current grid (a shrink after it scrolled
+                # off) renders at its OWN extent, so a full rebuild never truncates it.
+                self._insert_grid_row(cur, row,
+                                      self._history_render_width(row, screen.columns))
                 have = True
         self._top_rows = list(current)
 
@@ -5230,7 +5260,11 @@ class SecureTerminal(QPlainTextEdit):
             return ''
         lines = []
         for row in list(scr.history.top):
-            lines.append(''.join(row[x].data for x in range(scr.columns)).rstrip())
+            # A history row keeps its write-time width (pyte never narrows history), so read
+            # each to max(columns, its extent) -- reading only scr.columns would drop content
+            # beyond a since-shrunk width from the reseeded _raw. Matches the grid render path.
+            lines.append(''.join(row[x].data for x in
+                                 range(self._history_render_width(row, scr.columns))).rstrip())
         for y in range(scr.lines):
             row = scr.buffer[y]
             lines.append(''.join(row[x].data for x in range(scr.columns)).rstrip())
@@ -6134,7 +6168,18 @@ class SecureTerminal(QPlainTextEdit):
         if self._pid is None or self._spawn_exe is None:
             return False
         exe = self._read_exe(self._pid)
-        return exe is not None and exe != self._spawn_exe
+        if exe is None:
+            # /proc/<pid>/exe is UNREADABLE on this live child (the sole caller,
+            # _is_killable_fg under pgrp == child_pgrp, reaches here only for a
+            # foreground child already confirmed current). A bare login shell is
+            # same-uid and dumpable, so its exe ALWAYS reads; an unreadable exe means
+            # the child dropped dumpability by exec-ing a hardened / setuid-style
+            # program (a non-dumpable /proc/<pid>/exe). Fail toward REPLACED so the
+            # panic button still terminates it and the mode-toggle re-export refuses to
+            # type into it -- treating a non-dumpable exec'd program as the bare shell
+            # would let it escape Terminate (a stuck-program footgun).
+            return True
+        return exe != self._spawn_exe
 
     def _is_killable_fg(self, pgrp, child_pgrp, our):
         """True when foreground process group `pgrp` is a program Terminate should signal:
@@ -7687,7 +7732,17 @@ class SecureTerminal(QPlainTextEdit):
         # ctl_send_text and the GUI paste sites distinguish all three -- submit the withheld
         # CR / stay silent only on True, report False as a partial-write error, treat None as
         # a benign no-op. (_write returns a byte count; collapse it to this bool contract.)
-        return self._write(data) == len(data)
+        n = self._write(data)
+        if bracketed and n < len(data):
+            # A short write on a wedged / slow child can deliver the 200~ opener plus a
+            # partial body but not the 201~ closer, leaving the child stuck in bracketed-
+            # paste mode -- it then swallows Ctrl+C and every subsequent key into the open
+            # paste (a stuck terminal). Mirror the OSC-52 short-write close-frame: best-
+            # effort emit the closer so the child's buffered prefix is at least a terminated
+            # (if truncated) paste. A fully wedged child receives neither, which is correct
+            # -- it is not reading. Delivery still reports False (a partial write).
+            self._write(b'\x1b[201~')
+        return n == len(data)
 
     def _insert_next_staged(self):
         """Insert the next HELD line of a reviewed multi-line paste at the prompt, on
