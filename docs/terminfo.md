@@ -8,8 +8,14 @@ found at runtime. The code is the source of truth for behaviour.
 - `usr/share/secure-terminal/terminfo/secure-terminal.ti` -- the terminfo SOURCE,
   the only terminfo file committed to the repo.
 - Defines two TERM types for CLI mode's escape-stripping renderer:
-  - `secure-terminal` -- line-editing CLI.
-  - `secure-terminal-noedit` -- append-only CLI.
+  - `secure-terminal` -- line-editing CLI (the `full` level).
+  - `secure-terminal-noedit` -- shared by the `read-safe` AND `append-only` levels: it drops
+    the redraw escapes (el/cuf/hpa) so a shell appends completions plainly. It still advertises
+    cr/cub1, which `read-safe` honours; `append-only` additionally NEUTRALIZES cr/backspace in
+    the renderer (a bare CR becomes a flagged line break, backspace is dropped), so under it a
+    shell's own line editing is append-only too -- the documented degradation, not a terminfo
+    bug. A distinct entry for append-only was rejected on purpose: it would only differ in a
+    capability append-only deliberately overrides at the renderer.
 - Compiled entries are `tic` build artifacts and are NEVER committed: the compiled
   format is ncurses/version specific, so it is produced by the target's `tic`, not
   checked in.

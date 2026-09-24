@@ -219,7 +219,7 @@ class RevealedEditor(QPlainTextEdit):
         """(completed cell-lines, current cell-line) for `text` -- the SAME cell
         construction the terminal uses, so the box renders identically. 'read-safe':
         the box content carries no escape/CSI to honour (CR/BS act as before)."""
-        completed, current, _col, _sgr, _wraps = feed_line_edits(
+        completed, current, _col, _sgr, _wraps, _rp = feed_line_edits(
             [], 0, dict(_DEF_SGR), text, 0, 'read-safe')
         return completed, current
 
@@ -460,6 +460,18 @@ class RevealedEditor(QPlainTextEdit):
             self._insert(self._display_clean(text))
             return
         super().keyPressEvent(event)
+
+    def inputMethodEvent(self, event):
+        """Route IME / compose / dead-key input through _text, exactly like keyPressEvent.
+        The base QPlainTextEdit handler would apply the commit AND preedit strings straight
+        to the document, bypassing _text -- the sole authority Deliver reads -- so composed
+        input could cross text the review never saw (the same desync the context-menu and
+        drag-and-drop shut-offs close). Commit through _insert; drop the preedit (the document
+        is a pure render of _text, so an unvalidated preedit must never reach it)."""
+        commit = event.commitString()
+        if commit:
+            self._insert(self._display_clean(commit))
+        event.accept()
 
     def _move_vertical(self, direction):
         """Move the caret one line up/down, keeping the source-character column
