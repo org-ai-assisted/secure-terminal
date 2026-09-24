@@ -1285,7 +1285,7 @@ class SecureTerminal(QPlainTextEdit):
     def __init__(self, parent=None, command=None, tui=False, history='',
                  preview=False, cwd=None, mode='detail', colors=False,
                  markings=True, line_edits=True, show_command=False,
-                 theme='light', cg_path=None):
+                 theme='light', cg_path=None, initial_grid=None):
         super().__init__(parent)
         # Deterministic screenshot mode (SECURE_TERMINAL_SHOT=1, a startup capture
         # MODE -- never a persisted per-tab setting): hide the caret and render the
@@ -1801,6 +1801,11 @@ class SecureTerminal(QPlainTextEdit):
         self._notifier = None
         self._fd = None
         self._pid = None
+        # Deferred spawn: the fork+exec waits for the widget's first real geometry so the
+        # PTY is sized to the FINAL grid before the child renders (see _spawn_child /
+        # resizeEvent). A test passes initial_grid to spawn eagerly at a known grid.
+        self._spawn_pending = False
+        self._spawn_command = None
         if self._preview:
             # No child, no keyboard: a read-only rendering surface only.
             self.setReadOnly(True)
@@ -1818,13 +1823,17 @@ class SecureTerminal(QPlainTextEdit):
             self._raw += banner
             self._cap_raw()
             self._append(banner)
-        self._start(command)
-        if self._tui:
-            # A tab that STARTS in TUI must enter the grid view properly (seed the
-            # pyte screen from any restored scrollback, set _grid_shown and the
-            # scrollbar), or the first output would clear the history unseeded and a
-            # later switch to CLI would not rebuild the line document.
-            self._sync_display()
+        # Defer the fork+exec until the widget has real geometry, then size the PTY to the
+        # final grid BEFORE the child exec's (see _spawn_child) -- so the shell draws its
+        # first prompt at the final width and there is never a corrective startup SIGWINCH
+        # (the duplicate-prompt race; st/VTE/xterm/kitty all size before the child renders).
+        # A test passes initial_grid=(cols, rows) to spawn eagerly at a known grid (the
+        # suite reads a live child before any show); production spawns on the first
+        # resizeEvent/showEvent.
+        self._spawn_command = command
+        self._spawn_pending = True
+        if initial_grid is not None:
+            self._spawn_child(grid=initial_grid)
 
     def render_preview(self, text, mode='detail', markings=True):
         """Render `text` as a static, read-only preview in the chosen display mode,
@@ -4130,7 +4139,21 @@ class SecureTerminal(QPlainTextEdit):
             return True
         return bool(os.read(exec_r, 1))
 
-    def _start(self, command, keep_screen=False):
+    def _spawn_child(self, grid=None):
+        """Fork+exec the deferred child, sized to `grid` before it exec's. Fired by the
+        first real geometry (resizeEvent/showEvent) or eagerly from the ctor when a test
+        passes initial_grid. Every caller gates on `_spawn_pending` (so the several
+        resizeEvents a show/maximize fires spawn only one child); it is cleared here."""
+        self._spawn_pending = False
+        self._start(self._spawn_command, grid=grid)
+        if self._tui:
+            # A tab that STARTS in TUI must enter the grid view (seed the pyte screen from
+            # any restored scrollback, set _grid_shown and the scrollbar) or the first
+            # output would clear the history unseeded and a later switch to CLI would not
+            # rebuild the line document.
+            self._sync_display()
+
+    def _start(self, command, keep_screen=False, grid=None):
         term, terminfo_dir = self._child_term()
         # Parse in the PARENT so a malformed / whitespace-degenerate command (argv is
         # None) is known here, on EVERY path (CLI, IPC, GUI new-tab, session restore):
@@ -4151,6 +4174,13 @@ class SecureTerminal(QPlainTextEdit):
         # the child, and a successful execvp() closes exec_w for us -- exactly what the
         # handshake needs.
         exec_r, exec_w = os.pipe()
+        # Go-pipe barrier (parent -> child): the child blocks on this AFTER joining the
+        # cgroup and BEFORE it exec's, so the parent can set the PTY winsize to the final
+        # grid FIRST. The shell then draws its first prompt at the real width and there is
+        # no corrective startup SIGWINCH (the duplicate-prompt race). The parent closes the
+        # write end to release the child (EOF = go); a parent that dies first also closes
+        # it, so the child never wedges. os.pipe() fds are close-on-exec (PEP 446).
+        go_r, go_w = os.pipe()
         # Write end of the tab's cgroup.procs (None when isolation is off). The CHILD
         # writes its own pid here first thing, before it can fork, so a fork bomb is
         # bounded to the tab from birth. O_CLOEXEC drops it on a successful execvp.
@@ -4163,6 +4193,8 @@ class SecureTerminal(QPlainTextEdit):
         except BaseException:
             os.close(exec_r)
             os.close(exec_w)
+            os.close(go_r)
+            os.close(go_w)
             if cg_fd is not None:
                 os.close(cg_fd)
             raise
@@ -4175,6 +4207,16 @@ class SecureTerminal(QPlainTextEdit):
             # descendant are limited from the start; best-effort, never blocks exec.
             if cg_fd is not None:
                 resource_isolation.place_pid(cg_fd, os.getpid())
+            # Barrier: wait for the parent to size the PTY before exec'ing, so this child is
+            # born at the final width (see the go-pipe above). Close our write copy first or
+            # the read never sees EOF; then read until EOF (parent closed ITS write end).
+            os.close(go_w)
+            try:
+                while os.read(go_r, 1):
+                    pass
+            except OSError:
+                pass
+            os.close(go_r)
             os.environ['TERM'] = term
             if terminfo_dir:
                 # prepend our dir; a trailing empty entry keeps the system defaults
@@ -4245,6 +4287,17 @@ class SecureTerminal(QPlainTextEdit):
         # so it does not leak one fd per spawn (restart_as_shell re-opens it each time).
         if cg_fd is not None:
             os.close(cg_fd)
+        os.close(go_r)          # parent's read copy; the child holds the other read end
+        self._fd = fd           # _set_winsize (and the reader below) need the master fd
+        if not self._tui:
+            # Size the line-mode PTY to the FINAL grid before releasing the child to exec,
+            # so the shell draws its first prompt at the real width -- no corrective startup
+            # SIGWINCH / zsh reprint (the duplicate-prompt race). TUI sizes its pyte grid +
+            # PTY in _make_screen below (a full-screen program redraws on SIGWINCH, so it is
+            # not this race). grid is the caller's real geometry (initial_grid, or the first
+            # sizing); None on restart_as_shell, where the shown widget's grid is right.
+            self._set_winsize(*(grid if grid is not None else self._grid_size()))
+        os.close(go_w)          # release the child -> it chdir/execvp's at the sized grid
         # Parent: the write end is the child's; a successful exec closes it (CLOEXEC) ->
         # read EOF; a failed exec writes one byte -> read it. BOUNDED (see _await_exec): a
         # child wedged in a pre-exec os.chdir on a dead mount would otherwise block this read
@@ -4268,7 +4321,7 @@ class SecureTerminal(QPlainTextEdit):
         self._spawn_starttime = (None if self._command_exec_failed
                                  else self._pid_start_time(pid))
         SecureTerminal._LIVE_PTY_PIDS.add(pid)   # the app SIGCHLD handler reaps it
-        self._fd = fd
+        # self._fd was set right after fork (the winsize barrier needs it before release).
         # Close-on-exec: pty.fork()'s master fd is INHERITABLE by default, so a LATER tab's
         # forked shell would inherit THIS tab's pty master -- a program in that tab could then
         # scan /proc/self/fd and read another tab's output or inject keystrokes into it, a
@@ -6735,6 +6788,13 @@ class SecureTerminal(QPlainTextEdit):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._position_gutter()
+        if getattr(self, '_spawn_pending', False):
+            # First real geometry: fork+exec the child NOW, sized to this grid, so the
+            # shell draws its first prompt at the final width (no corrective SIGWINCH). A
+            # later WM resize is then an ordinary width change (old_cols != 0) that the
+            # reflow below rebuilds cleanly -- the race only ever hit the pre-geometry fork.
+            self._spawn_child(grid=(self._tui_grid_size() if self._tui else self._grid_size()))
+            return
         if self.tui_active() or (self._alt_screen and self._screen is not None):
             # TUI mode, or a full-screen program held in the background while in
             # line mode: keep the pyte screen and the pty at the (scrollbar-
@@ -7045,6 +7105,11 @@ class SecureTerminal(QPlainTextEdit):
         # hidden), which hideEvent's timer stop would otherwise leave dead.
         super().showEvent(event)
         self._restart_blink()
+        if getattr(self, '_spawn_pending', False):
+            # Fallback trigger: a tab shown without a preceding resizeEvent (its size did
+            # not change from the layout default) still spawns here, at the shown grid. If
+            # resizeEvent already fired, _spawn_pending is clear and this is a no-op.
+            self._spawn_child(grid=(self._tui_grid_size() if self._tui else self._grid_size()))
 
     def paintEvent(self, event):
         super().paintEvent(event)
