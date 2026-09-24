@@ -43,7 +43,7 @@ from secure_terminal.sanitize import (
     OSC_FEATURES, OSC_FEATURE_BY_KEY, OSC_NOTICE_DEFAULT_OFF,
     osc_code_description, sanitize_title)
 from secure_terminal.terminal import (
-    SecureTerminal, THEMES, DISPLAY_MODES,
+    SecureTerminal, THEMES, DISPLAY_MODES, LINE_EDITING_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
     BASE_POINT_SIZE, FONT_SIZE_MIN, FONT_SIZE_MAX,
     route_ctrl_wheel_zoom,
@@ -244,7 +244,7 @@ _PERSIST_DEFAULTS = {
     'allow_title': 'true', 'auto_tab_colors': 'true', 'bell': 'tab', 'bell_sound': '',
     'colored_markings': 'true', 'colors': 'true', 'confirm_close': 'true',
     'copy_warn': 'unicode', 'escape_limit': '4096', 'font_family': DEFAULT_FONT_FAMILY,
-    'font_size': '11', 'keybindings': '', 'line_edits': 'true', 'osc_clipboard': 'false',
+    'font_size': '11', 'keybindings': '', 'line_editing': 'full', 'osc_clipboard': 'false',
     'osc_clipboard_read': 'false', 'osc_clipboard_read_always': 'false',
     'osc_colors': 'false', 'osc_cwd': 'false', 'osc_hyperlink': 'false',
     'osc_notice': 'true', 'osc_notice_off': ','.join(sorted(OSC_NOTICE_DEFAULT_OFF)),
@@ -316,6 +316,16 @@ def _toggle_icon(theme_name, letter, color):
     if not icon.isNull():
         return icon
     return _letter_icon(letter, color)
+
+
+# Line editing levels for the settings combo: (config key, label, safety-dot colour).
+# The per-item dot is drawn by _dot_icon (defined below, the security-lamp helper).
+# Ordered most-permissive first (matching the old checkbox-on == full). Green = safest.
+_LINE_EDITING_ITEMS = [
+    ('full', 'Full -- tab completion & redraws', '#c6871a'),
+    ('read-safe', 'Read-safe -- no escape redraws', '#4a90d9'),
+    ('append-only', 'Append-only -- output only grows', '#1f9d63'),
+]
 
 
 def _dot_icon(color):
@@ -1373,7 +1383,8 @@ class MainWindow(QMainWindow):
         # progress bar stacks one line per update. Off makes escape-driven editing
         # append-only, so a program cannot redraw a line it already wrote. An
         # explicit saved 'false' still wins.
-        self._default_line_edits = cfg.get('line_edits', 'true') == 'true'
+        self._default_line_editing = cfg.get('line_editing') \
+            if cfg.get('line_editing') in LINE_EDITING_MODES else 'full'
         self._auto_color_idx = 0      # cycles TAB_PALETTE so neighbours differ
         try:
             self._default_zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(cfg['zoom'])))
@@ -1754,6 +1765,7 @@ class MainWindow(QMainWindow):
         term.clipboard_read_requested.connect(
             lambda t=term: self._on_clipboard_read_requested(t))
         term.advise_signal.connect(lambda msg, t=term: self._on_advise(t, msg))
+        term.alt_screen_changed.connect(lambda t=term: self._on_alt_screen_changed(t))
         term.osc_used.connect(lambda key, code, t=term: self._on_osc_used(t, key, code))
         term.escape_suppressed.connect(
             lambda t=term: self._on_escape_suppressed(t))
@@ -2074,11 +2086,11 @@ class MainWindow(QMainWindow):
         # inherited cwd if the dir has vanished.
         active = self.current()
         inherit_cwd = active.shell_cwd() if isinstance(active, SecureTerminal) else ''
-        # line_edits goes through the ctor, not apply_line_edits: the ctor forks the
+        # line_editing goes through the ctor, not apply_line_editing: the ctor forks the
         # child, so only a ctor value reaches the fork in time to pick the matching
         # terminfo entry (secure-terminal vs secure-terminal-noedit).
         term = SecureTerminal(tui=tui, command=command or None,
-                              line_edits=self._default_line_edits,
+                              line_editing=self._default_line_editing,
                               cwd=inherit_cwd or None,
                               show_command=True,
                               cg_path=self._alloc_cgroup())
@@ -2120,7 +2132,7 @@ class MainWindow(QMainWindow):
 
         tui = self._default_tui if (spec.get('tui') is None
                                     or 'tui' in self._locked) else spec['tui']
-        # line_edits via the ctor: it must be set before the ctor forks the child,
+        # line_editing via the ctor: it must be set before the ctor forks the child,
         # or the shell is handed the wrong terminfo entry (see new_tab).
         _cmd = spec.get('command')
         # An EXPLICIT empty command (over IPC, `_sanitize_tab_spec` only type-checks it)
@@ -2133,8 +2145,8 @@ class MainWindow(QMainWindow):
                 and (not _cmd or not str(_cmd[0]).strip())):
             return False              # opened NO tab -> caller must not count it
         term = SecureTerminal(tui=tui, command=_cmd or None,
-                              line_edits=bool(_tab('line_edits',
-                                                   self._default_line_edits)),
+                              line_editing=_tab('line_editing',
+                                                self._default_line_editing),
                               show_command=True,
                               cg_path=self._alloc_cgroup())
         term.apply_theme(self._default_theme)
@@ -2597,10 +2609,11 @@ class MainWindow(QMainWindow):
                            _saved_bool(info.get('colors', self._default_colors),
                                        self._default_colors),
                            self._default_colors),
-            line_edits=_locked('line_edits',
-                               _saved_bool(info.get('line_edits', self._default_line_edits),
-                                           self._default_line_edits),
-                               self._default_line_edits),
+            line_editing=_locked('line_editing',
+                                 info.get('line_editing')
+                                 if info.get('line_editing') in LINE_EDITING_MODES
+                                 else self._default_line_editing,
+                                 self._default_line_editing),
             markings=_locked('colored_markings',
                              _saved_bool(info.get('markings', self._default_markings),
                                          self._default_markings),
@@ -3510,7 +3523,6 @@ class MainWindow(QMainWindow):
         # so a tab switch only DISPLAYS state, never mutates it.
         _sync = [
             (self.act_colors, term.colors_enabled()),
-            (self.act_line_edits, term.line_edits_enabled()),
             (self.act_markings, term.markings_enabled()),
             (self.act_tui, term.current_tui()),
             (self.act_title, term.allow_title_enabled()),
@@ -3760,6 +3772,27 @@ class MainWindow(QMainWindow):
         term = self.current()
         active = term is not None and term.tui_active()
         self.tui_dot_action.setVisible(active)
+        if not active:
+            return
+        # Alt-screen active: a full-screen program holds the visible screen. Mark the dot
+        # distinctly (a ring) so the takeover reads at a glance, not only in the lamp detail.
+        if term.alt_active():
+            self.tui_dot.setStyleSheet('background-color:%s; border-radius:7px; '
+                                       'border:2px solid #e6e6e6;' % MODE_NEUTRAL)
+            self.tui_dot.setToolTip(
+                'TUI mode -- a full-screen program holds the ALTERNATE screen right now: '
+                'the visible screen is its to repaint, and your scrollback is hidden and '
+                'frozen behind it until it exits.')
+        else:
+            self.tui_dot.setStyleSheet('background-color:%s; border-radius:7px;' % MODE_NEUTRAL)
+            self.tui_dot.setToolTip(TUI_TOOLTIP)
+
+    def _on_alt_screen_changed(self, term):
+        """A tab entered or left the alternate screen. Refresh the alt-state indicators if
+        it is the CURRENT tab (a background tab's change is picked up when it is selected)."""
+        if term is self.current():
+            self._update_tui_indicator()
+            self._update_security_indicator()
 
     # -- security indicator: three lamps, one per independent risk axis -------
     def _build_security_indicator(self):
@@ -3875,6 +3908,19 @@ class MainWindow(QMainWindow):
         is green (safe)."""
         term = self.current()
         if term is not None and term.tui_active():
+            if term.alt_active():
+                return (MODE_NEUTRAL, 'TUI (alt)',
+                        'Mode: TUI, alternate screen ACTIVE.\n\n'
+                        'A full-screen program (vim, htop, less, ...) is holding the '
+                        'alternate screen right now: the visible screen is its to '
+                        'repaint, and your primary scrollback is hidden and FROZEN '
+                        'behind it until it exits. Nothing you already saw is lost -- '
+                        'Save Transcript / State Dump capture it, and it returns when '
+                        'the program quits. This is why TUI is LESS contained on-screen '
+                        'than CLI: the whole visible screen is repaintable, not just the '
+                        'current line.\n\n'
+                        'Turn TUI mode off (at a shell prompt) to return to the safe '
+                        'CLI mode.')
             return (MODE_NEUTRAL, 'TUI',
                     'Mode: TUI.\n\n'
                     'Escape sequences are interpreted through a confined screen '
@@ -4681,7 +4727,6 @@ class MainWindow(QMainWindow):
         gated = [
             ('unicode_mode', list(self._mode_actions.values())),
             ('colors', [self.act_colors]),
-            ('line_edits', [self.act_line_edits]),
             ('colored_markings', [self.act_markings]),
             ('auto_tab_colors', [self.act_auto_tab_colors]),
             ('osc_notice', [self.act_osc_notice]),
@@ -4772,7 +4817,7 @@ class MainWindow(QMainWindow):
         ('ui_scale', 'ui_scale', '_ui_scale'),
         ('colors', 'colors', '_default_colors'),
         ('colored_markings', 'markings', '_default_markings'),
-        ('line_edits', 'line_edits', '_default_line_edits'),
+        ('line_editing', 'line_editing', '_default_line_editing'),
         ('tui', 'tui', '_default_tui'),
         ('osc_notice', 'osc_notice', '_osc_notice'),
         ('tui_autobox_notice', 'tui_autobox_notice', '_tui_autobox_notice'),
@@ -4797,7 +4842,7 @@ class MainWindow(QMainWindow):
             'font_size': str(self._default_font_size),
             'ui_scale': str(self._ui_scale),
             'colors': 'true' if self._default_colors else 'false',
-            'line_edits': 'true' if self._default_line_edits else 'false',
+            'line_editing': self._default_line_editing,
             'colored_markings': 'true' if self._default_markings else 'false',
             'auto_tab_colors': 'true' if self._auto_tab_colors else 'false',
             'scrollback': str(self._scrollback),
@@ -5135,16 +5180,8 @@ class MainWindow(QMainWindow):
             'is on.')
         self.act_colors.toggled.connect(self.set_colors)
 
-        self.act_line_edits = QAction(
-            _toggle_icon('format-text-direction-ltr', 'L', '#0969da'),
-            '&Line editing', self, checkable=True)
-        self.act_line_edits.setChecked(self._default_line_edits)
-        self.act_line_edits.setToolTip(
-            'Let the shell rewrite the line you are typing in place -- this is what '
-            'tab completion needs. On by default. Off makes output append-only '
-            'against escapes, so nothing can redraw a line it already wrote, and '
-            'completion appends instead. Full explanation: secure-terminal(1), '
-            'CONFIGURATION.')
+        # Line editing is a 3-level combo in Global settings (no per-tab chrome control):
+        # no hidden QAction state-holder, unlike colors/tui/mode which have toolbar chips.
 
         self.act_markings = QAction('Colored &markings', self, checkable=True)
         self.act_markings.setChecked(self._default_markings)
@@ -5952,14 +5989,17 @@ class MainWindow(QMainWindow):
                  'disguised character stands out. On by default; the unicode display '
                  'mode above still applies. Off shows them untinted.')
 
-        line_edits = QCheckBox()
-        line_edits.setChecked(self._default_line_edits)
-        _tip_row(rendering, 'Line editing', line_edits,
-                 'Let the shell rewrite the line you are typing in place -- this '
-                 'is what tab completion needs. ON by default. OFF makes output '
-                 'append-only against escapes, so nothing can redraw a line it '
-                 'already wrote, and completion appends instead. Full explanation: '
-                 'secure-terminal(1), CONFIGURATION.')
+        line_editing = QComboBox()
+        for _key, _label, _color in _LINE_EDITING_ITEMS:
+            line_editing.addItem(_dot_icon(_color), _label, _key)
+        line_editing.setCurrentIndex(line_editing.findData(self._default_line_editing))
+        _tip_row(rendering, 'Line editing', line_editing,
+                 'CLI tabs only. This controls how much the line a program is CURRENTLY '
+                 'writing can be redrawn. In TUI mode the whole visible screen is always '
+                 'repaintable (full-screen apps like vim need that), so these levels do '
+                 'not apply -- TUI is LESS contained, not more. Output that has scrolled '
+                 'above the visible area is frozen (append-only) in both modes. Full '
+                 'explanation: secure-terminal(1), CONFIGURATION.')
 
         tui = QCheckBox()
         tui.setChecked(self._default_tui)
@@ -6192,7 +6232,7 @@ class MainWindow(QMainWindow):
             (font_size, 'font_size'), (ui_scale, 'ui_scale'), (zoom, 'zoom'),
             (scrollback, 'scrollback'), (mode, 'unicode_mode'),
             (colors, 'colors'), (markings, 'colored_markings'),
-            (line_edits, 'line_edits'), (tui, 'tui'),
+            (line_editing, 'line_editing'), (tui, 'tui'),
             (clip_read_always, 'osc_clipboard_read_always'),
             (tui_autobox_notice, 'tui_autobox_notice'), (osc, 'osc_notice'),
             (pdelay, 'paste_delay'), (esc_limit, 'escape_limit'),
@@ -6241,7 +6281,8 @@ class MainWindow(QMainWindow):
             _set(colors, lambda: colors.setChecked(True))
             _set(markings, lambda: markings.setChecked(True))
             _set(clip_read_always, lambda: clip_read_always.setChecked(False))
-            _set(line_edits, lambda: line_edits.setChecked(True))
+            _set(line_editing, lambda: line_editing.setCurrentIndex(
+                line_editing.findData('full')))
             _set(tui, lambda: tui.setChecked(False))
             _set(tui_autobox_notice, lambda: tui_autobox_notice.setChecked(True))
             _set(osc, lambda: osc.setChecked(True))
@@ -6346,7 +6387,7 @@ class MainWindow(QMainWindow):
                 'mode': mode.currentData(), 'colors': colors.isChecked(),
                 'markings': markings.isChecked(),
                 'osc_clipboard_read_always': clip_read_always.isChecked(),
-                'line_edits': line_edits.isChecked(),
+                'line_editing': line_editing.currentData(),
                 'tui': tui.isChecked(),
                 'osc': {k: cb.isChecked() for k, cb in osc_checks.items()},
                 'osc_notice': osc.isChecked(),
@@ -6445,7 +6486,7 @@ class MainWindow(QMainWindow):
             term.apply_mode(opts['mode'])
             term.apply_colors(opts['colors'])
             term.apply_markings(self._default_markings)   # _GLOBAL_KEYS resolved it (lock-aware)
-            term.apply_line_edits(opts['line_edits'])
+            term.apply_line_editing(opts['line_editing'])
             for key, value in osc.items():
                 term.apply_osc(key, value)
             self._refresh_tab_label(term)   # line-2 title visibility follows osc_title
@@ -6776,7 +6817,7 @@ class MainWindow(QMainWindow):
                 'mode': term.current_mode(),
                 'font_family': term.current_font_family(),
                 'colors': term.colors_enabled(),
-            'line_edits': term.line_edits_enabled(),
+            'line_editing': term.line_editing(),
                 'markings': term.markings_enabled(),
                 'tui': term.current_tui(),
                 'allow_title': term.allow_title_enabled(),
@@ -7186,13 +7227,11 @@ def _launch_parser(with_globals):
                    help='enable ANSI colours for this tab')
     p.add_argument('--no-colors', dest='colors', action='store_false',
                    help='disable ANSI colours for this tab')
-    p.add_argument('--line-edits', dest='line_edits', action='store_true',
-                   default=None,
-                   help='let the shell rewrite the current line in place for this '
-                        'tab (what tab completion needs)')
-    p.add_argument('--no-line-edits', dest='line_edits', action='store_false',
-                   help='append-only against escapes for this tab: nothing can '
-                        'redraw a line it already wrote')
+    p.add_argument('--line-editing', dest='line_editing',
+                   choices=LINE_EDITING_MODES, default=None,
+                   help='line-editing level for this tab (CLI mode): full (tab '
+                        'completion + redraws), read-safe (no escape redraws), or '
+                        'append-only (nothing can redraw a line it already wrote)')
     p.add_argument('--bell', metavar='CHANNELS',
                    help='bell channels for this tab, e.g. "audible,visual" (empty = silent)')
     p.add_argument('--osc', dest='osc', metavar='FEATURE', action='append',
@@ -7244,7 +7283,7 @@ def _parse_launch_args(argv):
         launch.tabs.append({
             'title': namespace.title, 'tui': namespace.tui,
             'mode': namespace.mode, 'command': namespace.cmd_string,
-            'colors': namespace.colors, 'line_edits': namespace.line_edits,
+            'colors': namespace.colors, 'line_editing': namespace.line_editing,
             'bell': namespace.bell, 'osc': namespace.osc})
     if command is not None:
         launch.tabs[-1]['command'] = command
@@ -7309,7 +7348,7 @@ def _parse_launch_args(argv):
             return v is not None
         return not any(_set(k)
                        for k in ('title', 'tui', 'mode', 'command',
-                                 'colors', 'line_edits', 'bell', 'osc'))
+                                 'colors', 'line_editing', 'bell', 'osc'))
 
     # A leading '--tab' means the first tab IS that group; drop the empty
     # placeholder for tokens before it (its globals were already read).
@@ -7332,7 +7371,7 @@ def _sanitize_tab_spec(spec):
     """Type-validate a tab spec received over IPC (owner-only, but defensive)."""
     title, tui = spec.get('title'), spec.get('tui')
     mode, command = spec.get('mode'), spec.get('command')
-    colors, line_edits = spec.get('colors'), spec.get('line_edits')
+    colors, line_editing = spec.get('colors'), spec.get('line_editing')
     bell, osc = spec.get('bell'), spec.get('osc')
     return {
         'title': title if isinstance(title, str) else None,
@@ -7340,7 +7379,7 @@ def _sanitize_tab_spec(spec):
         'mode': mode if mode in DISPLAY_MODES else None,
         'command': command if isinstance(command, (str, list)) else None,
         'colors': colors if isinstance(colors, bool) else None,
-        'line_edits': line_edits if isinstance(line_edits, bool) else None,
+        'line_editing': line_editing if line_editing in LINE_EDITING_MODES else None,
         'bell': bell if isinstance(bell, str) else None,
         'osc': [f for f in osc if isinstance(f, str)] if isinstance(osc, list) else None,
     }

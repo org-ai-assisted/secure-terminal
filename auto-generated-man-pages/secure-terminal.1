@@ -36,7 +36,7 @@ Run \fISTRING\fR, shell\-split but without a shell\. Prefer \fB\-\-\fR \fIPROGRA
 \fB\-\-tab\fR
 Start another per\-tab option group: the options after it configure the next tab\.
 .TP
-\fB\-\-colors\fR, \fB\-\-no\-colors\fR, \fB\-\-line\-edits\fR, \fB\-\-no\-line\-edits\fR, \fB\-\-bell\fR \fICHANNELS\fR, \fB\-\-osc\fR \fIFEATURE\fR
+\fB\-\-colors\fR, \fB\-\-no\-colors\fR, \fB\-\-line\-editing\fR \fILEVEL\fR, \fB\-\-bell\fR \fICHANNELS\fR, \fB\-\-osc\fR \fIFEATURE\fR
 Per\-tab overrides of the configured defaults for the matching keys (see CONFIGURATION); an administrator \fBlock\fR still wins\. \fB\-\-osc\fR is repeatable\.
 .TP
 \fB\-\-class\fR \fICLASS\fR
@@ -77,7 +77,7 @@ Run \fIPROGRAM\fR directly as a real argv (no shell reparse)\. Repeat a leading 
 secure\-terminal has two rendering modes, chosen per tab:
 .TP
 CLI mode (default, safe)
-A strict, line\-oriented display\. The only escapes honored are safe colour and four line\-local edits (cursor forward/back, cursor\-to\-column, erase\-in\-line), and only within the line being written; vertical and absolute movement is stripped\. A program can redraw its own current line, exactly as a carriage return does, but can never reach back to a line already scrolled past\. Those four are what tab completion needs (Tab makes the shell rewrite the line you are typing in place); \fBline_edits=false\fR, or \fBView > Line editing\fR, turns them off \-\- see the key's entry in the defaults file (see CONFIGURATION) for what that gains and costs\.
+A strict, line\-oriented display\. The only escapes honored are safe colour and four line\-local edits (cursor forward/back, cursor\-to\-column, erase\-in\-line), and only within the line being written; vertical and absolute movement is stripped\. A program can redraw its own current line, exactly as a carriage return does, but can never reach back to a line already scrolled past\. Those four are what tab completion needs (Tab makes the shell rewrite the line you are typing in place)\. The \fBline_editing\fR setting (Settings > Text rendering > Line editing) chooses how much of the current line a program may redraw: \fBfull\fR (the default), \fBread\-safe\fR (drop the four escapes; carriage return and backspace still act), or \fBappend\-only\fR (also neutralize those, so the line can never be overwritten) \-\- see the key's entry in the defaults file (see CONFIGURATION) for what each gains and costs\.
 .TP
 TUI mode (opt\-in)
 Escapes are interpreted inside an isolated in\-memory screen model that has no OS reach: it cannot set the window title or touch the system clipboard\. Every on\-screen character is still ASCII/unicode\-filtered and colours keep a contrast guard\. Use it to run full\-screen programs (ssh, an editor, htop) and for the shell's completion menus and progress displays\.

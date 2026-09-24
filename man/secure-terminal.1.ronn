@@ -60,7 +60,7 @@ Each launch opens its own independent window and process (see INSTANCES); pass
     Start another per-tab option group: the options after it configure the next
     tab.
 
-  * `--colors`, `--no-colors`, `--line-edits`, `--no-line-edits`, `--bell` <CHANNELS>, `--osc` <FEATURE>:
+  * `--colors`, `--no-colors`, `--line-editing` <LEVEL>, `--bell` <CHANNELS>, `--osc` <FEATURE>:
     Per-tab overrides of the configured defaults for the matching keys (see
     CONFIGURATION); an administrator `lock` still wins. `--osc` is repeatable.
 
@@ -127,9 +127,12 @@ secure-terminal has two rendering modes, chosen per tab:
     stripped. A program can redraw its own current line, exactly as a carriage
     return does, but can never reach back to a line already scrolled past. Those
     four are what tab completion needs (Tab makes the shell rewrite the line you
-    are typing in place); `line_edits=false`, or **View > Line editing**, turns
-    them off -- see the key's entry in the defaults file (see CONFIGURATION) for
-    what that gains and costs.
+    are typing in place). The `line_editing` setting (Settings > Text rendering >
+    Line editing) chooses how much of the current line a program may redraw: `full`
+    (the default), `read-safe` (drop the four escapes; carriage return and backspace
+    still act), or `append-only` (also neutralize those, so the line can never be
+    overwritten) -- see the key's entry in the defaults file (see CONFIGURATION) for
+    what each gains and costs.
 
   * TUI mode (opt-in):
     Escapes are interpreted inside an isolated in-memory screen model that has
