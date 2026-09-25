@@ -81,6 +81,7 @@ import codecs
 import struct
 import termios
 import shlex
+import types
 import unicodedata
 import inspect
 from typing import Any
@@ -1416,6 +1417,15 @@ class SecureTerminal(QPlainTextEdit):
         # isinstance guard: THEMES is a dict, so `theme in THEMES` on a non-hashable
         # (list/dict) would raise instead of falling back -- crash-safe at the sink, like
         # the mode kwarg (DISPLAY_MODES is a tuple, safe for any type).
+        # FREEZE state, set BEFORE apply_theme (which now consults self._frozen): while True the
+        # live view is PAUSED -- paint (stage 2) suppressed while the pty read (stage 1) keeps
+        # feeding pyte/_raw, so the frame holds still for inspection. `_frozen_state` is the snapshot
+        # dump_state serves while frozen; `_frozen_screen` is the STABLE grid copy the frozen badge
+        # render reads (never the live screen, which keeps advancing) so a re-render while frozen
+        # shows the FROZEN frame, never leaks newer content, and dump-tab matches dump-state.
+        self._frozen = False
+        self._frozen_state = None
+        self._frozen_screen = None
         self._theme = theme if isinstance(theme, str) and theme in THEMES else 'light'
         self.apply_theme(self._theme)
 
@@ -1426,12 +1436,6 @@ class SecureTerminal(QPlainTextEdit):
         # final mode -- never first in the default then re-rendered (the flicker +
         # scrollbar jumps of restoring into the wrong mode).
         self._mode = mode if mode in DISPLAY_MODES else 'detail'
-        # FREEZE: while True the live view is PAUSED -- the paint (stage 2) is suppressed while the
-        # pty read (stage 1) keeps feeding pyte/_raw, so the frame the user is reading holds still
-        # for inspection/debugging. `_frozen_state` is the snapshot of that frame captured at freeze
-        # (served by dump_state while frozen, so `ctl dump-state` matches what the user froze).
-        self._frozen = False
-        self._frozen_state = None
         self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
         # Retain the raw decoded output (line mode) so a display-mode change can
         # re-render the WHOLE buffer, not just new output. Bounded so a flood
@@ -1936,7 +1940,12 @@ class SecureTerminal(QPlainTextEdit):
         self._line_fmt_cache = {}     # and the line-mode SGR format cache
         self._grid_mark_cache = {}    # and the grid risk-class marking formats
         self._row_sig_cache = {}      # so cached grid rows re-render in the new theme
-        if self._grid_mode() and self._screen is not None:
+        if self._frozen:
+            # FROZEN: never blank the paused view (a bare _render_tui is suppressed while frozen,
+            # leaving the just-reset doc empty). Re-badge the frozen snapshot in the new theme for
+            # an expanding grid; other frozen views keep their document (theme applies on unfreeze).
+            self._repaint_frozen()
+        elif self._grid_mode() and self._screen is not None:
             # Repaint the grid (it owns the screen). Rebuild the WHOLE view, not just the
             # live tail: rows already promoted into permanent scrollback keep the format
             # baked in at promotion time and a cache clear does not touch them, so a bare
@@ -2097,19 +2106,24 @@ class SecureTerminal(QPlainTextEdit):
         on = bool(on)
         if on == self._frozen:
             return
-        self._frozen = on
         if on:
-            # Snapshot the frame the user is freezing, so dump_state/dump-tab return exactly it
-            # while the live model advances underneath.
+            # Snapshot the frame BEFORE flipping _frozen: _collect_state()'s _force_current_frame
+            # -> _flush_paint must run UNsuppressed so already-read (paint-pending) output lands in
+            # the snapshot -- else a line read just before Freeze is dropped from it forever.
             self._frozen_state = self._collect_state() if self._screen is not None else None
-            if self._grid_mode() and self._screen is not None \
-                    and self._mode in EXPANDING_MODES:
+            self._frozen_screen = (self._snapshot_grid()
+                                   if self._grid_mode() and self._screen is not None else None)
+            self._frozen = True
+            # Expanding grid mode: paint the frozen badge snapshot now (a badge cannot fit a live
+            # cell). box/show TUI: the last live grid frame stays. CLI: the document already shows
+            # the frozen frame; new output buffers into the model/_raw but is not painted.
+            if self._frozen_screen is not None and self._mode in EXPANDING_MODES:
                 self._reset_grid_view()
                 self._render_frozen()
-            # box/show TUI: the last live grid frame simply stays (paint now suppressed). CLI: the
-            # document already shows the live frame; new output buffers into the model/_raw.
         else:
+            self._frozen = False
             self._frozen_state = None
+            self._frozen_screen = None
             # A resize was SUPPRESSED while frozen (resizeEvent early-returned), so the pyte
             # screen / pty winsize can be stale vs the current widget size. Reconcile it now --
             # mirroring resizeEvent's own branching -- then rebuild to the current frame.
@@ -2121,6 +2135,24 @@ class SecureTerminal(QPlainTextEdit):
                     self._set_winsize(new_cols, new_rows)
             self._rerender(full=True)      # rebuild to the CURRENT frame (grid catch-up or CLI _raw)
         self.freeze_changed.emit()
+
+    def _snapshot_grid(self):
+        """A lightweight, STABLE copy of the VISIBLE pyte grid at freeze time (a shallow copy of
+        each row -- cells are immutable and replaced on write, never mutated in place -- keeping
+        the defaultdict so a sparse column still yields a default cell). The frozen render reads
+        this, so it holds the frozen frame while the live screen keeps advancing."""
+        screen = self._screen
+        return types.SimpleNamespace(
+            lines=screen.lines, columns=screen.columns,
+            buffer={y: copy.copy(screen.buffer[y]) for y in range(screen.lines)})
+
+    def _repaint_frozen(self):
+        """Re-render the FROZEN frame after a setting change while frozen -- and NEVER blank the
+        view. Only an expanding grid frame can be re-badged (from the snapshot); every other frozen
+        view keeps its already-painted document (the changed setting takes effect on unfreeze)."""
+        if self._frozen_screen is not None and self._mode in EXPANDING_MODES:
+            self._reset_grid_view()
+            self._render_frozen()
 
     def _cap_raw(self):
         """Bound the retained raw output, cutting at an escape BOUNDARY. A plain
@@ -2167,6 +2199,14 @@ class SecureTerminal(QPlainTextEdit):
         self._paint_pending = []
         self._paint_pending_wraps = []
         self._paint_dirty = False
+        if self._frozen:
+            # FROZEN: the view is paused. The live paint (_render_tui / _flush_paint) is suppressed,
+            # so the normal clear-and-replay below would blank the document. Instead re-render the
+            # FROZEN frame in the (possibly new) setting without blanking: an expanding grid frame is
+            # re-badged from the snapshot; every other frozen view keeps its document (the setting
+            # takes effect on unfreeze, which calls _rerender(full=True) after clearing _frozen).
+            self._repaint_frozen()
+            return
         if self._grid_mode() and self._screen is not None:
             # A theme / markings / colour toggle changes how EVERY cell formats, but a bare
             # _render_tui() reconciles only the LIVE grid -- rows already promoted into
@@ -2178,13 +2218,7 @@ class SecureTerminal(QPlainTextEdit):
             # would else clear the doc and _render_tui() no-op on the None screen, wiping the
             # seeded content; fall through to the CLI replay below, which rebuilds it from _raw.
             self._reset_grid_view()
-            if self._frozen and self._mode in EXPANDING_MODES:
-                # Frozen expanding mode: a format toggle (theme/markings/colour) routes here; the
-                # suppressed _render_tui would leave the just-cleared doc blank, so re-paint the
-                # frozen badge snapshot instead. (Unfreeze catches up via _render_tui.)
-                self._render_frozen()
-            else:
-                self._render_tui()
+            self._render_tui()
             return
         self.clear()
         # The document was just cleared and is about to be replayed from _raw, so a shift-click
@@ -2273,7 +2307,11 @@ class SecureTerminal(QPlainTextEdit):
         # above pyte's cap -- must be preserved untouched.
         # NB: the rebuild reconstructs scrollback from pyte's bounded history, so a
         # reduction still cannot retain document rows older than that cap.
-        if (self._grid_mode() and self._screen is not None
+        if self._frozen:
+            # FROZEN: a bare _render_tui is suppressed, so resetting the grid would blank the
+            # paused view. Re-badge the frozen snapshot (expanding grid) or leave the document.
+            self._repaint_frozen()
+        elif (self._grid_mode() and self._screen is not None
                 and self.blockCount() < before):
             self._reset_grid_view()
             self._render_tui()
@@ -3180,13 +3218,14 @@ class SecureTerminal(QPlainTextEdit):
             self._render_tui()
 
     def _render_frozen(self):
-        """Paint the FROZEN expanding-mode frame once, from the current pyte buffer: each cell as
-        its per-mode <U+XXXX> badge (reveal/detail badge non-ASCII and keep ASCII; state badges
-        every char), tinted per mode -- state by the program's REAL SGR attributes, reveal/detail by
-        the risk class (matching each mode's CLI render). A static scrollable document; the pyte
-        model keeps advancing under the freeze (reading is not painting). Same badge+tint contract
+        """Paint the FROZEN expanding-mode frame once, from the SNAPSHOT taken at freeze time
+        (self._frozen_screen), NOT the live pyte screen -- which keeps advancing under the freeze
+        (reads never stop), so painting from it would leak newer content into the "frozen" view and
+        desync dump-tab from dump-state. Each cell renders as its per-mode <U+XXXX> badge (reveal/
+        detail badge non-ASCII and keep ASCII; state badges every char), tinted per mode -- state by
+        the program's REAL SGR attributes, reveal/detail by the risk class. Same badge+tint contract
         as the CLI cells_to_runs path, so the frozen TUI view matches the CLI view of the bytes."""
-        screen = self._screen
+        screen = self._frozen_screen
         if screen is None:
             return
         risk_on = self._markings and self._mode != 'state'   # reveal/detail: risk tint; state: SGR
