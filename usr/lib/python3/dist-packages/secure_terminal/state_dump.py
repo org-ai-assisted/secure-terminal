@@ -31,6 +31,8 @@ import unicodedata
 import pyte.modes
 import pyte.charsets as _charsets
 
+from secure_terminal.sanitize import _cp_name
+
 FORMAT_VERSION = 2
 
 # Unicode categories that must be BADGED in the human-readable text dump: a grid cell's
@@ -54,11 +56,7 @@ def _safe_grid_text(text):
     out = []
     for ch in text:
         if unicodedata.category(ch) in _UNSAFE_DUMP_CATS:
-            try:
-                name = unicodedata.name(ch)
-            except ValueError:
-                name = 'UNNAMED'
-            out.append('<U+%04X %s>' % (ord(ch), name))
+            out.append('<U+%04X %s>' % (ord(ch), _cp_name(ord(ch))))
         else:
             out.append(ch)
     return ''.join(out)

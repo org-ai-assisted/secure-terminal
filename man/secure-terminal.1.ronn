@@ -23,8 +23,9 @@ out of, without worrying about invisible characters, bidi overrides or escape
 sequences. Its default display mode, `detail`, is printable ASCII: a non-ASCII
 character is NAMED inline as `<U+XXXX NAME>` rather than drawn, so a look-alike
 reads as its identity. The other modes trade that differently -- `reveal` shortens
-the badge to the codepoint, `codepoints` badges EVERY character including printable
-ASCII (a cat -v/hexdump audit view; CLI mode, boxes in TUI), `box` replaces the
+the badge to the codepoint, `state` badges EVERY character as `<U+XXXX>` tinted by the
+program's own SGR attributes (codepoint + attributes, the live sibling of Save Screen State
+Dump; renders inline in CLI, a frozen snapshot in TUI), `box` replaces the
 character with one coloured placeholder glyph, and `show` renders a printable glyph
 as itself (tinted by risk class), which is the one mode that puts real non-ASCII on
 screen. What holds in EVERY mode is that no invisible, bidi or control character
@@ -51,7 +52,7 @@ Each launch opens its own independent window and process (see INSTANCES); pass
     model) or in the safe CLI mode. Overrides the configured default for this
     tab only. TUI mode needs `python3-pyte`.
 
-  * `--mode` `box`|`show`|`reveal`|`detail`:
+  * `--mode` `state`|`box`|`show`|`reveal`|`detail`:
     Initial unicode display mode (see DISPLAY MODES).
 
   * `-e`, `--command` <STRING>:
@@ -161,11 +162,48 @@ label for `detail` is "Detail"):
     coloured box.
 
   * `reveal`:
-    Show a `<U+XXXX>` codepoint badge (hover for its name).
+    Show a `<U+XXXX>` codepoint badge (hover for its name). Non-ASCII, plus the
+    control characters BS (`<U+0008>`) and CR (`<U+000D>`), are badged; printable
+    ASCII, tab and newline stay as themselves.
 
   * `detail`:
     Like reveal but with the codepoint's Unicode name inline, `<U+XXXX NAME>`, so
     a homoglyph reads as its identity rather than a bare number (the safe default).
+    Also badges BS and CR (`<U+000D CARRIAGE RETURN>`).
+
+  * `state`:
+    Badge EVERY character as `<U+XXXX>` (printable ASCII included), each tinted by
+    the PROGRAM'S OWN SGR attributes rather than by risk class -- codepoint plus
+    attributes, the live sibling of Save Screen State Dump. In CLI (line) mode the
+    badges render inline; in TUI (grid) mode a `<U+XXXX>` badge cannot fit one grid
+    cell, so entering `state` (like `reveal`/`detail`) FREEZES the frame and renders
+    the snapshot as badges (see FREEZE below).
+
+In every display mode a tab is drawn with a faint arrow guide (mirroring the faint
+dot shown for an anomalous space), so the whitespace structure of a line is visible
+without altering what copies out. In the TUI grid pyte has already expanded tabs to
+cursor moves, so the guide appears in CLI (line) mode.
+
+## FREEZE
+
+Freeze pauses the LIVE view so a fast-repainting or scrolling frame can be read
+and inspected. The program keeps running -- only the on-screen repaint is
+suspended; the terminal keeps reading its output, so nothing blocks. Unfreeze
+catches up to the current frame. It works in every display mode, TUI and CLI, and
+is primarily a DEBUGGING aid: freeze a frame that looks wrong, then inspect it.
+
+Toggle it with the Freeze toolbar button, the menu item, the `/freeze [on|off]`
+command, or `Ctrl+Shift+B`. While frozen, `ctl dump-state` and `ctl dump-tab` (see
+REMOTE CONTROL) return exactly the frozen frame -- the snapshot captured at freeze
+time -- while the live model advances underneath, so what you froze is what an
+inspector sees.
+
+The expanding badge modes (`reveal`, `detail`, `state`) cannot render a `<U+XXXX>`
+badge inside a single TUI grid cell, so entering one of them in a TUI tab
+AUTO-FREEZES the frame and renders the snapshot as badges; switching back to `box`
+or `show` (which fit the grid) resumes the live view. CLI (line) mode never
+auto-freezes -- badges expand inline there. Manual freeze is orthogonal and works
+in any mode at any time.
 
 ## REVIEW BAR
 

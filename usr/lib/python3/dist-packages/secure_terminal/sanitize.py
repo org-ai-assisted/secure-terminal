@@ -47,6 +47,36 @@ _CATEGORY_NAMES = {
     'Zp': 'Paragraph Separator', 'Zs': 'Space Separator',
 }
 
+# unicodedata.name() has no name for the C0/C1 control characters and DEL (they
+# carry formal Unicode name ALIASES, not names), so a control that reaches a badge
+# reads as "UNNAMED". Name them from their standard aliases instead -- CR/BS now
+# badge in reveal/detail, so "<U+000D CARRIAGE RETURN>" must say what it is.
+_CONTROL_NAMES = {
+    0x00: 'NULL', 0x01: 'START OF HEADING', 0x02: 'START OF TEXT',
+    0x03: 'END OF TEXT', 0x04: 'END OF TRANSMISSION', 0x05: 'ENQUIRY',
+    0x06: 'ACKNOWLEDGE', 0x07: 'BELL', 0x08: 'BACKSPACE',
+    0x09: 'CHARACTER TABULATION', 0x0A: 'LINE FEED', 0x0B: 'LINE TABULATION',
+    0x0C: 'FORM FEED', 0x0D: 'CARRIAGE RETURN', 0x0E: 'SHIFT OUT',
+    0x0F: 'SHIFT IN', 0x10: 'DATA LINK ESCAPE', 0x11: 'DEVICE CONTROL ONE',
+    0x12: 'DEVICE CONTROL TWO', 0x13: 'DEVICE CONTROL THREE',
+    0x14: 'DEVICE CONTROL FOUR', 0x15: 'NEGATIVE ACKNOWLEDGE',
+    0x16: 'SYNCHRONOUS IDLE', 0x17: 'END OF TRANSMISSION BLOCK', 0x18: 'CANCEL',
+    0x19: 'END OF MEDIUM', 0x1A: 'SUBSTITUTE', 0x1B: 'ESCAPE',
+    0x1C: 'INFORMATION SEPARATOR FOUR', 0x1D: 'INFORMATION SEPARATOR THREE',
+    0x1E: 'INFORMATION SEPARATOR TWO', 0x1F: 'INFORMATION SEPARATOR ONE',
+    0x7F: 'DELETE',
+}
+_CONTROL_NAMES.update({cp: 'CONTROL-%04X' % cp for cp in range(0x80, 0xA0)})
+
+
+def _cp_name(cp):
+    """Unicode name for a code point, falling back to the control-character alias
+    (unicodedata.name has none) and only then to 'UNNAMED'. ASCII-only output."""
+    try:
+        return unicodedata.name(chr(cp))
+    except (ValueError, TypeError):
+        return _CONTROL_NAMES.get(cp, 'UNNAMED')
+
 
 def describe_codepoint(cp):
     """Human description of a Unicode code point for the reveal-badge tooltip:
@@ -56,10 +86,7 @@ def describe_codepoint(cp):
     if not isinstance(cp, int) or cp < 0 or cp > 0x10FFFF:
         return 'U+???? (not a code point)'
     ch = chr(cp)
-    try:
-        name = unicodedata.name(ch)
-    except ValueError:
-        name = 'unnamed code point'
+    name = _cp_name(cp)
     cat = unicodedata.category(ch)
     cat_long = _CATEGORY_NAMES.get(cat, cat)
     esc = '\\u%04x' % cp if cp <= 0xFFFF else '\\U%08x' % cp
@@ -94,7 +121,12 @@ ANSI_PALETTE = [
 #   'detail' -- like reveal but verbose: <U+XXXX NAME>, the codepoint plus its
 #               official Unicode name inline (what `unicode-show` annotates), so
 #               a homoglyph reads as its identity, not just a number (default, safe).
-DISPLAY_MODES = ('box', 'show', 'reveal', 'detail', 'codepoints')
+DISPLAY_MODES = ('box', 'show', 'reveal', 'detail', 'state')
+# The EXPANDING badge modes: each renders a code point as a multi-column <U+XXXX> badge, so a badge
+# cannot fit one fixed TUI grid cell. In CLI they render live inline; in TUI they FREEZE the frame
+# (see SecureTerminal freeze). Box/Show fit the grid and render live. Used for the auto-freeze, the
+# expanding-wrap decision, and mode-availability.
+EXPANDING_MODES = ('reveal', 'detail', 'state')
 
 # line-editing levels (see feed_line_edits and the `line_editing` entry in 30_defaults.conf).
 # 'full' = honour the line-local CSI edits + CR/BS; 'read-safe' = strip the CSI edits, CR/BS
@@ -124,11 +156,7 @@ SPACE_MARK = '\u2423'
 def _detail_badge(cp):
     """A verbose reveal badge: <U+XXXX NAME>, all printable ASCII (Unicode names
     are ASCII), so it is safe in every display and never re-enables an escape."""
-    try:
-        name = unicodedata.name(chr(cp))
-    except (ValueError, TypeError):
-        name = 'UNNAMED'
-    return '<U+%04X %s>' % (cp, name)
+    return '<U+%04X %s>' % (cp, _cp_name(cp))
 
 # CSI (ESC [ ...), OSC (ESC ] ... BEL/ST), the DCS/SOS/PM/APC string sequences
 # (ESC P/X/^/_ ... ST) and other two-byte escapes.
@@ -591,11 +619,12 @@ def too_close(a, b):
 
 def render_output(text, mode='detail'):
     """Turn decoded child output into safe display text under one display mode.
-    Escape sequences are always removed (there is no ANSI parser). Printable
-    ASCII, tab and newline, and the two interactive cursor controls backspace
-    (0x08) and carriage return (0x0D) always pass through -- the widget honors the
-    latter two as line-local edits. Everything else is handled per `mode`
-    (see DISPLAY_MODES)."""
+    Escape sequences are always removed (there is no ANSI parser). Printable ASCII,
+    tab and newline always pass through. The two interactive cursor controls backspace
+    (0x08) and carriage return (0x0D) pass through in box/show (the widget honors them
+    as line-local edits), but reveal/detail BADGE them (make the cursor-control visible
+    instead of relaying it). Everything else is handled per `mode` (see DISPLAY_MODES).
+    'state' badges EVERY character (printable ASCII included) as its <U+XXXX>."""
     if '\x1b' in text:
         # Every ANSI_RE alternative begins with ESC, so on ESC-free text the sub is
         # a guaranteed no-op; skipping it keeps plain output (the common case) off
@@ -604,12 +633,13 @@ def render_output(text, mode='detail'):
     out = []
     for ch in text:
         cp = ord(ch)
-        if mode == 'codepoints':
-            # Most-explicit mode: EVERY character (printable ASCII included) becomes its
-            # <U+XXXX> badge, so nothing can pose as anything -- a live cat -v / hexdump for
-            # auditing a suspicious line. Tab and newline pass through as STRUCTURE (keep the
-            # per-line, aligned layout readable); BEL is a signal, dropped like every other
-            # mode. This is `reveal` generalized to all code points -- inert ASCII output.
+        if mode == 'state':
+            # State ("codepoint + attributes"): EVERY character (printable ASCII included)
+            # becomes its <U+XXXX> badge, so nothing can pose as anything. render_output emits
+            # only the inert badge TEXT (cli.py's straight-to-terminal path + the caret-offset
+            # math); the per-cell TINT by the program's real SGR is applied by cells_to_runs'
+            # 'state' branch (CLI) and _grid_cell_format (the frozen TUI view). Tab and newline
+            # pass through as STRUCTURE (aligned layout); BEL is a signal, dropped as everywhere.
             if cp in (0x09, 0x0A):
                 out.append(ch)
             elif cp == 0x07:
@@ -617,7 +647,11 @@ def render_output(text, mode='detail'):
             else:
                 out.append('<U+%04X>' % cp)
             continue
-        if cp in (0x08, 0x09, 0x0A, 0x0D) or 0x20 <= cp <= 0x7E:
+        if (0x20 <= cp <= 0x7E or cp in (0x09, 0x0A)
+                or (cp in (0x08, 0x0D) and mode not in ('reveal', 'detail'))):
+            # printable ASCII + tab/newline pass in every mode; backspace/carriage-return pass
+            # in box/show (the widget honors them as line edits, cli.py relays them) but fall
+            # through to the badge in reveal/detail -- "show all codepoints, also show CR/BS".
             out.append(ch)
         elif cp == 0x07:
             # A standalone BEL is a bell SIGNAL (rung, or not, per the bell
@@ -1097,14 +1131,15 @@ def _cell_display(ch, mode):
     in show mode is the box; every other cell is render_output."""
     if mode == 'show' and _combining_count(ch) > _ZALGO_MARK_MAX:
         return BOX
-    # Fast path: render_output returns 0x20-0x7E and the four line-local control bytes
-    # (BS/TAB/LF/CR) VERBATIM, ahead of any mode branch, so a single such cell is its own display
-    # in every mode. Returning it directly is behaviour-identical and skips the per-cell regex /
-    # loop overhead for the overwhelmingly common case (plain text). EXCEPT codepoints, which
-    # badges even printable ASCII -- it must go through render_output.
-    if len(ch) == 1 and mode != 'codepoints':
+    # Fast path: render_output returns printable ASCII + tab/newline VERBATIM in every mode, and
+    # backspace/carriage-return verbatim in box/show only (reveal/detail badge them). Mirror that
+    # gate exactly so a single such cell is its own display -- behaviour-identical, skipping the
+    # per-cell regex/loop for the common case (plain text). EXCEPT 'state', which badges even
+    # printable ASCII -- it must go through render_output.
+    if len(ch) == 1 and mode != 'state':
         cp = ord(ch)
-        if 0x20 <= cp <= 0x7E or cp in (0x08, 0x09, 0x0A, 0x0D):
+        if (0x20 <= cp <= 0x7E or cp in (0x09, 0x0A)
+                or (cp in (0x08, 0x0D) and mode not in ('reveal', 'detail'))):
             return ch
     return render_output(ch, mode)
 
@@ -1715,6 +1750,10 @@ WRAP_NL = '\x00wrap'
 # keeps its real U+0020 (so copy / transcript / toPlainText all yield a plain space); the
 # widget paints a faint dot over each flagged column (display-only, all display modes).
 WS_ANOMALY = 'whitespace'
+# Tab marking colour class. Unlike the space anomaly (position/run based), EVERY tab is marked:
+# a tab is invisible layout, so the widget paints a faint distinct guide (an arrow) over each one,
+# in every display mode. The real '\t' is kept in the document (copy/transcript unchanged).
+TAB_MARK = 'tab'
 
 
 def whitespace_anomaly_cols(chars, flag_trailing=True, flag_leading=True):
@@ -1864,7 +1903,13 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
             # Source code point for the risk colour + hover inspection: a multi-cp cell (a
             # boxed Zalgo base+marks) has no single ord(); use its worst code point.
             src_cp = ord(ch) if len(ch) == 1 else marking_cp_for_cell(ch)
-            if markings and not structural:
+            if mode == 'state':
+                # State tints the badge by the cell's REAL program SGR (colour/bold/attrs),
+                # NOT the risk class -- "codepoint + attributes". Risk markings never override
+                # here (that is State's whole point); colours off falls to no tint. Still tagged
+                # MARK_KEY with src_cp so hover/click names the character.
+                color = key if colors else None
+            elif markings and not structural:
                 color = marking_class(src_cp)
             elif colors:
                 color = key
@@ -1895,6 +1940,11 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
             elif col in flagged and not _space_is_visible(key):
                 # invisible padding: keep the real space, paint the dot.
                 add(ch, (MARK_KEY, WS_ANOMALY, 0x20))
+            elif ch == '\t' and markings:
+                # EVERY tab: keep the real '\t' (layout/copy/transcript unchanged) but tag it so
+                # the widget paints a faint arrow guide -- tabs are otherwise invisible in every
+                # display mode. Distinct-but-similar to the space dot; display-only.
+                add(ch, (MARK_KEY, TAB_MARK, 0x09))
             else:
                 # not flagged, OR a bg-coloured (visible) space that keeps its own SGR.
                 emit(ch, key)
