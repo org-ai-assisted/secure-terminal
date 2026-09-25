@@ -5773,11 +5773,19 @@ class SecureTerminal(QPlainTextEdit):
         program IN PLACE -- the inverse of restart_as_shell. Used when a --if-absent reopen matches
         this tab: reuse it instead of opening a duplicate or deduping against a dead shell. Returns
         True when it relaunches; a no-op (False) unless this IS a reverted-shell tab (self._command
-        is None) that remembers a command (self._exited_command) and still has a live fd."""
+        is None) that remembers a command (self._exited_command) and still has a live fd. Refuses
+        (returns False) when a FOREGROUND PROGRAM is running in the fallback shell -- re-running the
+        launch command would SIGHUP it and kill the user's work; the caller then leaves the tab as
+        is. (An unsubmitted command LINE typed in an idle shell is not detectable and is discarded,
+        as it is on any restart -- the widget cannot introspect the shell's line buffer.)"""
         if (self._command is not None or self._exited_command is None
-                or self._fd is None):
+                or self._fd is None or self.has_foreground_program()):
             return False
-        _was_alt = self._reset_child_state()
+        # A reverted login shell is never on the alt screen (a foreground alt program is refused
+        # above via has_foreground_program), so _reset_child_state's was-alt result is always False
+        # here -- no alt_screen_changed emit is needed; the relaunched program's own _on_readable
+        # emits when IT enters the alt screen.
+        self._reset_child_state()
         # Restore the remembered command and fork it FRESH (like the initial launch: for a TUI tab
         # _start makes a new screen so the program repaints; the interim login shell's screen is not
         # kept). _start re-derives _command_malformed / _command_exec_failed for it.
@@ -5788,8 +5796,6 @@ class SecureTerminal(QPlainTextEdit):
             # A TUI tab must enter grid view after a fresh start (mirror _spawn_child), or the first
             # output clears the unseeded history and a later CLI<->TUI switch mis-renders.
             self._sync_display()
-        if _was_alt and not self._alt_screen:
-            self.alt_screen_changed.emit()
         return True
 
     def _append(self, text):

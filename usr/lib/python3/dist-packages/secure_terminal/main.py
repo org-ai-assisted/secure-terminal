@@ -2446,7 +2446,13 @@ class MainWindow(QMainWindow):
             if self.tabs.indexOf(term) < 0:
                 continue                    # a stale key not in the bar
             key = getattr(term, 'launch_command', None)
-            if key is not None:
+            if key is None:
+                continue
+            existing = by_key.get(key)
+            # Duplicate command in two tabs: prefer the one still RUNNING it (its _command is set)
+            # over a reverted-to-shell one, so _ipc_open dedups against the LIVE instance (skip),
+            # never relaunches a reverted duplicate while another tab already runs the command.
+            if existing is None or getattr(existing, '_command', None) is None:
                 by_key[key] = term
         return by_key
 
