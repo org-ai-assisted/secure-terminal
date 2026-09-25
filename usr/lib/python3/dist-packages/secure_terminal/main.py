@@ -2437,15 +2437,18 @@ class MainWindow(QMainWindow):
         return None
 
     def _live_commands(self):
-        """Normalized launch commands of the window's current tabs (skips None)."""
-        keys = set()
+        """Map of {normalized launch command -> its tab} for the window's current tabs (skips a
+        None key). Includes a tab that reverted to a login shell but KEEPS its launch_command (its
+        program exited): _ipc_open reuses that tab (relaunch_command) rather than deduping against a
+        dead shell or opening a duplicate. The term is the value so _ipc_open can act on it."""
+        by_key = {}
         for term in self._tab_ids:
             if self.tabs.indexOf(term) < 0:
                 continue                    # a stale key not in the bar
             key = getattr(term, 'launch_command', None)
             if key is not None:
-                keys.add(key)
-        return keys
+                by_key[key] = term
+        return by_key
 
     def _ipc_open(self, request):
         # Only a --reuse handoff reaches here (an 'open' request). --reuse always
@@ -2466,8 +2469,8 @@ class MainWindow(QMainWindow):
         if_absent = request.get('if_absent', False)
         if not isinstance(if_absent, bool):
             return {'ok': False, 'error': 'if_absent must be a boolean'}
-        present = self._live_commands() if if_absent else set()
-        opened = skipped = 0
+        present = self._live_commands() if if_absent else {}
+        opened = skipped = reattached = 0
         for spec in (tabs if isinstance(tabs, list) else []):
             if not isinstance(spec, dict):
                 continue
@@ -2475,18 +2478,28 @@ class MainWindow(QMainWindow):
             if if_absent:
                 key = self._normalize_command(spec.get('command'))
                 if key is not None and key in present:
-                    skipped += 1
+                    term = present[key]
+                    # A tab with this launch command already exists. If it reverted to a login shell
+                    # (its program exited -- term._command is None), RE-RUN the command in it so a
+                    # reopen reuses the tab (relaunch_command) instead of leaving a dead shell. A tab
+                    # still RUNNING the command is left as-is (skip). A None value is a same-batch
+                    # placeholder (a duplicate spec), also just skipped.
+                    if (term is not None and getattr(term, '_command', None) is None
+                            and term.relaunch_command()):
+                        reattached += 1
+                    else:
+                        skipped += 1
                     continue
                 if key is not None:
-                    present.add(key)        # also dedup within this one batch
+                    present[key] = None     # also dedup within this one batch
             if self._open_launch_tab(spec):
                 opened += 1                 # count ONLY a tab that was actually created
-        if opened == 0 and skipped == 0:
+        if opened == 0 and skipped == 0 and reattached == 0:
             self.new_tab()                  # a bare reuse (or an all-declined batch): a tab
         self.show()
         self.raise_()
         self.activateWindow()
-        return {'ok': True, 'opened': opened, 'skipped': skipped}
+        return {'ok': True, 'opened': opened, 'skipped': skipped, 'reattached': reattached}
 
     def _add_placeholder_tab(self, info, at):
         """Insert a lightweight placeholder page for a not-yet-restored session tab,
@@ -2771,7 +2784,7 @@ class MainWindow(QMainWindow):
                 # and closes (its dead child cannot stay).
                 self._shell_exited_pending.discard(term)
                 if term.restart_as_shell():
-                    term.launch_command = None
+                    # Keep launch_command (see _on_shell_exited): a reopen reuses this reverted tab.
                     self._update_terminate_enabled()
                     return
             # If this tab holds a paste/copy review, hide the bar first -- otherwise it
@@ -2824,10 +2837,9 @@ class MainWindow(QMainWindow):
         # no-ops (returns False) for a plain login-shell tab, which still closes on
         # `exit`, as a real terminal does.
         if term.restart_as_shell():
-            # The tab no longer runs its launch program -- clear the launch_command so
-            # a repeated --if-absent for the same program OPENS a fresh tab instead of
-            # deduping against this now-a-plain-shell tab (silently reported "skipped").
-            term.launch_command = None
+            # The tab reverted to a login shell but KEEPS its launch_command: a repeated --if-absent
+            # for the same command REUSES this tab (relaunch_command, via _ipc_open) instead of
+            # opening a duplicate, and the tooltip shows the command as "... (exited)".
             self._update_terminate_enabled()   # _command is now None; refresh chrome/label
             return
         self.close_tab(index)
@@ -2923,7 +2935,13 @@ class MainWindow(QMainWindow):
         add('instance group', self._instance_group)
         add('name', self._user_titles.get(term))
         add('program', self._prog_titles.get(term))
-        add('command', _command_display(term._command) or '(login shell)')
+        # A reverted-to-shell tab (_command is None) still remembers what it RAN: show that as
+        # "... (exited)" rather than an anonymous "(login shell)", so a stopped session tab still
+        # says which session it was.
+        cmd_disp = _command_display(term._command)
+        if not cmd_disp and getattr(term, '_exited_command', None):
+            cmd_disp = '%s (exited)' % _command_display(term._exited_command)
+        add('command', cmd_disp or '(login shell)')
         add('mode', 'TUI' if term.current_tui() else 'CLI')
         add('pid', term._pid)
         add('pts', self._tab_pts(term))

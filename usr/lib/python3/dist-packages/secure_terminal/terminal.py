@@ -1537,6 +1537,11 @@ class SecureTerminal(QPlainTextEdit):
         # button's "never kill a bare shell" guard is one of them -- leaving _command as ''
         # (falsy but not None) would let terminate_foreground SIGKILL an idle shell.
         self._command = command if command else None
+        # The launch command this tab last RAN, kept after restart_as_shell drops it to a login
+        # shell (self._command -> None): the tooltip shows it as "... (exited)", and
+        # relaunch_command re-runs it in place when --if-absent re-opens the same tab. None until a
+        # launched program actually exits.
+        self._exited_command = None
         self._command_malformed = False   # set by _start: a malformed/whitespace command
         self._command_exec_failed = False  # set by _start: the -e program could not exec
         self._spawn_exe = None             # set by _start: /proc exe of the spawned child (an
@@ -5631,6 +5636,70 @@ class SecureTerminal(QPlainTextEdit):
             lines.pop()
         return '\r\n'.join(lines)
 
+    def _reset_child_state(self):
+        """Tear down the current child's pty + half-parsed stream/VT state IN PLACE so a fresh
+        child can be forked into this SAME widget -- shared by restart_as_shell (-> login shell)
+        and relaunch_command (-> the original program). Drops every pending paste/copy review and
+        OSC-52 clipboard-read consent FIRST (SECURITY: reviewed input, and a consent dialog, must
+        never carry into the new child). Returns whether the alt screen was cleared, so the caller
+        can emit alt_screen_changed AFTER the new child is forked. Does NOT touch self._command --
+        the caller sets it."""
+        # SECURITY: drop any pending paste/copy review FIRST. Its held (reviewed) text must never
+        # become dispatchable to the NEW child -- a reviewed multiline paste would then execute.
+        if (self._review_active or self._pending_paste is not None
+                or self._pending_copy is not None):
+            self._pending_paste = None
+            self._pending_copy = None
+            self._pending_copy_strip = None
+            self._review_active = False
+            self.paste_review_resolved.emit()
+        # SECURITY: a PENDING OSC-52 clipboard-read consent -- a dialog the exiting program opened,
+        # still up during the paste-delay countdown -- must not survive into the new child: clicking
+        # Allow would then reply the system clipboard into an UNRELATED child's pty. Drop the pending
+        # state, and forget an allow-always grant, since the new child is a different context.
+        self._clipboard_read = None
+        self._clipboard_read_always = False
+        # Tear down the current child's pty. SIGHUP it: for restart_as_shell the read that brought us
+        # here raised EIO (the child exited) so this is a no-op ESRCH; for relaunch_command the login
+        # shell is still LIVE, so the SIGHUP replaces it. A program that CLOSED the tty yet keeps
+        # running is reaped either way, matching close_tab.
+        self._release_pty(hangup=True)
+        # rmcup: if the exiting child was on the ALT screen, restore the pre-program PRIMARY screen
+        # (+ its scrollback) so its transient full-screen frame is dropped but the shell output that
+        # preceded it survives. Done BEFORE the stream-state reset clears _alt_saved.
+        _was_alt = self._alt_screen        # caller emits alt_screen_changed if this clears it
+        if self._alt_screen:
+            self._alt_leave()
+        # Reset the half-parsed per-child stream state so the new child's very first bytes are not
+        # corrupted by a stale carry, a stuck alt-screen bit, or the old child's mouse-tracking.
+        self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        self._esc_carry = ''
+        self._esc_drop = ''
+        self._esc_dropped = 0
+        self._esc_notified = False
+        self._osc_carry = b''
+        self._notice_carry = b''
+        self._alt_scan_carry = ''
+        self._alt_feed_carry = b''
+        self._sync_scan_carry = ''
+        self._mouse_scan_carry = ''
+        self._alt_screen = False
+        self._alt_saved = None
+        self._alt_owner_pgrp = None
+        self._alt_view = False
+        # Clear the VT display/input baseline (mouse reporting, OSC palette, SGR pen, cursor
+        # visibility) and -- when a grid screen survives via keep_screen -- its DEC/ANSI modes,
+        # scroll region, hidden cursor and G0/G1 charset. The buffer + scrollback are untouched.
+        self._reset_vt_to_prompt_baseline()
+        self._bracket_had_fg = False
+        self._bracket_owner = None       # 2004 cleared above; drop its stale owner too
+        self._sync_update = False
+        self._line_dirty = False
+        # SECURITY: a held multi-line paste for the OLD child must not survive into the new one --
+        # else a later paste gesture would insert a line reviewed for the OLD context.
+        self._staged_paste = []
+        return _was_alt
+
     def restart_as_shell(self):
         """A launched program (-- PROGRAM tab) exited: drop to a fresh login shell
         IN PLACE instead of closing the tab, so a finished program (a session, an
@@ -5652,74 +5721,11 @@ class SecureTerminal(QPlainTextEdit):
             #    a bad path must not silently become an interactive shell. A program that
             #    genuinely RAN and exited (even 127) leaves this flag False and restarts.
             return False
-        # SECURITY: drop any pending paste/copy review FIRST. Its held (reviewed) text
-        # must never become dispatchable to the NEW shell -- a reviewed multiline paste
-        # would then execute in it. Resolving hides the review bar and clears the
-        # suspended-input state before the new child exists.
-        if (self._review_active or self._pending_paste is not None
-                or self._pending_copy is not None):
-            self._pending_paste = None
-            self._pending_copy = None
-            self._pending_copy_strip = None
-            self._review_active = False
-            self.paste_review_resolved.emit()
-        # SECURITY: a PENDING OSC-52 clipboard-read consent -- a dialog the exited program
-        # opened, still up during the paste-delay countdown -- must not survive into the new
-        # shell: clicking Allow would then reply the system clipboard into an UNRELATED
-        # shell's pty. Drop the pending state, and also forget an allow-always grant, since
-        # the new shell is a different context that must re-consent.
-        self._clipboard_read = None
-        self._clipboard_read_always = False
-        # Tear down the exited child's pty (the master fd still opens; the read that
-        # brought us here raised EIO). SIGHUP the child: EIO means every pty-slave
-        # holder is gone, but a program that CLOSED the tty yet keeps running would
-        # otherwise be left orphaned + invisible when we fork the new shell -- SIGHUP
-        # reaps it (a no-op ESRCH for one that truly exited), matching close_tab.
-        self._release_pty(hangup=True)
-        # rmcup: if the exited program was on the ALT screen, restore the pre-program
-        # PRIMARY screen (+ its scrollback) so its transient full-screen frame is dropped
-        # but the shell output that preceded it survives. A program that stayed on the
-        # primary screen (a build log, `-- cat file`) needs no restore -- its output is
-        # already on the screen kept below via keep_screen. Done BEFORE the stream-state
-        # reset clears _alt_saved.
-        _was_alt = self._alt_screen        # emit alt_screen_changed at the end if this clears it
-        if self._alt_screen:
-            self._alt_leave()
-        # Reset the half-parsed per-child stream state so the new shell's very first
-        # bytes are not corrupted by a stale carry, a stuck alt-screen bit, or the
-        # exited program's mouse-tracking request.
-        self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
-        self._esc_carry = ''
-        self._esc_drop = ''
-        self._esc_dropped = 0
-        self._esc_notified = False
-        self._osc_carry = b''
-        self._notice_carry = b''
-        self._alt_scan_carry = ''
-        self._alt_feed_carry = b''
-        self._sync_scan_carry = ''
-        self._mouse_scan_carry = ''
-        self._alt_screen = False
-        self._alt_saved = None
-        self._alt_owner_pgrp = None
-        self._alt_view = False
-        # Clear the VT display/input baseline (mouse reporting, OSC palette, SGR pen,
-        # cursor visibility) and -- when the grid screen survives via keep_screen below
-        # -- its DEC/ANSI modes, scroll region, hidden cursor and G0/G1 charset. Shared
-        # with the ordinary foreground-exit edge so the two paths leave the identical
-        # baseline; the buffer + scrollback are untouched.
-        self._reset_vt_to_prompt_baseline()
-        self._bracket_had_fg = False
-        self._bracket_owner = None       # 2004 cleared above; drop its stale owner too
-        self._sync_update = False
-        self._line_dirty = False
-        # SECURITY: a held multi-line paste for the EXITED program's shell must not
-        # survive into the fresh one -- else a later paste gesture would insert a line
-        # reviewed for the OLD context into the new login shell. Drop it with the rest
-        # of the per-child state.
-        self._staged_paste = []
-        # Now a plain login-shell tab; a visible separator marks the handover so the
-        # new prompt is never mistaken for the exited program's output.
+        _was_alt = self._reset_child_state()
+        # Remember what this tab RAN (for the tooltip's "... (exited)" and relaunch_command), then
+        # become a plain login-shell tab; a visible separator marks the handover so the new prompt
+        # is never mistaken for the exited program's output.
+        self._exited_command = self._command
         self._command = None
         _banner = '\r\n[secure-terminal] program exited -- new shell\r\n'
         if self._grid_mode():
@@ -5758,6 +5764,30 @@ class SecureTerminal(QPlainTextEdit):
         # The alt screen was dropped above but only _on_readable emits on a live flip, so
         # notify the UI here too -- else the security indicator keeps reading "TUI (alt)"
         # after a program that exited while still on the alternate screen is restarted.
+        if _was_alt and not self._alt_screen:
+            self.alt_screen_changed.emit()
+        return True
+
+    def relaunch_command(self):
+        """A tab that reverted to a login shell (its launched program exited) re-runs that ORIGINAL
+        program IN PLACE -- the inverse of restart_as_shell. Used when a --if-absent reopen matches
+        this tab: reuse it instead of opening a duplicate or deduping against a dead shell. Returns
+        True when it relaunches; a no-op (False) unless this IS a reverted-shell tab (self._command
+        is None) that remembers a command (self._exited_command) and still has a live fd."""
+        if (self._command is not None or self._exited_command is None
+                or self._fd is None):
+            return False
+        _was_alt = self._reset_child_state()
+        # Restore the remembered command and fork it FRESH (like the initial launch: for a TUI tab
+        # _start makes a new screen so the program repaints; the interim login shell's screen is not
+        # kept). _start re-derives _command_malformed / _command_exec_failed for it.
+        self._command = self._exited_command
+        self._exited_command = None
+        self._start(self._command)
+        if self._tui:
+            # A TUI tab must enter grid view after a fresh start (mirror _spawn_child), or the first
+            # output clears the unseeded history and a later CLI<->TUI switch mis-renders.
+            self._sync_display()
         if _was_alt and not self._alt_screen:
             self.alt_screen_changed.emit()
         return True
