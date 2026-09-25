@@ -385,7 +385,9 @@ def main(argv=None):
                              "each non-ASCII character named inline as "
                              "<U+XXXX NAME>), box (non-ASCII becomes '_' in the "
                              "CLI), show (render printable glyphs), reveal "
-                             "(<U+XXXX> badges)")
+                             "(<U+XXXX> badges), state (EVERY character as a "
+                             "<U+XXXX> badge tinted by the program's own SGR "
+                             "attributes -- codepoint + attributes)")
     parser.add_argument('command', nargs=argparse.REMAINDER,
                         help='command to run (default: your login shell)')
     args = parser.parse_args(argv)

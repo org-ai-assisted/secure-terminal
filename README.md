@@ -120,10 +120,22 @@ The safety model above does not cost you the usual conveniences:
   wears a louder colour than honest foreign text, and the invisible, bidi and
   control classes (which have no visible glyph) still show as a coloured placeholder.
   Reveal shows every non-ASCII character as a `<U+XXXX>` badge to inspect exactly
-  what is there. Codepoints goes further, badging EVERY character (printable ASCII
-  included) as `<U+XXXX>` -- a cat -v/hexdump audit view for a suspicious line, in
-  CLI mode; a TUI tab boxes it, since a badge cannot fit a fixed grid cell. Escapes
-  are stripped in every mode.
+  what is there (and badges the control chars BS/CR too; Detail names them, e.g.
+  `<U+000D CARRIAGE RETURN>`). State goes further, badging EVERY character (printable
+  ASCII included) as `<U+XXXX>`, each tinted by the program's OWN SGR attributes
+  (codepoint + attributes) -- the live sibling of Save Screen State Dump. It renders
+  inline in CLI mode; a TUI tab freezes the frame and renders the snapshot as badges,
+  since a badge cannot fit a fixed grid cell. Escapes are stripped in every mode.
+- **Freeze / Unfreeze** (Freeze toolbar button, the File menu, `/freeze`, or
+  `Ctrl+Shift+B`). Pauses the live view in any mode so a fast or scrolling frame can
+  be read -- the program keeps running (output is still read; only the repaint is
+  suspended), and unfreezing catches up. Mainly a debugging aid: freeze a frame that
+  looks wrong and inspect it (while frozen, `ctl dump-state`/`dump-tab` return exactly
+  the frozen frame). Reveal/Detail/State auto-freeze in a TUI tab because their badges
+  cannot fit the grid; CLI never auto-freezes.
+- **Tab guide.** Every mode draws a tab with a faint arrow guide (mirroring the faint
+  dot for an anomalous space), so a line's whitespace structure is visible without
+  changing what copies out.
 - **Save transcript** (File menu, `Ctrl+Shift+S`). Writes the current tab's
   scrollback to a file. Because the buffer is already sanitized plain ASCII, the
   saved file is safe to open anywhere, unlike a normal terminal's raw log.

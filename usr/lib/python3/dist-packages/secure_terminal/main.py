@@ -43,7 +43,7 @@ from secure_terminal.sanitize import (
     OSC_FEATURES, OSC_FEATURE_BY_KEY, OSC_NOTICE_DEFAULT_OFF,
     osc_code_description, sanitize_title)
 from secure_terminal.terminal import (
-    SecureTerminal, THEMES, DISPLAY_MODES, LINE_EDITING_MODES,
+    SecureTerminal, THEMES, DISPLAY_MODES, EXPANDING_MODES, LINE_EDITING_MODES,
     sound_file_allowed, BELL_SOUND_DIRS, DEFAULT_FONT_FAMILY,
     BASE_POINT_SIZE, FONT_SIZE_MIN, FONT_SIZE_MAX,
     route_ctrl_wheel_zoom,
@@ -80,22 +80,22 @@ TUI_TOOLTIP = (
     'program CAN draw a misleading interface within its screen, so only run '
     'programs you trust. The strict cli mode remains safe by design.')
 
-# The two display modes that expand a codepoint inline (Reveal <U+XXXX>, Detail
-# <U+XXXX NAME>) need a flowing line layout. TUI mode's fixed pyte grid has one
-# cell per character and cannot grow one, so they would fall back to Box while the
-# toolbar still highlighted them -- a control that lies about what is on screen.
-_INLINE_MODES = ('reveal', 'detail', 'codepoints')
+# The EXPANDING badge modes (Reveal <U+XXXX>, Detail <U+XXXX NAME>, State <U+XXXX>+attrs) expand a
+# codepoint inline, so they need a flowing line layout. TUI mode's fixed pyte grid cannot grow a
+# cell, so in TUI they FREEZE the frame and render the snapshot as badges (SecureTerminal.set_frozen)
+# rather than auto-box. They stay SELECTABLE in TUI (they freeze, not grey). EXPANDING_MODES is the
+# single source (secure_terminal.sanitize); imported via terminal.
 
 # Passive banner shown once (dismissable, and switchable off via tui_autobox_notice)
 # when entering TUI auto-switches Reveal/Detail to Box. Box still marks every
 # non-ASCII byte by risk class, so the switch loses no security -- only the inline
 # codepoint text, which the grid cannot render anyway.
-_TUI_AUTOBOX_MESSAGE = (
-    'Reveal/Detail show each codepoint inline, which TUI mode\'s fixed grid '
-    'cannot do -- switched this tab to Box for the full-screen view. Box still '
-    'flags every non-ASCII byte by risk class, so nothing is hidden. Switch back '
-    'to CLI mode to use Reveal/Detail; turn this notice off under '
-    'View > Unicode > Notify on TUI auto-Box.')
+_FROZEN_MESSAGE = (
+    'FROZEN -- the live view is PAUSED on one frame so you can read it; the program keeps running '
+    '(its output is still read). A TUI tab freezes automatically in an expanding badge mode '
+    '(State/Reveal/Detail), since the fixed grid cannot show a <U+XXXX> badge inline. Unfreeze (or '
+    'switch to Box/Show) to resume the live view; Save Screen State Dump for a savable capture. '
+    'Turn this notice off under View > Unicode > Notify on freeze.')
 
 # Appended to the Reveal/Detail controls while they are unavailable (TUI grid
 # active). Stripped again when CLI mode restores them, so the note never lingers.
@@ -148,7 +148,7 @@ MODE_NEUTRAL = '#6b7280'
 # action buttons with the chip captions still shown -- with margin below the
 # full-layout width, so a first run never overflows; widening restores the full
 # text-beside-icon labels, narrowing hides the captions (icons tier).
-TOOLBAR_DEFAULT_WIDTH = 860
+TOOLBAR_DEFAULT_WIDTH = 950
 TOOLBAR_COMPACT_SLACK = 48       # hysteresis, px, so the switch does not oscillate
 
 # menu label -> theme key in terminal.THEMES
@@ -1643,9 +1643,8 @@ class MainWindow(QMainWindow):
         self._user_titles = {}       # term -> user-set tab name
         self._prog_titles = {}       # term -> program (OSC) title
         self._osc_cwd = {}           # term -> OSC-7 reported working directory
-        self._pre_tui_mode = {}      # term -> display mode to restore after TUI
         self._tab_colors = {}        # term -> tab colour name (for persistence)
-        self._advisories = {}        # term -> (kind, banner text); kind tui|osc|autobox
+        self._advisories = {}        # term -> (kind, banner text); kind tui|osc|frozen|escape
         self._osc_notified = set()   # (term, key) pairs already shown the OSC notice
         self._esc_notified = set()   # terms already shown the escape-suppressed notice
         self._closing_tabs = set()   # terms mid-close (reentrancy guard across the modal)
@@ -1766,6 +1765,7 @@ class MainWindow(QMainWindow):
             lambda t=term: self._on_clipboard_read_requested(t))
         term.advise_signal.connect(lambda msg, t=term: self._on_advise(t, msg))
         term.alt_screen_changed.connect(lambda t=term: self._on_alt_screen_changed(t))
+        term.freeze_changed.connect(lambda t=term: self._on_freeze_changed(t))
         term.osc_used.connect(lambda key, code, t=term: self._on_osc_used(t, key, code))
         term.escape_suppressed.connect(
             lambda t=term: self._on_escape_suppressed(t))
@@ -1877,13 +1877,13 @@ class MainWindow(QMainWindow):
         """A terminal raised an advisory. It belongs to THAT tab, so remember it
         per-tab (with its kind) and only show the banner while its tab is current --
         otherwise the hint would hang over an unrelated terminal. kind is 'tui' for
-        a full-screen hint (auto-dismissed when TUI is enabled), 'osc', or 'autobox'
-        (Reveal/Detail auto-switched to Box on entering TUI)."""
-        # The banner slot is one-per-tab, and the 'escape' freeze notice is the most
-        # actionable (output is actively being discarded) AND de-duped (it never
-        # re-raises), so a lower-priority notice must not overwrite it -- only another
-        # 'escape' may. Autobox is conveyed by the greyed Reveal/Detail controls and a
-        # 'tui'/'osc' hint is lesser, so they wait until the freeze notice is dismissed.
+        a full-screen hint (auto-dismissed when TUI is enabled), 'osc', or 'frozen'
+        (an expanding mode auto-froze the frame on entering TUI)."""
+        # The banner slot is one-per-tab, and the 'escape' notice is the most actionable
+        # (output is actively being discarded) AND de-duped (it never re-raises), so a
+        # lower-priority notice must not overwrite it -- only another 'escape' may. The
+        # 'frozen' notice yields to a pending 'osc'/'escape' at its call site
+        # (_on_freeze_changed), the freeze being conveyed by the Freeze button + the lamp.
         if kind != 'escape' and self._advisories.get(term, (None,))[0] == 'escape':
             return
         self._advisories[term] = (kind, message)
@@ -2112,7 +2112,7 @@ class MainWindow(QMainWindow):
         self._apply_osc_defaults(term)
         # a tab born in TUI cannot render Reveal/Detail -- box it so the chip never
         # claims a mode the grid is not in. Silent: no active mode was yanked.
-        self._enforce_tui_autobox(term, notify=False)
+        self._reconcile_tui_freeze(term)
         self._add_tab(term)
 
     def _osc_locked(self, feat):
@@ -2176,7 +2176,7 @@ class MainWindow(QMainWindow):
         for feat in (spec.get('osc') or []):
             if feat in valid and not self._osc_locked(feat):
                 term.apply_osc(feat, True)
-        self._enforce_tui_autobox(term, notify=False)   # box Reveal/Detail in a TUI tab
+        self._reconcile_tui_freeze(term)
         self._add_tab(term)
         # Carry the launch command ON the term (not a side dict) so it dies with the
         # tab automatically -- no cleanup path to keep in sync. Read by --if-absent
@@ -2695,10 +2695,10 @@ class MainWindow(QMainWindow):
                         else info.get('bell', self._default_bell))
         term.apply_bell_sound(self._default_bell_sound)
         self._connect_bell_tray(term)
-        # a restored TUI tab is normally already Box (saved after its own auto-box),
-        # but a session from older code could carry Reveal/Detail; box it so the
-        # restored chip never disagrees with the grid. Silent on restore.
-        self._enforce_tui_autobox(term, notify=False)
+        # a restored TUI tab in an expanding mode (State/Reveal/Detail) cannot fit its
+        # badges in the grid, so freeze it -- matching a live entry into TUI. Silent on
+        # restore (the banner is driven by freeze_changed only for interactive toggles).
+        self._reconcile_tui_freeze(term)
         index = self._add_tab(term, activate=activate, at=at, uid=info.get('uid'))
         name = info.get('name')
         if isinstance(name, str) and name:
@@ -2785,7 +2785,6 @@ class MainWindow(QMainWindow):
             self._osc_cwd.pop(term, None)
             self._tab_colors.pop(term, None)
             self._advisories.pop(term, None)
-            self._pre_tui_mode.pop(term, None)   # else a closed auto-boxed tab lingers
             self._osc_notified = {p for p in self._osc_notified if p[0] is not term}
             self._esc_notified.discard(term)
             uid = self._tab_ids.pop(term, None)
@@ -3516,6 +3515,7 @@ class MainWindow(QMainWindow):
         for key, action in self._theme_actions.items():
             action.setChecked(key == active)
         self._sync_mode_toggles(term.current_mode())
+        self._sync_freeze_button()          # the Freeze toggle follows the current tab
         # These are connected via `toggled`, which fires on a programmatic
         # setChecked too -- so reflecting the current tab's state here would call
         # set_colors/set_tui/set_title and rewrite the persisted defaults on every
@@ -3624,21 +3624,10 @@ class MainWindow(QMainWindow):
         if 'unicode_mode' in self._locked:
             return                        # admin-locked; not user-changeable
         term = self.current()
-        if mode in _INLINE_MODES and isinstance(term, SecureTerminal) \
-                and term.tui_active():
-            # The chips/menu for these are disabled in TUI, but a /mode slash
-            # command bypasses the UI; refuse it here so this is the one choke
-            # point and the on-screen mode never disagrees with the control.
-            self.statusBar().showMessage(
-                'Reveal/Detail need CLI mode -- TUI mode\'s fixed grid cannot '
-                'expand a codepoint inline. Switch to CLI to use them.', 6000)
-            self._sync_mode_toggles(term.current_mode())
-            return
         if term is not None:
+            # Expanding modes (reveal/detail/state) are allowed in TUI now -- apply_mode
+            # auto-freezes the frame to render their badges (they no longer fall back to Box).
             term.apply_mode(mode)
-            # An explicit mode choice supersedes any remembered pre-TUI mode, so a
-            # later CLI switch must not overwrite it with a stale restore.
-            self._pre_tui_mode.pop(term, None)
         self._sync_mode_toggles(mode)
         self._update_security_indicator()
         self._default_mode = mode
@@ -3656,27 +3645,20 @@ class MainWindow(QMainWindow):
         self._sync_mode_availability()
 
     def _sync_mode_availability(self):
-        """Grey out the inline modes (Reveal/Detail) while the current tab's TUI
-        grid is active -- it cannot expand a codepoint inline, so leaving them
-        clickable would let a control claim a mode the screen is not in. Box and
-        Show stay selectable (both render meaningfully full-screen). A no-op when
-        an admin has locked unicode_mode: _apply_locks owns those controls then and
-        re-enabling here would undo the lock."""
+        """Every display mode is selectable in every context: Box/Show render live in the TUI
+        grid, and the expanding modes (reveal/detail/state) FREEZE the frame there (they no longer
+        fall back to Box), so none is greyed. Ensure the expanding-mode controls are enabled and
+        carry no stale TUI note. A no-op when an admin has locked unicode_mode (_apply_locks owns
+        those controls then and re-enabling here would undo the lock)."""
         if 'unicode_mode' in self._locked:
             return
-        term = self.current()
-        disable = isinstance(term, SecureTerminal) and term.tui_active()
-        for key in _INLINE_MODES:
-            action = self._mode_actions.get(key)
-            button = self._mode_buttons.get(key)
-            for control in (action, button):
+        for key in EXPANDING_MODES:
+            for control in (self._mode_actions.get(key), self._mode_buttons.get(key)):
                 if control is None:
                     continue
-                control.setEnabled(not disable)
+                control.setEnabled(True)
                 tip = control.toolTip()
-                if disable and not tip.endswith(_TUI_MODE_NOTE):
-                    control.setToolTip(tip + _TUI_MODE_NOTE)
-                elif not disable and tip.endswith(_TUI_MODE_NOTE):
+                if tip.endswith(_TUI_MODE_NOTE):
                     control.setToolTip(tip[:-len(_TUI_MODE_NOTE)])
 
     def set_colors(self, enabled):
@@ -3725,19 +3707,11 @@ class MainWindow(QMainWindow):
                 if self._advisories.get(term, (None,))[0] == 'tui':
                     self._advisories.pop(term, None)
                     self._refresh_banner()
-                # Reveal/Detail cannot render in the grid, so auto-switch this TAB
-                # to Box (marks every byte -- security unchanged) with a passive
-                # notice, remembering the prior mode to restore on CLI. Box and Show
-                # already render full-screen, so they are left as the user set them.
-                self._enforce_tui_autobox(term, notify=True)
-            else:
-                prior = self._pre_tui_mode.pop(term, None)
-                if prior is not None:
-                    term.apply_mode(prior)
-                # the "switched to Box" notice explained the now-undone switch
-                if self._advisories.get(term, (None,))[0] == 'autobox':
-                    self._advisories.pop(term, None)
-                    self._refresh_banner()
+            # Reconcile the freeze for the new context: an expanding mode (reveal/detail/state) in
+            # TUI freezes the frame to render its badges; leaving TUI (or a non-expanding mode)
+            # unfreezes to the live view. apply_tui above already reconciled it; this is idempotent
+            # and keeps the one choke point. The FROZEN banner is driven by freeze_changed.
+            self._reconcile_tui_freeze(term)
             self._sync_mode_toggles(term.current_mode())
         self._default_tui = bool(enabled)
         self.act_tui.setChecked(enabled)
@@ -3746,27 +3720,16 @@ class MainWindow(QMainWindow):
         self._update_security_indicator()
         self._persist()
 
-    def _enforce_tui_autobox(self, term, notify):
-        """A tab entering TUI cannot render Reveal/Detail (the fixed grid has no
-        room to expand a codepoint inline), so silently boxes them. Make that
-        honest: switch such a tab to Box, remember the prior mode to restore when
-        it leaves TUI, and -- for a live toggle -- raise the passive notice. Box
-        marks every non-ASCII byte, so no security is lost. A no-op for a tab that
-        is not in TUI, is already Box/Show, or whose mode an admin has locked."""
-        if not (isinstance(term, SecureTerminal) and term.tui_active()):
+    def _reconcile_tui_freeze(self, term):
+        """Keep a tab's freeze in step with its mode + TUI: an EXPANDING badge mode
+        (reveal/detail/state) in the TUI grid FREEZES the frame to render its badges (the fixed
+        grid cannot expand a codepoint inline); any other case is the live view. The terminal also
+        self-reconciles on apply_mode / apply_tui; this covers tab construction / restore / switch,
+        where neither is called. The FROZEN banner + the Freeze button are driven by freeze_changed
+        (_on_freeze_changed), so nothing to raise here. set_frozen is idempotent."""
+        if not isinstance(term, SecureTerminal):
             return
-        if 'unicode_mode' in self._locked:
-            return                        # a locked mode is a deliberate choice
-        if term.current_mode() in _INLINE_MODES:
-            self._pre_tui_mode[term] = term.current_mode()
-            term.apply_mode('box')
-            # The banner slot is one-per-tab. A pending OSC notice is security-
-            # relevant and de-duped (it will not re-raise), so it must win: the
-            # greyed Reveal/Detail controls already convey the auto-switch. Only
-            # raise the autobox notice when it will not clobber an OSC one.
-            if notify and self._tui_autobox_notice \
-                    and self._advisories.get(term, (None,))[0] != 'osc':
-                self._on_advise(term, _TUI_AUTOBOX_MESSAGE, 'autobox')
+        term.set_frozen(term.tui_active() and term.current_mode() in EXPANDING_MODES)
 
     def _update_tui_indicator(self):
         term = self.current()
@@ -3793,6 +3756,47 @@ class MainWindow(QMainWindow):
         if term is self.current():
             self._update_tui_indicator()
             self._update_security_indicator()
+
+    def _on_freeze_changed(self, term):
+        """A tab's freeze (paused-view) state toggled. Keep the FROZEN banner + the Freeze
+        button + the indicators in step; only the CURRENT tab drives the button/indicators (a
+        background tab's change is picked up on select). The banner is per-tab so it survives a
+        switch. Gated on the notify setting; the button/lamp show frozen even with it off."""
+        frozen = isinstance(term, SecureTerminal) and term.frozen()
+        pending = self._advisories.get(term, (None,))[0]
+        have = pending == 'frozen'
+        # A pending 'osc'/'escape' notice is more actionable (a program used/over-ran an
+        # escape) and owns the one-per-tab slot; the freeze is already conveyed by the
+        # Freeze button + the lamp, so the FROZEN banner yields to them.
+        if frozen and not have and self._tui_autobox_notice \
+                and pending not in ('osc', 'escape'):
+            self._on_advise(term, _FROZEN_MESSAGE, 'frozen')
+        elif have and not frozen:
+            self._advisories.pop(term, None)
+            self._refresh_banner()
+        if term is self.current():
+            self._sync_freeze_button()
+            self._update_security_indicator()
+
+    def _sync_freeze_button(self):
+        """Reflect the current tab's freeze state on the Freeze toggle (no signal loop:
+        setChecked does not emit triggered)."""
+        term = self.current()
+        frozen = isinstance(term, SecureTerminal) and term.frozen()
+        if self.act_freeze.isChecked() != frozen:
+            _b = self.act_freeze.blockSignals(True)
+            self.act_freeze.setChecked(frozen)
+            self.act_freeze.blockSignals(_b)
+        self.act_freeze.setEnabled(isinstance(term, SecureTerminal))
+
+    def set_frozen(self, on=None):
+        """Freeze/unfreeze the current tab's live view (the toolbar toggle / menu / /freeze). A
+        general debugging aid: pause a buggy-looking CLI or TUI frame to read (or dump-state) it
+        while the program keeps running. `on=None` toggles."""
+        term = self.current()
+        if not isinstance(term, SecureTerminal):
+            return
+        term.set_frozen((not term.frozen()) if on is None else bool(on))
 
     # -- security indicator: three lamps, one per independent risk axis -------
     def _build_security_indicator(self):
@@ -3864,6 +3868,15 @@ class MainWindow(QMainWindow):
         (green); lossy, but nothing deceptive."""
         term = self.current()
         mode = term.current_mode() if term is not None else 'detail'
+        if mode == 'state':
+            return ('#1f8a54', 'State',
+                    'Display: STATE (green, safe).\n\n'
+                    'Every character -- printable ASCII included -- is shown as its <U+XXXX> '
+                    'badge tinted by the program\'s own SGR attributes (codepoint + attributes). '
+                    'In CLI mode the badges are live; a TUI tab FREEZES the frame (the live grid '
+                    'is paused) so one snapshot can be read -- switch mode or Unfreeze to resume, '
+                    'or Save Screen State Dump for a savable capture. Escapes are removed and '
+                    'pasting is sanitized.')
         if mode == 'show':
             return (MODE_NEUTRAL, 'Show',
                     'Display: SHOW.\n\n'
@@ -5012,6 +5025,19 @@ class MainWindow(QMainWindow):
         self.act_terminate.triggered.connect(self.terminate_foreground)
         file_menu.addAction(self.act_terminate)
 
+        self.act_freeze = QAction(
+            QIcon.fromTheme('media-playback-pause', _letter_icon('P', '#1f8a54')),
+            '&Freeze view', self, checkable=True)
+        self._bind(self.act_freeze, 'freeze', 'Ctrl+Shift+B')
+        self.act_freeze.setToolTip(
+            'FREEZE the live view on the current frame so you can read it (or dump it) while the '
+            'program keeps running -- a debugging aid for a buggy-looking CLI or TUI frame. Works '
+            'in every display mode. Unfreeze to resume. Expanding modes (State/Reveal/Detail) freeze '
+            'automatically in TUI, since a badge cannot fit a grid cell.')
+        self.act_freeze.triggered.connect(
+            lambda checked: self.set_frozen(checked))
+        file_menu.addAction(self.act_freeze)
+
         file_menu.addSeparator()
         self.act_persist = QAction('Restore session &on start', self,
                                    checkable=True)
@@ -5120,6 +5146,11 @@ class MainWindow(QMainWindow):
         self._mode_group.setExclusive(True)
         self._mode_actions = {}
         for label, key, colour, tip in (
+            ('&State', 'state', '#1f8a54',
+             'Show EVERY character (printable ASCII included) as its <U+XXXX> badge, tinted by '
+             'the PROGRAM\'S OWN attributes -- codepoint + attributes, the live sibling of Save '
+             'Screen State Dump. Live in CLI; a TUI tab FREEZES the frame so you can read it '
+             '(switch mode or Unfreeze to resume).'),
             ('&Box', 'box', '#1f8a54',
              'Non-ASCII OUTPUT is drawn as a coloured box (by risk class): safe and '
              'hard to miss, though lossy -- you see something was there, not which '
@@ -5146,19 +5177,20 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _checked, k=key: self.set_mode(k))
             self._mode_group.addAction(act)
             self._mode_actions[key] = act
+        self.act_state = self._mode_actions['state']
         self.act_box = self._mode_actions['box']
         self.act_reveal = self._mode_actions['reveal']
         self.act_detail = self._mode_actions['detail']
         self.act_show = self._mode_actions['show']
 
         self.act_tui_autobox_notice = QAction(
-            '&Notify on TUI auto-Box', self, checkable=True)
+            '&Notify on freeze', self, checkable=True)
         self.act_tui_autobox_notice.setChecked(self._tui_autobox_notice)
         self.act_tui_autobox_notice.setToolTip(
-            'Show a dismissible banner when entering TUI mode auto-switches this '
-            'tab from Reveal/Detail to Box (the fixed grid cannot expand a '
-            'codepoint inline). On by default. Box still marks every non-ASCII '
-            'byte, so the switch loses no security.')
+            'Show a dismissible banner when a tab FREEZES the live view -- either you froze it, '
+            'or a TUI tab entered an expanding badge mode (State/Reveal/Detail), which freezes the '
+            'frame to render its badges. On by default. The Freeze button + the security lamp still '
+            'show the frozen state even with this off.')
         self._sync_mode_toggles(self._default_mode)
 
         self.act_font = QAction('Fo&nt...', self)
@@ -5463,14 +5495,23 @@ class MainWindow(QMainWindow):
         norm = QKeySequence(seq).toString()
         this_override = bool(norm) and norm != QKeySequence(default).toString()
         if norm:
-            for _oact, _odef, _olbl in self._shortcuts.values():
+            for _oid, (_oact, _odef, _olbl) in self._shortcuts.items():
                 if QKeySequence(_oact.shortcut()).toString() != norm:
                     continue
+                other_override = (QKeySequence(_oact.shortcut()).toString()
+                                  != QKeySequence(_odef).toString())
                 if this_override:
                     seq = default                          # this override collides -> drop it
-                elif (QKeySequence(_oact.shortcut()).toString()
-                        != QKeySequence(_odef).toString()):
+                elif other_override:
                     _oact.setShortcut(QKeySequence(_odef))  # the OTHER was the override -> revert it
+                else:
+                    # Two BUILT-IN defaults share a chord: a developer accident, not a
+                    # user override. Qt renders BOTH dead ("ambiguous shortcut") and the
+                    # Keyboard Shortcuts dialog hangs on the duplicate -- so fail LOUD at
+                    # build time rather than ship a silent, dialog-wedging collision.
+                    raise RuntimeError(
+                        'duplicate default shortcut %r for %r and %r -- pick a free chord'
+                        % (norm, ident, _oid))
                 break
         action.setShortcut(QKeySequence(seq))
         label = action.text().replace('&', '').replace('...', '').strip()
@@ -5765,10 +5806,11 @@ class MainWindow(QMainWindow):
     _COMMAND_HELP = (
         'Slash commands (the leading / is optional):\n\n'
         '  /theme dark|light\n'
-        '  /mode codepoints|box|show|reveal|detail\n'
+        '  /mode state|box|show|reveal|detail\n'
         '  /colors on|off\n'
         '  /tui on|off\n'
         '  /title on|off\n'
+        '  /freeze [on|off]      (pause or resume the live view for reading -- toggles if bare)\n'
         '  /zoom <25-400>\n'
         '  /scrollback <lines, 0 = unlimited>\n'
         '  /paste-delay <seconds>\n'
@@ -5807,6 +5849,10 @@ class MainWindow(QMainWindow):
             self.set_tui(on)
         elif cmd == 'title' and (on or off):
             self.set_allow_title(on)
+        elif cmd == 'freeze':
+            # Freeze/unfreeze the live view (parity with the toolbar toggle). Bare /freeze
+            # toggles; /freeze on|off is explicit.
+            self.set_frozen(on if (on or off) else None)
         elif cmd == 'terminate':
             # The Terminate action as a command (parity with the toolbar/menu button).
             term = self.current()
@@ -5967,16 +6013,16 @@ class MainWindow(QMainWindow):
 
         rendering = _section('Text rendering')
         mode = QComboBox()
-        for label, key in (('Codepoints (every char <U+XXXX>)', 'codepoints'),
+        for label, key in (('State (codepoint + attributes)', 'state'),
                            ('Box', 'box'), ('Reveal unicode', 'reveal'),
                            ('Detail (named)', 'detail'), ('Show unicode', 'show')):
             mode.addItem(label, key)
         mode.setCurrentIndex(mode.findData(self._default_mode))
         _tip_row(rendering, 'Unicode', mode,
-                 'How characters are shown: Codepoints (EVERY character, even ASCII, as its '
-                 '<U+XXXX> badge -- a cat -v/hexdump audit view; CLI mode, boxes in TUI), Box '
-                 '(a safe placeholder), Reveal (the codepoint), Detail (the named codepoint), '
-                 'or Show (the real glyph, tinted by risk class).')
+                 'How characters are shown: State (EVERY character as its <U+XXXX> badge tinted by '
+                 'the program\'s own attributes -- CLI live, TUI freezes the frame), Box (a safe '
+                 'placeholder), Reveal (the codepoint), Detail (the named codepoint), or Show (the '
+                 'real glyph, tinted by risk class).')
 
         colors = QCheckBox()
         colors.setChecked(self._default_colors)
@@ -6013,11 +6059,11 @@ class MainWindow(QMainWindow):
 
         tui_autobox_notice = QCheckBox()
         tui_autobox_notice.setChecked(self._tui_autobox_notice)
-        _tip_row(rendering, 'Notify on TUI auto-Box', tui_autobox_notice,
-                 'Show a dismissible banner when entering TUI mode switches a tab '
-                 'from Reveal/Detail to Box (the fixed grid cannot expand a '
-                 'codepoint inline). On by default; Box still marks every non-ASCII '
-                 'byte, so the switch loses no security.')
+        _tip_row(rendering, 'Notify on freeze', tui_autobox_notice,
+                 'Show a dismissible banner when entering TUI mode FREEZES a tab in an '
+                 'expanding mode (State/Reveal/Detail) -- the fixed grid cannot expand a '
+                 '<U+XXXX> badge, so the frame is paused and the snapshot rendered as '
+                 'badges. On by default; the program keeps running, only the view pauses.')
 
         # granular OSC feature toggles: each off by default, its risk coloured in
         # the label and its layman attack-surface hint as the tooltip.
@@ -6656,6 +6702,7 @@ class MainWindow(QMainWindow):
         bar.addAction(self.act_paste)
         bar.addSeparator()
         bar.addAction(self.act_terminate)
+        bar.addAction(self.act_freeze)
 
         spacer = QWidget(bar)
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding,
@@ -6666,6 +6713,7 @@ class MainWindow(QMainWindow):
         # Show (red, a glyph can deceive). Grouped and labelled so it is obvious
         # these three are one unicode setting.
         uni_frame, self._mode_buttons = self._chip_group('unicode:', (
+            ('state', 'State', '#1f8a54', self.act_state.toolTip()),
             ('box', 'Box', '#1f8a54', self.act_box.toolTip()),
             ('reveal', 'Reveal', '#1f8a54', self.act_reveal.toolTip()),
             ('detail', 'Detail', '#1f8a54', self.act_detail.toolTip()),
