@@ -1522,6 +1522,28 @@ def _build_fold_maps():
                         break
     except Exception:                 # pylint: disable=broad-except
         pass                          # no data -> no refinement / no fold
+    # Compatibility characters that NFKC-decompose to printable ASCII (superscripts,
+    # subscripts, circled/parenthesised letters and digits, modifier letters, ...) POSE AS
+    # that ASCII even though the confusables data does not list them -- e.g. U+00B2 SUPERSCRIPT
+    # TWO folds to '2', so an amount or version written with a real superscript reads as a
+    # plain number. Fold them the same way: a SINGLE-ASCII decomposition joins the confusable
+    # set (display tint + paste class), a MULTI-ASCII one (a ligature -> "fi") the fold-only
+    # path. setdefault keeps the confusables data authoritative where it already has the source,
+    # and the all-printable-ASCII gate leaves honest foreign text (accents, CJK) untouched --
+    # their NFKC form is not ASCII. unicodedata is stdlib, so this runs even with no confusables
+    # data. Single-char stays T3-homomorphic; the multi map is fold-only, so T7 display/paste
+    # class agreement is unchanged.
+    for _cp in range(0x80, 0x110000):
+        _ch = chr(_cp)
+        _dec = unicodedata.decomposition(_ch)
+        if not _dec or _dec[0] != '<':        # compatibility (tagged) decompositions only
+            continue
+        if _ch in single or _ch in multi:
+            continue                          # the confusables data is authoritative; keep the
+        _nfkc = unicodedata.normalize('NFKC', _ch)  # two maps DISJOINT (no source in both)
+        if not _nfkc or _nfkc == _ch or not all(0x20 <= ord(_g) <= 0x7E for _g in _nfkc):
+            continue
+        (single if len(_nfkc) == 1 else multi)[_ch] = _nfkc
     _ASCII_FOLD_MAP, _MULTICHAR_ASCII_FOLD = single, multi
 
 
@@ -1550,10 +1572,12 @@ _ASCII_CONFUSABLES = None
 
 
 def _ascii_confusables():
-    """The NON-ASCII code points that are CONFUSABLE with a printable ASCII character
-    -- the true homoglyphs (Cyrillic a, Greek omicron), as distinct from merely foreign
-    non-deceptive non-ASCII (CJK, emoji, an accented e). Derived from _ascii_fold_map so
-    the detection set and the fold mapping can never drift."""
+    """The NON-ASCII code points that pose as a printable ASCII character -- the true
+    homoglyphs (Cyrillic a, Greek omicron) AND the compatibility characters that
+    NFKC-decompose to a single ASCII (SUPERSCRIPT TWO -> '2', a circled letter -> its
+    letter), as distinct from merely foreign non-deceptive non-ASCII (CJK, emoji, an
+    accented e). Derived from _ascii_fold_map so the detection set and the fold mapping
+    can never drift."""
     global _ASCII_CONFUSABLES
     if _ASCII_CONFUSABLES is None:
         _ASCII_CONFUSABLES = frozenset(ord(ch) for ch in _ascii_fold_map())
