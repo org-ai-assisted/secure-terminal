@@ -7358,7 +7358,14 @@ class SecureTerminal(QPlainTextEdit):
         # as usual.
         point = event.position().toPoint()
         cp = self._cp_at(point)
-        if cp is not None:
+        # State mode tags EVERY cell with its source code point (for the hover tooltip),
+        # ordinary printable ASCII included -- so gating the popup on "has a tag" would
+        # hijack word/line selection over plain text there (a double-click popped the
+        # char inspector instead of selecting the word). Open the popup only for a
+        # genuinely inspection-worthy character (control, non-ASCII, or a neutralized
+        # box); plain printable ASCII falls through to word-select. Hover still names
+        # every code point in State mode, so nothing is lost.
+        if cp is not None and not (0x20 <= cp <= 0x7e):
             self._show_char_popup(cp, event.globalPosition().toPoint())
             return
         if event.button() != Qt.MouseButton.LeftButton:
