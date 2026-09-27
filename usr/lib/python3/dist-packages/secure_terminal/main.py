@@ -1597,9 +1597,10 @@ class MainWindow(QMainWindow):
         # area (a free child of `central`, positioned in _position_banner -- NOT a
         # layout item). An auto notice must not resize the terminal: as a layout
         # sibling it shrank the grid, which SIGWINCHed the child (re-prompt, and a
-        # full-screen reflow). As an overlay the child's winsize is untouched; the
-        # terminal reserves a matching top INSET (set_chrome_top_inset) so content
-        # renders below the banner rather than behind it. Its text is selectable but
+        # full-screen reflow). As a TRUE overlay it reserves NO grid pixels, so the
+        # child's winsize is untouched AND a full-screen program keeps every row (its
+        # bottom line is never clipped); the banner briefly floats over the top row
+        # while shown and that region repaints when it hides. Its text is selectable but
         # lives outside any terminal document, so it is never copied as program output.
         # (This mirrors iTerm2's announcement banner and Konsole's KMessageWidget:
         # a top-anchored overlay that leaves the PTY grid intact.)
@@ -1988,19 +1989,19 @@ class MainWindow(QMainWindow):
             self._position_banner()
         else:
             self._banner.setVisible(False)
-            # Drop the current tab's top inset so its content reclaims the band. A
-            # backgrounded tab that still holds an advisory keeps its inset until it
-            # is shown again -- harmless, since the inset is winsize-neutral and the
-            # tab is not visible.
+            # The banner is a true overlay reserving no viewport pixels, so hiding it
+            # exposes the terminal row it floated over; repaint that region so the covered
+            # content reappears at once, not only on the program's next frame.
             term = self.current()
             if term is not None:
-                term.set_chrome_top_inset(0)
+                term.viewport().update()
 
     def _position_banner(self):
-        """Lay the advisory overlay across the top of the terminal content area
-        (below the tab strip) and reserve a matching inset on the current terminal so
-        its output renders below the banner, not behind it. Idempotent; re-run on
-        show, window resize and zoom (the wrapped height tracks width and font)."""
+        """Float the advisory overlay across the top of the terminal content area (below
+        the tab strip), OVER the terminal output -- a true overlay that reserves NO grid
+        pixels, so a full-screen program keeps every row and its bottom line is never
+        clipped. Idempotent; re-run on show, window resize and zoom (the wrapped height
+        tracks width and font)."""
         banner = getattr(self, '_banner', None)
         if banner is None or not banner.isVisible():
             return
@@ -2021,12 +2022,6 @@ class MainWindow(QMainWindow):
         height = min(height, max(1, avail // 2))
         banner.setGeometry(geo.left(), top, width, height)
         banner.raise_()
-        # current() is normally live (the banner shows only for a tab that holds an
-        # advisory), but closing the LAST tab can fire a resize while the banner is
-        # still visible and current() is already None -- guard that window.
-        term = self.current()
-        if term is not None:
-            term.set_chrome_top_inset(height)
 
     def _on_tab_step(self, step):
         """Ctrl+PageUp/Down: move to the previous/next tab, wrapping around."""
