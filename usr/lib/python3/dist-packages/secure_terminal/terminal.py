@@ -1509,11 +1509,6 @@ class SecureTerminal(QPlainTextEdit):
         # clamp its row to the child's actual screen, symmetric with _cols -- a click
         # in the sub-row strip below the last row must not name a row past the grid.
         self._rows = 0
-        # Pixels reserved at the TOP of the viewport for a floating chrome overlay
-        # (the OSC advisory banner). Added back in _text_area so the grid/winsize is
-        # banner-INDEPENDENT: showing or hiding the banner never resizes the child
-        # (no SIGWINCH -> no re-prompt, no full-screen reflow). See set_chrome_top_inset.
-        self._chrome_top_inset = 0
 
         # seconds the paste-warning "Allow" button stays disabled.
         self._paste_delay = 3
@@ -2802,11 +2797,12 @@ class SecureTerminal(QPlainTextEdit):
         width still changes by one column when ENTERING/LEAVING the alt screen, but that
         is already a full mode switch the program redraws around -- not a toggle loop.
 
-        The advisory-banner inset is added BACK to the height for the same reason:
-        the banner floats over the top of the viewport (reserved via setViewportMargins),
-        which shrinks vp.height(); adding it back keeps the row count -- and thus the
-        winsize -- the SAME whether the banner is shown or hidden, so an auto notice
-        never SIGWINCHes a running program (which would re-prompt and reflow it)."""
+        The advisory banner is a TRUE overlay (floated over the top of the viewport by
+        _position_banner, reserving NO viewport pixels), so it does not enter this height
+        at all: the grid always uses the full viewport, the winsize is stable whether the
+        banner shows or hides (no SIGWINCH / re-prompt / reflow), and a full-screen program
+        keeps every row -- its bottom line is never clipped by a reserved band. The banner
+        briefly covers the top row while shown; Qt repaints that region when it hides."""
         margin = int(self.document().documentMargin())
         vp = self.viewport()
         bar = self.verticalScrollBar()
@@ -2815,21 +2811,7 @@ class SecureTerminal(QPlainTextEdit):
                        and not self._alt_screen)
                    else 0)
         return (max(1, vp.width() - reserve - 2 * margin),
-                max(1, vp.height() - 2 * margin + self._chrome_top_inset))
-
-    def set_chrome_top_inset(self, px):
-        """Reserve `px` at the TOP of the viewport for a floating chrome overlay (the
-        OSC advisory banner drawn by the window), so terminal content renders BELOW it.
-        The band is added back in _text_area, so the child's winsize is UNCHANGED --
-        toggling the banner never resizes the grid (no SIGWINCH, no reflow/re-prompt).
-        The setViewportMargins change triggers a resizeEvent whose _grid_size, now
-        adding the inset back, recomputes the SAME size, so the ioctl is a no-op."""
-        px = max(0, int(px))
-        if px == self._chrome_top_inset:
-            return
-        self._chrome_top_inset = px
-        self._apply_viewport_margins()
-        self._position_gutter()
+                max(1, vp.height() - 2 * margin))
 
     # -- left gutter (per-line no-trailing-newline marker) --------------------
 
@@ -2840,13 +2822,13 @@ class SecureTerminal(QPlainTextEdit):
         return self.fontMetrics().horizontalAdvance('M') + 2 * _GUTTER_PAD
 
     def _apply_viewport_margins(self):
-        """Set both reserved insets at once (Qt has a single setViewportMargins): the
-        LEFT gutter strip and the TOP banner band. Called from either owner so neither
-        clobbers the other's margin."""
-        # Both insets are read defensively: __init__ calls _apply_font (hence this) before
-        # either _gutter or _chrome_top_inset exists.
+        """Reserve the LEFT gutter strip (the per-line no-trailing-newline marker). The
+        advisory banner reserves NOTHING here -- it is a true overlay floated over the top
+        of the viewport (see _position_banner / _text_area), so it never enters the viewport
+        margins and cannot shrink the grid."""
+        # Read defensively: __init__ calls _apply_font (hence this) before _gutter exists.
         left = self._gutter_width_px() if getattr(self, '_gutter', None) else 0
-        self.setViewportMargins(left, getattr(self, '_chrome_top_inset', 0), 0, 0)
+        self.setViewportMargins(left, 0, 0, 0)
 
     def _update_gutter_width(self, _count=0):
         """Re-reserve the gutter margin (font/zoom change, block-count change)."""
@@ -3390,8 +3372,8 @@ class SecureTerminal(QPlainTextEdit):
             # A fixed canvas (alt screen, or a primary full-screen frame with no promoted
             # scrollback): its row 0 is the TOP of the program's screen and must always be
             # visible, exactly as a real terminal shows it. Any off-by-one between the pyte
-            # grid and the viewport height (an exact-fit fencepost, or an advisory-banner
-            # inset) leaves a small scroll range, and following the TAIL there scrolls row 0
+            # grid and the viewport height (an exact-fit fencepost) leaves a small scroll
+            # range, and following the TAIL there scrolls row 0
             # off the top -- so a SHORT full-screen frame (a one-line status program, or the
             # alt-screen demo shot whose payload draws a single line at row 0) renders as an
             # empty viewport even though the document holds the content. Pin to the top.

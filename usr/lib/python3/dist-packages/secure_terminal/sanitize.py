@@ -2009,12 +2009,23 @@ _DEFAULT_IGNORABLE_RANGES = (
     (0xE0100, 0xE01EF),    # variation selectors supplement 17-256
 )
 
+# NOT Unicode Default_Ignorable, but treated identically here: str.isprintable() keeps
+# them (category So), yet they render as an INKLESS BLANK in essentially every font, so
+# like a variation selector they must be neutralized or they ride SHOW / paste / clipboard
+# as an invisible -- the exact "output lies" hazard every mode is meant to prevent. U+2800
+# is the "empty" braille cell (dots-down); real braille dots U+2801-28FF still render.
+# U+FFFC marks an embedded object that is NOT present, so it too is blank here.
+_BLANK_GLYPH_CPS = frozenset({0x2800, 0xFFFC})
+
 
 def is_default_ignorable(ch):
-    """True for an invisible-on-its-own default-ignorable character that
-    str.isprintable() nonetheless keeps (see _DEFAULT_IGNORABLE_RANGES)."""
+    """True for an invisible-on-its-own character that str.isprintable() nonetheless
+    keeps: the Unicode Default_Ignorable set (see _DEFAULT_IGNORABLE_RANGES) plus the
+    blank-rendering glyphs (see _BLANK_GLYPH_CPS). Named for the dominant case; the
+    shared ROLE every caller relies on is 'str.isprintable() lies -- this shows nothing'."""
     cp = ord(ch)
-    return any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE_RANGES)
+    return (cp in _BLANK_GLYPH_CPS
+            or any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE_RANGES))
 
 
 def sanitize_paste(text):
