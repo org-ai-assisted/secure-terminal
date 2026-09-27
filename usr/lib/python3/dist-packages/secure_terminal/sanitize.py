@@ -1541,7 +1541,19 @@ def _build_fold_maps():
         if _ch in single or _ch in multi:
             continue                          # the confusables data is authoritative; keep the
         _nfkc = unicodedata.normalize('NFKC', _ch)  # two maps DISJOINT (no source in both)
-        if not _nfkc or _nfkc == _ch or not all(0x20 <= ord(_g) <= 0x7E for _g in _nfkc):
+        # VISIBLE printable ASCII only (0x21..0x7E, NEVER U+0020): a char whose NFKC is a space
+        # (U+3000 IDEOGRAPHIC SPACE, the U+2000..200A set) must NOT fold to ' ' -- that would
+        # INJECT a word break the disguise did not have (ascii_fold("rm\u3000-rf") -> "rm -rf"),
+        # turning an inert token into a split command. Non-ASCII spaces are neutralised by
+        # is_space_separator / SPACE_MARK, not by the confusable fold.
+        if not _nfkc or _nfkc == _ch or not all(0x21 <= ord(_g) <= 0x7E for _g in _nfkc):
+            continue
+        # Defer if a decomposition COMPONENT is itself an authoritative look-alike: U+FB05 (long
+        # s + t) rides U+017F, which the confusables table folds to 'f' (its VISUAL twin) while
+        # NFKC decomposes it to 's' -- so NFKC 'st' would DISAGREE with the 'ft' the look-alike
+        # implies. Leave such a source to the confusable machinery rather than store a conflicting
+        # fold that neither reveals the real disguise nor flags it.
+        if any(chr(int(_p, 16)) in single for _p in _dec.split()[1:]):
             continue
         (single if len(_nfkc) == 1 else multi)[_ch] = _nfkc
     _ASCII_FOLD_MAP, _MULTICHAR_ASCII_FOLD = single, multi
