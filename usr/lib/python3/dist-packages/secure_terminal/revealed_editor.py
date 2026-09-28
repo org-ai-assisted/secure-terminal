@@ -32,17 +32,16 @@ defensive re-drop happen only on DELIVER, in review.py.
 """
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QFont, QGuiApplication
-from PyQt6.QtWidgets import QPlainTextEdit
+from PyQt6.QtGui import QTextCursor, QGuiApplication
 
 from secure_terminal.sanitize import (
     feed_line_edits, cells_to_runs, sanitize_clipboard_unicode, reveal_display,
-    MARK_KEY, THEMES, DISPLAY_MODES, BASE_POINT_SIZE,
+    DISPLAY_MODES,
     display_len, _cell_display, _collapse_zalgo_runs,
     _is_mark, _COMBINING_RUN_MAX,
 )
 from secure_terminal.terminal import (
-    SecureTerminal, DEFAULT_FONT_FAMILY, route_ctrl_wheel_zoom)
+    _RenderedTextView, DEFAULT_FONT_FAMILY, route_ctrl_wheel_zoom)
 
 # The SGR state a plain (no-program-colour) review cell carries -- what
 # feed_line_edits stores when handed the default state dict. Reviewed text has no
@@ -51,9 +50,15 @@ from secure_terminal.terminal import (
 _DEF_SGR = {'fg': None, 'bg': None, 'bold': False}
 
 
-class RevealedEditor(QPlainTextEdit):
+class RevealedEditor(_RenderedTextView):
     """One editable, revealed, multi-line review box. Emits `changed` after every
-    edit so the review bar can recompute the hidden-character table live."""
+    edit so the review bar can recompute the hidden-character table live.
+
+    It inherits the terminal's render surface (_RenderedTextView): the fixed-pitch
+    ligature-off font, the palette theme, the (MARK_KEY, ...) marking formats, the
+    whitespace-dot / tab-arrow paint overlays, the 2px bar caret, the left gutter and the
+    per-mode wrap -- so the reviewed text renders IDENTICALLY to the console. Only the
+    editable source-string model lives here."""
 
     changed = pyqtSignal()
     # A bulk paste INTO the box (Ctrl+V / middle-click / drag / context-menu), distinct
@@ -64,14 +69,15 @@ class RevealedEditor(QPlainTextEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Inherit the shared render surface: font (ligatures off), 2px bar caret + blink,
+        # the left gutter, the format cache. Rendering is defined ONCE in the base, so the
+        # box cannot drift from the console.
+        self._setup_rendered_view()
         self._text = ''
         self._pos = 0
         self._mode = 'detail'
         self._markings = True
         self._theme = 'light'
-        self._font_family = DEFAULT_FONT_FAMILY
-        self._zoom = 100
-        self.setUndoRedoEnabled(False)
         # self._text is the ONLY authority for what the box holds (source() + deliver
         # read it); the base QPlainTextEdit document is a pure RENDER of it, rebuilt only
         # by _render(). Every base-editor mutation path that could edit the document
@@ -84,26 +90,18 @@ class RevealedEditor(QPlainTextEdit):
         # any selection BEFORE the base sees the press, so no drag-move can start).
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.setAcceptDrops(False)
-        # NoWrap: a revealed line of wide badges must keep its glyph columns stable,
-        # and the box is short; the scrollbar-as-needed exposes an over-wide line
-        # for manual inspection without an auto-follow hiding the row start.
-        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setFrameStyle(0)
-        self._apply_font()
+        # Wrap per display mode via the base, exactly like the console: NoWrap in box/show
+        # keeps a revealed line of wide badges column-stable; detail/reveal wrap to the
+        # width. The box is short, so a residual NoWrap line keeps a manual horizontal
+        # scrollbar (the base sets the policy). Needs _mode set (above).
+        self._sync_wrap_mode()
         self.apply_theme(self._theme)
 
     # -- appearance -----------------------------------------------------------
-    def _apply_font(self):
-        """The terminal font at the tab's family + zoom, so the box's glyph metrics
-        match the console detail view exactly (DEFAULT_FONT_FAMILY is a hard package
-        dependency; the Monospace hint still steers Qt for a user-picked family)."""
-        font = QFont()
-        font.setFamily(self._font_family or DEFAULT_FONT_FAMILY)
-        font.setStyleHint(QFont.StyleHint.Monospace)
-        font.setFixedPitch(True)
-        font.setPointSize(max(1, round(BASE_POINT_SIZE * self._zoom / 100.0)))
-        self.setFont(font)
+    def _grid_mode(self):
+        """The box is never a TUI grid, so the inherited _sync_wrap_mode wraps in
+        detail/reveal and stays NoWrap in box/show."""
+        return False
 
     def set_font_family(self, family):
         """Follow the reviewed tab's font family."""
@@ -118,18 +116,17 @@ class RevealedEditor(QPlainTextEdit):
             return
         self._apply_font()
 
-    def apply_theme(self, theme):
-        """Follow the reviewed tab's theme, so a homoglyph's risk tint reads on the
-        same background the terminal draws. Unknown -> the app default 'light'."""
-        self._theme = theme if theme in THEMES else 'light'
-        base, text = THEMES[self._theme]
-        self.setStyleSheet('QPlainTextEdit{background:%s;color:%s;}' % (base, text))
+    def _rerender(self):
+        """Re-render hook the inherited (palette-based) apply_theme calls after it repaints
+        the Base/Text palette -- so a homoglyph's risk tint reads on the same background the
+        terminal draws."""
         self._render()
 
     def set_mode(self, mode):
         """Follow the reviewed tab's display mode (box/show/reveal/detail), so the
         box reveals risk exactly as the console does. Unknown -> 'detail'."""
         self._mode = mode if mode in DISPLAY_MODES else 'detail'
+        self._sync_wrap_mode()
         self._render()
 
     def wheelEvent(self, event):
@@ -223,25 +220,12 @@ class RevealedEditor(QPlainTextEdit):
             [], 0, dict(_DEF_SGR), text, 0, 'read-safe')
         return completed, current
 
-    def _format(self, key):
-        """QTextCharFormat for a cell's render key. A (MARK_KEY, class, cp) key tints
-        a neutralized/revealed marking by its risk class (the same MARKING_COLORS the
-        terminal and the review table use); every other key is the default format
-        (reviewed text has no program colour)."""
-        fmt = QTextCharFormat()
-        if isinstance(key, tuple) and len(key) == 3 and key[0] == MARK_KEY:
-            color = key[1]
-            if isinstance(color, str):
-                spec = SecureTerminal.MARKING_COLORS[self._theme][color]
-                fmt.setForeground(QColor(spec['fg']))
-                if spec['bg'] is not None:
-                    fmt.setBackground(QColor(spec['bg']))
-        return fmt
-
     def _render(self):
         """Rebuild the document from the source string and place the caret at the
         display offset of the source-index caret. Colours OFF, markings ON -- the box
-        exists to REVEAL risk, exactly like the review mirror it replaces."""
+        exists to REVEAL risk, exactly like the console. Every run key is mapped through
+        the inherited _marking_format (the SAME whitespace-dot / tab-arrow / risk-tint
+        seam the terminal uses), so the box renders identically."""
         completed, current = self._build(self._text)
         runs, _prefix = cells_to_runs(completed, current, self._mode,
                                       colors=False, markings=self._markings)
@@ -249,7 +233,7 @@ class RevealedEditor(QPlainTextEdit):
         doc_cursor.select(QTextCursor.SelectionType.Document)
         doc_cursor.removeSelectedText()
         for run_text, key in runs:
-            doc_cursor.insertText(run_text, self._format(key))
+            doc_cursor.insertText(run_text, self._marking_format(key))
         caret = self._caret_doc_pos()
         tc = self.textCursor()
         tc.setPosition(min(caret, self.document().characterCount() - 1))
