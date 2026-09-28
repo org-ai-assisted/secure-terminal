@@ -2196,6 +2196,7 @@ class SecureTerminal(QPlainTextEdit):
         the defaultdict so a sparse column still yields a default cell). The frozen render reads
         this, so it holds the frozen frame while the live screen keeps advancing."""
         screen = self._screen
+        assert screen is not None       # only reached from the freeze path, guarded on a live screen
         return types.SimpleNamespace(
             lines=screen.lines, columns=screen.columns,
             buffer={y: copy.copy(screen.buffer[y]) for y in range(screen.lines)})
