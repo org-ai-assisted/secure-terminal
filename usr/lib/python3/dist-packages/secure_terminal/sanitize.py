@@ -664,7 +664,7 @@ def render_output(text, mode='detail'):
         elif mode == 'reveal':
             out.append('<U+%04X>' % cp)
         elif (mode == 'show' and cp >= 0x80 and ch.isprintable()
-              and not is_default_ignorable(ch)):
+              and not is_invisible(ch)):
             # str.isprintable() is TRUE for the default-ignorable set (variation
             # selectors, the Hangul fillers, the combining grapheme joiner), which
             # render as nothing at all. Show's contract is that a character with no
@@ -1639,13 +1639,27 @@ def is_bidi_control(cp):
             or cp in (0x200E, 0x200F, 0x061C))
 
 
+# NOT Unicode Default_Ignorable, but renders identically to one: str.isprintable() keeps
+# them (category So), yet they show an INKLESS BLANK in essentially every font, so like a
+# variation selector they must be neutralized or they ride SHOW / paste / clipboard as an
+# invisible -- the exact "output lies" hazard every mode is meant to prevent. U+2800 is the
+# "empty" braille cell (dots-down); real braille dots U+2801-28FF still render. U+FFFC marks
+# an embedded object that is NOT present, so it too is blank here. Folded into is_invisible
+# (the "shows nothing" predicate), NOT is_default_ignorable -- that stays EXACTLY the Unicode
+# Default_Ignorable property the Z3 proof checks against the standard (lemma L-di).
+_BLANK_GLYPH_CPS = frozenset({0x2800, 0xFFFC})
+
+
 def is_invisible(ch):
     """True for a character that renders as NOTHING yet is not a control byte:
     zero-width, BOM, the line/paragraph separators, the invisible math operators,
-    and the default-ignorables str.isprintable() wrongly reports as printable.
-    Derived from the Unicode properties rather than a hand-written list, which is
-    how U+2061..U+2064 and U+00AD ended up unlisted and mis-coloured."""
-    return not ch.isprintable() or is_default_ignorable(ch)
+    the default-ignorables str.isprintable() wrongly reports as printable, and the
+    printable-but-inkless blank glyphs (_BLANK_GLYPH_CPS). Derived from the Unicode
+    properties rather than a hand-written list, which is how U+2061..U+2064 and U+00AD
+    ended up unlisted and mis-coloured. This is the predicate the display / paste /
+    clipboard filters consult; is_default_ignorable is the narrower Unicode-standard set."""
+    return (not ch.isprintable() or is_default_ignorable(ch)
+            or ord(ch) in _BLANK_GLYPH_CPS)
 
 
 @functools.lru_cache(maxsize=8192)
@@ -2045,23 +2059,15 @@ _DEFAULT_IGNORABLE_RANGES = (
     (0xE0100, 0xE01EF),    # variation selectors supplement 17-256
 )
 
-# NOT Unicode Default_Ignorable, but treated identically here: str.isprintable() keeps
-# them (category So), yet they render as an INKLESS BLANK in essentially every font, so
-# like a variation selector they must be neutralized or they ride SHOW / paste / clipboard
-# as an invisible -- the exact "output lies" hazard every mode is meant to prevent. U+2800
-# is the "empty" braille cell (dots-down); real braille dots U+2801-28FF still render.
-# U+FFFC marks an embedded object that is NOT present, so it too is blank here.
-_BLANK_GLYPH_CPS = frozenset({0x2800, 0xFFFC})
-
-
 def is_default_ignorable(ch):
-    """True for an invisible-on-its-own character that str.isprintable() nonetheless
-    keeps: the Unicode Default_Ignorable set (see _DEFAULT_IGNORABLE_RANGES) plus the
-    blank-rendering glyphs (see _BLANK_GLYPH_CPS). Named for the dominant case; the
-    shared ROLE every caller relies on is 'str.isprintable() lies -- this shows nothing'."""
+    """True for EXACTLY the Unicode Default_Ignorable_Code_Point set (see
+    _DEFAULT_IGNORABLE_RANGES): invisible-on-its-own characters that str.isprintable()
+    nonetheless keeps -- variation selectors, the Hangul fillers, the combining grapheme
+    joiner, U+00AD, and the rest. Kept EQUAL to the Unicode standard property so the Z3
+    proof (lemma L-di) can check it against unicodedata; the printable-but-inkless blank
+    glyphs that are NOT Default_Ignorable live in is_invisible, not here."""
     cp = ord(ch)
-    return (cp in _BLANK_GLYPH_CPS
-            or any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE_RANGES))
+    return any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE_RANGES)
 
 
 def sanitize_paste(text):
@@ -2137,7 +2143,7 @@ def sanitize_paste_unicode(text):
     for ch in text:
         if ch == '\n' or ch == '\r':
             out.append('\r')
-        elif ch == '\t' or (ch.isprintable() and not is_default_ignorable(ch)):
+        elif ch == '\t' or (ch.isprintable() and not is_invisible(ch)):
             out.append(ch)
         # control, bidi, zero-width, other invisibles -> dropped
     return ''.join(out)
@@ -2153,7 +2159,7 @@ def sanitize_clipboard_unicode(text):
     (accents, CJK) is KEPT and newlines are PRESERVED as newlines -- clipboard text
     is multi-line content, not a shell submission."""
     return ''.join(ch for ch in text
-                   if (ch.isprintable() and not is_default_ignorable(ch))
+                   if (ch.isprintable() and not is_invisible(ch))
                    or ch in '\n\t')
 
 
@@ -2299,10 +2305,10 @@ def tui_cell(ch, mode):
     # UAX #15 stream-safe format allows at most 30 marks per base.
     if len(ch) > _COMBINING_RUN_MAX + 1:
         ch = ch[:_COMBINING_RUN_MAX + 1]
-    # is_default_ignorable, not str.isprintable() alone: the default-ignorable set
-    # (variation selectors, the Hangul fillers, the combining grapheme joiner)
-    # reports as printable yet renders as NOTHING, so "show" would have passed an
-    # invisible straight into a grid cell -- the same hole render_output closes, and
+    # is_invisible, not str.isprintable() alone: the default-ignorable set (variation
+    # selectors, the Hangul fillers, the combining grapheme joiner) plus the inkless
+    # blank glyphs report as printable yet render as NOTHING, so "show" would have passed
+    # an invisible straight into a grid cell -- the same hole render_output closes, and
     # a live spoofing primitive (ad<U+3164>min reads as "admin"). Leaving it here
     # made a payload safe in CLI show mode and unsafe in TUI show mode.
     # A Zalgo stack (> _ZALGO_MARK_MAX combining marks on one base) is neutralized to the box
@@ -2312,7 +2318,7 @@ def tui_cell(ch, mode):
     if mode == 'show' and _combining_count(ch) > _ZALGO_MARK_MAX:
         return BOX
     if all(_cell_cp_safe(ord(c), mode) and c.isprintable()
-           and not is_default_ignorable(c) for c in ch):
+           and not is_invisible(c) for c in ch):
         return ch
     # A single non-ASCII space (NBSP, U+3000, ...) is not str.isprintable(), so it
     # falls through the check above; in SHOW mode render it as the distinct
