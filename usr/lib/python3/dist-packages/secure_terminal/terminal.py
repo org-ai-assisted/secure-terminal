@@ -210,6 +210,39 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             self.cursor.x -= 1
         super().linefeed()
 
+    def resize_preserving_scrollback(self, lines, columns):
+        """Resize the PRIMARY screen without destroying scrollback content. Stock pyte
+        Screen.resize clips the TOP rows on a height shrink (cursor to 0,0 +
+        delete_lines from the top) and drops them outright -- so the output above the
+        prompt VANISHES on a shrink, and a later grow (the copy/paste review bar
+        opening then closing, a window drag) never brings it back. Instead scroll the
+        clipped CONTENT rows into history first, exactly as index() does when output
+        scrolls a line off the top; the renderer draws that history ABOVE the live grid
+        and trims the grow's trailing blanks (Bug #64), so a shrink+grow round trip is
+        visually lossless. Only the height shrink of a BOTTOM-ANCHORED (shell) frame is
+        preserved; a grow, a width change, and the identical-size fast path defer to
+        pyte. NOT for the alt screen -- the caller gates that."""
+        old_lines = self.lines
+        if lines < old_lines:
+            drop = old_lines - lines
+            # last_content: the last non-blank row (pyte fills unwritten cells with a
+            # plain space, so a written non-space is real content). Two uses:
+            #  - A program managing a fixed canvas (Claude Code) draws content BELOW the
+            #    cursor (a status/hint line) and REPAINTS on the SIGWINCH, so preserving
+            #    would leave stale duplicate scrollback and cost it the fixed-canvas
+            #    treatment; a shell's cursor sits at the LAST content row (the prompt),
+            #    nothing below. Preserve only the shell shape (last_content <= cursor.y).
+            #  - Never push a trailing-blank row: an empty or just-cleared grid must not
+            #    manufacture blank scrollback, matching a plain terminal resize.
+            last_content = max(
+                (y for y in range(old_lines)
+                 if any(c.data != ' ' for c in self.buffer[y].values())),
+                default=-1)
+            if last_content <= self.cursor.y:
+                for y in range(min(drop, last_content + 1)):
+                    self.history.top.append(self.buffer[y])
+        super().resize(lines, columns)
+
     def draw(self, data):
         # New glyphs make any no-trailing-newline flag on the cursor row STALE (a
         # cursor-addressed rewrite of a flagged row must not keep the old row's gutter
@@ -1317,7 +1350,8 @@ class SecureTerminal(QPlainTextEdit):
     def __init__(self, parent=None, command=None, tui=False, history='',
                  preview=False, cwd=None, mode='detail', colors=False,
                  markings=True, line_editing='full', show_command=False,
-                 theme='light', cg_path=None, initial_grid=None):
+                 theme='light', cg_path=None, initial_grid=None,
+                 solid_cursor=None):
         super().__init__(parent)
         # Deterministic screenshot mode (SECURE_TERMINAL_SHOT=1, a startup capture
         # MODE -- never a persisted per-tab setting): hide the caret and render the
@@ -1335,6 +1369,15 @@ class SecureTerminal(QPlainTextEdit):
         # so there is never a second one; shot mode additionally suppresses OURS
         # (paintEvent) so a capture stays byte-identical.
         self.setCursorWidth(0)
+        # Solid-cursor mode (--solid-cursor / SECURE_TERMINAL_SOLID_CURSOR=1): draw the caret
+        # ALWAYS-ON and NON-BLINKING, and draw it in shot mode too. A blinking caret is
+        # non-deterministic (a screenshot grabs a random blink phase), which is why the shot
+        # path hides it; a SOLID caret sits at a fixed position and renders byte-identically, so
+        # a capture can show a typing indicator without losing determinism. The ctor arg wins
+        # (tests); otherwise the process-wide env set from the CLI flag. Still yields to a TUI
+        # program's DECTCEM hide and to the non-interactive preview surface.
+        self._solid_cursor = (bool(solid_cursor) if solid_cursor is not None
+                              else os.environ.get('SECURE_TERMINAL_SOLID_CURSOR') == '1')
         self._cursor_on = True         # blink phase: True = drawn this half-cycle
         self._cursor_visible = True    # a TUI program can hide it (DECTCEM); CLI always shows
         self._blink_pos = None         # doc position the blink last reset SOLID at (cursor move)
@@ -3114,7 +3157,17 @@ class SecureTerminal(QPlainTextEdit):
         # on the SIGWINCH from the new winsize, so do not force a render here (that
         # would flash a blank frame). The document keeps the last frame until the
         # program's redraw arrives.
-        self._screen.resize(rows, cols)
+        if self._alt_screen:
+            # Alt screen: a plain clip -- the full-screen program repaints on SIGWINCH,
+            # and preserving would pollute the primary history the snapshot restores on
+            # exit.
+            self._screen.resize(rows, cols)
+        else:
+            # Primary screen: preserve the clipped top rows into scrollback on a shrink
+            # for a bottom-anchored (shell) frame, so a transient shrink (the copy/paste
+            # review bar opening then closing) never destroys the output above the prompt.
+            # The method itself no-ops the preservation for a program-managed canvas.
+            self._screen.resize_preserving_scrollback(rows, cols)
         # pyte.Screen.resize() does NOT clamp the cursor on a shrink, so a subsequent
         # \r-only redraw (an ordinary status/spinner) would write to a now-out-of-range
         # row that render skips -- then reappears verbatim when the window grows back
@@ -7476,7 +7529,8 @@ class SecureTerminal(QPlainTextEdit):
         system cursor-flash time is 0 (blinking disabled)."""
         self._cursor_on = True
         flash = QApplication.styleHints().cursorFlashTime()
-        if self.hasFocus() and flash > 0 and not self._shot:
+        if (self.hasFocus() and flash > 0 and not self._shot
+                and not self._solid_cursor):     # solid mode: always-on, never blink
             self._blink_timer.start(max(1, flash // 2))
         else:
             self._blink_timer.stop()
@@ -7515,11 +7569,13 @@ class SecureTerminal(QPlainTextEdit):
         # deterministic screenshot (shot mode), on a non-interactive preview surface,
         # when the widget is not visible (a queued paint into teardown), and while a
         # TUI program has hidden the cursor (DECTCEM).
-        if (self._shot or self._preview or not self._cursor_visible
-                or not self.isVisible()):
+        # Shot mode hides the blinking caret for determinism -- but a SOLID caret is
+        # deterministic (fixed position, always on), so draw it even in a shot.
+        if ((self._shot and not self._solid_cursor) or self._preview
+                or not self._cursor_visible or not self.isVisible()):
             return
         if self.hasFocus() and not self._cursor_on:
-            return                          # blink OFF half-cycle
+            return                          # blink OFF half-cycle (never true in solid mode)
         painter = QPainter(self.viewport())
         painter.fillRect(self._cursor_rect(), self._cursor_color())
         painter.end()
