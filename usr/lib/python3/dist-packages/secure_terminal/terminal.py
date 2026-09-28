@@ -1636,6 +1636,10 @@ class SecureTerminal(QPlainTextEdit):
         # pyte has no separate alt buffer, so without this the program's clear/draw
         # would destroy the primary screen and pollute the scrollback.
         self._alt_saved = None
+        # Margins ride WITH the alt snapshot: pyte shares one Screen, so a DECSTBM scroll
+        # region an alt program leaves set would leak into the primary (a real terminal
+        # keeps alt/primary margins independent).
+        self._alt_saved_margins = None
         # 'Save Transcript' scrollback (Option B): the alt screen is NOT scrollback, so
         # the primary transcript text is frozen at alt entry (returned while the program
         # runs, instead of the ephemeral grid), and each finished full-screen session
@@ -4546,12 +4550,19 @@ class SecureTerminal(QPlainTextEdit):
             # launched us, so the child (and any host it ssh's into) cannot learn
             # the host emulator's identity/version or a correlatable session id.
             # LINES/COLUMNS are dropped too: the real size comes from TIOCSWINSZ,
-            # and a stale value here would mislead programs.
+            # and a stale value here would mislead programs. The SECURE_TERMINAL_*
+            # entries are OUR OWN app-config vars (screenshot / solid-cursor /
+            # transcript modes): they are read once by the app at construction and
+            # are meaningless to a child shell, so they must not ride into it, into a
+            # host it ssh's into, or into a NESTED secure-terminal (which would
+            # silently inherit this process's modes instead of using its own flags).
             for _var in ('TERM_PROGRAM', 'TERM_PROGRAM_VERSION',
                          'VTE_VERSION', 'KONSOLE_VERSION', 'KONSOLE_DBUS_SERVICE',
                          'KONSOLE_DBUS_SESSION', 'WT_SESSION', 'WT_PROFILE_ID',
                          'ITERM_SESSION_ID', 'ITERM_PROFILE', 'KITTY_WINDOW_ID',
-                         'KITTY_PID', 'ALACRITTY_WINDOW_ID', 'LINES', 'COLUMNS'):
+                         'KITTY_PID', 'ALACRITTY_WINDOW_ID', 'LINES', 'COLUMNS',
+                         'SECURE_TERMINAL_SHOT', 'SECURE_TERMINAL_SOLID_CURSOR',
+                         'SECURE_TERMINAL_TRANSCRIPT_FILE'):
                 os.environ.pop(_var, None)
             # We render 24-bit colour faithfully (with a contrast guard) in both
             # modes, so advertise it -- a fixed value, not inherited, so it is not a
@@ -5179,6 +5190,12 @@ class SecureTerminal(QPlainTextEdit):
             s.history._replace(top=copy.copy(s.history.top),
                                bottom=copy.copy(s.history.bottom)),
             copy.copy(s.cursor))
+        # Snapshot the primary's margins too (immutable, so no copy). A full-screen alt
+        # program that sets a DECSTBM scroll region and exits WITHOUT resetting it would
+        # otherwise leave the region set on this shared Screen -- leaking into the primary
+        # shell and permanently disabling the scrollback-preserving shrink (which gates on
+        # margins is None). _alt_leave restores this.
+        self._alt_saved_margins = s.margins
         # The snapshot above hid the scrollbar while _alt_screen was False, so the later
         # alt paint no longer toggles the bar -- and the resize that reclaims the bar's
         # column for the (wider, scrollback-free) alt canvas never fires. Reconcile the
@@ -5216,7 +5233,11 @@ class SecureTerminal(QPlainTextEdit):
         self._append_exit_snapshot(self._walk_document_text())
         self._screen.buffer, self._screen.history, self._screen.cursor = \
             self._alt_saved
+        # Restore the primary's margins, undoing any DECSTBM region the alt program left
+        # set (see _alt_enter) so the returned-to shell is region-free again.
+        self._screen.margins = self._alt_saved_margins
         self._alt_saved = None
+        self._alt_saved_margins = None
         self._alt_owner_pgrp = None
         self._alt_primary_text = ''       # the frozen primary is now restored, live again
         self._reset_grid_view()           # rebuild scrollback from restored history
