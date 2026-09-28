@@ -5234,8 +5234,15 @@ class SecureTerminal(QPlainTextEdit):
         self._screen.buffer, self._screen.history, self._screen.cursor = \
             self._alt_saved
         # Restore the primary's margins, undoing any DECSTBM region the alt program left
-        # set (see _alt_enter) so the returned-to shell is region-free again.
-        self._screen.margins = self._alt_saved_margins
+        # set (see _alt_enter) so the returned-to shell is region-free again. Drop a saved
+        # region that no longer FITS: a resize DURING the alt session can shrink the screen
+        # below the saved region's bottom, and restoring an out-of-range region would
+        # misdirect every subsequent scroll/cursor op until the next resize -- so clamp to
+        # None (what pyte's own resize does to margins), matching the just-resized shape.
+        _saved_m = self._alt_saved_margins
+        if _saved_m is not None and _saved_m.bottom > self._screen.lines - 1:
+            _saved_m = None
+        self._screen.margins = _saved_m
         self._alt_saved = None
         self._alt_saved_margins = None
         self._alt_owner_pgrp = None
