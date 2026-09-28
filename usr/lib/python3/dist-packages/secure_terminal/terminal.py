@@ -6213,7 +6213,15 @@ class SecureTerminal(QPlainTextEdit):
         already in the snapshot's per-cell `rows`, so it is deliberately EXCLUDED
         here (no duplication). While a full-screen program holds the alternate
         screen there is no scrollback above the alt grid, so the primary transcript
-        frozen at alt entry is returned instead."""
+        frozen at alt entry is returned instead.
+
+        Reflects the LAST COMMITTED FRAME: this reads the promoted Qt document, and
+        `_force_current_frame` deliberately does NOT repaint while a render is
+        deferred (an active selection, DEC 2026 sync, or a SIGWINCH resize that has
+        not yet been redrawn -- see `_render_tui` / `_sync_tui_size`). Rows clipped
+        into pyte history by such a resize are still in the pyte model and appear on
+        the next render, but are not yet promoted here -- so the dump is the last
+        painted frame, not a guaranteed-exhaustive live snapshot."""
         if self._alt_saved is not None:
             return self._alt_primary_text
         self._force_current_frame()      # the dump must include the last unpainted frame
