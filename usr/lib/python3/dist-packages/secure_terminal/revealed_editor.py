@@ -239,6 +239,13 @@ class RevealedEditor(_RenderedTextView):
         tc.setPosition(min(caret, self.document().characterCount() - 1))
         self.setTextCursor(tc)
         self.ensureCursorVisible()
+        # Show the (inherited) bar caret SOLID after every edit / navigation, then let it
+        # blink: _render is the box's single caret-placement chokepoint, so this is the
+        # box's analogue of the terminal's _mark_cursor_moved (which the box has no output
+        # cursor to trigger). Without it a keystroke / click landing in the blink OFF phase
+        # leaves the caret invisible for up to cursorFlashTime()/2 -- a regression from the
+        # native caret this widget used before it shared the terminal's painted caret.
+        self._restart_blink()
 
     def _offset(self, index):
         """The document offset of source `index`: the display width up to the START of
