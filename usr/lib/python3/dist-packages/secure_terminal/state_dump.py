@@ -294,8 +294,26 @@ def _fit_snapshot(snap, max_bytes):
     if _encoded_len(snap) <= max_bytes:
         return snap
     snap = dict(snap)
+    # Truncate the DOCUMENT (scrollback) FIRST, before dropping any grid rows: in TUI the
+    # document is the scrollback ABOVE the live grid, and the live grid (`rows`) is the
+    # current screen a debugger most wants -- shedding old scrollback must not evict it.
+    if 'document' in snap and _encoded_len(snap) > max_bytes:
+        doc = snap['document']
+        _orig_doc_len = len(doc)
+        # Keep the TAIL (the most recent scrollback, nearest the current screen), dropping
+        # from the front -- consistent with the text path's _fit_dump_reply.
+        while doc and _encoded_len({**snap, 'document': doc,
+                                    'document_truncated': True}) > max_bytes:
+            doc = doc[len(doc) // 8 + 1:]
+        # Flag ONLY when the document was actually shortened: an empty (or already-fitting)
+        # document, with the overflow coming from another field, must not be mislabelled
+        # document-truncated.
+        if len(doc) < _orig_doc_len:
+            snap['document'] = doc
+            snap['document_truncated'] = True
+    # Only if the current screen ITSELF still overflows do we drop grid rows.
     rows = list(snap.get('rows') or [])
-    if rows:
+    if rows and _encoded_len(snap) > max_bytes:
         dropped = 0
         # Drop from the END (keep the top of the screen); geometric step so a huge grid
         # converges in a few re-encodes, not one row at a time.
@@ -306,21 +324,6 @@ def _fit_snapshot(snap, max_bytes):
             rows = rows[:-step]
         snap['rows'] = rows
         snap['truncated_rows'] = dropped
-    if 'document' in snap and _encoded_len(snap) > max_bytes:
-        doc = snap['document']
-        _orig_doc_len = len(doc)
-        # Keep the TAIL (the current screen / most recent output), dropping from the
-        # front -- consistent with the text path's _fit_dump_reply, and because the live
-        # screen is what a debugger wants, not the oldest scrollback.
-        while doc and _encoded_len({**snap, 'document': doc,
-                                    'document_truncated': True}) > max_bytes:
-            doc = doc[len(doc) // 8 + 1:]
-        # Flag ONLY when the document was actually shortened: an empty (or already-fitting)
-        # document, with the overflow coming from another field, must not be mislabelled
-        # document-truncated.
-        if len(doc) < _orig_doc_len:
-            snap['document'] = doc
-            snap['document_truncated'] = True
     # An explicit tab-stop list can itself blow the budget (a program can HTS every column
     # of a 65535-wide screen), and rows/document shrinking never touches it -- collapse it
     # to a count so the bound holds.
@@ -391,6 +394,13 @@ def dump_text(snap):
         out.append(snap['document'])
         return '\n'.join(out) + '\n'
 
+    # Scrollback FIRST (above the header + grid), so a ctl reply that tail-caps the text
+    # (main._fit_dump_reply keeps the last _DUMP_MAX bytes) preserves the header and the
+    # live grid -- a large scrollback sheds its OLDEST lines, never the current state.
+    document = snap.get('document') or ''
+    if document:
+        out.append('--- scrollback (above the grid) ---')
+        out.append(document)
     cur = snap['cursor']
     out.append('mode: tui            size: %dx%d'
                % (snap['columns'], snap['lines']))
@@ -418,10 +428,6 @@ def dump_text(snap):
     out.append('tabstops: %s'
                % ('default(8)' if tabs == 'default'
                   else ' '.join(str(t) for t in tabs) or '(none)'))
-    document = snap.get('document') or ''
-    if document:
-        out.append('--- scrollback (above the grid) ---')
-        out.append(document)
     out.append('--- grid ---  (blank cells and fully-blank rows elided; '
                'row index shows gaps)')
     for row in snap['rows']:
