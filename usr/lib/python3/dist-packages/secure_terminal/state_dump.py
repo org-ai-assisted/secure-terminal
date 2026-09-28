@@ -207,7 +207,8 @@ def collect(screen, *, mode, columns, alt_screen, saved_primary, mouse_modes,
       program-set field that leaks into the next prompt unless reset, so it is dumped
       in BOTH modes.
     - `cli_pen`: the CLI-mode SGR pen dict {'fg','bg','bold'} (fg/bg None == default).
-    - `document`: CLI-mode rendered line-document text.
+    - `document`: the scrollback text -- CLI: the whole rendered line document; TUI: the
+      promoted scrollback ABOVE the live grid (the grid is dumped per-cell in `rows`).
     """
     snap = {
         'version': FORMAT_VERSION,
@@ -260,6 +261,9 @@ def collect(screen, *, mode, columns, alt_screen, saved_primary, mouse_modes,
         if not blank:
             rows.append({'y': y, 'text': text, 'runs': runs})
     snap['rows'] = rows
+    # Scrollback ABOVE the live grid (the grid itself is the per-cell `rows`). Stored under
+    # the same `document` key CLI uses, so _fit_snapshot's truncation covers it in both modes.
+    snap['document'] = document or ''
     return snap
 
 
@@ -414,6 +418,10 @@ def dump_text(snap):
     out.append('tabstops: %s'
                % ('default(8)' if tabs == 'default'
                   else ' '.join(str(t) for t in tabs) or '(none)'))
+    document = snap.get('document') or ''
+    if document:
+        out.append('--- scrollback (above the grid) ---')
+        out.append(document)
     out.append('--- grid ---  (blank cells and fully-blank rows elided; '
                'row index shows gaps)')
     for row in snap['rows']:
