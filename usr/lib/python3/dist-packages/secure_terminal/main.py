@@ -7210,6 +7210,7 @@ class _Launch:
         self.test_canary = False   # --test-canary -> headless positive control, exit
         self.tray = False          # --tray -> start hidden-to-tray with the sanitizer armed
         self.terminate_verbose = False  # --terminate-verbose -> dump a max Terminate diagnostic
+        self.solid_cursor = False  # --solid-cursor -> always-on, non-blinking caret (screenshots)
 
 
 def _launch_parser(with_globals):
@@ -7280,6 +7281,10 @@ def _launch_parser(with_globals):
                             'current() resolved, each tab foreground state, the kill '
                             'decision + result) to a copyable box and the state-dir file '
                             'terminate-debug.txt, to debug a Terminate that does nothing')
+        p.add_argument('--solid-cursor', dest='solid_cursor', action='store_true',
+                       help='draw the text cursor always-on and NON-BLINKING (useful for '
+                            'deterministic screenshots -- the blinking caret is otherwise '
+                            'hidden in capture mode); applies to every tab in this process')
     p.add_argument('--title', help='initial tab title')
     p.add_argument('--tui', action='store_true', default=None,
                    help='start this tab in TUI mode')
@@ -7347,6 +7352,7 @@ def _parse_launch_args(argv):
             launch.test_canary = namespace.test_canary
             launch.tray = namespace.tray
             launch.terminate_verbose = namespace.terminate_verbose
+            launch.solid_cursor = namespace.solid_cursor
         else:
             namespace = parser.parse_args(group)
         launch.tabs.append({
@@ -7753,6 +7759,12 @@ def main(cg_base=None):
     # security-test harness's positive control would then silently no-op). Anything
     # after a '--' is the child's argv and never sets a global flag.
     launch = _parse_launch_args(sys.argv[1:])
+    # --solid-cursor is process-wide: export it so the SecureTerminal ctor picks it up (mirrors
+    # SECURE_TERMINAL_SHOT), and every tab this process opens draws an always-on, non-blinking
+    # caret. Set before any terminal is created. (A --reuse launch opens tabs in ANOTHER process,
+    # which this env does not reach; the flag is documented as per-process.)
+    if launch.solid_cursor:
+        os.environ['SECURE_TERMINAL_SOLID_CURSOR'] = '1'
     # Headless positive control for security-test harnesses; before Qt (no display).
     # See CANARY_TOKEN.
     if launch.test_canary:
