@@ -36,6 +36,13 @@ FROM gcr.io/oss-fuzz-base/base-builder-python@sha256:9dd557a4ba0e0cdfbeabc0bb115
 ## bad_build_check at startup with ModuleNotFoundError.
 RUN pip3 install --no-cache-dir regex
 
+## The shared CFLite smoke-run guard lives in org-ai-assisted/dist-ai (the single
+## source for our cross-repo test/fuzz assets), NOT this package. Clone it at
+## build time; build.sh sources $SRC/dist-ai/usr/share/clusterfuzzlite-lib/
+## smoke-run.bash. dist-ai is public; @master per the org's branch-tracking model.
+RUN git clone --depth 1 --branch master \
+      https://github.com/org-ai-assisted/dist-ai "$SRC/dist-ai"
+
 COPY . $SRC/secure-terminal
 COPY .clusterfuzzlite/build.sh $SRC/build.sh
 WORKDIR $SRC/secure-terminal
