@@ -6205,6 +6205,21 @@ class SecureTerminal(QPlainTextEdit):
                 return cp
         return None
 
+    def _scrollback_above_grid(self):
+        """The scrollback text ABOVE the live grid, for the TUI state dump.
+
+        The document is [promoted scrollback ...][live grid], so the scrollback is
+        the blocks before grid_top (blockCount - _grid_rows). The current grid is
+        already in the snapshot's per-cell `rows`, so it is deliberately EXCLUDED
+        here (no duplication). While a full-screen program holds the alternate
+        screen there is no scrollback above the alt grid, so the primary transcript
+        frozen at alt entry is returned instead."""
+        if self._alt_saved is not None:
+            return self._alt_primary_text
+        self._force_current_frame()      # the dump must include the last unpainted frame
+        grid_top = max(0, self.document().blockCount() - self._grid_rows)
+        return self._walk_document_text(end_block=grid_top)
+
     def _collect_state(self):
         """A deterministic snapshot of the CURRENT terminal state, branching on the
         display mode: TUI reads the live pyte grid + its scalar state; CLI (no escape
@@ -6236,7 +6251,7 @@ class SecureTerminal(QPlainTextEdit):
             title=self._last_title,
             palette=self._osc_palette,
             cli_pen=None if tui else self._sgr,
-            document=None if tui else self.transcript_text())
+            document=self._scrollback_above_grid() if tui else self.transcript_text())
 
     def dump_state(self, fmt='text', max_bytes=None):
         """The current terminal state as a string: 'text' (human + technical, diffable;
@@ -6282,7 +6297,7 @@ class SecureTerminal(QPlainTextEdit):
                 '(recorded separately, not in scroll order) ====='
                 + ''.join(self._alt_exit_snapshots))
 
-    def _walk_document_text(self):
+    def _walk_document_text(self, end_block=None):
         """Render the CURRENT document to lossless text WITHOUT forcing a frame (a
         read-only walk, safe to call from the feed path). In Box mode the display
         collapses every neutralized byte to an inert box, which toPlainText saves as a
@@ -6291,13 +6306,21 @@ class SecureTerminal(QPlainTextEdit):
         capped raw stream) and expand each box to its source codepoint named inline
         (<U+XXXX NAME>, the Detail rendering). Non-box display passes through unchanged:
         Reveal/Detail already carry <U+XXXX> badges, and Show keeps the glyph you opted
-        into. Works the same in CLI and TUI (both render a document)."""
+        into. Works the same in CLI and TUI (both render a document).
+
+        `end_block` bounds the walk to blocks [0, end_block) -- the scrollback ABOVE the
+        live grid, used by the state dump so the current grid (already dumped per-cell) is
+        not duplicated. None (the default) walks the whole document."""
         doc = self.document()
         out = []
         cur = QTextCursor(doc)
         block = doc.begin()
         first = True
+        idx = 0
         while block.isValid():
+            if end_block is not None and idx >= end_block:
+                break
+            idx += 1
             if not first:                       # blocks are newline-separated,
                 out.append('\n')                # exactly like toPlainText
             first = False
