@@ -3157,6 +3157,11 @@ class SecureTerminal(QPlainTextEdit):
         self._grid_row_ids = []
         self._grid_row_sig = []
         self._row_sig_cache = {}      # buffer swap (alt enter/leave), seed, resize-rebuild
+        # The document was just cleared with no repaint yet, so the last-painted snapshot no
+        # longer matches it. Invalidate it: if the following _render_tui() is deferred by a held
+        # selection (theme/mode/markings/scrollback-cap/restart all clear then re-render), a dump
+        # falls back to the live grid rather than serving the stale pre-clear frame.
+        self._painted_screen = None
         # The document was just cleared, so a shift-click anchor into the OLD content now points
         # at unrelated text -- drop it, so a Shift+click after a rebuild starts fresh at the click.
         self._shift_click_anchor = None
@@ -6253,7 +6258,13 @@ class SecureTerminal(QPlainTextEdit):
         wrapper-level flags pyte does not model -- the alternate screen and mouse
         reporting -- are added in both modes. Volatile fields (the alt-owner pgrp,
         timers) are deliberately excluded so two idle snapshots are identical. See
-        secure_terminal.state_dump for the format."""
+        secure_terminal.state_dump for the format.
+
+        While a text selection holds the render (see below), TUI reads the LAST-PAINTED grid
+        frame instead of the live pyte model, so the grid rows stay coherent with the
+        (equally deferred) scrollback document and match what is actually on screen -- the
+        on-screen grid is frozen by the same selection guard. This is deliberate; the dump
+        catches up when the selection clears and a render re-arms."""
         # Bind the narrowed screen once: `screen is not None` IS the TUI test, so every
         # attribute read below narrows cleanly (no unguarded self._screen.<attr>).
         screen = self._screen if self._grid_mode() else None
