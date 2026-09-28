@@ -1289,7 +1289,572 @@ def _build_non_content_keys():
     ))
 
 
-class SecureTerminal(QPlainTextEdit):
+class _RenderedTextView(QPlainTextEdit):
+    """Shared render surface for the live terminal and the review box: font +
+    ligature-off, palette theme, marking formats, the whitespace/tab dot overlays, the
+    2px bar caret, the left gutter, and per-mode wrap. SecureTerminal adds pty / grid /
+    OSC / live output; RevealedEditor adds the editable model. Rendering lives here ONCE
+    so the two surfaces cannot drift."""
+
+    def _setup_rendered_view(self):
+        """Establish the shared render state + child widgets for a fresh view. Called by a
+        subclass that does NOT set them up inline (RevealedEditor); SecureTerminal builds
+        the same state in its own __init__."""
+        self._shot = False
+        self._solid_cursor = False
+        self._preview = False
+        self._cursor_on = True
+        self._cursor_visible = True
+        self._blink_pos = None
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._blink_cursor)
+        self.setCursorWidth(0)
+        self.setUndoRedoEnabled(False)
+        self.setFrameStyle(0)
+        self._base_point_size = BASE_POINT_SIZE
+        self._zoom = 100
+        self._font_family = DEFAULT_FONT_FAMILY
+        self._applied_font_size = None
+        self._applied_font_family = None
+        self._line_fmt_cache = {}
+        self._gutter = _GutterArea(self)
+        self.updateRequest.connect(self._update_gutter_area)
+        self._apply_font()
+        self._update_gutter_width()
+        self._position_gutter()
+
+    def _apply_font(self):
+        """Build the fixed-pitch font at the chosen family + zoom, with OpenType ligature
+        / contextual-alternate features OFF (ligatures HIDE characters, a deception vector
+        for a WYSIWYG terminal; the default family Hack ships none anyway). Returns True
+        when a new font was applied, False when (size, family) was unchanged -- so a
+        subclass override can gate its follow-on work (a pty winsize sync) on a real
+        change."""
+        size = max(1, round(self._base_point_size * self._zoom / 100.0))
+        family = self._font_family or DEFAULT_FONT_FAMILY
+        if size == self._applied_font_size and family == self._applied_font_family:
+            return False
+        self._applied_font_size = size
+        self._applied_font_family = family
+        font = QFont()
+        font.setFamily(family)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFixedPitch(True)
+        for _tag in ('liga', 'clig', 'calt', 'dlig'):
+            try:
+                font.setFeature(_tag, 0)
+            except (AttributeError, TypeError, ValueError):
+                pass                 # per-feature control needs Qt >= 6.7; skip
+        font.setPointSize(size)
+        self.setFont(font)
+        # The glyph size drives the gutter width; re-reserve + reposition it (both
+        # self-guard before the gutter exists, for the ctor's first _apply_font).
+        self._update_gutter_width()
+        self._position_gutter()
+        return True
+
+    def _marking_format(self, key):
+        """QTextCharFormat for a (MARK_KEY, class, cp) marking/structural key: a
+        whitespace anomaly -> the dot-paint flag only; a tab -> the arrow flag only; a
+        risk-class string -> its MARKING_COLORS tint; else the default format. Carries the
+        source code point (_CP_PROP) except on the two overlay-only classes (copy / hover
+        treat those as ordinary space / tab). Cached in _line_fmt_cache. A non-marking key
+        (None / a plain-text run) -> the default format, so a caller can map EVERY run key
+        through this one seam (the review box does)."""
+        if not (isinstance(key, tuple) and len(key) == 3 and key[0] == MARK_KEY):
+            return QTextCharFormat()
+        color = key[1]
+        fmt = self._line_fmt_cache.get(key)
+        if fmt is not None:
+            return fmt
+        if color == WS_ANOMALY:
+            fmt = QTextCharFormat()
+            fmt.setProperty(_WS_DOT_PROP, True)
+            return _cache_bounded(self._line_fmt_cache, key, fmt)
+        if color == TAB_MARK:
+            fmt = QTextCharFormat()
+            fmt.setProperty(_TAB_MARK_PROP, True)
+            return _cache_bounded(self._line_fmt_cache, key, fmt)
+        if isinstance(color, str):
+            fmt = QTextCharFormat()
+            spec = self.MARKING_COLORS[self._theme][color]
+            fmt.setForeground(QColor(spec['fg']))
+            if spec['bg'] is not None:
+                fmt.setBackground(QColor(spec['bg']))
+        else:
+            fmt = QTextCharFormat()
+        fmt.setProperty(_CP_PROP, key[2])
+        return _cache_bounded(self._line_fmt_cache, key, fmt)
+
+    def apply_theme(self, theme):
+        """Set the view's Base/Text palette from the theme (unknown -> 'light'), so
+        palette-reading overlays (dots, caret, gutter) draw in the theme colours, then
+        re-render. SecureTerminal overrides with its richer OSC-aware version."""
+        theme = theme if isinstance(theme, str) and theme in THEMES else 'light'
+        base, text = THEMES[theme]
+        self._theme = theme
+        pal = self.palette()
+        pal.setColor(QPalette.ColorRole.Base, QColor(base))
+        pal.setColor(QPalette.ColorRole.Text, QColor(text))
+        self.setPalette(pal)
+        self._line_fmt_cache = {}
+        self._rerender()
+
+    def _visible_blocks(self):
+        """Yield (block, top_y, bottom_y) for each visible block, in viewport
+        coordinates."""
+        block = self.firstVisibleBlock()
+        offset = self.contentOffset()
+        while block.isValid():
+            geo = self.blockBoundingGeometry(block).translated(offset)
+            top = int(geo.top())
+            bottom = int(geo.bottom())
+            if top > self.viewport().height():
+                break
+            if block.isVisible():
+                yield block, top, bottom
+            block = block.next()
+
+    def _gutter_blocks(self):
+        """Visible blocks in gutter/viewport coordinates (see _visible_blocks)."""
+        return self._visible_blocks()
+
+    def _fragment_prop_runs(self, block, prop):
+        """(start, end) document positions of each fragment in `block` whose char format
+        carries `prop` -- the CLI seam the whitespace-dot and tab-arrow overlays share."""
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid() and frag.charFormat().property(prop):
+                yield frag.position(), frag.position() + frag.length()
+            it += 1
+
+    def _ws_dot_runs(self, block):
+        """(start, end) doc positions of each whitespace-anomaly run in `block`, from the
+        document fragments (the _WS_DOT_PROP flag). SecureTerminal overrides to add the
+        TUI grid path."""
+        yield from self._fragment_prop_runs(block, _WS_DOT_PROP)
+
+    def _cursor_anchor(self):
+        """The QTextCursor the visible bar caret is drawn at: the edit caret. SecureTerminal
+        overrides to pin it to the output cursor (independent of a selection)."""
+        return self.textCursor()
+
+    def _cursor_color(self):
+        """The bar caret colour: the theme foreground. SecureTerminal overrides to honour
+        OSC 12 / OSC 10."""
+        _bg, theme_fg = THEMES.get(self._theme, THEMES['dark'])
+        return QColor(theme_fg)
+
+    def _rerender(self):
+        """Re-render hook after a theme change; a subclass with retained content overrides."""
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._restart_blink()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)          # FIRST, so hasFocus() is true when
+        self._restart_blink()                # _restart_blink gates its timer start on it
+
+    def focusOutEvent(self, event):
+        # Unfocused: stop blinking and draw the cursor statically (a real terminal shows a
+        # solid cursor when its window loses focus, never a blank).
+        self._blink_timer.stop()
+        self._cursor_on = True
+        self._update_cursor_region()
+        super().focusOutEvent(event)
+
+
+    # Colours of a neutralized/revealed marking, by THEME then risk class: a
+    # foreground tint plus an optional background BAND (bg None = no band). BOTH
+    # themes give the genuinely-dangerous classes (bidi/control/invisible/
+    # confusable/combining) a band, because a foreground-only tint was optically
+    # swallowed by the base and vanished. Honest foreign text ('nonascii') stays a
+    # subtle fg-only tint in both, so it is not mistaken for an attack. Light is the
+    # shipped default, so its bands are the primary case (dark bands kept for users
+    # who switch).
+    MARKING_COLORS: dict[str, dict[str, dict[str, str | None]]] = {
+        'light': {
+            'bidi':       {'fg': '#b3261e', 'bg': '#ffb3ab'},   # red    -- reorders text (worst)
+            'control':    {'fg': '#0842a0', 'bg': '#aecbff'},   # blue   -- C0 / DEL / C1 controls
+            'invisible':  {'fg': '#8a5000', 'bg': '#ffcf8f'},   # amber  -- zero-width / BOM / separators
+            'confusable': {'fg': '#a4113f', 'bg': '#ffb3ca'},   # rose   -- a homoglyph posing as ASCII
+            'combining':  {'fg': '#5b21b6', 'bg': '#cdb0ff'},   # violet -- a stacked combining mark (Zalgo)
+            'nonascii':   {'fg': '#6d28d9', 'bg': None},        # purple -- honest foreign: subtle, no band
+            'whitespace': {'fg': '#9aa0a6', 'bg': None},        # faint grey -- an anomalous space (invisible fg; the WIDGET paints a dot, this entry serves the colour-only review TABLE)
+            'tab':        {'fg': '#9aa0a6', 'bg': None},        # faint grey -- a tab (the WIDGET paints an arrow guide; this entry serves the colour-only review TABLE)
+        },
+        'dark': {
+            'bidi':       {'fg': '#ff5a60', 'bg': '#5c1820'},   # red    -- reorders text (worst)
+            'control':    {'fg': '#5cb0ff', 'bg': '#143a5c'},   # blue   -- C0 / DEL / C1 controls
+            'invisible':  {'fg': '#ffb340', 'bg': '#4d3a0e'},   # amber  -- zero-width / BOM / separators
+            'confusable': {'fg': '#ff6f9d', 'bg': '#551d35'},   # rose   -- a homoglyph posing as ASCII
+            'combining':  {'fg': '#c9a3ff', 'bg': '#46306b'},   # violet -- a stacked combining mark (Zalgo)
+            'nonascii':   {'fg': '#a06cff', 'bg': None},        # purple -- honest foreign: subtle, no band
+            'whitespace': {'fg': '#7a7f86', 'bg': None},        # faint grey -- an anomalous space (invisible fg; the WIDGET paints a dot, this entry serves the colour-only review TABLE)
+            'tab':        {'fg': '#7a7f86', 'bg': None},        # faint grey -- a tab (the WIDGET paints an arrow guide; this entry serves the colour-only review TABLE)
+        },
+    }
+
+    def _sync_wrap_mode(self):
+        """Pick the line-wrap mode for the current display mode, so the widget
+        behaves like a real terminal: content wraps to the width, it never scrolls
+        off the right edge.
+
+        - Box / Show: each cell is ~1 column, so NoWrap -- this keeps a glyph's
+          line/column STABLE across a box<->show toggle (a pixel-width wrap made a
+          wide glyph jump lines on the toggle; see the ctor). The child already
+          hard-wraps at self._cols, so ordinary output does not overflow; a residual
+          run of wide Show-mode glyphs is left-anchored by _paint_line's home-pin
+          when that keeps the caret visible (else the caret is followed).
+        - Detail / Reveal: each cell expands to a wide <U+XXXX> badge that overflows
+          the width the child was told, so wrap the DISPLAY to the viewport --
+          otherwise the overflow is reachable only by a horizontal scroll that hides
+          the start of every row. This is a SOFT (visual) wrap: it inserts no
+          document newline, so copy/transcript are unchanged.
+        - TUI grid: sized to fit and its Detail/Reveal cells fall back to the box, so
+          it never overflows; NoWrap.
+        """
+        # A preview instance renders via the CLI line path even when tui=True, so it is NOT a
+        # real pyte grid: treat it as non-grid here so detail/reveal overflow wraps to the
+        # viewport / keeps a scrollbar instead of being clipped away unreachably. Key on the
+        # preview FLAG, not screen==None -- a real TUI terminal creates its screen lazily
+        # (apply_tui before _make_screen), and it IS still a grid.
+        is_grid = self._grid_mode() and not getattr(self, '_preview', False)
+        wrap = (not is_grid
+                and self._mode in ('detail', 'reveal', 'state'))
+        self.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth if wrap
+            else QPlainTextEdit.LineWrapMode.NoWrap)
+        # A TUI grid is a fixed viewport-wide canvas: a real terminal never shows a
+        # horizontal scrollbar on one. The grid is sized to fit, but a Show-mode wide
+        # glyph (or fractional char-advance accumulation) can render a few pixels past
+        # the viewport and raise an AsNeeded bar; suppress it in grid mode -- the
+        # home-pin in _place_grid_cursor keeps column 0 visible and the residual clips
+        # at the right edge, exactly as a real terminal does. CLI keeps AsNeeded: a
+        # genuinely long NoWrap Box/Show line there is reachable by a real scroll.
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if is_grid
+            else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+    # -- left gutter (per-line no-trailing-newline marker) --------------------
+
+    def _gutter_width_px(self):
+        """Width of the left annotation strip: one glyph cell plus padding. Scales with
+        the font so a zoom keeps it proportionate; a constant strip means enabling it
+        SIGWINCHes the child once at startup, never per notice (no flicker loop)."""
+        return self.fontMetrics().horizontalAdvance('M') + 2 * _GUTTER_PAD
+
+    def _apply_viewport_margins(self):
+        """Reserve the LEFT gutter strip (the per-line no-trailing-newline marker). The
+        advisory banner reserves NOTHING here -- it is a true overlay floated over the top
+        of the viewport (see _position_banner / _text_area), so it never enters the viewport
+        margins and cannot shrink the grid."""
+        # Read defensively: __init__ calls _apply_font (hence this) before _gutter exists.
+        left = self._gutter_width_px() if getattr(self, '_gutter', None) else 0
+        self.setViewportMargins(left, 0, 0, 0)
+
+    def _update_gutter_width(self, _count=0):
+        """Re-reserve the gutter margin (font/zoom change, block-count change)."""
+        self._apply_viewport_margins()
+
+    def _update_gutter_area(self, rect, dy):
+        """Scroll/repaint the gutter in step with the viewport (updateRequest). Wired only
+        after _gutter exists, so no None-guard is needed."""
+        g = self._gutter
+        if dy:
+            g.scroll(0, dy)
+        else:
+            g.update(0, rect.y(), g.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_gutter_width()
+
+    def _position_gutter(self):
+        """Align the gutter strip with the viewport: same top/height, its own width,
+        pinned to the content's left edge. Block y-coordinates are viewport-relative, so
+        an aligned top lets the paint map them straight to gutter coordinates."""
+        g = getattr(self, '_gutter', None)
+        if g is None:
+            return
+        vp = self.viewport().geometry()
+        g.setGeometry(QRect(self.contentsRect().left(), vp.top(),
+                            self._gutter_width_px(), vp.height()))
+
+    def _block_no_newline(self, block):
+        """True if `block`'s line carries the no-trailing-newline annotation, in BOTH
+        render paths: a TUI grid block records it on its _GridRow; a CLI line block
+        records it as a userState bit. Neither is document content, so it is unforgeable
+        (a program cannot print its way into either channel) and copy-safe."""
+        data = block.userData()
+        if isinstance(data, _GridRow):
+            return data.no_newline
+        return bool(_blk_flags(block) & _BLK_NO_NEWLINE)
+
+    def _block_redraw(self, block):
+        """True if `block`'s line carries the append-only redraw-neutralized annotation
+        (a \\r/\\b that would have overwritten it was dropped). CLI line mode only -- a TUI
+        grid block never sets it. Unforgeable + copy-safe, like the no-newline channel."""
+        if isinstance(block.userData(), _GridRow):
+            return False
+        return bool(_blk_flags(block) & _BLK_REDRAW)
+
+    def _block_last_line_center(self, block, block_top):
+        """Viewport y of the centre of the block's LAST visual line. A wrapped block
+        (Detail/Reveal wrap to the width) spans several visual lines; the no-newline
+        belongs to its FINAL row, so the glyph rides there -- not the block centre,
+        which a tall wrapped block pushes far off-screen. The block is always laid out
+        here (the caller reached it through blockBoundingGeometry), so lineCount >= 1."""
+        line = block.layout().lineAt(block.layout().lineCount() - 1)
+        return int(block_top + line.y() + line.height() / 2)
+
+    def _paint_gutter(self, event):
+        """Draw the per-line markers. Same-coloured background as the terminal keeps the
+        strip unobtrusive; a muted return-arrow glyph marks each no-trailing-newline
+        line, on that line's LAST visual row. Font-independent (drawn with QPainter, no
+        glyph font dependency) and ASCII-only in source. QPainter clips to the widget,
+        so a glyph whose row is scrolled out is harmlessly clipped. Called only from the
+        gutter widget's own paintEvent, so self._gutter is always live here."""
+        painter = QPainter(self._gutter)
+        painter.fillRect(event.rect(), self.palette().color(QPalette.ColorRole.Base))
+        fg = self.palette().color(QPalette.ColorRole.Text)
+        fg.setAlpha(150)                          # muted: a note, not program output
+        redraw_col = self._redraw_glyph_color()
+        for block, top, _bottom in self._gutter_blocks():
+            # One glyph per line; the append-only redraw marker (a security event) takes
+            # precedence over no-trailing-newline on the rare line carrying both.
+            if self._block_redraw(block):
+                self._draw_redraw_glyph(
+                    painter, self._block_last_line_center(block, top), redraw_col)
+            elif self._block_no_newline(block):
+                self._draw_no_newline_glyph(
+                    painter, self._block_last_line_center(block, top), fg)
+        painter.end()
+
+    def _draw_no_newline_glyph(self, painter, mid, color):
+        """A small return-arrow (down then left, with a head) centred vertically on the
+        marked line at `mid`: the universal 'a newline belongs here' mark."""
+        cx = self._gutter_width_px() // 2
+        h = self.fontMetrics().height()
+        a = max(2, h // 4)                         # arm half-length
+        pen = QPen(color)
+        pen.setWidth(max(1, h // 12))
+        painter.setPen(pen)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.drawLine(cx + a, mid - a, cx + a, mid + a)     # vertical stroke down
+        painter.drawLine(cx + a, mid + a, cx - a, mid + a)     # left along the base
+        painter.drawLine(cx - a, mid + a, cx, mid)             # arrowhead
+        painter.drawLine(cx - a, mid + a, cx, mid + 2 * a)
+
+    def _redraw_glyph_color(self):
+        """Control-risk-class tint for the append-only redraw marker (a neutralized \\r/\\b is
+        a control byte). A fixed blue reads on both light and dark; this is chrome, not
+        per-cell paint, so it does not go through the theme marking map."""
+        c = QColor(0x4a, 0x90, 0xd9)               # control-class blue
+        c.setAlpha(210)
+        return c
+
+    def _draw_redraw_glyph(self, painter, mid, color):
+        """A small circular arrow (a 'redraw' loop) centred at `mid`: a program tried to
+        redraw/overwrite this line and append-only neutralized it, so the line only grew."""
+        cx = self._gutter_width_px() // 2
+        h = self.fontMetrics().height()
+        r = max(2, h // 5)
+        pen = QPen(color)
+        pen.setWidth(max(1, h // 12))
+        painter.setPen(pen)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # a C-shaped loop with a ~60deg gap at the upper right, and a small arrowhead at
+        # the gap -- reads as a return/redraw arrow at any font size.
+        painter.drawArc(cx - r, mid - r, 2 * r, 2 * r, 60 * 16, 300 * 16)
+        tip_x, tip_y = cx + r, mid - r // 2
+        painter.drawLine(tip_x, tip_y, tip_x - max(2, r // 2), tip_y - max(1, r // 2))
+        painter.drawLine(tip_x, tip_y, tip_x + max(1, r // 3), tip_y - max(2, r // 2))
+
+    def _block_at_gutter_y(self, y):
+        """The visible block whose row contains gutter-local y, or None. Half-open [top, bottom)
+        so the shared boundary pixel (block N's int(bottom) == block N+1's int(top) when the line
+        height is fractional) belongs to the LOWER block, not both -- an inclusive test returned
+        the upper block for that row, mis-annotating the gutter by one pixel at every boundary."""
+        for block, top, bottom in self._gutter_blocks():
+            if top <= y < bottom:
+                return block
+        return None
+
+    def _gutter_tooltip(self, block):
+        """The gutter tooltip text for `block`, or '' when the row carries no marker.
+        A pure seam so the tooltip CONTENT is testable directly, without synthesizing a
+        hover event and reading it back off QToolTip."""
+        if block is not None and self._block_redraw(block):
+            return ('Append-only: a redraw of this line was neutralized '
+                    '(a program tried to overwrite it)')
+        if block is not None and self._block_no_newline(block):
+            return 'This line has no trailing newline'
+        return ''
+
+    def _gutter_hover(self, event):
+        """Show the tooltip when the pointer is over a marked line's glyph."""
+        block = self._block_at_gutter_y(event.position().toPoint().y())
+        text = self._gutter_tooltip(block)
+        gutter = getattr(self, '_gutter', self)
+        if text:
+            QToolTip.showText(event.globalPosition().toPoint(), text, gutter)
+        else:
+            QToolTip.hideText()
+
+
+    # -- our own blinking cursor (native caret hidden; see paintEvent) ---------
+    def _cursor_rect(self):
+        """Viewport rectangle of the cursor: a thin vertical bar at the cursor anchor,
+        the line's height (a bar never hides the glyph under it, unlike a block, and
+        matches the caret shape this terminal already showed)."""
+        r = self.cursorRect(self._cursor_anchor())
+        return QRect(r.x(), r.y(), 2, r.height())
+
+    def _update_cursor_region(self):
+        r = self._cursor_rect()
+        self.viewport().update(r.x() - 1, r.y() - 1, r.width() + 3, r.height() + 2)
+
+    def _blink_cursor(self):
+        self._cursor_on = not self._cursor_on
+        self._update_cursor_region()
+
+    def _mark_cursor_moved(self, pos):
+        """Reset the cursor SOLID and (re)start its blink ONLY when the output cursor
+        actually MOVED (typing / the program repositioning the caret). A render that
+        redraws WITHOUT moving the cursor -- a spinner or streaming output elsewhere on
+        a continuously-repainting TUI (e.g. Claude Code) -- must NOT force solid: forcing
+        _cursor_on=True every frame out-paces the blink timer so the OFF half-cycle never
+        shows and the cursor looks permanently solid. Leaving it alone when the position
+        is unchanged lets the timer keep blinking. Also (re)starts the timer from the
+        output path, which the old code only did on focus-in."""
+        if pos != self._blink_pos:
+            self._blink_pos = pos
+            self._restart_blink()
+
+    def _restart_blink(self):
+        """Show the cursor at once and (re)start its blink -- called on every output-
+        cursor placement, so a streaming/moving cursor stays solid and it blinks
+        once output settles. No blink when unfocused, in shot mode, or when the
+        system cursor-flash time is 0 (blinking disabled)."""
+        self._cursor_on = True
+        flash = QApplication.styleHints().cursorFlashTime()
+        if (self.hasFocus() and flash > 0 and not self._shot
+                and not self._solid_cursor):     # solid mode: always-on, never blink
+            self._blink_timer.start(max(1, flash // 2))
+        else:
+            self._blink_timer.stop()
+        self._update_cursor_region()
+
+    def hideEvent(self, event):
+        # A hidden widget (a background tab, or one being closed) must not keep a
+        # blink timer alive: its timeout would repaint a viewport that may be mid-
+        # teardown. showEvent restarts it when the tab is shown again.
+        self._blink_timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # Faint dots over whitespace-anomaly cells, BEFORE the caret's shot/blink guards:
+        # unlike the blinking caret, the dots are a rendering feature and must appear in a
+        # deterministic screenshot too. The document holds real spaces, so the dots never
+        # reach copy/transcript.
+        if self.isVisible():
+            self._paint_ws_dots()
+            self._paint_tab_marks()
+        # Our own terminal cursor, drawn over the text. It blinks independent of any
+        # selection (the native caret, which we hid, does not). Suppressed for a
+        # deterministic screenshot (shot mode), on a non-interactive preview surface,
+        # when the widget is not visible (a queued paint into teardown), and while a
+        # TUI program has hidden the cursor (DECTCEM).
+        # Shot mode hides the blinking caret for determinism -- but a SOLID caret is
+        # deterministic (fixed position, always on), so draw it even in a shot.
+        if ((self._shot and not self._solid_cursor) or self._preview
+                or not self._cursor_visible or not self.isVisible()):
+            return
+        if self.hasFocus() and not self._cursor_on:
+            return                          # blink OFF half-cycle (never true in solid mode)
+        painter = QPainter(self.viewport())
+        painter.fillRect(self._cursor_rect(), self._cursor_color())
+        painter.end()
+
+    def _ws_dot_rects(self):
+        """Viewport cell rectangles of every visible whitespace-anomaly cell, one per
+        flagged column. cursorRect maps a document position to the viewport, so this is
+        correct under scroll and soft-wrap alike. Both render paths: the CLI flowing document
+        and the TUI grid (interior-only there, so grid padding is never flagged)."""
+        doc = self.document()
+        cur = QTextCursor(doc)
+        cell_w = max(2, self.fontMetrics().horizontalAdvance(' '))
+        # _gutter_blocks yields only visible blocks, and the QPainter clips to the
+        # viewport, so an off-edge dot needs no explicit bounds check here.
+        for block, _top, _bottom in self._gutter_blocks():
+            for a, b in self._ws_dot_runs(block):
+                for pos in range(a, b):
+                    cur.setPosition(pos)
+                    r = self.cursorRect(cur)
+                    yield QRect(r.x(), r.y(), cell_w, r.height())
+
+    def _paint_ws_dots(self):
+        """Draw a faint centred dot over each whitespace-anomaly cell. Display-only: the
+        cells are real spaces in the document, so the marker never enters copy / transcript
+        / toPlainText -- only the on-screen look changes, in every display mode."""
+        rects = list(self._ws_dot_rects())
+        if not rects:
+            return
+        color = self.palette().color(QPalette.ColorRole.Text)
+        color.setAlpha(90)                        # faint: a hint, not program ink
+        painter = QPainter(self.viewport())
+        painter.setPen(color)
+        painter.setFont(self.font())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        align = int(Qt.AlignmentFlag.AlignCenter)
+        for rect in rects:
+            painter.drawText(rect, align, _WS_DOT_GLYPH)
+        painter.end()
+
+    def _tab_mark_runs(self, block):
+        """(start,end) doc positions of each tab run in `block` -- the _TAB_MARK_PROP flag on the
+        char format. CLI (line) mode only: the TUI grid has no '\\t' char (pyte expands tabs), so a
+        _GridRow block yields nothing here."""
+        yield from self._fragment_prop_runs(block, _TAB_MARK_PROP)
+
+    def _tab_mark_rects(self):
+        """Viewport rect of each visible tab, spanning its RENDERED width -- a tab advances to the
+        next tab stop, so the span is cursorRect(pos)..cursorRect(pos+1), not one cell."""
+        doc = self.document()
+        cur = QTextCursor(doc)
+        fallback = max(2, self.fontMetrics().horizontalAdvance(' '))
+        for block, _top, _bottom in self._gutter_blocks():
+            for a, b in self._tab_mark_runs(block):
+                for pos in range(a, b):
+                    cur.setPosition(pos)
+                    r0 = self.cursorRect(cur)
+                    cur.setPosition(pos + 1)
+                    r1 = self.cursorRect(cur)
+                    w = (r1.x() - r0.x()) if (r1.y() == r0.y() and r1.x() > r0.x()) else fallback
+                    yield QRect(r0.x(), r0.y(), w, r0.height())
+
+    def _paint_tab_marks(self):
+        """Draw a faint arrow guide over each tab, spanning its width. Display-only: the document
+        holds a real '\\t', so the marker never enters copy / transcript / toPlainText -- only the
+        on-screen look changes, in every display mode (CLI line rendering)."""
+        rects = list(self._tab_mark_rects())
+        if not rects:
+            return
+        color = self.palette().color(QPalette.ColorRole.Text)
+        color.setAlpha(90)                        # faint: a hint, not program ink
+        painter = QPainter(self.viewport())
+        painter.setPen(color)
+        painter.setFont(self.font())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        align = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        for rect in rects:
+            painter.drawText(rect, align, _TAB_MARK_GLYPH)
+        painter.end()
+
+
+class SecureTerminal(_RenderedTextView):
     # emitted when the child shell exits, so the window can close its tab
     shell_exited = pyqtSignal()
     # Ctrl+wheel over the widget asks the window to zoom by +1/-1 step
@@ -2025,38 +2590,13 @@ class SecureTerminal(QPlainTextEdit):
             self._rerender()
 
     def _apply_font(self, sync=True):
-        """Build the terminal font from the chosen family and current zoom. The
-        default family (Hack) is a hard package dependency, so no fallback chain is
-        needed; the Monospace style hint still steers Qt's own substitution toward
-        a fixed-pitch face if a user picks a family that is not installed. OpenType
-        ligature and contextual-alternate features are turned off where the Qt build
-        allows it -- ligatures HIDE characters, a deception vector for a WYSIWYG
-        terminal; the default family (Hack) ships no ligature tables anyway."""
-        size = max(1, round(self._base_point_size * self._zoom / 100.0))
-        family = self._font_family or DEFAULT_FONT_FAMILY
-        if size == self._applied_font_size and family == self._applied_font_family:
-            # Nothing changed: skip the setFont relayout + pyte resize/SIGWINCH. This
-            # dedups the leading-edge zoom debounce -- a single notch applies once
-            # (leading), and the trailing timer fire, still at the same size, no-ops
-            # here instead of forcing a second relayout + child redraw.
+        """Build the font via the shared base (fixed-pitch, ligatures off), then -- on a
+        real (size, family) change -- push the new glyph size through to the pty winsize
+        (the terminal-only half the base does not do)."""
+        if not super()._apply_font():
+            # Nothing changed: the base deduped (the leading-edge zoom debounce applies
+            # once; the trailing same-size fire no-ops here instead of relayout + redraw).
             return
-        self._applied_font_size = size
-        self._applied_font_family = family
-        font = QFont()
-        font.setFamily(family)
-        font.setStyleHint(QFont.StyleHint.Monospace)
-        font.setFixedPitch(True)
-        for _tag in ('liga', 'clig', 'calt', 'dlig'):
-            try:
-                font.setFeature(_tag, 0)
-            except (AttributeError, TypeError, ValueError):
-                pass                 # per-feature control needs Qt >= 6.7; skip
-        font.setPointSize(size)
-        self.setFont(font)
-        # The glyph size drives the gutter width; re-reserve + reposition it (both
-        # self-guard before the gutter exists, for the ctor's first _apply_font).
-        self._update_gutter_width()
-        self._position_gutter()
         if sync:
             # Push the new glyph size through to the pty winsize, exactly as
             # resizeEvent does for a viewport resize: a zoom changes how many
@@ -2537,47 +3077,6 @@ class SecureTerminal(QPlainTextEdit):
         faithfully. CLI mode stays the safe one-dimensional line display."""
         return self.tui_active()
 
-    def _sync_wrap_mode(self):
-        """Pick the line-wrap mode for the current display mode, so the widget
-        behaves like a real terminal: content wraps to the width, it never scrolls
-        off the right edge.
-
-        - Box / Show: each cell is ~1 column, so NoWrap -- this keeps a glyph's
-          line/column STABLE across a box<->show toggle (a pixel-width wrap made a
-          wide glyph jump lines on the toggle; see the ctor). The child already
-          hard-wraps at self._cols, so ordinary output does not overflow; a residual
-          run of wide Show-mode glyphs is left-anchored by _paint_line's home-pin
-          when that keeps the caret visible (else the caret is followed).
-        - Detail / Reveal: each cell expands to a wide <U+XXXX> badge that overflows
-          the width the child was told, so wrap the DISPLAY to the viewport --
-          otherwise the overflow is reachable only by a horizontal scroll that hides
-          the start of every row. This is a SOFT (visual) wrap: it inserts no
-          document newline, so copy/transcript are unchanged.
-        - TUI grid: sized to fit and its Detail/Reveal cells fall back to the box, so
-          it never overflows; NoWrap.
-        """
-        # A preview instance renders via the CLI line path even when tui=True, so it is NOT a
-        # real pyte grid: treat it as non-grid here so detail/reveal overflow wraps to the
-        # viewport / keeps a scrollbar instead of being clipped away unreachably. Key on the
-        # preview FLAG, not screen==None -- a real TUI terminal creates its screen lazily
-        # (apply_tui before _make_screen), and it IS still a grid.
-        is_grid = self._grid_mode() and not getattr(self, '_preview', False)
-        wrap = (not is_grid
-                and self._mode in ('detail', 'reveal', 'state'))
-        self.setLineWrapMode(
-            QPlainTextEdit.LineWrapMode.WidgetWidth if wrap
-            else QPlainTextEdit.LineWrapMode.NoWrap)
-        # A TUI grid is a fixed viewport-wide canvas: a real terminal never shows a
-        # horizontal scrollbar on one. The grid is sized to fit, but a Show-mode wide
-        # glyph (or fractional char-advance accumulation) can render a few pixels past
-        # the viewport and raise an AsNeeded bar; suppress it in grid mode -- the
-        # home-pin in _place_grid_cursor keeps column 0 visible and the residual clips
-        # at the right edge, exactly as a real terminal does. CLI keeps AsNeeded: a
-        # genuinely long NoWrap Box/Show line there is reachable by a real scroll.
-        self.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if is_grid
-            else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-
     def _grid_fixed_canvas(self):
         """True when the TUI grid must behave as a fixed, non-scrolling canvas: the
         alternate screen, OR a primary-buffer frame whose document is ENTIRELY the live
@@ -2880,185 +3379,6 @@ class SecureTerminal(QPlainTextEdit):
                    else 0)
         return (max(1, vp.width() - reserve - 2 * margin),
                 max(1, vp.height() - 2 * margin))
-
-    # -- left gutter (per-line no-trailing-newline marker) --------------------
-
-    def _gutter_width_px(self):
-        """Width of the left annotation strip: one glyph cell plus padding. Scales with
-        the font so a zoom keeps it proportionate; a constant strip means enabling it
-        SIGWINCHes the child once at startup, never per notice (no flicker loop)."""
-        return self.fontMetrics().horizontalAdvance('M') + 2 * _GUTTER_PAD
-
-    def _apply_viewport_margins(self):
-        """Reserve the LEFT gutter strip (the per-line no-trailing-newline marker). The
-        advisory banner reserves NOTHING here -- it is a true overlay floated over the top
-        of the viewport (see _position_banner / _text_area), so it never enters the viewport
-        margins and cannot shrink the grid."""
-        # Read defensively: __init__ calls _apply_font (hence this) before _gutter exists.
-        left = self._gutter_width_px() if getattr(self, '_gutter', None) else 0
-        self.setViewportMargins(left, 0, 0, 0)
-
-    def _update_gutter_width(self, _count=0):
-        """Re-reserve the gutter margin (font/zoom change, block-count change)."""
-        self._apply_viewport_margins()
-
-    def _update_gutter_area(self, rect, dy):
-        """Scroll/repaint the gutter in step with the viewport (updateRequest). Wired only
-        after _gutter exists, so no None-guard is needed."""
-        g = self._gutter
-        if dy:
-            g.scroll(0, dy)
-        else:
-            g.update(0, rect.y(), g.width(), rect.height())
-        if rect.contains(self.viewport().rect()):
-            self._update_gutter_width()
-
-    def _position_gutter(self):
-        """Align the gutter strip with the viewport: same top/height, its own width,
-        pinned to the content's left edge. Block y-coordinates are viewport-relative, so
-        an aligned top lets the paint map them straight to gutter coordinates."""
-        g = getattr(self, '_gutter', None)
-        if g is None:
-            return
-        vp = self.viewport().geometry()
-        g.setGeometry(QRect(self.contentsRect().left(), vp.top(),
-                            self._gutter_width_px(), vp.height()))
-
-    def _block_no_newline(self, block):
-        """True if `block`'s line carries the no-trailing-newline annotation, in BOTH
-        render paths: a TUI grid block records it on its _GridRow; a CLI line block
-        records it as a userState bit. Neither is document content, so it is unforgeable
-        (a program cannot print its way into either channel) and copy-safe."""
-        data = block.userData()
-        if isinstance(data, _GridRow):
-            return data.no_newline
-        return bool(_blk_flags(block) & _BLK_NO_NEWLINE)
-
-    def _block_redraw(self, block):
-        """True if `block`'s line carries the append-only redraw-neutralized annotation
-        (a \\r/\\b that would have overwritten it was dropped). CLI line mode only -- a TUI
-        grid block never sets it. Unforgeable + copy-safe, like the no-newline channel."""
-        if isinstance(block.userData(), _GridRow):
-            return False
-        return bool(_blk_flags(block) & _BLK_REDRAW)
-
-    def _gutter_blocks(self):
-        """Yield (block, top_y, bottom_y) for each visible block, in gutter/viewport
-        coordinates."""
-        block = self.firstVisibleBlock()
-        offset = self.contentOffset()
-        while block.isValid():
-            geo = self.blockBoundingGeometry(block).translated(offset)
-            top = int(geo.top())
-            bottom = int(geo.bottom())
-            if top > self.viewport().height():
-                break
-            if block.isVisible():
-                yield block, top, bottom
-            block = block.next()
-
-    def _block_last_line_center(self, block, block_top):
-        """Viewport y of the centre of the block's LAST visual line. A wrapped block
-        (Detail/Reveal wrap to the width) spans several visual lines; the no-newline
-        belongs to its FINAL row, so the glyph rides there -- not the block centre,
-        which a tall wrapped block pushes far off-screen. The block is always laid out
-        here (the caller reached it through blockBoundingGeometry), so lineCount >= 1."""
-        line = block.layout().lineAt(block.layout().lineCount() - 1)
-        return int(block_top + line.y() + line.height() / 2)
-
-    def _paint_gutter(self, event):
-        """Draw the per-line markers. Same-coloured background as the terminal keeps the
-        strip unobtrusive; a muted return-arrow glyph marks each no-trailing-newline
-        line, on that line's LAST visual row. Font-independent (drawn with QPainter, no
-        glyph font dependency) and ASCII-only in source. QPainter clips to the widget,
-        so a glyph whose row is scrolled out is harmlessly clipped. Called only from the
-        gutter widget's own paintEvent, so self._gutter is always live here."""
-        painter = QPainter(self._gutter)
-        painter.fillRect(event.rect(), self.palette().color(QPalette.ColorRole.Base))
-        fg = self.palette().color(QPalette.ColorRole.Text)
-        fg.setAlpha(150)                          # muted: a note, not program output
-        redraw_col = self._redraw_glyph_color()
-        for block, top, _bottom in self._gutter_blocks():
-            # One glyph per line; the append-only redraw marker (a security event) takes
-            # precedence over no-trailing-newline on the rare line carrying both.
-            if self._block_redraw(block):
-                self._draw_redraw_glyph(
-                    painter, self._block_last_line_center(block, top), redraw_col)
-            elif self._block_no_newline(block):
-                self._draw_no_newline_glyph(
-                    painter, self._block_last_line_center(block, top), fg)
-        painter.end()
-
-    def _draw_no_newline_glyph(self, painter, mid, color):
-        """A small return-arrow (down then left, with a head) centred vertically on the
-        marked line at `mid`: the universal 'a newline belongs here' mark."""
-        cx = self._gutter_width_px() // 2
-        h = self.fontMetrics().height()
-        a = max(2, h // 4)                         # arm half-length
-        pen = QPen(color)
-        pen.setWidth(max(1, h // 12))
-        painter.setPen(pen)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.drawLine(cx + a, mid - a, cx + a, mid + a)     # vertical stroke down
-        painter.drawLine(cx + a, mid + a, cx - a, mid + a)     # left along the base
-        painter.drawLine(cx - a, mid + a, cx, mid)             # arrowhead
-        painter.drawLine(cx - a, mid + a, cx, mid + 2 * a)
-
-    def _redraw_glyph_color(self):
-        """Control-risk-class tint for the append-only redraw marker (a neutralized \\r/\\b is
-        a control byte). A fixed blue reads on both light and dark; this is chrome, not
-        per-cell paint, so it does not go through the theme marking map."""
-        c = QColor(0x4a, 0x90, 0xd9)               # control-class blue
-        c.setAlpha(210)
-        return c
-
-    def _draw_redraw_glyph(self, painter, mid, color):
-        """A small circular arrow (a 'redraw' loop) centred at `mid`: a program tried to
-        redraw/overwrite this line and append-only neutralized it, so the line only grew."""
-        cx = self._gutter_width_px() // 2
-        h = self.fontMetrics().height()
-        r = max(2, h // 5)
-        pen = QPen(color)
-        pen.setWidth(max(1, h // 12))
-        painter.setPen(pen)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        # a C-shaped loop with a ~60deg gap at the upper right, and a small arrowhead at
-        # the gap -- reads as a return/redraw arrow at any font size.
-        painter.drawArc(cx - r, mid - r, 2 * r, 2 * r, 60 * 16, 300 * 16)
-        tip_x, tip_y = cx + r, mid - r // 2
-        painter.drawLine(tip_x, tip_y, tip_x - max(2, r // 2), tip_y - max(1, r // 2))
-        painter.drawLine(tip_x, tip_y, tip_x + max(1, r // 3), tip_y - max(2, r // 2))
-
-    def _block_at_gutter_y(self, y):
-        """The visible block whose row contains gutter-local y, or None. Half-open [top, bottom)
-        so the shared boundary pixel (block N's int(bottom) == block N+1's int(top) when the line
-        height is fractional) belongs to the LOWER block, not both -- an inclusive test returned
-        the upper block for that row, mis-annotating the gutter by one pixel at every boundary."""
-        for block, top, bottom in self._gutter_blocks():
-            if top <= y < bottom:
-                return block
-        return None
-
-    def _gutter_tooltip(self, block):
-        """The gutter tooltip text for `block`, or '' when the row carries no marker.
-        A pure seam so the tooltip CONTENT is testable directly, without synthesizing a
-        hover event and reading it back off QToolTip."""
-        if block is not None and self._block_redraw(block):
-            return ('Append-only: a redraw of this line was neutralized '
-                    '(a program tried to overwrite it)')
-        if block is not None and self._block_no_newline(block):
-            return 'This line has no trailing newline'
-        return ''
-
-    def _gutter_hover(self, event):
-        """Show the tooltip when the pointer is over a marked line's glyph."""
-        block = self._block_at_gutter_y(event.position().toPoint().y())
-        text = self._gutter_tooltip(block)
-        gutter = getattr(self, '_gutter', self)
-        if text:
-            QToolTip.showText(event.globalPosition().toPoint(), text, gutter)
-        else:
-            QToolTip.hideText()
 
     def _grid_size(self):
         """Columns and rows that fit the viewport at the current font. Used for
@@ -4192,37 +4512,6 @@ class SecureTerminal(QPlainTextEdit):
             fmt.setFontWeight(QFont.Weight.Bold)
         return fmt
 
-    # Colours of a neutralized/revealed marking, by THEME then risk class: a
-    # foreground tint plus an optional background BAND (bg None = no band). BOTH
-    # themes give the genuinely-dangerous classes (bidi/control/invisible/
-    # confusable/combining) a band, because a foreground-only tint was optically
-    # swallowed by the base and vanished. Honest foreign text ('nonascii') stays a
-    # subtle fg-only tint in both, so it is not mistaken for an attack. Light is the
-    # shipped default, so its bands are the primary case (dark bands kept for users
-    # who switch).
-    MARKING_COLORS: dict[str, dict[str, dict[str, str | None]]] = {
-        'light': {
-            'bidi':       {'fg': '#b3261e', 'bg': '#ffb3ab'},   # red    -- reorders text (worst)
-            'control':    {'fg': '#0842a0', 'bg': '#aecbff'},   # blue   -- C0 / DEL / C1 controls
-            'invisible':  {'fg': '#8a5000', 'bg': '#ffcf8f'},   # amber  -- zero-width / BOM / separators
-            'confusable': {'fg': '#a4113f', 'bg': '#ffb3ca'},   # rose   -- a homoglyph posing as ASCII
-            'combining':  {'fg': '#5b21b6', 'bg': '#cdb0ff'},   # violet -- a stacked combining mark (Zalgo)
-            'nonascii':   {'fg': '#6d28d9', 'bg': None},        # purple -- honest foreign: subtle, no band
-            'whitespace': {'fg': '#9aa0a6', 'bg': None},        # faint grey -- an anomalous space (invisible fg; the WIDGET paints a dot, this entry serves the colour-only paths: revealed editor / review table)
-            'tab':        {'fg': '#9aa0a6', 'bg': None},        # faint grey -- a tab (the WIDGET paints an arrow guide; this entry serves the colour-only paths: revealed editor / review table)
-        },
-        'dark': {
-            'bidi':       {'fg': '#ff5a60', 'bg': '#5c1820'},   # red    -- reorders text (worst)
-            'control':    {'fg': '#5cb0ff', 'bg': '#143a5c'},   # blue   -- C0 / DEL / C1 controls
-            'invisible':  {'fg': '#ffb340', 'bg': '#4d3a0e'},   # amber  -- zero-width / BOM / separators
-            'confusable': {'fg': '#ff6f9d', 'bg': '#551d35'},   # rose   -- a homoglyph posing as ASCII
-            'combining':  {'fg': '#c9a3ff', 'bg': '#46306b'},   # violet -- a stacked combining mark (Zalgo)
-            'nonascii':   {'fg': '#a06cff', 'bg': None},        # purple -- honest foreign: subtle, no band
-            'whitespace': {'fg': '#7a7f86', 'bg': None},        # faint grey -- an anomalous space (invisible fg; the WIDGET paints a dot, this entry serves the colour-only paths: revealed editor / review table)
-            'tab':        {'fg': '#7a7f86', 'bg': None},        # faint grey -- a tab (the WIDGET paints an arrow guide; this entry serves the colour-only paths: revealed editor / review table)
-        },
-    }
-
     def _fmt_from_key(self, key, glyphless=False):
         """QTextCharFormat for a cell's SGR key (a sorted-items tuple), or the
         default format for None. `glyphless` (a whitespace-only run) skips the
@@ -4236,38 +4525,20 @@ class SecureTerminal(QPlainTextEdit):
         if key is None:
             return QTextCharFormat()
         if isinstance(key, tuple) and len(key) == 3 and key[0] == MARK_KEY:
+            color = key[1]
+            if not (isinstance(color, tuple) and color):
+                # WS/TAB overlay flag, risk-class tint, structural or None: the shared
+                # marking format (the review box renders these identically).
+                return self._marking_format(key)
             fmt = self._line_fmt_cache.get(key)
             if fmt is None:
-                color = key[1]
-                if color == WS_ANOMALY:
-                    # A whitespace anomaly carries NO glyph colour (the cell is a real
-                    # space) and NO _CP_PROP (copy/hover treat it as an ordinary space):
-                    # only the dot flag, which paintEvent reads to draw the faint dot.
-                    fmt = QTextCharFormat()
-                    fmt.setProperty(_WS_DOT_PROP, True)
-                    return _cache_bounded(self._line_fmt_cache, key, fmt)
-                if color == TAB_MARK:
-                    # A tab: the cell is a real '\t' (kept for layout/copy); only the flag, which
-                    # paintEvent reads to draw the faint arrow guide over the tab's width.
-                    fmt = QTextCharFormat()
-                    fmt.setProperty(_TAB_MARK_PROP, True)
-                    return _cache_bounded(self._line_fmt_cache, key, fmt)
-                if isinstance(color, str):
-                    fmt = QTextCharFormat()
-                    spec = self.MARKING_COLORS[self._theme][color]
-                    fmt.setForeground(QColor(spec['fg']))
-                    if spec['bg'] is not None:
-                        fmt.setBackground(QColor(spec['bg']))
-                elif color:                   # the program's own SGR items-tuple
-                    # a structural block/half-block glyph SHOWN in its own SGR keeps its
-                    # truecolor bg -- the contrast guard must not band the gradient. Gate
-                    # on Show: in a strict mode the same source glyph is a neutralized
-                    # placeholder that MUST keep the guard (else fg==bg hides it).
-                    fmt = self._format_for(
-                        dict(color),
-                        structural=(self._mode == 'show' and is_structural(key[2])))
-                else:
-                    fmt = QTextCharFormat()
+                # the program's own SGR items-tuple: a structural block/half-block glyph
+                # SHOWN in its own SGR keeps its truecolor bg -- the contrast guard must not
+                # band the gradient. Gate on Show: in a strict mode the same source glyph is
+                # a neutralized placeholder that MUST keep the guard (else fg==bg hides it).
+                fmt = self._format_for(
+                    dict(color),
+                    structural=(self._mode == 'show' and is_structural(key[2])))
                 fmt.setProperty(_CP_PROP, key[2])
                 return _cache_bounded(self._line_fmt_cache, key, fmt)
             return fmt
@@ -7593,13 +7864,6 @@ class SecureTerminal(QPlainTextEdit):
         the prompt (this is what keeps it blinking there while you select)."""
         return self._out_cursor if self._out_cursor is not None else self.textCursor()
 
-    def _cursor_rect(self):
-        """Viewport rectangle of the cursor: a thin vertical bar at the output
-        cursor, the line's height (a bar never hides the glyph under it, unlike a
-        block, and matches the caret shape this terminal already showed)."""
-        r = self.cursorRect(self._cursor_anchor())
-        return QRect(r.x(), r.y(), 2, r.height())
-
     def _cursor_color(self):
         # OSC 12 sets the cursor colour (_osc_color stores it under 'cursor'); prefer
         # it. Fall back to OSC 10's default fg, then the theme fg -- so an OSC 12 update
@@ -7608,84 +7872,15 @@ class SecureTerminal(QPlainTextEdit):
         return QColor(self._osc_palette.get(
             'cursor', self._osc_palette.get('fg', theme_fg)))
 
-    def _update_cursor_region(self):
-        r = self._cursor_rect()
-        self.viewport().update(r.x() - 1, r.y() - 1, r.width() + 3, r.height() + 2)
-
-    def _blink_cursor(self):
-        self._cursor_on = not self._cursor_on
-        self._update_cursor_region()
-
-    def _mark_cursor_moved(self, pos):
-        """Reset the cursor SOLID and (re)start its blink ONLY when the output cursor
-        actually MOVED (typing / the program repositioning the caret). A render that
-        redraws WITHOUT moving the cursor -- a spinner or streaming output elsewhere on
-        a continuously-repainting TUI (e.g. Claude Code) -- must NOT force solid: forcing
-        _cursor_on=True every frame out-paces the blink timer so the OFF half-cycle never
-        shows and the cursor looks permanently solid. Leaving it alone when the position
-        is unchanged lets the timer keep blinking. Also (re)starts the timer from the
-        output path, which the old code only did on focus-in."""
-        if pos != self._blink_pos:
-            self._blink_pos = pos
-            self._restart_blink()
-
-    def _restart_blink(self):
-        """Show the cursor at once and (re)start its blink -- called on every output-
-        cursor placement, so a streaming/moving cursor stays solid and it blinks
-        once output settles. No blink when unfocused, in shot mode, or when the
-        system cursor-flash time is 0 (blinking disabled)."""
-        self._cursor_on = True
-        flash = QApplication.styleHints().cursorFlashTime()
-        if (self.hasFocus() and flash > 0 and not self._shot
-                and not self._solid_cursor):     # solid mode: always-on, never blink
-            self._blink_timer.start(max(1, flash // 2))
-        else:
-            self._blink_timer.stop()
-        self._update_cursor_region()
-
-    def hideEvent(self, event):
-        # A hidden widget (a background tab, or one being closed) must not keep a
-        # blink timer alive: its timeout would repaint a viewport that may be mid-
-        # teardown. showEvent restarts it when the tab is shown again.
-        self._blink_timer.stop()
-        super().hideEvent(event)
-
     def showEvent(self, event):
-        # A re-shown tab must resume blinking even when Qt does NOT redeliver a
-        # focusInEvent (focus never actually left the widget, only the tab was
-        # hidden), which hideEvent's timer stop would otherwise leave dead.
+        # The base (super().showEvent) resumes blinking; here also fire a deferred spawn
+        # for a tab shown without a preceding resizeEvent.
         super().showEvent(event)
-        self._restart_blink()
         if getattr(self, '_spawn_pending', False):
             # Fallback trigger: a tab shown without a preceding resizeEvent (its size did
             # not change from the layout default) still spawns here, at the shown grid. If
             # resizeEvent already fired, _spawn_pending is clear and this is a no-op.
             self._spawn_child(grid=(self._tui_grid_size() if self._tui else self._grid_size()))
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        # Faint dots over whitespace-anomaly cells, BEFORE the caret's shot/blink guards:
-        # unlike the blinking caret, the dots are a rendering feature and must appear in a
-        # deterministic screenshot too. The document holds real spaces, so the dots never
-        # reach copy/transcript.
-        if self.isVisible():
-            self._paint_ws_dots()
-            self._paint_tab_marks()
-        # Our own terminal cursor, drawn over the text. It blinks independent of any
-        # selection (the native caret, which we hid, does not). Suppressed for a
-        # deterministic screenshot (shot mode), on a non-interactive preview surface,
-        # when the widget is not visible (a queued paint into teardown), and while a
-        # TUI program has hidden the cursor (DECTCEM).
-        # Shot mode hides the blinking caret for determinism -- but a SOLID caret is
-        # deterministic (fixed position, always on), so draw it even in a shot.
-        if ((self._shot and not self._solid_cursor) or self._preview
-                or not self._cursor_visible or not self.isVisible()):
-            return
-        if self.hasFocus() and not self._cursor_on:
-            return                          # blink OFF half-cycle (never true in solid mode)
-        painter = QPainter(self.viewport())
-        painter.fillRect(self._cursor_rect(), self._cursor_color())
-        painter.end()
 
     def _ws_dot_runs(self, block):
         """(start, end) document positions of each whitespace-anomaly run in `block`: from the
@@ -7700,92 +7895,7 @@ class SecureTerminal(QPlainTextEdit):
                 if fmt.property(_WS_DOT_PROP):
                     yield base + start, base + start + length
         else:
-            it = block.begin()
-            while not it.atEnd():
-                frag = it.fragment()
-                if frag.isValid() and frag.charFormat().property(_WS_DOT_PROP):
-                    yield frag.position(), frag.position() + frag.length()
-                it += 1
-
-    def _ws_dot_rects(self):
-        """Viewport cell rectangles of every visible whitespace-anomaly cell, one per
-        flagged column. cursorRect maps a document position to the viewport, so this is
-        correct under scroll and soft-wrap alike. Both render paths: the CLI flowing document
-        and the TUI grid (interior-only there, so grid padding is never flagged)."""
-        doc = self.document()
-        cur = QTextCursor(doc)
-        cell_w = max(2, self.fontMetrics().horizontalAdvance(' '))
-        # _gutter_blocks yields only visible blocks, and the QPainter clips to the
-        # viewport, so an off-edge dot needs no explicit bounds check here.
-        for block, _top, _bottom in self._gutter_blocks():
-            for a, b in self._ws_dot_runs(block):
-                for pos in range(a, b):
-                    cur.setPosition(pos)
-                    r = self.cursorRect(cur)
-                    yield QRect(r.x(), r.y(), cell_w, r.height())
-
-    def _paint_ws_dots(self):
-        """Draw a faint centred dot over each whitespace-anomaly cell. Display-only: the
-        cells are real spaces in the document, so the marker never enters copy / transcript
-        / toPlainText -- only the on-screen look changes, in every display mode."""
-        rects = list(self._ws_dot_rects())
-        if not rects:
-            return
-        color = self.palette().color(QPalette.ColorRole.Text)
-        color.setAlpha(90)                        # faint: a hint, not program ink
-        painter = QPainter(self.viewport())
-        painter.setPen(color)
-        painter.setFont(self.font())
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        align = int(Qt.AlignmentFlag.AlignCenter)
-        for rect in rects:
-            painter.drawText(rect, align, _WS_DOT_GLYPH)
-        painter.end()
-
-    def _tab_mark_runs(self, block):
-        """(start,end) doc positions of each tab run in `block` -- the _TAB_MARK_PROP flag on the
-        char format. CLI (line) mode only: the TUI grid has no '\\t' char (pyte expands tabs), so a
-        _GridRow block yields nothing here."""
-        it = block.begin()
-        while not it.atEnd():
-            frag = it.fragment()
-            if frag.isValid() and frag.charFormat().property(_TAB_MARK_PROP):
-                yield frag.position(), frag.position() + frag.length()
-            it += 1
-
-    def _tab_mark_rects(self):
-        """Viewport rect of each visible tab, spanning its RENDERED width -- a tab advances to the
-        next tab stop, so the span is cursorRect(pos)..cursorRect(pos+1), not one cell."""
-        doc = self.document()
-        cur = QTextCursor(doc)
-        fallback = max(2, self.fontMetrics().horizontalAdvance(' '))
-        for block, _top, _bottom in self._gutter_blocks():
-            for a, b in self._tab_mark_runs(block):
-                for pos in range(a, b):
-                    cur.setPosition(pos)
-                    r0 = self.cursorRect(cur)
-                    cur.setPosition(pos + 1)
-                    r1 = self.cursorRect(cur)
-                    w = (r1.x() - r0.x()) if (r1.y() == r0.y() and r1.x() > r0.x()) else fallback
-                    yield QRect(r0.x(), r0.y(), w, r0.height())
-
-    def _paint_tab_marks(self):
-        """Draw a faint arrow guide over each tab, spanning its width. Display-only: the document
-        holds a real '\\t', so the marker never enters copy / transcript / toPlainText -- only the
-        on-screen look changes, in every display mode (CLI line rendering)."""
-        rects = list(self._tab_mark_rects())
-        if not rects:
-            return
-        color = self.palette().color(QPalette.ColorRole.Text)
-        color.setAlpha(90)                        # faint: a hint, not program ink
-        painter = QPainter(self.viewport())
-        painter.setPen(color)
-        painter.setFont(self.font())
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        align = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        for rect in rects:
-            painter.drawText(rect, align, _TAB_MARK_GLYPH)
-        painter.end()
+            yield from self._fragment_prop_runs(block, _WS_DOT_PROP)
 
     def reset_caret(self, keep_view=False):
         """Snap the visible caret back to the output cursor (where typed input
@@ -8115,19 +8225,13 @@ class SecureTerminal(QPlainTextEdit):
         if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
                 and not self._review_active):
             self._write(b'\x1b[I')          # DEC 1004 focus-in report
-        super().focusInEvent(event)         # FIRST, so hasFocus() is true when
-        self._restart_blink()               # _restart_blink gates its timer start on it
+        super().focusInEvent(event)         # base: QPlainTextEdit focus-in, then restart blink
 
     def focusOutEvent(self, event):
         if (_MOUSE_FOCUS_MODE in self._mouse_modes and self._mouse_input_allowed()
                 and not self._review_active):
             self._write(b'\x1b[O')          # DEC 1004 focus-out report
-        # Unfocused: stop blinking and draw the cursor statically (a real terminal
-        # shows a solid/hollow cursor when its window loses focus, never a blank).
-        self._blink_timer.stop()
-        self._cursor_on = True
-        self._update_cursor_region()
-        super().focusOutEvent(event)
+        super().focusOutEvent(event)        # base: stop blink, draw the cursor statically
 
     # -- paste: warn on, then sanitize, anything unusual ----------------------
     def _bracketed_paste_active(self):
