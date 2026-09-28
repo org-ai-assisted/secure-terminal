@@ -1476,6 +1476,10 @@ class SecureTerminal(QPlainTextEdit):
         self._frozen = False
         self._frozen_state = None
         self._frozen_screen = None
+        # Stable copy of the LAST-PAINTED grid frame. A dump taken while a later render is
+        # deferred (an active selection) reads this so its grid rows and its promoted-document
+        # scrollback come from ONE frame -- see _render_tui / _collect_state.
+        self._painted_screen = None
         self._theme = theme if isinstance(theme, str) and theme in THEMES else 'light'
         self.apply_theme(self._theme)
 
@@ -2191,15 +2195,24 @@ class SecureTerminal(QPlainTextEdit):
         self.freeze_changed.emit()
 
     def _snapshot_grid(self):
-        """A lightweight, STABLE copy of the VISIBLE pyte grid at freeze time (a shallow copy of
-        each row -- cells are immutable and replaced on write, never mutated in place -- keeping
-        the defaultdict so a sparse column still yields a default cell). The frozen render reads
-        this, so it holds the frozen frame while the live screen keeps advancing."""
+        """A lightweight, STABLE snapshot of the VISIBLE pyte grid plus the scalar VT state a
+        state dump reads. A shallow copy of each row (cells are immutable and replaced on write,
+        never mutated in place -- keeping the defaultdict so a sparse column still yields a default
+        cell) and copies of the mutable `mode`/`tabstops` sets; every other field is immutable, so a
+        reference is stable. Two readers: the frozen badge render (buffer/lines/columns only) and
+        `_collect_state`, which serves this as the coherent LAST-PAINTED frame for a dump taken
+        while a selection defers the live render. Exposes the same attribute surface
+        state_dump.collect reads off a live pyte Screen, so it is a drop-in for it."""
         screen = self._screen
-        assert screen is not None       # only reached from the freeze path, guarded on a live screen
+        assert screen is not None       # only reached with a live screen (freeze / paint choke points)
+        cur = screen.cursor
         return types.SimpleNamespace(
             lines=screen.lines, columns=screen.columns,
-            buffer={y: copy.copy(screen.buffer[y]) for y in range(screen.lines)})
+            buffer={y: copy.copy(screen.buffer[y]) for y in range(screen.lines)},
+            cursor=types.SimpleNamespace(x=cur.x, y=cur.y, hidden=cur.hidden, attrs=cur.attrs),
+            mode=set(screen.mode), margins=screen.margins, charset=screen.charset,
+            g0_charset=screen.g0_charset, g1_charset=screen.g1_charset,
+            tabstops=set(screen.tabstops), default_char=screen.default_char)
 
     def _repaint_frozen(self):
         """Re-render the FROZEN frame after a setting change while frozen -- and NEVER blank the
@@ -3144,6 +3157,11 @@ class SecureTerminal(QPlainTextEdit):
         self._grid_row_ids = []
         self._grid_row_sig = []
         self._row_sig_cache = {}      # buffer swap (alt enter/leave), seed, resize-rebuild
+        # The document was just cleared with no repaint yet, so the last-painted snapshot no
+        # longer matches it. Invalidate it: if the following _render_tui() is deferred by a held
+        # selection (theme/mode/markings/scrollback-cap/restart all clear then re-render), a dump
+        # falls back to the live grid rather than serving the stale pre-clear frame.
+        self._painted_screen = None
         # The document was just cleared, so a shift-click anchor into the OLD content now points
         # at unrelated text -- drop it, so a Shift+click after a rebuild starts fresh at the click.
         self._shift_click_anchor = None
@@ -3359,6 +3377,11 @@ class SecureTerminal(QPlainTextEdit):
         finally:
             self._programmatic_scroll = False
         self.viewport().update()
+        # Retain a stable copy of the frame just painted. A dump taken while a later render is
+        # deferred (an active selection freezes the rebuild above) pairs THIS grid with the
+        # same-frame promoted document, so _collect_state never stitches newer live-grid rows
+        # onto older scrollback (the two-frame dump this guards against).
+        self._painted_screen = self._snapshot_grid()
 
     def _render_interval(self):
         """Coalesce window for the render/paint debounce: interactive 16ms for the
@@ -6235,12 +6258,29 @@ class SecureTerminal(QPlainTextEdit):
         wrapper-level flags pyte does not model -- the alternate screen and mouse
         reporting -- are added in both modes. Volatile fields (the alt-owner pgrp,
         timers) are deliberately excluded so two idle snapshots are identical. See
-        secure_terminal.state_dump for the format."""
+        secure_terminal.state_dump for the format.
+
+        While a text selection holds the render (see below), TUI reads the LAST-PAINTED grid
+        frame instead of the live pyte model, so the grid rows stay coherent with the
+        (equally deferred) scrollback document and match what is actually on screen -- the
+        on-screen grid is frozen by the same selection guard. This is deliberate; the dump
+        catches up when the selection clears and a render re-arms."""
         # Bind the narrowed screen once: `screen is not None` IS the TUI test, so every
         # attribute read below narrows cleanly (no unguarded self._screen.<attr>).
         screen = self._screen if self._grid_mode() else None
         tui = screen is not None
         alt_active = self._alt_saved is not None
+        # While a text selection is active, _render_tui bails (a rebuild would drag the
+        # selection), so _scrollback_above_grid's document is the LAST-PAINTED frame, not the
+        # live one. Reading the live pyte grid for `rows` would then stitch a newer grid onto
+        # that older scrollback -- an incoherent two-frame dump. Serve the same-frame painted-grid
+        # snapshot so `rows` and `document` are ONE frame. PRIMARY only (alt returns a frozen
+        # primary transcript, already decoupled from the live alt grid) and only once a frame has
+        # been painted (else nothing coherent to pair -- fall back to the live grid).
+        grid = screen
+        if (tui and not alt_active and self._painted_screen is not None
+                and (self._mouse_selecting or self.textCursor().hasSelection())):
+            grid = self._painted_screen
         # A frozen primary is held whenever alt is active, and a TUI->CLI switch leaves it
         # held (apply_tui does not _alt_leave, and _screen is never cleared), so key the
         # saved-primary dims on the LIVE pyte screen, not the grid-mode-gated `screen` --
@@ -6250,9 +6290,9 @@ class SecureTerminal(QPlainTextEdit):
         saved_primary = ((live.columns, live.lines)
                          if alt_active and live is not None else None)
         return state_dump.collect(
-            screen,
+            grid,
             mode='tui' if tui else 'cli',
-            columns=screen.columns if screen is not None else self._cols,
+            columns=grid.columns if grid is not None else self._cols,
             alt_screen=alt_active,
             saved_primary=saved_primary,
             mouse_modes=self._mouse_modes,
