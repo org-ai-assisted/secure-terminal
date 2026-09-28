@@ -219,11 +219,18 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         clipped CONTENT rows into history first, exactly as index() does when output
         scrolls a line off the top; the renderer draws that history ABOVE the live grid
         and trims the grow's trailing blanks (Bug #64), so a shrink+grow round trip is
-        visually lossless. Only the height shrink of a BOTTOM-ANCHORED (shell) frame is
-        preserved; a grow, a width change, and the identical-size fast path defer to
-        pyte. NOT for the alt screen -- the caller gates that."""
+        visually lossless. Only the height shrink of a BOTTOM-ANCHORED (shell) frame with
+        DEFAULT margins is preserved; a grow, a width change, a scroll region, and the
+        identical-size fast path defer to pyte. NOT for the alt screen -- caller gates."""
         old_lines = self.lines
-        if lines < old_lines:
+        # A DECSTBM scroll region (margins set) breaks the "clip from the top" model this
+        # relies on: pyte's resize runs delete_lines at row 0, which a region NOT starting
+        # at row 0 makes a NO-OP (delete_lines is margin-clamped), so the top rows are NOT
+        # dropped -- pushing them would DUPLICATE them into scrollback while the region's
+        # most recent rows vanish (an ncurses/tmux app reserving a top status line, then
+        # resized). Such a program owns a fixed region and repaints on SIGWINCH, so defer
+        # wholesale to pyte when a region is set.
+        if lines < old_lines and self.margins is None:
             drop = old_lines - lines
             # last_content: the last non-blank row (pyte fills unwritten cells with a
             # plain space, so a written non-space is real content). Two uses:
