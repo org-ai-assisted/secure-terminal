@@ -7284,7 +7284,9 @@ def _launch_parser(with_globals):
         p.add_argument('--solid-cursor', dest='solid_cursor', action='store_true',
                        help='draw the text cursor always-on and NON-BLINKING (useful for '
                             'deterministic screenshots -- the blinking caret is otherwise '
-                            'hidden in capture mode); applies to every tab in this process')
+                            'hidden in capture mode); applies to EVERY tab this window '
+                            'process opens for its whole lifetime, including tabs added '
+                            'later by --reuse; not inherited by child processes')
     p.add_argument('--title', help='initial tab title')
     p.add_argument('--tui', action='store_true', default=None,
                    help='start this tab in TUI mode')
