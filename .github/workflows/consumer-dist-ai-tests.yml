@@ -36,3 +36,10 @@ concurrency:
 jobs:
   dist-ai-tests:
     uses: org-ai-assisted/developer-meta-files/.github/workflows/reusable-dist-ai-tests.yml@master
+    ## secure-terminal's --core lane is HEAVY: Z3 formal verification over the full code-point
+    ## space, the 130-terminal widget suites, and the plain + coverage runners each executing the
+    ## whole suite set. The reusable's default 20-minute budget (sized for a fast core lane)
+    ## cancels the job mid-run once the suites actually COMPLETE (rather than failing fast), so
+    ## raise it. Not the shared default -- a per-consumer override for this heavy lane.
+    with:
+      timeout-minutes: 40
