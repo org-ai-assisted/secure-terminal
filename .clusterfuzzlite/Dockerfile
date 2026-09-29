@@ -36,6 +36,15 @@ FROM gcr.io/oss-fuzz-base/base-builder-python@sha256:9dd557a4ba0e0cdfbeabc0bb115
 ## bad_build_check at startup with ModuleNotFoundError.
 RUN pip3 install --no-cache-dir regex
 
+## The base image compiles CPython into /usr/local (no apt python3), so it ships
+## python3 at /usr/local/bin/python3 with NO /usr/bin/python3. Our scripts use the
+## project-standard `#!/usr/bin/python3` shebang and are run DIRECTLY (style R-193:
+## via the shebang, not `python3 <script>`, which drops the shebang's flags), so
+## build.sh's `./seed-hex-to-bin.py` would fail "bad interpreter: /usr/bin/python3".
+## Symlink the absolute path to the image's own python3 (same interpreter PATH already
+## resolves; /usr/local/bin precedes /usr/bin, so this shadows nothing).
+RUN ln -sf "$(command -v python3)" /usr/bin/python3
+
 ## The shared CFLite smoke-run guard lives in org-ai-assisted/dist-ai (the single
 ## source for our cross-repo test/fuzz assets), NOT this package. Clone it at
 ## build time; build.sh sources $SRC/dist-ai/usr/share/clusterfuzzlite-lib/
