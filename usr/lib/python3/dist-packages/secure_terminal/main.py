@@ -1180,13 +1180,15 @@ class SecureTabBar(QTabBar):
         # cap, where _paint_content's middle-elide keeps its ends. When even the floors do
         # not fit, Qt falls back to scroll buttons (idiomatic), not unreadable squeezing.
         hint = self.tabSizeHint(index)
-        f1 = QFont(self.font())
-        f1.setWeight(QFont.Weight.DemiBold)
-        fm = QFontMetrics(f1)
+        # Measure the label in the REGULAR widget font -- the SAME face super().tabSizeHint
+        # measured it in to build `hint`. _paint_content draws the label in DemiBold, but the
+        # size hint's label contribution is regular-font; measuring the excess in DemiBold
+        # (wider) over-counts, so the floor would SHRINK as the label grows -- the opposite of
+        # a fixed "number + _MIN_LABEL_CHARS" floor, re-squeezing long names below readability.
+        fm = QFontMetrics(self.font())
         label = self.tabText(index)
-        # Measure in the SAME face _paint_content draws the label in, so the cap matches
-        # what is actually rendered. Only the label portion is capped; the number prefix and
-        # chrome extents already summed into tabSizeHint stay in the floor.
+        # Only the label portion is capped; the number prefix and chrome extents already summed
+        # into tabSizeHint stay in the floor.
         excess = max(0, fm.horizontalAdvance(label)
                      - fm.horizontalAdvance('x' * self._MIN_LABEL_CHARS))
         hint.setWidth(hint.width() - excess)
@@ -2530,7 +2532,7 @@ class MainWindow(QMainWindow):
         None key). Includes a tab that reverted to a login shell but KEEPS its launch_command (its
         program exited): _ipc_open reuses that tab (relaunch_command) rather than deduping against a
         dead shell or opening a duplicate. The term is the value so _ipc_open can act on it."""
-        by_key = {}
+        by_key: dict = {}
         for term in self._tab_ids:
             if self.tabs.indexOf(term) < 0:
                 continue                    # a stale key not in the bar
@@ -2967,7 +2969,9 @@ class MainWindow(QMainWindow):
         if not isinstance(term, SecureTerminal):
             return
         current = self._user_titles.get(term, '')
-        dlg = _TabEditDialog(self, current or self.tabs.tabText(index),
+        # Prefill the current effective label: the user title, or the cwd basename when none.
+        prefill = current or self.tabs.tabText(index)
+        dlg = _TabEditDialog(self, prefill,
                              self._tab_colors.get(term), self._TAB_COLOR_PRESETS)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2975,10 +2979,14 @@ class MainWindow(QMainWindow):
         # _refresh_tab_label(term) / indexOf() would touch a freed C++ object and crash.
         if not self._tab_is_live(term):
             return
-        # a user name takes precedence over any program-set title, and is
-        # not lost when a program later sets its own title.
-        self._user_titles[term] = sanitize_title(dlg.tab_name().strip())  # ASCII-only
-        self._refresh_tab_label(term)
+        name = dlg.tab_name().strip()
+        # Record a USER title ONLY when the name was actually changed. Accepting the prefilled
+        # cwd default unchanged -- e.g. to set only the colour -- must NOT freeze that basename
+        # into a user title (it would then stop tracking the directory). A user name takes
+        # precedence over a program-set title and survives a later program title.
+        if name != prefill:
+            self._user_titles[term] = sanitize_title(name)   # ASCII-only
+            self._refresh_tab_label(term)
         # colour incl. "No colour" (None -> set_tab_color clears it)
         self.set_tab_color(self.tabs.indexOf(term), dlg.tab_colour())
 
