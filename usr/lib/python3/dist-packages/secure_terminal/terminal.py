@@ -2810,36 +2810,19 @@ class SecureTerminal(_RenderedTextView):
             self._raw = tail_from_escape_boundary(self._raw, self._RAW_MAX)
 
     def _reflow(self):
-        """Debounced width-change re-render so a resize never drops older scrollback.
+        """Debounced width-change re-render for LINE (CLI) mode: replay the retained _raw
+        through _feed_line so a long line re-wraps to the new self._cols (see resizeEvent's
+        line-mode branch).
 
-        GRID mode (non-alt, not frozen): re-wrap the scrollback to the NEW width like a modern
-        reflowing terminal (VTE/konsole/kitty/alacritty) -- pyte never reflows history.top in
-        place, so a plain resize else leaves older scrollback wrapped at the OLD width
-        ("wrapped in the middle" of a widened window). Rebuild from _grid_text (the CURRENT
-        screen's LOGICAL lines: autowrap-joined via row.wrapped), NOT the raw _raw byte stream.
-        Replaying _raw would re-execute the stream at the new width -- re-deriving \\r-overwritten
-        content, resurrecting VT state a prompt-baseline reset already cleared (charset / margins
-        / DECAWM / cursor visibility are NOT written to _raw), and re-running alt enter/leave
-        (repeated exit-snapshots). _grid_text is plain text with charset already resolved into
-        the stored glyphs, so the re-wrap is faithful and side-effect-free. Tradeoff: SGR colour
-        is not carried (a re-render of existing scrollback), matching the keep-screen exit bake.
-        A LIVE alt-screen program owns its fixed canvas and repaints on SIGWINCH, so it is NEVER
-        reflowed (universal alt-screen exclusion); _sync_tui_size already tracked its winsize.
-        CLI mode replays _raw through _feed_line (hard-wrap self._cols). Frozen falls through so
-        _repaint_frozen keeps the paused view."""
-        if (self._grid_mode() and self._screen is not None
-                and not self._alt_screen and not self._frozen):
-            text = self._grid_text()      # CURRENT logical lines (faithful; no escapes)
-            self._sync_wrap_mode()
-            self._make_screen()           # fresh HistoryScreen sized to the new grid; resets view
-            if text:
-                self._seeding = True      # replayed content already happened; do not ring
-                try:
-                    self._feed_stream((text + '\r\n').encode('utf-8', 'replace'))
-                finally:
-                    self._seeding = False
-            self._render_tui()
-            return
+        GRID/TUI mode is deliberately NOT reflowed on resize. A grid tab often runs a live
+        foreground program (claude / tmux / vim -- alt-screen OR a non-alt full-canvas TUI)
+        that owns the screen and repaints on the SIGWINCH from the resized winsize; rebuilding
+        the pyte grid underneath it interleaves the rebuilt frame with the program's ongoing
+        cursor-addressed output and CORRUPTS the buffer (two frames merged, borders bleeding).
+        So a grid resize only re-syncs the winsize (_sync_tui_size); pyte does not reflow
+        history.top, matching a no-reflow terminal (xterm). The row.wrapped flag + _grid_text
+        logical-line join are still used by the keep-screen exit bake (restart_as_shell), which
+        runs only when a -- PROGRAM has EXITED (no live program to corrupt)."""
         self._rerender(full=True)
 
     def _rerender(self, full=False):
@@ -7695,20 +7678,12 @@ class SecureTerminal(_RenderedTextView):
         if self.tui_active() or (self._alt_screen and self._screen is not None):
             # TUI mode, or a full-screen program held in the background while in
             # line mode: keep the pyte screen and the pty at the (scrollbar-
-            # independent) grid, so a later flip to TUI needs no resize.
-            old_cols = self._screen.columns if self._screen is not None else 0
-            self._sync_tui_size()          # resize the live grid + winsize NOW (SIGWINCH)
-            # A width change leaves already-promoted scrollback wrapped at the OLD width
-            # (pyte never reflows history.top), so debounce a reflow that rebuilds from _raw
-            # at the new width. Non-alt only: a live alt program repaints its own canvas
-            # (its winsize is already updated above). Guarded on the timer, which a resize
-            # during construction can precede.
-            new_cols = self._screen.columns if self._screen is not None else 0
-            # Reflow only when there is RETAINED output to re-wrap (_raw): a fresh/empty grid
-            # has nothing to reflow, and re-seeding would needlessly clear the live frame.
-            if (old_cols and new_cols != old_cols and not self._alt_screen
-                    and self._raw and getattr(self, '_reflow_timer', None)):
-                self._reflow_timer.start(self._zoom_debounce_ms)
+            # independent) grid, so a later flip to TUI needs no resize. The running
+            # program repaints on the SIGWINCH from the new winsize. Do NOT rebuild the
+            # grid here: a re-seed under a live foreground program (claude/tmux -- a
+            # NON-alt TUI that still owns the canvas) interleaves the rebuilt frame with
+            # the program's ongoing cursor-addressed output and corrupts the buffer.
+            self._sync_tui_size()
         else:
             # Plain line mode still needs the pty's winsize kept in step with the
             # widget: the shell reads COLUMNS from it, and zsh pads its prompt
