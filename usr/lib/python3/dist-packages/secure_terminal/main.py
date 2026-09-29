@@ -418,6 +418,77 @@ class _ZoomDialog(QDialog):
             super().wheelEvent(event)
 
 
+class _TabEditDialog(QDialog):
+    """Combined tab RENAME + tab-COLOUR picker (double-click a tab, or context 'Rename...').
+
+    Holds a PENDING colour selection (a QColor, or None for 'No colour') so Cancel reverts
+    it; the caller reads tab_name()/tab_colour() after exec() and applies them through the
+    window's own setters (which re-resolve the live tab). The dialog captures NO terminal,
+    so its custom-colour picker needs no post-modal liveness guard."""
+
+    def __init__(self, parent, name, current_color, presets):
+        super().__init__(parent)
+        self.setWindowTitle('Edit Tab')
+        # None == 'no colour'; an invalid/empty spec folds to None (matches set_tab_color).
+        c = QColor(current_color) if current_color else QColor()
+        self._selected = c if c.isValid() else None
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel('Tab name:'))
+        self._name = QLineEdit(name)
+        self._name.selectAll()
+        lay.addWidget(self._name)
+        lay.addWidget(QLabel('Colour:'))
+        row = QHBoxLayout()
+        for cname, value in presets:
+            b = QPushButton(cname)
+            b.clicked.connect(lambda _checked=False, v=value: self._set(QColor(v)))
+            row.addWidget(b)
+        custom = QPushButton('Custom...')
+        custom.clicked.connect(self._pick_custom)
+        row.addWidget(custom)
+        clear = QPushButton('No colour')
+        clear.clicked.connect(lambda _checked=False: self._set(None))
+        row.addWidget(clear)
+        # a live swatch of the pending selection, so the choice is visible before OK
+        self._swatch = QFrame()
+        self._swatch.setFixedSize(22, 22)
+        self._swatch.setFrameShape(QFrame.Shape.Box)
+        row.addWidget(self._swatch)
+        lay.addLayout(row)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        ok = QPushButton('OK')
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton('Cancel')
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        lay.addLayout(buttons)
+        self._update_swatch()
+
+    def _set(self, color):
+        self._selected = color if (color is not None and color.isValid()) else None
+        self._update_swatch()
+
+    def _pick_custom(self):
+        # QColorDialog returns an INVALID QColor on Cancel; only a real pick changes the
+        # pending selection (Cancel is a no-op), mirroring _pick_custom_tab_color.
+        color = QColorDialog.getColor(parent=self)
+        if color.isValid():
+            self._set(color)
+
+    def _update_swatch(self):
+        self._swatch.setStyleSheet(
+            'background:%s;' % self._selected.name() if self._selected else '')
+
+    def tab_name(self):
+        return self._name.text()
+
+    def tab_colour(self):
+        return self._selected
+
+
 _QWIDGETSIZE_MAX = (1 << 24) - 1   # Qt's QWIDGETSIZE_MAX (no-maximum sentinel; PyQt does not export it)
 
 # Tooltip card colours (background, foreground, border) by theme. Single source shared by
@@ -908,6 +979,7 @@ class SecureTabBar(QTabBar):
     _LINE2_H = 19            # reserved height of the untrusted band (fits the larger title)
     _PULSE_TICKS = 6         # bounded pulse frames (~3 on/off cycles)
     _PULSE_MS = 90           # per-frame interval
+    _MIN_LABEL_CHARS = 16    # floor: never squeeze a tab below number + this many label chars
 
     # theme -> (muted_fg, band_bg, band_line, caution, bell); light first.
     _THEME = {
@@ -1097,6 +1169,28 @@ class SecureTabBar(QTabBar):
         if self._two_line:
             sz.setHeight(sz.height() + self._LINE2_H)
         return sz
+
+    def minimumTabSizeHint(self, index):
+        # The floor Qt will not shrink a tab below when elideMode squeezes N tabs to fit.
+        # Default Qt returns a tiny min, so a crowded bar squeezed every tab far below its
+        # natural width and _paint_content middle-elided even a short label ("1  dev725" ->
+        # "1..25"). Cap the floor at the tab number + _MIN_LABEL_CHARS of label: a SHORT
+        # label's natural width is below the cap, so its floor IS its natural width and Qt
+        # never squeezes it (it always shows in full); a LONG label may still shrink to the
+        # cap, where _paint_content's middle-elide keeps its ends. When even the floors do
+        # not fit, Qt falls back to scroll buttons (idiomatic), not unreadable squeezing.
+        hint = self.tabSizeHint(index)
+        f1 = QFont(self.font())
+        f1.setWeight(QFont.Weight.DemiBold)
+        fm = QFontMetrics(f1)
+        label = self.tabText(index)
+        # Measure in the SAME face _paint_content draws the label in, so the cap matches
+        # what is actually rendered. Only the label portion is capped; the number prefix and
+        # chrome extents already summed into tabSizeHint stay in the floor.
+        excess = max(0, fm.horizontalAdvance(label)
+                     - fm.horizontalAdvance('x' * self._MIN_LABEL_CHARS))
+        hint.setWidth(hint.width() - excess)
+        return hint
 
     def tabLayoutChange(self):
         # Qt centres the close button in the FULL (two-line) tab height, dropping it onto
@@ -2855,7 +2949,13 @@ class MainWindow(QMainWindow):
         enters C++, so it is safe to call even on an already-deleted term."""
         return any(self.tabs.widget(i) is term for i in range(self.tabs.count()))
 
+    # 5 quick tab colours, single-sourced by the double-click dialog AND the context menu.
+    _TAB_COLOR_PRESETS = (('Red', '#d83933'), ('Green', '#1f8a54'),
+                          ('Blue', '#3b82f6'), ('Yellow', '#e5a50a'),
+                          ('Purple', '#8b5cf6'))
+
     def rename_tab(self, index):
+        # Double-click a tab (or context 'Rename...'): a combined RENAME + tab-COLOUR dialog.
         if index < 0:
             return
         term = self.tabs.widget(index)
@@ -2867,16 +2967,20 @@ class MainWindow(QMainWindow):
         if not isinstance(term, SecureTerminal):
             return
         current = self._user_titles.get(term, '')
-        name, ok = QInputDialog.getText(
-            self, 'Rename Tab', 'Tab name:',
-            text=current or self.tabs.tabText(index))
+        dlg = _TabEditDialog(self, current or self.tabs.tabText(index),
+                             self._tab_colors.get(term), self._TAB_COLOR_PRESETS)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
         # The tab's shell may have exited during the modal, deleting term; a stale
-        # _refresh_tab_label(term) would indexOf() a freed C++ object and crash.
-        if ok and self._tab_is_live(term):
-            # a user name takes precedence over any program-set title, and is
-            # not lost when a program later sets its own title.
-            self._user_titles[term] = sanitize_title(name.strip())   # ASCII-only, like every title
-            self._refresh_tab_label(term)
+        # _refresh_tab_label(term) / indexOf() would touch a freed C++ object and crash.
+        if not self._tab_is_live(term):
+            return
+        # a user name takes precedence over any program-set title, and is
+        # not lost when a program later sets its own title.
+        self._user_titles[term] = sanitize_title(dlg.tab_name().strip())  # ASCII-only
+        self._refresh_tab_label(term)
+        # colour incl. "No colour" (None -> set_tab_color clears it)
+        self.set_tab_color(self.tabs.indexOf(term), dlg.tab_colour())
 
     def _default_transcript_path(self, term):
         """This TAB's on-save transcript file path (the state dir is the one place
@@ -3223,9 +3327,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction('Rename...', lambda: self.rename_tab(self._tab_index(term)))
         color_menu = menu.addMenu('Colour')
-        for name, value in (('Red', '#d83933'), ('Green', '#1f8a54'),
-                            ('Blue', '#3b82f6'), ('Yellow', '#e5a50a'),
-                            ('Purple', '#8b5cf6')):
+        for name, value in self._TAB_COLOR_PRESETS:
             color_menu.addAction(
                 name, lambda v=value: self.set_tab_color(self._tab_index(term), QColor(v)))
         color_menu.addAction(
