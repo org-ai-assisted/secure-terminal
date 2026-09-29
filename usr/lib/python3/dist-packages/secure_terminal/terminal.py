@@ -208,6 +208,17 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         # report: https://github.com/org-ai-assisted/pyte-audit/blob/master/reports/bug-H-linefeed-pending-wrap.md
         if self.cursor.x == self.columns:
             self.cursor.x -= 1
+        # Soft-wrap continuation flag. draw() sets _autowrapping while it runs, and draw() only
+        # ever receives PRINTABLE text (the Stream dispatches control chars separately), so a
+        # linefeed reached from there is an AUTOWRAP: the row being LEFT continues onto the next.
+        # Flag it BEFORE super().linefeed() (which may scroll it into history.top), so the flag
+        # rides the row OBJECT through the scroll -- a retroactive index range would miss a
+        # row that scrolled off mid-batch. _grid_text rejoins flagged rows into one logical line
+        # so a later reflow / CLI replay re-wraps at the current width, not the write-time wrap.
+        if getattr(self, '_autowrapping', False):
+            _wrapped_row = self.buffer.get(self.cursor.y)
+            if _wrapped_row is not None:
+                _wrapped_row.wrapped = True
         super().linefeed()
 
     def resize_preserving_scrollback(self, lines, columns):
@@ -258,6 +269,22 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         _row = self.buffer.get(self.cursor.y)
         if _row is not None and getattr(_row, 'no_newline', False):
             _row.no_newline = False
+        # draw() only ever receives PRINTABLE text (the Stream dispatches control chars
+        # separately), so every linefeed pyte fires while _autowrapping is set is an AUTOWRAP
+        # -- linefeed() flags the wrapped row, scroll-safe by OBJECT (see linefeed()). Marking
+        # here by a post-draw index range would miss a row that scrolled off mid-batch.
+        self._autowrapping = True
+        try:
+            self._draw(data)
+        finally:
+            self._autowrapping = False
+            # NB: do NOT clear the resting row's `wrapped` here. A cursor-addressed overwrite of
+            # a row that is STILL a wrap continuation (its next row belongs to the same logical
+            # line) leaves the flag correctly set; clearing it would split the line on reflow.
+            # A row that genuinely stops being a continuation is cleared where that happens --
+            # erase_in_line / erase_in_display (a blanked row) -- not here.
+
+    def _draw(self, data):
         # Bound a Zalgo flood. pyte merges each zero-width combining mark into
         # the cell before the cursor via unicodedata.normalize("NFC",
         # cell.data + mark) -- O(len) per mark -- so a base plus thousands of
@@ -273,22 +300,7 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         # rest of the chunk unmarked -- the per-char loop below instead marks the
         # C0 (via _merge_invisible/_mark_own_cell) and keeps going.
         if data.isascii() and data.isprintable():
-            # This batch has NO newline (isprintable() excludes control chars), so any row the
-            # cursor CROSSES here was left by AUTOWRAP -- flag it a soft-wrap continuation, so
-            # _grid_text can rejoin the logical line (a later reflow / CLI replay then re-wraps
-            # it at the current width instead of freezing the write-time wrap). The resting row
-            # is cleared: it ends partial (a later wrap re-flags it), which ALSO drops a stale
-            # flag when a cursor-addressed rewrite shortens a previously-wrapped row.
-            _y0 = self.cursor.y
             super().draw(data)
-            if pyte.modes.DECAWM in self.mode:
-                for _y in range(_y0, self.cursor.y):
-                    _r = self.buffer.get(_y)
-                    if _r is not None:
-                        _r.wrapped = True
-            _rest = self.buffer.get(self.cursor.y)
-            if _rest is not None:
-                _rest.wrapped = False
             return
         for ch in data:
             combining = ord(ch) >= 0x0300 and unicodedata.combining(ch)
@@ -331,19 +343,7 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                 # printable (wcwidth >= 1) char.
                 self._merge_combining(target, ch)
                 continue
-            # autowrap continuation flag (see the fast path): a printable char drawn while the
-            # cursor sits past the last column wraps the current row onto the next.
-            if self.cursor.x == self.columns and pyte.modes.DECAWM in self.mode:
-                _wr = self.buffer.get(self.cursor.y)
-                if _wr is not None:
-                    _wr.wrapped = True
             super().draw(ch)
-        # The resting row ends partial (never the row just wrapped), so clear a stale flag --
-        # a cursor-addressed rewrite that shortens a previously-wrapped row must not keep a
-        # wrong continuation that _grid_text would then mis-join.
-        _rest = self.buffer.get(self.cursor.y)
-        if _rest is not None:
-            _rest.wrapped = False
 
     def _mark_own_cell(self, ch):
         """Mark a zero-width character in the cell AT the cursor. Reached whenever the
@@ -423,6 +423,11 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         row = self.buffer.get(self.cursor.y)
         if row is not None and getattr(row, 'no_newline', False):
             row.no_newline = False
+        # An erase that blanks the END of the line (how 0 = cursor->end, 2 = whole line) ends
+        # any soft-wrap continuation: the row no longer flows into the next, so drop its wrapped
+        # flag -- else _grid_text would glue the blanked row onto the following logical line.
+        if how in (0, 2) and row is not None and getattr(row, 'wrapped', False):
+            row.wrapped = False
         # Forward ONLY `how`, like the sibling erase_in_display: stock pyte's
         # erase_in_line(self, how=0, private=False) has just two slots, so
         # forwarding the captured *args (a multi-param CSI, ESC[1;2;3K -> how=1,
@@ -455,8 +460,14 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             ys = range(self.cursor.y, self.lines)
         for y in ys:
             row = self.buffer.get(y)
-            if row is not None and getattr(row, 'no_newline', False):
+            if row is None:
+                continue
+            if getattr(row, 'no_newline', False):
                 row.no_newline = False
+            # A blanked row is no longer a soft-wrap continuation (see erase_in_line); drop the
+            # flag so _grid_text does not glue the cleared region onto the next logical line.
+            if getattr(row, 'wrapped', False):
+                row.wrapped = False
         super().erase_in_display(how)
 
     def _scroll_margins(self):
@@ -2801,21 +2812,32 @@ class SecureTerminal(_RenderedTextView):
     def _reflow(self):
         """Debounced width-change re-render so a resize never drops older scrollback.
 
-        GRID mode (non-alt, not frozen): rebuild the pyte screen from the retained _raw at
-        the NEW width, so scrollback RE-WRAPS to the window like a modern reflowing terminal
-        (VTE/konsole/kitty/alacritty), reusing the same _make_screen + _seed_grid engine as
-        the CLI->TUI seed -- pyte never reflows history.top in place, so a plain resize else
-        leaves older scrollback wrapped at the OLD width ("wrapped in the middle" of a
-        widened window). A LIVE alt-screen program owns its fixed canvas and repaints on
-        SIGWINCH, so it is NEVER reflowed from _raw (universal alt-screen exclusion);
-        _sync_tui_size already tracked its winsize. CLI mode replays _raw through _feed_line,
-        whose hard-wrap is self._cols. Frozen falls through so _repaint_frozen keeps the
-        paused view."""
+        GRID mode (non-alt, not frozen): re-wrap the scrollback to the NEW width like a modern
+        reflowing terminal (VTE/konsole/kitty/alacritty) -- pyte never reflows history.top in
+        place, so a plain resize else leaves older scrollback wrapped at the OLD width
+        ("wrapped in the middle" of a widened window). Rebuild from _grid_text (the CURRENT
+        screen's LOGICAL lines: autowrap-joined via row.wrapped), NOT the raw _raw byte stream.
+        Replaying _raw would re-execute the stream at the new width -- re-deriving \\r-overwritten
+        content, resurrecting VT state a prompt-baseline reset already cleared (charset / margins
+        / DECAWM / cursor visibility are NOT written to _raw), and re-running alt enter/leave
+        (repeated exit-snapshots). _grid_text is plain text with charset already resolved into
+        the stored glyphs, so the re-wrap is faithful and side-effect-free. Tradeoff: SGR colour
+        is not carried (a re-render of existing scrollback), matching the keep-screen exit bake.
+        A LIVE alt-screen program owns its fixed canvas and repaints on SIGWINCH, so it is NEVER
+        reflowed (universal alt-screen exclusion); _sync_tui_size already tracked its winsize.
+        CLI mode replays _raw through _feed_line (hard-wrap self._cols). Frozen falls through so
+        _repaint_frozen keeps the paused view."""
         if (self._grid_mode() and self._screen is not None
                 and not self._alt_screen and not self._frozen):
+            text = self._grid_text()      # CURRENT logical lines (faithful; no escapes)
             self._sync_wrap_mode()
-            self._make_screen()      # fresh HistoryScreen sized to the new grid; resets view
-            self._seed_grid()        # replay _raw -> scrollback re-wrapped + current frame
+            self._make_screen()           # fresh HistoryScreen sized to the new grid; resets view
+            if text:
+                self._seeding = True      # replayed content already happened; do not ring
+                try:
+                    self._feed_stream((text + '\r\n').encode('utf-8', 'replace'))
+                finally:
+                    self._seeding = False
             self._render_tui()
             return
         self._rerender(full=True)
@@ -6045,11 +6067,16 @@ class SecureTerminal(_RenderedTextView):
         lines = []
         buf = ''
         for row, width in rows:
-            seg = ''.join(row[x].data for x in range(width))
             if getattr(row, 'wrapped', False):
-                buf += seg                      # autowrap: the logical line continues, no break
+                # A wrapped row is full to its WRITTEN extent; read only that. scr.columns can be
+                # WIDER than the row after a widen (pyte does not backfill new columns), so
+                # reading to `width` would inject trailing spaces into the MIDDLE of the joined
+                # logical line.
+                extent = max(row.keys(), default=-1) + 1
+                buf += ''.join(row[x].data for x in range(extent))   # continues, no break
             else:
-                lines.append((buf + seg).rstrip())   # explicit line end
+                seg = ''.join(row[x].data for x in range(width))
+                lines.append((buf + seg).rstrip())                   # explicit line end
                 buf = ''
         if buf:                                 # a trailing still-wrapped row with no hard end
             lines.append(buf.rstrip())
