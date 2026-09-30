@@ -371,15 +371,6 @@ class RevealedEditor(_RenderedTextView):
                 i -= 1
             self._replace(text[:i] + text[self._pos:], i)
 
-    def _line_bounds(self):
-        """(start, end) source indices of the line the caret is on (end excludes the
-        trailing '\n')."""
-        start = self._text.rfind('\n', 0, self._pos) + 1
-        end = self._text.find('\n', self._pos)
-        if end == -1:
-            end = len(self._text)
-        return start, end
-
     def keyPressEvent(self, event):
         key = event.key()
         mods = event.modifiers()
@@ -433,15 +424,16 @@ class RevealedEditor(_RenderedTextView):
             self._render()
             return
         if key in (Qt.Key.Key_Home,):
-            self._pos = self._line_bounds()[0]
-            self._render()
+            self._move_line_edge(forward=False)
             return
         if key in (Qt.Key.Key_End,):
-            self._pos = self._line_bounds()[1]
-            self._render()
+            self._move_line_edge(forward=True)
             return
-        if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-            self._move_vertical(-1 if key == Qt.Key.Key_Up else 1)
+        if key in (Qt.Key.Key_Up,):
+            self._move_vertical(down=False)
+            return
+        if key in (Qt.Key.Key_Down,):
+            self._move_vertical(down=True)
             return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._insert('\n')
@@ -464,27 +456,60 @@ class RevealedEditor(_RenderedTextView):
             self._insert(self._display_clean(commit))
         event.accept()
 
-    def _move_vertical(self, direction):
-        """Move the caret one line up/down, keeping the source-character column
-        offset within the line (clamped to the target line's length)."""
-        start, _end = self._line_bounds()
-        col = self._pos - start
-        if direction < 0:
-            if start == 0:
-                self._pos = 0
-            else:
-                prev_start = self._text.rfind('\n', 0, start - 1) + 1
-                self._pos = min(prev_start + col, start - 1)
-        else:
-            nl = self._text.find('\n', self._pos)
-            if nl == -1:
-                self._pos = len(self._text)
-            else:
-                next_start = nl + 1
-                next_end = self._text.find('\n', next_start)
-                if next_end == -1:
-                    next_end = len(self._text)
-                self._pos = min(next_start + col, next_end)
+    def _index_row_y(self, index):
+        """The viewport y of source `index`'s caret in the rendered layout -- the seam
+        that lets vertical motion tell one VISUAL row from another (an atomic badge that
+        wraps spans several rows at one source index)."""
+        tc = self.textCursor()
+        tc.setPosition(min(self._offset(index), self.document().characterCount() - 1))
+        return self.cursorRect(tc).center().y()
+
+    def _move_line_edge(self, forward):
+        """Home/End: to the current VISUAL row's edge (soft-wrap aware in detail/reveal,
+        the logical line in box/show). Reads the row edge off the layout, then snaps to a
+        source-cell boundary ON that row -- Home ceils FORWARD so a row that starts inside a
+        wrapped badge lands on its own first editable boundary, not the badge's start on the
+        row above; End takes the nearest boundary to the row end. self._text is untouched."""
+        tc = self.textCursor()
+        tc.setPosition(self._caret_doc_pos())
+        tc.movePosition(QTextCursor.MoveOperation.EndOfLine if forward
+                        else QTextCursor.MoveOperation.StartOfLine)
+        doc_pos = tc.position()
+        self._pos = (self._source_index_for_doc_pos(doc_pos) if forward
+                     else self._ceil_index(doc_pos))
+        self._render()
+
+    def _move_vertical(self, down):
+        """Up/Down by one VISUAL row. Uses Qt's OWN cursor movement (movePosition), which
+        is correct for a soft-wrapped layout and, unlike a viewport-x mapping, is invariant
+        to horizontal scroll and to a goal column past a short row's end; it reads the target
+        off the rendered layout -- never mutating it -- then maps it back through the doc-pos
+        -> source seam mousePressEvent uses, so self._text stays the sole authority.
+
+        A wide badge (a revealed invisible in detail mode) can wrap across several visual rows
+        at ONE source index, so a single step can land back on -- or inside -- it; keep
+        stepping until a DIFFERENT cell on a row genuinely past the start is reached, so the
+        caret cannot stall on a multi-row badge. Running off the first/last visual row falls to
+        the document start/end.
+
+        Column is taken fresh from the caret each press (Qt carries it within this one move);
+        a persistent goal column across a RUN of presses is deliberately not kept -- the box is
+        a short atomic-token review surface, not a general editor, and a scroll- and
+        wrap-correct goal column would need QTextLayout x-mapping out of proportion to it."""
+        op = (QTextCursor.MoveOperation.Down if down
+              else QTextCursor.MoveOperation.Up)
+        tc = self.textCursor()
+        tc.setPosition(self._caret_doc_pos())
+        start_y = self.cursorRect(tc).center().y()
+        result = None
+        while tc.movePosition(op):
+            idx = self._source_index_for_doc_pos(tc.position())
+            if idx != self._pos and (self._index_row_y(idx) > start_y if down
+                                     else self._index_row_y(idx) < start_y):
+                result = idx
+                break
+        self._pos = len(self._text) if (result is None and down) else (
+            0 if result is None else result)
         self._render()
 
     def insertFromMimeData(self, source):
@@ -513,12 +538,12 @@ class RevealedEditor(_RenderedTextView):
         self._pos = self._source_index_for_doc_pos(doc_pos)
         self._render()
 
-    def _source_index_for_doc_pos(self, doc_pos):
-        """The source index whose caret document offset is nearest `doc_pos`. _offset
-        is monotonic in the index, so bisect for the crossing point and pick the
-        nearer of the two neighbours -- O(log n) offset builds instead of a full
-        scan, and it reuses the one offset function, so a click lands exactly where
-        the caret would draw for that index."""
+    def _ceil_index(self, doc_pos):
+        """The FIRST source index whose caret document offset is >= `doc_pos`. _offset is
+        monotonic in the index, so bisect for the crossing point -- O(log n) offset builds.
+        Used directly by Home (the first editable boundary at/after a visual row's start,
+        so a row that begins mid-badge snaps FORWARD onto its own row, not back onto the
+        badge's start on the previous row) and as the seam for the nearest-index snap."""
         lo, hi = 0, len(self._text)
         while lo < hi:
             mid = (lo + hi) // 2
@@ -526,7 +551,13 @@ class RevealedEditor(_RenderedTextView):
                 lo = mid + 1
             else:
                 hi = mid
-        # lo is the first index whose offset >= doc_pos; compare it with lo-1.
+        return lo
+
+    def _source_index_for_doc_pos(self, doc_pos):
+        """The source index whose caret document offset is NEAREST `doc_pos`: the ceil
+        crossing point or its lower neighbour, whichever is closer -- so a click lands
+        exactly where the caret would draw for that index."""
+        lo = self._ceil_index(doc_pos)
         if lo > 0 and abs(self._offset(lo - 1) - doc_pos) <= abs(self._offset(lo) - doc_pos):
             return lo - 1
         return lo
