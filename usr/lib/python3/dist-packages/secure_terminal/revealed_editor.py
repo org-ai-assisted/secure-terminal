@@ -464,13 +464,27 @@ class RevealedEditor(_RenderedTextView):
         and the logical lines in box/show alike. Reads the target off the rendered
         document's layout (never mutating it), then maps it back through the same
         doc-pos -> source seam mousePressEvent uses, so self._text stays the sole
-        authority. `edge` (Start/End of document) is the boundary fallback for Up/Down
-        at the first/last visual row; Home/End pass none (a row edge always resolves)."""
+        authority.
+
+        A non-None `edge` (Start/End of document) marks a VERTICAL move (Up/Down):
+        one wide badge (a revealed invisible in detail mode) can wrap across several
+        visual rows, so a single step can land back inside the SAME source cell --
+        keep stepping the same way until the source index actually changes, so a
+        multi-row badge cannot trap the caret, and fall to the document edge once the
+        first/last visual row is reached. Home/End pass no edge: a row edge always
+        resolves and landing on the caret's own cell is correct."""
         tc = self.textCursor()
         tc.setPosition(self._caret_doc_pos())
-        if not tc.movePosition(op) and edge is not None:
-            tc.movePosition(edge)
-        self._pos = self._source_index_for_doc_pos(tc.position())
+        moved = tc.movePosition(op)
+        new_pos = self._source_index_for_doc_pos(tc.position())
+        if edge is not None:
+            while moved and new_pos == self._pos:
+                moved = tc.movePosition(op)
+                new_pos = self._source_index_for_doc_pos(tc.position())
+            if not moved:
+                tc.movePosition(edge)
+                new_pos = self._source_index_for_doc_pos(tc.position())
+        self._pos = new_pos
         self._render()
 
     def insertFromMimeData(self, source):
