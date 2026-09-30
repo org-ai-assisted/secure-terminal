@@ -371,15 +371,6 @@ class RevealedEditor(_RenderedTextView):
                 i -= 1
             self._replace(text[:i] + text[self._pos:], i)
 
-    def _line_bounds(self):
-        """(start, end) source indices of the line the caret is on (end excludes the
-        trailing '\n')."""
-        start = self._text.rfind('\n', 0, self._pos) + 1
-        end = self._text.find('\n', self._pos)
-        if end == -1:
-            end = len(self._text)
-        return start, end
-
     def keyPressEvent(self, event):
         key = event.key()
         mods = event.modifiers()
@@ -433,15 +424,18 @@ class RevealedEditor(_RenderedTextView):
             self._render()
             return
         if key in (Qt.Key.Key_Home,):
-            self._pos = self._line_bounds()[0]
-            self._render()
+            self._visual_nav(QTextCursor.MoveOperation.StartOfLine)
             return
         if key in (Qt.Key.Key_End,):
-            self._pos = self._line_bounds()[1]
-            self._render()
+            self._visual_nav(QTextCursor.MoveOperation.EndOfLine)
             return
-        if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-            self._move_vertical(-1 if key == Qt.Key.Key_Up else 1)
+        if key in (Qt.Key.Key_Up,):
+            self._visual_nav(QTextCursor.MoveOperation.Up,
+                             QTextCursor.MoveOperation.Start)
+            return
+        if key in (Qt.Key.Key_Down,):
+            self._visual_nav(QTextCursor.MoveOperation.Down,
+                             QTextCursor.MoveOperation.End)
             return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._insert('\n')
@@ -464,27 +458,19 @@ class RevealedEditor(_RenderedTextView):
             self._insert(self._display_clean(commit))
         event.accept()
 
-    def _move_vertical(self, direction):
-        """Move the caret one line up/down, keeping the source-character column
-        offset within the line (clamped to the target line's length)."""
-        start, _end = self._line_bounds()
-        col = self._pos - start
-        if direction < 0:
-            if start == 0:
-                self._pos = 0
-            else:
-                prev_start = self._text.rfind('\n', 0, start - 1) + 1
-                self._pos = min(prev_start + col, start - 1)
-        else:
-            nl = self._text.find('\n', self._pos)
-            if nl == -1:
-                self._pos = len(self._text)
-            else:
-                next_start = nl + 1
-                next_end = self._text.find('\n', next_start)
-                if next_end == -1:
-                    next_end = len(self._text)
-                self._pos = min(next_start + col, next_end)
+    def _visual_nav(self, op, edge=None):
+        """Move the caret by one VISUAL row (Up/Down) or to a VISUAL row edge
+        (Home/End), following the soft-wrapped rows the user sees in detail/reveal
+        and the logical lines in box/show alike. Reads the target off the rendered
+        document's layout (never mutating it), then maps it back through the same
+        doc-pos -> source seam mousePressEvent uses, so self._text stays the sole
+        authority. `edge` (Start/End of document) is the boundary fallback for Up/Down
+        at the first/last visual row; Home/End pass none (a row edge always resolves)."""
+        tc = self.textCursor()
+        tc.setPosition(self._caret_doc_pos())
+        if not tc.movePosition(op) and edge is not None:
+            tc.movePosition(edge)
+        self._pos = self._source_index_for_doc_pos(tc.position())
         self._render()
 
     def insertFromMimeData(self, source):
