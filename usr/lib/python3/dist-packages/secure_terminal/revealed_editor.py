@@ -31,7 +31,7 @@ invisibles are dropped for display; the '\n'->'\r' shell-submit mapping and the
 defensive re-drop happen only on DELIVER, in review.py.
 """
 
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QTextCursor, QGuiApplication
 
 from secure_terminal.sanitize import (
@@ -75,11 +75,6 @@ class RevealedEditor(_RenderedTextView):
         self._setup_rendered_view()
         self._text = ''
         self._pos = 0
-        # Remembered viewport x for a RUN of Up/Down, so vertical motion keeps its column
-        # across short rows (Down onto a shorter row then Up returns to the start column),
-        # like a native editor. Set on the first vertical step, carried by _move_vertical,
-        # and cleared by _render() on EVERY other caret change (Left/Right/Home/End/edit/click).
-        self._goal_x = None
         self._mode = 'detail'
         self._markings = True
         self._theme = 'light'
@@ -251,9 +246,6 @@ class RevealedEditor(_RenderedTextView):
         # leaves the caret invisible for up to cursorFlashTime()/2 -- a regression from the
         # native caret this widget used before it shared the terminal's painted caret.
         self._restart_blink()
-        # Any render is a caret change; drop the vertical goal column. _move_vertical is the
-        # one path that re-establishes it (after this call) so a Up/Down RUN keeps its column.
-        self._goal_x = None
 
     def _offset(self, index):
         """The document offset of source `index`: the display width up to the START of
@@ -488,29 +480,30 @@ class RevealedEditor(_RenderedTextView):
         self._render()
 
     def _move_vertical(self, down):
-        """Up/Down by one VISUAL row, keeping the goal column (self._goal_x) across a run.
-        Reads the target off the rendered layout -- never mutating it -- then maps it back
-        through the doc-pos -> source seam mousePressEvent uses, so self._text stays the sole
-        authority.
+        """Up/Down by one VISUAL row. Uses Qt's OWN cursor movement (movePosition), which
+        is correct for a soft-wrapped layout and, unlike a viewport-x mapping, is invariant
+        to horizontal scroll and to a goal column past a short row's end; it reads the target
+        off the rendered layout -- never mutating it -- then maps it back through the doc-pos
+        -> source seam mousePressEvent uses, so self._text stays the sole authority.
 
-        Steps one visual row at a time and, at each, takes the boundary nearest the goal
-        column via cursorForPosition; a wide badge (a revealed invisible in detail mode) can
-        wrap across several rows at ONE source index, so a step is accepted only once it
-        reaches a DIFFERENT cell on a row genuinely past the start (else the caret could
-        stall on, or inside, the badge). Running off the first/last visual row falls to the
-        document start/end."""
+        A wide badge (a revealed invisible in detail mode) can wrap across several visual rows
+        at ONE source index, so a single step can land back on -- or inside -- it; keep
+        stepping until a DIFFERENT cell on a row genuinely past the start is reached, so the
+        caret cannot stall on a multi-row badge. Running off the first/last visual row falls to
+        the document start/end.
+
+        Column is taken fresh from the caret each press (Qt carries it within this one move);
+        a persistent goal column across a RUN of presses is deliberately not kept -- the box is
+        a short atomic-token review surface, not a general editor, and a scroll- and
+        wrap-correct goal column would need QTextLayout x-mapping out of proportion to it."""
         op = (QTextCursor.MoveOperation.Down if down
               else QTextCursor.MoveOperation.Up)
         tc = self.textCursor()
         tc.setPosition(self._caret_doc_pos())
-        start_rect = self.cursorRect(tc)
-        goal_x = start_rect.center().x() if self._goal_x is None else self._goal_x
-        start_y = start_rect.center().y()
+        start_y = self.cursorRect(tc).center().y()
         result = None
         while tc.movePosition(op):
-            row_y = self.cursorRect(tc).center().y()
-            cand = self.cursorForPosition(QPoint(int(goal_x), int(row_y)))
-            idx = self._source_index_for_doc_pos(cand.position())
+            idx = self._source_index_for_doc_pos(tc.position())
             if idx != self._pos and (self._index_row_y(idx) > start_y if down
                                      else self._index_row_y(idx) < start_y):
                 result = idx
@@ -518,7 +511,6 @@ class RevealedEditor(_RenderedTextView):
         self._pos = len(self._text) if (result is None and down) else (
             0 if result is None else result)
         self._render()
-        self._goal_x = goal_x               # re-establish after _render() cleared it
 
     def insertFromMimeData(self, source):
         """A paste INTO the box: re-sanitize the pasted text the same way (drop
