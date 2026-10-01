@@ -3897,14 +3897,21 @@ class SecureTerminal(_RenderedTextView):
         point so hover/click can name it. Strict modes keep risk-colouring it."""
         cp = marking_cp_for_cell(cell.data)
         if cp is None or not (disp == BOX or self._mode == 'show'):
-            if not self._effective_colors():
-                # colors=false hardening: strip the program's ANSI colour (fg/bg/reverse)
-                # from a plain grid cell -- the same monochrome treatment the CLI path
-                # (cells_to_runs, colors=False) applies -- so a TUI program cannot deceive
-                # with colour. Keeps bold/underscore (shape). _rerender clears the caches.
-                return self._pyte_format(cell._replace(fg='default', bg='default',
-                                                       reverse=False))
-            return self._pyte_format(cell)
+            # colors=false hardening: strip the program's ANSI colour (fg/bg/reverse)
+            # from a plain grid cell -- the same monochrome treatment the CLI path
+            # (cells_to_runs, colors=False) applies -- so a TUI program cannot deceive
+            # with colour. Keeps bold/underscore (shape). _rerender clears the caches.
+            pcell = cell if self._effective_colors() else cell._replace(
+                fg='default', bg='default', reverse=False)
+            if self._mode == 'state':
+                # STATE badges EVERY cell (ASCII included) and tints by the program's OWN
+                # SGR, never a risk class -- so it skips the marking branch below. But
+                # hover/click must still name the character, at parity with the CLI state
+                # path (cells_to_runs tags every badge with its source code point) and the
+                # frozen reveal/detail view (whose _fmt_from_key marking carries it). The
+                # frozen grid is the only state-mode grid renderer (expanding modes freeze).
+                return self._state_cp_format(pcell)
+            return self._pyte_format(pcell)
         # box-drawing / block elements shown as their real glyph in SHOW mode are
         # purely structural, not a deception: they wear the program's OWN SGR like a
         # real terminal, never a risk-class tint -- yet still carry their source code
@@ -3935,6 +3942,22 @@ class SecureTerminal(_RenderedTextView):
                 pcell = cell if self._effective_colors() else cell._replace(
                     fg='default', bg='default', reverse=False)
                 fmt = QTextCharFormat(self._pyte_format(pcell, structural))   # program SGR
+            fmt.setProperty(_CP_PROP, cp)
+            return _cache_bounded(self._grid_mark_cache, key, fmt)
+        return fmt
+
+    def _state_cp_format(self, cell):
+        """Program-SGR format for a frozen STATE-mode grid cell, tagged with its source
+        code point (_CP_PROP) so hover/click names the character -- parity with the CLI
+        state path (cells_to_runs) and the frozen reveal/detail view. The cell's colours
+        are already gated by _effective_colors() at the call site. Copy the shared cached
+        _pyte_format (never mutate it) and cache per (cp, SGR) so identical adjacent cells
+        still coalesce by format identity in _render_frozen."""
+        cp = ord(cell.data) if len(cell.data) == 1 else marking_cp_for_cell(cell.data)
+        key = ('state', cp, cell.fg, cell.bg, cell.bold, cell.reverse, cell.underscore)
+        fmt = self._grid_mark_cache.get(key)
+        if fmt is None:
+            fmt = QTextCharFormat(self._pyte_format(cell))
             fmt.setProperty(_CP_PROP, cp)
             return _cache_bounded(self._grid_mark_cache, key, fmt)
         return fmt
