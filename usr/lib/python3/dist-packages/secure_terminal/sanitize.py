@@ -1987,8 +1987,13 @@ def cells_to_runs(lines, current, mode, colors, markings=True, wraps=None):
                 # Internal append-only redraw marker: same zero-text run channel, its own
                 # key drives the left-gutter "redraw attempted" glyph. Unforgeable SGR key.
                 add('', _REDRAW_KEY)
-            elif col in flagged and not _space_is_visible(key):
-                # invisible padding: keep the real space, paint the dot.
+            elif mode != 'state' and col in flagged and not _space_is_visible(key):
+                # invisible padding: keep the real space, paint the dot. NOT in state mode: there
+                # every char becomes its <U+XXXX> badge tinted by the program's SGR ("codepoint +
+                # attributes"), so a flagged space must fall through to emit() and render as a
+                # <U+0020> badge keeping its SGR -- the dot would drop the attributes AND is
+                # redundant (the badge already makes every space explicit). Tabs are unaffected:
+                # state passes a tab through as structure, not a badge, so it keeps its arrow guide.
                 add(ch, (MARK_KEY, WS_ANOMALY, 0x20))
             elif ch == '\t' and markings:
                 # EVERY tab: keep the real '\t' (layout/copy/transcript unchanged) but tag it so

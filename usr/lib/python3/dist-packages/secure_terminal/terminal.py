@@ -3701,7 +3701,17 @@ class SecureTerminal(_RenderedTextView):
         finally:
             self.setUpdatesEnabled(True)
             self._programmatic_scroll = False
-        self._apply_vscroll_policy()
+        # The frozen badge document is NOT the live grid: each cell expanded to a wide <U+XXXX>
+        # badge (state badges EVERY char), so a screen-width row runs far past the viewport. The
+        # live-grid policy (_sync_wrap_mode's NoWrap, and _apply_vscroll_policy forcing the vertical
+        # bar OFF on a fixed canvas) would strand most badges unreachable. Give the paused document
+        # its OWN policy: SOFT-wrap to the viewport (matching the CLI expanding view; inserts no
+        # document newline, so copy/transcript are unchanged) and allow a vertical scrollbar. The
+        # soft wrap removes all horizontal overflow, so the grid's horizontal-bar-off stays as-is
+        # (no bar needed). Unfreeze reverts the wrap/v-policy: _rerender(full=True) -> _sync_wrap_mode
+        # (NoWrap) and _render_tui_body -> _apply_vscroll_policy (v-policy for the live canvas).
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.viewport().update()
 
     def _render_tui(self):
@@ -5555,26 +5565,34 @@ class SecureTerminal(_RenderedTextView):
         scrollback is clean."""
         if self._alt_saved is None or self._screen is None:
             return
-        # Append ONE final-frame snapshot of the full-screen session as a bounded record,
-        # so 'Save Transcript' keeps a trace of what was displayed without logging every
-        # frame. Render the alt screen to the document FIRST (same debounce reason as
-        # _alt_enter): the whole enter/draw/leave can arrive in one read before the render
-        # timer fires, so a bare walk would snapshot a stale (or empty) frame, not the
-        # program's actual last screen.
-        # Force the ALT render branch (mirror of _alt_enter forcing the primary branch):
-        # _read_and_render already flipped _alt_screen OFF for this leaving read, so an
-        # unguarded render here would take the primary branch on the still-alt screen and
-        # PROMOTE the alt program's history.top as scrollback -- inflating the snapshot with
-        # the whole pre-program shell scrollback (a Save-Transcript that lies about what was
-        # shown). The alt branch renders only the final grid frame.
-        if self._grid_mode():
-            _was_alt = self._alt_screen
-            self._alt_screen = True
-            try:
-                self._render_tui()
-            finally:
-                self._alt_screen = _was_alt
-        self._append_exit_snapshot(self._walk_document_text())
+        # FROZEN: the view is a paused snapshot and the paint is suppressed, yet the pty read
+        # (hence this _alt_leave) keeps running under the freeze. Skip every DOCUMENT-touching
+        # step -- the forced render below is a no-op while frozen, and the _reset_grid_view()
+        # further down would BLANK the frozen frame with nothing to repaint it. The MODEL is
+        # still restored below, and unfreeze's _rerender(full=True) rebuilds to the live frame.
+        # Tradeoff: a full-screen session that ends while the view is frozen leaves no
+        # final-frame transcript snapshot -- acceptable versus a blanked view.
+        if not self._frozen:
+            # Append ONE final-frame snapshot of the full-screen session as a bounded record,
+            # so 'Save Transcript' keeps a trace of what was displayed without logging every
+            # frame. Render the alt screen to the document FIRST (same debounce reason as
+            # _alt_enter): the whole enter/draw/leave can arrive in one read before the render
+            # timer fires, so a bare walk would snapshot a stale (or empty) frame, not the
+            # program's actual last screen.
+            # Force the ALT render branch (mirror of _alt_enter forcing the primary branch):
+            # _read_and_render already flipped _alt_screen OFF for this leaving read, so an
+            # unguarded render here would take the primary branch on the still-alt screen and
+            # PROMOTE the alt program's history.top as scrollback -- inflating the snapshot with
+            # the whole pre-program shell scrollback (a Save-Transcript that lies about what was
+            # shown). The alt branch renders only the final grid frame.
+            if self._grid_mode():
+                _was_alt = self._alt_screen
+                self._alt_screen = True
+                try:
+                    self._render_tui()
+                finally:
+                    self._alt_screen = _was_alt
+            self._append_exit_snapshot(self._walk_document_text())
         self._screen.buffer, self._screen.history, self._screen.cursor = \
             self._alt_saved
         # Restore the primary's margins, undoing any DECSTBM region the alt program left
@@ -5591,7 +5609,8 @@ class SecureTerminal(_RenderedTextView):
         self._alt_saved_margins = None
         self._alt_owner_pgrp = None
         self._alt_primary_text = ''       # the frozen primary is now restored, live again
-        self._reset_grid_view()           # rebuild scrollback from restored history
+        if not self._frozen:
+            self._reset_grid_view()       # rebuild scrollback from restored history (frozen: held)
 
     # Cap the accumulated exit snapshots so a long-lived tab that runs many full-screen
     # programs cannot grow the transcript without bound.
