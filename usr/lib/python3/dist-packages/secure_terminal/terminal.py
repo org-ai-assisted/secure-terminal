@@ -2760,6 +2760,16 @@ class SecureTerminal(_RenderedTextView):
             self._frozen = False
             self._frozen_state = None
             self._frozen_screen = None
+            # Restore the live-grid scroll/wrap policy BEFORE reconciling the size below. A frozen
+            # expanding doc may have shown a vertical scrollbar (_render_frozen), which narrows the
+            # viewport; _sync_tui_size reads the viewport to size the pyte grid, so a still-narrowed
+            # width would resize the screen (SIGWINCH + pyte clears the alt screen) for nothing --
+            # blanking a program that ignores SIGWINCH. The VERTICAL policy (the width-affecting one)
+            # goes first: either call can trigger a synchronous resizeEvent -> _sync_tui_size, and
+            # _sync_wrap_mode's horizontal-bar change would else fire that sizing while the vertical
+            # bar still narrows the viewport. _rerender(full=True) re-applies both idempotently.
+            self._apply_vscroll_policy()
+            self._sync_wrap_mode()
             # A resize was SUPPRESSED while frozen (resizeEvent early-returned), so the pyte
             # screen / pty winsize can be stale vs the current widget size. Reconcile it now --
             # mirroring resizeEvent's own branching -- then rebuild to the current frame.
