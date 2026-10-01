@@ -4001,7 +4001,8 @@ class MainWindow(QMainWindow):
             return ('#1f8a54', 'State',
                     'Display: STATE (green, safe).\n\n'
                     'Every character -- printable ASCII included -- is shown as its <U+XXXX> '
-                    'badge tinted by the program\'s own SGR attributes (codepoint + attributes). '
+                    'badge tinted by the program\'s own SGR attributes (codepoint + attributes); '
+                    'tabs and newlines preserve layout and BEL is dropped. '
                     'In CLI mode the badges are live; a TUI tab FREEZES the frame (the live grid '
                     'is paused) so one snapshot can be read -- switch mode or Unfreeze to resume, '
                     'or Save Screen State Dump for a savable capture. Escapes are removed and '
