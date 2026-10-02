@@ -520,8 +520,17 @@ class InfoTip(QLabel):
         # its text can be selected. Translucent so the rounded card has clean corners
         # (a frameless top-level otherwise shows the square window corners behind the
         # radius). Parented to the window for clean teardown.
+        # BypassWindowManagerHint (X11 override-redirect): the window manager must NOT
+        # re-place this tip. A WM-managed Tool window is positioned by the WM's own
+        # policy, and an "under the pointer" policy drops the tip ONTO the very widget
+        # the pointer rests on -- covering the hovered tab close button / review-bar
+        # Paste button (the reported un-clickable popup). Override-redirect makes the
+        # WM leave it alone, so _place's computed position (clear of the source) is
+        # honoured exactly. The tip still receives mouse events (it is not transparent),
+        # so the text stays selectable.
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-                            | Qt.WindowType.WindowStaysOnTopHint)
+                            | Qt.WindowType.WindowStaysOnTopHint
+                            | Qt.WindowType.BypassWindowManagerHint)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
@@ -1159,13 +1168,24 @@ class SecureTabBar(QTabBar):
     # -- geometry + paint -----------------------------------------------------
     def tabSizeHint(self, index):
         sz = super().tabSizeHint(index)
-        # _paint_content prepends the tab number ("N  ") in DemiBold and draws the
-        # accent bar + lock glyph + (reserved) bell marker. super() measured only the
-        # bare tabText, so add every extra we paint or the label elides ("1  s...").
+        # _paint_content prepends the tab number ("N  ") and draws the label in DemiBold
+        # (super() measured only the bare tabText in the REGULAR font), the accent bar +
+        # lock glyph on the left, and -- left of the close button -- an optional bell AND
+        # activity marker on the right, each shrinking the label's draw area. Reserve ALL
+        # of it, or a SHORT label elides the moment its tab shows a marker ("dev778" ->
+        # "dev..." on a busy session tab). The markers are reserved UNCONDITIONALLY (not by
+        # the tab's current bell/activity state) so the tab width stays STABLE as streaming
+        # output toggles them, instead of jittering on every marker change.
         f1 = QFont(self.font())
         f1.setWeight(QFont.Weight.DemiBold)
-        prefix_w = QFontMetrics(f1).horizontalAdvance('%d  ' % (index + 1))
-        sz.setWidth(sz.width() + self._ACCENT_W + self._PAD + self._GLYPH + 4 + prefix_w)
+        fm1 = QFontMetrics(f1)
+        prefix_w = fm1.horizontalAdvance('%d  ' % (index + 1))
+        label = self.tabText(index)
+        demibold_excess = max(0, fm1.horizontalAdvance(label)
+                              - QFontMetrics(self.font()).horizontalAdvance(label))
+        markers_w = 2 * (self._GLYPH + 4)        # worst case: bell + activity both shown
+        sz.setWidth(sz.width() + self._ACCENT_W + self._PAD + self._GLYPH + 4
+                    + prefix_w + demibold_excess + markers_w)
         if self._two_line:
             sz.setHeight(sz.height() + self._LINE2_H)
         return sz
@@ -1180,12 +1200,15 @@ class SecureTabBar(QTabBar):
         # cap, where _paint_content's middle-elide keeps its ends. When even the floors do
         # not fit, Qt falls back to scroll buttons (idiomatic), not unreadable squeezing.
         hint = self.tabSizeHint(index)
-        # Measure the label in the REGULAR widget font -- the SAME face super().tabSizeHint
-        # measured it in to build `hint`. _paint_content draws the label in DemiBold, but the
-        # size hint's label contribution is regular-font; measuring the excess in DemiBold
-        # (wider) over-counts, so the floor would SHRINK as the label grows -- the opposite of
-        # a fixed "number + _MIN_LABEL_CHARS" floor, re-squeezing long names below readability.
-        fm = QFontMetrics(self.font())
+        # Measure the label in DemiBold -- the SAME face tabSizeHint now reserves it in (and
+        # _paint_content draws it in). The excess measured here must use the same font as the
+        # hint's label contribution, or the floor drifts with length: measuring in a NARROWER
+        # font than the hint reserved would make the floor SHRINK as the label grows (re-
+        # squeezing long names below readability). With both in DemiBold the label-dependent
+        # terms cancel, so the floor is a CONSTANT "number + _MIN_LABEL_CHARS + chrome".
+        f1 = QFont(self.font())
+        f1.setWeight(QFont.Weight.DemiBold)
+        fm = QFontMetrics(f1)
         label = self.tabText(index)
         # Only the label portion is capped; the number prefix and chrome extents already summed
         # into tabSizeHint stay in the floor.
