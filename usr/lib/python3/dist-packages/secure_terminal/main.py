@@ -520,8 +520,17 @@ class InfoTip(QLabel):
         # its text can be selected. Translucent so the rounded card has clean corners
         # (a frameless top-level otherwise shows the square window corners behind the
         # radius). Parented to the window for clean teardown.
+        # BypassWindowManagerHint (X11 override-redirect): the window manager must NOT
+        # re-place this tip. A WM-managed Tool window is positioned by the WM's own
+        # policy, and an "under the pointer" policy drops the tip ONTO the very widget
+        # the pointer rests on -- covering the hovered tab close button / review-bar
+        # Paste button (the reported un-clickable popup). Override-redirect makes the
+        # WM leave it alone, so _place's computed position (clear of the source) is
+        # honoured exactly. The tip still receives mouse events (it is not transparent),
+        # so the text stays selectable.
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-                            | Qt.WindowType.WindowStaysOnTopHint)
+                            | Qt.WindowType.WindowStaysOnTopHint
+                            | Qt.WindowType.BypassWindowManagerHint)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
