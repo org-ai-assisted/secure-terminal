@@ -528,6 +528,10 @@ class InfoTip(QLabel):
         # WM leave it alone, so _place's computed position (clear of the source) is
         # honoured exactly. The tip still receives mouse events (it is not transparent),
         # so the text stays selectable.
+        # NOTE: this app is wayland-first (X11 is used ONLY for the traditional-terminal
+        # comparison screenshots). This override-redirect flag is the X11 mechanism that
+        # keeps the WM off the tip on an X11 session; under wayland the compositor owns
+        # placement and the hint is a harmless no-op.
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
                             | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.BypassWindowManagerHint)
