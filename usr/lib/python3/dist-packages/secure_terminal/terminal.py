@@ -946,6 +946,41 @@ def _trim_blank_wrap_fill(completed, wraps):
         out_w.append(w)
     return out_c, out_w
 
+
+def _drop_prompt_sp_frames(completed, wraps, width):
+    """Drop zsh PROMPT_SP end-of-line-marker frames in CLI line mode.
+
+    zsh (PROMPT_SP + PROMPT_CR, both on by default, in EVERY shell config) precedes each
+    prompt with a frame that fills the line to the full width -- the PROMPT_EOL_MARK char
+    ('%' for a user, '#' for root) then spaces, or, after its own erase step, all spaces --
+    then returns via CR to overwrite it in place. In the common single-read case the prompt
+    overwrites it cleanly (no completed line); but when a following Enter's newline flushes
+    the frame BEFORE the prompt has redrawn over it, the full-width space/marker row is left
+    behind. Mashing Enter then fills the buffer with these rows (observed: ~24 blank rows for
+    25 Enters). They carry no information secure-terminal does not already show -- a missing
+    final newline has its own left-gutter glyph -- so they are pure redundant noise here.
+
+    Drop a COMPLETED line that is EXACTLY the terminal width and holds only spaces, or a
+    single leading '%'/'#' then spaces. Keying on the full width is what keeps a program's
+    genuine blank line (which is EMPTY, width 0) and ordinary short output: only the
+    full-width all-space / marker row -- the PROMPT_SP signature -- is removed. (A program
+    that deliberately prints a full line of spaces plus a newline in line mode is the one
+    accepted false positive; vanishingly rare, and the redundant-marker removal is the
+    deliberate trade.) Width 0 (pre-winsize) disables the trim, so nothing matches by
+    accident before the real column count is known."""
+    if width <= 0:
+        return completed, wraps
+    out_c, out_w = [], []
+    for cl, w in zip(completed, wraps):
+        if len(cl) == width:
+            text = ''.join(c for c, _s in cl)
+            body = text[1:] if text[:1] in ('#', '%') else text
+            if body.strip() == '':
+                continue                     # a PROMPT_SP marker frame -> drop
+        out_c.append(cl)
+        out_w.append(w)
+    return out_c, out_w
+
 # Alternate-screen enter/leave, as BYTES: pyte has no alt buffer, so the feed path
 # acts on these to snapshot/restore the primary screen at the exact boundary.
 _ALT_ENTER_BYTES = (b'\x1b[?1049h', b'\x1b[?1047h', b'\x1b[?47h')
@@ -6367,6 +6402,10 @@ class SecureTerminal(_RenderedTextView):
         # Post-overwrite + trailing-only, so a wiped line stays wiped and mid-line blanks
         # and genuine blank lines are kept.
         completed, wraps = _trim_blank_wrap_fill(completed, wraps)
+        # Drop zsh's redundant PROMPT_SP end-of-line-marker frames (a full-width space/
+        # marker row left behind when an Enter's newline flushes the marker before the
+        # prompt redraws over it), so mashing Enter does not fill the buffer with them.
+        completed, wraps = _drop_prompt_sp_frames(completed, wraps, wrap)
         self._paint_pending.extend(completed)
         self._paint_pending_wraps.extend(wraps)
         # Bound the debounced backlog. A hidden tab coalesces at the slow cadence, so a
