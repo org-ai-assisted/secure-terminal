@@ -992,7 +992,12 @@ class SecureTabBar(QTabBar):
     _LINE2_H = 19            # reserved height of the untrusted band (fits the larger title)
     _PULSE_TICKS = 6         # bounded pulse frames (~3 on/off cycles)
     _PULSE_MS = 90           # per-frame interval
-    _MIN_LABEL_CHARS = 16    # floor: never squeeze a tab below number + this many label chars
+    _MIN_LABEL_CHARS = 10    # floor: never squeeze a tab below number + this many label chars
+    _RESERVED_MARKERS = 1    # right-side marker slots reserved in the tab width. ONE covers
+                             # the common busy-tab case (activity OR bell) with no width jitter
+                             # or label elide; the rare bell+activity-at-once briefly elides.
+                             # Reserving BOTH unconditionally made every tab ~17px wider, so
+                             # far fewer fit before the bar scrolls -- width wins over the rare case.
 
     # theme -> (muted_fg, band_bg, band_line, caution, bell); light first.
     _THEME = {
@@ -1175,11 +1180,11 @@ class SecureTabBar(QTabBar):
         # _paint_content prepends the tab number ("N  ") and draws the label in DemiBold
         # (super() measured only the bare tabText in the REGULAR font), the accent bar +
         # lock glyph on the left, and -- left of the close button -- an optional bell AND
-        # activity marker on the right, each shrinking the label's draw area. Reserve ALL
-        # of it, or a SHORT label elides the moment its tab shows a marker ("dev778" ->
-        # "dev..." on a busy session tab). The markers are reserved UNCONDITIONALLY (not by
-        # the tab's current bell/activity state) so the tab width stays STABLE as streaming
-        # output toggles them, instead of jittering on every marker change.
+        # activity marker on the right, each shrinking the label's draw area. Reserve the
+        # chrome plus _RESERVED_MARKERS marker slots, or a SHORT label elides the moment its
+        # tab shows a marker ("dev778" -> "dev..." on a busy session tab). The slots are
+        # reserved UNCONDITIONALLY (not by the tab's current bell/activity state) so the tab
+        # width stays STABLE as streaming output toggles a marker, instead of jittering.
         f1 = QFont(self.font())
         f1.setWeight(QFont.Weight.DemiBold)
         fm1 = QFontMetrics(f1)
@@ -1187,7 +1192,7 @@ class SecureTabBar(QTabBar):
         label = self.tabText(index)
         demibold_excess = max(0, fm1.horizontalAdvance(label)
                               - QFontMetrics(self.font()).horizontalAdvance(label))
-        markers_w = 2 * (self._GLYPH + 4)        # worst case: bell + activity both shown
+        markers_w = self._RESERVED_MARKERS * (self._GLYPH + 4)
         sz.setWidth(sz.width() + self._ACCENT_W + self._PAD + self._GLYPH + 4
                     + prefix_w + demibold_excess + markers_w)
         if self._two_line:
