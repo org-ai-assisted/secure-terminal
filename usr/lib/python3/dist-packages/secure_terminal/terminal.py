@@ -4733,14 +4733,17 @@ class SecureTerminal(_RenderedTextView):
         # grid column (xterm parity), which a character hit-test cannot give. contentOffset().x
         # does NOT include the left document margin (unlike y), so col subtracts it here.
         col = int((pos.x() - margin - off.x()) // char_w) + 1
-        # ROW from the REAL painted line PITCH, not fontMetrics().height(): QTextLine rounds the
-        # pitch UP by ~1px at some zooms (a 23px row vs a 22px font height at zoom 170), so a
+        # ROW from the REAL painted line height, not fontMetrics().height(): QTextLine rounds the
+        # line UP by ~1px at some zooms (23px vs a 22px font height at zoom 170), so a
         # fontMetrics().height() step DRIFTS and, near a cell's lower edge in the lower rows,
         # names the row BELOW -- the off-by-one that left Claude Code's "jump to bottom" pill
-        # non-clickable while the line ABOVE was. blockBoundingRect gives the pitch the layout
-        # actually painted; the geometric step still EXTRAPOLATES a click below the content to a
+        # non-clickable while the line ABOVE was. Use the first visible block's SINGLE visual
+        # line height -- NOT blockBoundingRect().height(), which is the whole block (N*line in a
+        # wrapping mode); the geometric step still EXTRAPOLATES a click below the content to a
         # high row (then clamped to the grid height), matching a real terminal's blank cells.
-        pitch = self.blockBoundingRect(self.firstVisibleBlock()).height() or (metrics.height() or 1)
+        _layout = self.firstVisibleBlock().layout()
+        pitch = ((_layout.lineAt(0).height() if _layout and _layout.lineCount() else 0)
+                 or metrics.height() or 1)
         row = int((pos.y() - off.y()) // pitch) + 1
         cols = self._cols if self._cols and self._cols > 0 else self._MAX_LINE
         rows = self._rows if self._rows and self._rows > 0 else self._MAX_LINE
