@@ -2352,9 +2352,15 @@ class MainWindow(QMainWindow):
         # Qt's dispatch (QAbstractSocketPrivate::canReadNotification) -- a use-after-free
         # BEFORE any Python slot code runs. So _finish disconnects readyRead FIRST (with no
         # slot left, Qt disables the read notifier), then disconnectFromServer + deleteLater.
-        # The `finished` latch makes _finish idempotent because BOTH on_ready (after it has
-        # replied or rejected the frame) and `disconnected` (a bare liveness-probe connect
-        # that sent no request) call it; whichever fires first tears down, the rest no-op.
+        # Under a CONCURRENT burst (claude-rc-session open-all sends one --reuse open per
+        # session) the danger compounds: if anything pumps the event loop while a connection
+        # is live, a sibling's `disconnected` can run _finish and tear THIS socket down
+        # mid-dispatch, so on_ready must never touch it afterwards (the `finished` gate below).
+        # _ipc_open defers its only event-pumping step (the window raise/activate) off this
+        # slot for the same reason. The `finished` latch makes _finish idempotent because BOTH
+        # on_ready (after it has replied or rejected the frame) and `disconnected` (a bare
+        # liveness-probe connect that sent no request) call it; whichever fires first tears
+        # down, the rest no-op.
         finished = {'done': False}
 
         def _finish():
@@ -2375,6 +2381,8 @@ class MainWindow(QMainWindow):
             if payload is None:
                 return                      # frame not complete yet; more may follow
             reply = self._dispatch_request(payload)
+            if finished['done']:
+                return                      # torn down mid-dispatch -> never touch the freed socket
             conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
             conn.flush()
             _finish()
@@ -2626,9 +2634,24 @@ class MainWindow(QMainWindow):
         if opened == 0 and skipped == 0 and reattached == 0:
             self.new_tab()                  # a bare reuse (or an all-declined batch): a tab
         self.show()
+        # Raise/activate on a CLEAN event-loop turn, NOT synchronously here. _ipc_open runs
+        # inside the QLocalSocket readyRead slot (_on_instance_connection.on_ready), and
+        # raise_()/activateWindow() pump the platform event loop (a window-activation
+        # roundtrip). Pumping while the connection is still live lets a CONCURRENT --reuse
+        # client's readyRead/disconnected fire re-entrantly and free this very socket before
+        # on_ready writes its reply -- the Qt QAbstractSocketPrivate::canReadNotification
+        # use-after-free an `open-all` burst (one --reuse open per session) hit repeatedly.
+        # Deferring the only event-pumping step keeps the dispatch non-reentrant: the reply is
+        # framed and the socket torn down first, the window surfaces one turn later. show() on
+        # the already-visible primary is a no-op, so callers reading isVisible() are unaffected.
+        QTimer.singleShot(0, self._raise_activate)
+        return {'ok': True, 'opened': opened, 'skipped': skipped, 'reattached': reattached}
+
+    def _raise_activate(self):
+        """Bring the window to the front. Deferred from _ipc_open via singleShot so the
+        activation roundtrip's event pump cannot re-enter a live IPC socket (see _ipc_open)."""
         self.raise_()
         self.activateWindow()
-        return {'ok': True, 'opened': opened, 'skipped': skipped, 'reattached': reattached}
 
     def _add_placeholder_tab(self, info, at):
         """Insert a lightweight placeholder page for a not-yet-restored session tab,
