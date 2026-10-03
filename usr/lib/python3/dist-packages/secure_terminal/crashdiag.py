@@ -2,17 +2,22 @@
 
 A GUI-launched secure-terminal (from a .desktop file, a session manager, or an
 autostart unit) has no visible stderr, so a crash vanishes with no diagnostic --
-exactly the reported gap. Two crash paths matter:
+exactly the reported gap. Three failure paths matter:
 
 - a Python exception escaping a Qt slot: PyQt6 delivers it to `sys.excepthook`
   and then aborts the process (SIGABRT), so the traceback is the only clue;
 - a native fatal signal (SIGSEGV / SIGABRT / SIGFPE / SIGBUS / SIGILL) from Qt's
-  C++ layer (e.g. a bad paint/layout at extreme zoom).
+  C++ layer (e.g. a bad paint/layout at extreme zoom);
+- a HANG: a wedged event loop emits no signal and no exception, so neither path
+  above fires and the log stays empty. On a ptrace-restricted VM (Kicksecure
+  security-misc `kernel.yama.ptrace_scope=3`, no py-spy/gdb) a live freeze is then
+  un-introspectable. An on-demand SIGUSR1 dumper closes that: `kill -USR1 <pid>`
+  appends every thread's Python stack to the same log.
 
-Both are teed to a durable, owner-only file at one fixed path under the state
-root (found regardless of instance group), and to stderr for a terminal launch.
-`faulthandler` runs inside the signal handler and cannot call back into Python,
-so it writes the native dump straight to the log's fd; a terminal user reads the
+The first two are teed to a durable, owner-only file at one fixed path under the
+state root (found regardless of instance group), and to stderr for a terminal
+launch. `faulthandler` runs inside the signal handler and cannot call back into
+Python, so it writes the dump straight to the log's fd; a terminal user reads the
 same file. A handler here must never itself raise -- losing the diagnostic is the
 one unacceptable outcome.
 """
@@ -20,6 +25,7 @@ one unacceptable outcome.
 import datetime
 import faulthandler
 import os
+import signal
 import stat
 import sys
 import traceback
@@ -113,6 +119,18 @@ def note_qt_message(log, mode, message):
     write_note(log, 'qt message', message + '\n')
 
 
+def register_hang_dumper(log):
+    """On-demand all-thread stack dump for a HANG. A wedged event loop raises no
+    exception and triggers no fatal signal, so excepthook/faulthandler never fire
+    and the log stays empty; on a ptrace-restricted VM there is then no external
+    way to see where it is stuck. SIGUSR1 (the app uses no USR signal) dumps every
+    thread's Python stack to the durable log, so `kill -USR1 <pid>` introspects a
+    live freeze. chain=False: there is no prior USR1 handler worth preserving, and
+    an unhandled SIGUSR1's default action is to TERMINATE -- so registering it is
+    also what makes the signal safe to send."""
+    faulthandler.register(signal.SIGUSR1, file=log, all_threads=True, chain=False)
+
+
 def install(state_root, stderr=None):
     """Wire crash diagnostics; return (path, log_stream). Call once, early in
     main(), before the Qt event loop. The log stream is kept open for the process
@@ -123,6 +141,8 @@ def install(state_root, stderr=None):
     log = _open_append(path)
     # Native fatal signals -> dump every thread's Python stack to the durable log.
     faulthandler.enable(file=log, all_threads=True)
+    # SIGUSR1 -> the same all-thread dump ON DEMAND, the only way to diagnose a HANG.
+    register_hang_dumper(log)
     sys.excepthook = make_excepthook(log, stderr)
     return path, log
 
