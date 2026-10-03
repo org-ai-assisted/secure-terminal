@@ -119,16 +119,16 @@ def note_qt_message(log, mode, message):
     write_note(log, 'qt message', message + '\n')
 
 
-def register_hang_dumper(log):
+def register_hang_dumper(stream):
     """On-demand all-thread stack dump for a HANG. A wedged event loop raises no
     exception and triggers no fatal signal, so excepthook/faulthandler never fire
     and the log stays empty; on a ptrace-restricted VM there is then no external
     way to see where it is stuck. SIGUSR1 (the app uses no USR signal) dumps every
-    thread's Python stack to the durable log, so `kill -USR1 <pid>` introspects a
-    live freeze. chain=False: there is no prior USR1 handler worth preserving, and
-    an unhandled SIGUSR1's default action is to TERMINATE -- so registering it is
-    also what makes the signal safe to send."""
-    faulthandler.register(signal.SIGUSR1, file=log, all_threads=True, chain=False)
+    thread's Python stack to `stream`, so `kill -USR1 <pid>` introspects a live
+    freeze. chain=False: there is no prior USR1 handler worth preserving, and an
+    unhandled SIGUSR1's default action is to TERMINATE -- so registering it is also
+    what makes the signal safe to send."""
+    faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True, chain=False)
 
 
 def install(state_root, stderr=None):
@@ -137,11 +137,17 @@ def install(state_root, stderr=None):
     lifetime (faulthandler writes to its fd from the signal handler)."""
     if stderr is None:
         stderr = sys.stderr
+    # Register the SIGUSR1 hang dumper against stderr FIRST, so the signal is NON-FATAL
+    # even if the durable log fails to open below. An unregistered SIGUSR1 TERMINATES the
+    # process (default action), so an operator's `kill -USR1` on a hung instance would kill
+    # it rather than dump -- the one thing the dumper exists to prevent. Re-pointed at the
+    # durable log once it opens (the preferred target; faulthandler keeps only the last
+    # file registered per signal).
+    register_hang_dumper(stderr)
     path = crash_log_path(state_root)
     log = _open_append(path)
     # Native fatal signals -> dump every thread's Python stack to the durable log.
     faulthandler.enable(file=log, all_threads=True)
-    # SIGUSR1 -> the same all-thread dump ON DEMAND, the only way to diagnose a HANG.
     register_hang_dumper(log)
     sys.excepthook = make_excepthook(log, stderr)
     return path, log
@@ -149,9 +155,12 @@ def install(state_root, stderr=None):
 
 def install_best_effort(state_root, stderr=None):
     """install(), but never raise: a launch must not fail because the crash log
-    could not be opened. Returns the log stream, or None if diagnostics could not
-    be wired (they then stay at their defaults)."""
+    could not be opened or diagnostics could not be wired. Returns the log stream,
+    or None when the durable log is unavailable -- in which case install() has still
+    registered the SIGUSR1 hang dumper against stderr, so `kill -USR1` dumps there
+    instead of killing the app. Catches faulthandler's RuntimeError/ValueError too,
+    not only the log's OSError, to honour the never-raise contract."""
     try:
         return install(state_root, stderr)[1]
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return None
