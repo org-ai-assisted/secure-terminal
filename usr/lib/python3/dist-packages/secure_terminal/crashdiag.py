@@ -299,7 +299,13 @@ def install(state_root, stderr=None):
     # it rather than dump -- the one thing the dumper exists to prevent. Re-pointed at the
     # durable log once it opens (the preferred target; faulthandler keeps only the last
     # file registered per signal).
-    register_hang_dumper(stderr)
+    # Best-effort: a CLOSED/unusable stderr (a GUI launch may have none) makes
+    # faulthandler.register raise -- that must NOT abort the whole install, which would lose
+    # the durable log too. Swallow it; the log registration below is the real target.
+    try:
+        register_hang_dumper(stderr)
+    except (OSError, RuntimeError, ValueError):
+        pass
     path = crash_log_path(state_root)
     log = _open_append(path)
     # Native fatal signals -> dump every thread's Python stack to the durable log.
