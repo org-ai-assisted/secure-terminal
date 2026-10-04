@@ -2134,6 +2134,36 @@ def ensure_utf8_ctype(environ=None):
         env['LC_CTYPE'] = 'C.UTF-8'
 
 
+# Env vars stripped from every pty child before exec, by BOTH the GUI (terminal.py)
+# and the CLI wrapper (cli.py). Two kinds:
+#   - terminal-fingerprint vars inherited from whatever terminal launched us: a child
+#     (or a host it ssh's into) must not learn the host emulator's identity/version or a
+#     correlatable session id. LINES/COLUMNS go too -- the real size comes from TIOCSWINSZ,
+#     and a stale value here would mislead programs.
+#   - our OWN app-config vars (screenshot / solid-cursor / transcript modes): read once by
+#     the app at construction, meaningless to a child shell, and must not ride into it, into
+#     a host it ssh's into, or into a NESTED secure-terminal (which would silently inherit
+#     this process's modes instead of using its own flags).
+CHILD_ENV_SCRUB = (
+    'TERM_PROGRAM', 'TERM_PROGRAM_VERSION',
+    'VTE_VERSION', 'KONSOLE_VERSION', 'KONSOLE_DBUS_SERVICE',
+    'KONSOLE_DBUS_SESSION', 'WT_SESSION', 'WT_PROFILE_ID',
+    'ITERM_SESSION_ID', 'ITERM_PROFILE', 'KITTY_WINDOW_ID',
+    'KITTY_PID', 'ALACRITTY_WINDOW_ID', 'LINES', 'COLUMNS',
+    'SECURE_TERMINAL_SHOT', 'SECURE_TERMINAL_SOLID_CURSOR',
+    'SECURE_TERMINAL_TRANSCRIPT_FILE')
+
+
+def scrub_child_env(environ=None):
+    """Remove the CHILD_ENV_SCRUB vars from `environ` (default os.environ) IN THE PTY CHILD,
+    before exec. Shared by terminal.py (GUI) and cli.py (CLI wrapper -- which never imports
+    Qt) so the one anti-fingerprinting denylist cannot drift between the two spawn paths.
+    Idempotent; a var that is already absent is a no-op (pop with default)."""
+    env = os.environ if environ is None else environ
+    for _var in CHILD_ENV_SCRUB:
+        env.pop(_var, None)
+
+
 def sanitize_paste_unicode(text):
     """Like sanitize_paste but KEEP printable non-ASCII (the euro sign, accents,
     CJK) instead of dropping it, for a deliberate "paste with unicode". The
