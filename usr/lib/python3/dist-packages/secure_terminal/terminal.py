@@ -4726,17 +4726,25 @@ class SecureTerminal(_RenderedTextView):
         column count."""
         metrics = self.fontMetrics()
         char_w = metrics.horizontalAdvance('M') or 1
-        char_h = metrics.height() or 1
         off = self.contentOffset()
         margin = self.document().documentMargin()
         pos = event.position()
-        # Margin asymmetry: contentOffset() places the content's DRAW origin in the
-        # viewport. Its y ALREADY includes the top document margin (the first grid row
-        # is painted at off.y()), so the row must NOT subtract margin again -- doing so
-        # shifted every cell down by margin px, misreporting a click in a cell's top
-        # band as the row ABOVE. Its x does NOT include the left margin, so col keeps it.
+        # COLUMN from the geometric cell width: a click in an EMPTY cell must still report its
+        # grid column (xterm parity), which a character hit-test cannot give. contentOffset().x
+        # does NOT include the left document margin (unlike y), so col subtracts it here.
         col = int((pos.x() - margin - off.x()) // char_w) + 1
-        row = int((pos.y() - off.y()) // char_h) + 1
+        # ROW from the REAL painted line height, not fontMetrics().height(): QTextLine rounds the
+        # line UP by ~1px at some zooms (23px vs a 22px font height at zoom 170), so a
+        # fontMetrics().height() step DRIFTS and, near a cell's lower edge in the lower rows,
+        # names the row BELOW -- the off-by-one that left Claude Code's "jump to bottom" pill
+        # non-clickable while the line ABOVE was. Use the first visible block's SINGLE visual
+        # line height -- NOT blockBoundingRect().height(), which is the whole block (N*line in a
+        # wrapping mode); the geometric step still EXTRAPOLATES a click below the content to a
+        # high row (then clamped to the grid height), matching a real terminal's blank cells.
+        _layout = self.firstVisibleBlock().layout()
+        pitch = ((_layout.lineAt(0).height() if _layout and _layout.lineCount() else 0)
+                 or metrics.height() or 1)
+        row = int((pos.y() - off.y()) // pitch) + 1
         cols = self._cols if self._cols and self._cols > 0 else self._MAX_LINE
         rows = self._rows if self._rows and self._rows > 0 else self._MAX_LINE
         col = min(col, cols) if col > 1 else 1

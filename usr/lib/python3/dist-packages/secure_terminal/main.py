@@ -259,6 +259,16 @@ _PERSIST_DEFAULTS = {
 # exhaust fds/memory, so a frame past this is a runaway, refused whole.
 _MAX_OPEN_TABS = 64
 
+# Bound (seconds) for synchronously reading one framed request off an accepted
+# single-instance socket, and for flushing its reply, on the Qt MAIN thread. A legit
+# client sends its (tiny) frame before/at connect, so the first read returns it with NO
+# wait; this bound only caps a slow/partial/non-reading client. Kept well UNDER the
+# client's 1.5s send_request timeout and the hang-watchdog threshold, so a same-UID client
+# that connects and then stalls cannot freeze the UI for long -- the socket is owner-only,
+# so the worst case is a bounded same-UID self-DoS, not a cross-user one. A dropped slow
+# client just retries via _handoff; it is never a crash.
+_IPC_SERVE_TIMEOUT = 0.5
+
 # menu label -> scrollback limit in lines (0 = unlimited)
 SCROLLBACK_CHOICES = [
     ('1,000 lines', 1000),
@@ -2346,44 +2356,64 @@ class MainWindow(QMainWindow):
         conn = self._server.nextPendingConnection()
         if conn is None:
             return
-        framer = ipc.Framer()
-        # Service the connection, then detach and tear it down exactly once. A QLocalSocket
-        # whose readyRead notifier fires while the socket is being torn down segfaults in
-        # Qt's dispatch (QAbstractSocketPrivate::canReadNotification) -- a use-after-free
-        # BEFORE any Python slot code runs. So _finish disconnects readyRead FIRST (with no
-        # slot left, Qt disables the read notifier), then disconnectFromServer + deleteLater.
-        # The `finished` latch makes _finish idempotent because BOTH on_ready (after it has
-        # replied or rejected the frame) and `disconnected` (a bare liveness-probe connect
-        # that sent no request) call it; whichever fires first tears down, the rest no-op.
-        finished = {'done': False}
-
-        def _finish():
-            if finished['done']:
-                return
-            finished['done'] = True
-            conn.readyRead.disconnect(on_ready)
-            conn.disconnectFromServer()
+        cid = _ipc_next_conn_id()
+        _ipc_trace('accept', cid)
+        # Service each connection SYNCHRONOUSLY, here in the newConnection slot: read the
+        # framed request with a bounded wait, dispatch, write + flush the reply, then close.
+        # We deliberately do NOT connect the readyRead signal. Qt delivering readyRead on a
+        # QLocalSocket that is being torn down under a CONCURRENT --reuse burst (claude-rc-session
+        # open-all, or overlapping --reuse clients on the group) segfaults inside Qt's C++
+        # dispatch (QAbstractSocketPrivate::canReadNotification) -- a use-after-free BEFORE any
+        # Python slot runs (crash.log 2026-10-02: SIGSEGV in on_ready; reproduced by the burst
+        # E2E in test_instances). A synchronous read goes straight to the socket fd and never
+        # enters that async readyRead-notifier path, so the UAF site is gone. newConnection is
+        # delivered one connection at a time, so each is fully served and closed in turn.
+        try:
+            self._serve_instance_request(conn, cid)
+        finally:
+            _ipc_trace('finish', cid)
+            # abort() closes + frees the socket synchronously (the reply, if any, was already
+            # flushed inside _serve_instance_request); deleteLater reaps the QObject on the
+            # next event-loop turn.
+            conn.abort()
             conn.deleteLater()
 
-        def on_ready():
+    def _serve_instance_request(self, conn, cid):
+        """Read one framed request off an accepted single-instance socket (bounded by
+        _IPC_SERVE_TIMEOUT), dispatch it, and write the reply. Synchronous, with no readyRead
+        signal (see _on_instance_connection for the use-after-free this avoids). A bare
+        liveness probe (socket_is_live connects, sends nothing, then closes) delivers no full
+        frame and is dropped with no reply."""
+        framer = ipc.Framer()
+        deadline = time.monotonic() + _IPC_SERVE_TIMEOUT
+        payload = None
+        while True:
             try:
                 payload = framer.feed(bytes(conn.readAll()))
             except ValueError:
-                conn.abort()
-                _finish()
+                return                      # malformed frame -> drop, no reply
+            if payload is not None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return                      # no full frame within the budget -> drop
+            _ipc_trace('wait-read', cid)
+            # Bounded wait for more bytes. False = timeout OR the peer closed with no full
+            # frame (a bare liveness probe) -> drop. waitForReadyRead reads this socket's fd
+            # directly; it does NOT emit the readyRead signal whose teardown dispatch segfaults.
+            if not conn.waitForReadyRead(int(remaining * 1000)):
                 return
-            if payload is None:
-                return                      # frame not complete yet; more may follow
-            reply = self._dispatch_request(payload)
-            conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
-            conn.flush()
-            _finish()
-
-        conn.readyRead.connect(on_ready)
-        # A bare connect (the socket_is_live liveness probe connects then closes with no
-        # framed request) never delivers a full frame; reap it via `disconnected`. The
-        # `finished` latch keeps this idempotent with on_ready's own teardown.
-        conn.disconnected.connect(_finish)
+        _ipc_trace('dispatch-start', cid)
+        reply = self._dispatch_request(payload)
+        _ipc_trace('dispatch-end', cid)
+        conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
+        conn.flush()
+        # Flush the reply to the kernel before the caller abort()s the socket (abort discards
+        # unsent data). Bounded (reply delivery is best-effort): if a client stops reading, its
+        # reply for an already-applied open is lost and it may retry -- open-all passes
+        # --if-absent, which dedups the retry. The old async design was equally best-effort here.
+        conn.waitForBytesWritten(int(_IPC_SERVE_TIMEOUT * 1000))
+        _ipc_trace('replied', cid)
 
     def _dispatch_request(self, payload):
         """Handle one IPC request; return a reply dict. Every request is same-UID
@@ -2626,9 +2656,22 @@ class MainWindow(QMainWindow):
         if opened == 0 and skipped == 0 and reattached == 0:
             self.new_tab()                  # a bare reuse (or an all-declined batch): a tab
         self.show()
+        # Raise/activate on a CLEAN event-loop turn, NOT synchronously here. _ipc_open runs
+        # inside the synchronous single-instance dispatch (_serve_instance_request), and
+        # raise_()/activateWindow() pump the platform event loop (a window-activation
+        # roundtrip). Pumping mid-serve could re-enter connection handling for a CONCURRENT
+        # --reuse client and surface the window before the reply is even framed; deferring the
+        # only event-pumping step keeps the dispatch non-reentrant -- the reply is written and
+        # the socket closed first, the window surfaces one turn later. show() on the
+        # already-visible primary is a no-op, so callers reading isVisible() are unaffected.
+        QTimer.singleShot(0, self._raise_activate)
+        return {'ok': True, 'opened': opened, 'skipped': skipped, 'reattached': reattached}
+
+    def _raise_activate(self):
+        """Bring the window to the front. Deferred from _ipc_open via singleShot so the
+        activation roundtrip's event pump cannot re-enter a live IPC dispatch (see _ipc_open)."""
         self.raise_()
         self.activateWindow()
-        return {'ok': True, 'opened': opened, 'skipped': skipped, 'reattached': reattached}
 
     def _add_placeholder_tab(self, info, at):
         """Insert a lightweight placeholder page for a not-yet-restored session tab,
@@ -7291,6 +7334,32 @@ def _is_font_noise(_category, message):
 # already-installed Qt message handler closure can tee later without a global rebind.
 _CRASH_LOG: list = []
 
+# Opt-in IPC lifecycle tracing. The single-instance dispatch is where a concurrent
+# --reuse burst (claude-rc-session open-all) stresses socket connect/serve/teardown --
+# the on_ready use-after-free class. Tracing each connection's
+# accept/wait-read/dispatch/reply/finish (monotonic-stamped, per-conn id) makes the
+# interleaving visible when reproducing the burst. Off by default (zero footprint);
+# appended to the same durable crash.log as a dense, banner-less line.
+_IPC_DEBUG = os.environ.get('SECURE_TERMINAL_IPC_DEBUG') == '1'
+_IPC_CONN_SEQ = [0]
+
+
+def _ipc_next_conn_id():
+    """Monotonic per-process connection id for IPC tracing. Single-threaded (the Qt
+    main thread is the only caller), so a plain counter needs no lock."""
+    _IPC_CONN_SEQ[0] += 1
+    return _IPC_CONN_SEQ[0]
+
+
+def _ipc_trace(event, cid):
+    """Append one IPC-lifecycle trace line when SECURE_TERMINAL_IPC_DEBUG=1. A no-op
+    otherwise, so the readyRead hot path pays nothing when tracing is off."""
+    if not _IPC_DEBUG:
+        return
+    log = _CRASH_LOG[0] if _CRASH_LOG else None
+    crashdiag.append_line(log, 'ipc t=%.6f conn=%d %s'
+                          % (time.monotonic(), cid, event))
+
 
 def _quiet_font_warnings():
     """Drop the font-shaping warnings (see _is_font_noise) and pass everything
@@ -8067,7 +8136,26 @@ def main(cg_base=None):
                         pass               # best-effort teardown; never block quit
     app.aboutToQuit.connect(_shutdown_all_tabs)
 
+    # Always-on hang detector. A wedged event loop emits no signal and raises no
+    # exception, so crash.log stays empty and the on-demand SIGUSR1 dumper needs a
+    # human -- useless for an unattended freeze. A daemon thread watches a heartbeat
+    # this main-thread QTimer advances; when the loop stops servicing it, the thread
+    # (still alive while the main thread is wedged) dumps every thread's stack to the
+    # crash log. Armed HERE, as the loop is about to run -- not during startup, whose
+    # synchronous window/tab build can legitimately exceed the threshold under load.
+    # A nested modal loop still ticks this timer, so a modal is never mis-flagged.
+    _crash_log = _CRASH_LOG[0] if _CRASH_LOG else None
+    if _crash_log is not None:
+        crashdiag.start_hang_watchdog(_crash_log)
+        _heartbeat_timer = QTimer(app)
+        _heartbeat_timer.timeout.connect(crashdiag.heartbeat)
+        _heartbeat_timer.start(crashdiag.HANG_HEARTBEAT_MS)
+
     rc = app.exec()
+    # Stop the hang watchdog now the loop it watches has returned (it is a daemon
+    # thread, so this is cleanup, not correctness -- but it keeps a main()-driving
+    # test, where app.exec is mocked, from leaving a thread that would later dump).
+    crashdiag.stop_hang_watchdog()
     # Delete the window -- and with it every child widget and its native XCB
     # handle -- explicitly WHILE the QApplication and its XCB connection are still
     # alive, then flush the deferred deletion now. Otherwise Python GCs the widgets
