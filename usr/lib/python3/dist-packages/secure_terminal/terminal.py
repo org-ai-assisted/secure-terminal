@@ -649,7 +649,7 @@ from secure_terminal.sanitize import (
     sanitize_paste_unicode, sanitize_clipboard, sanitize_clipboard_unicode,
     sanitize_clipboard_display,
     paste_findings, paste_is_multiline, paste_no_autosubmit, tui_cell,
-    ensure_utf8_ctype,
+    ensure_utf8_ctype, scrub_child_env,
     sanitize_title,
     feed_line_edits, cells_to_runs, cells_display_col, display_len,
     MARK_KEY, WRAP_NL, _NO_NEWLINE_KEY, _REDRAW_KEY, LINE_EDITING_MODES, BOX,
@@ -4982,24 +4982,11 @@ class SecureTerminal(_RenderedTextView):
                 # prepend our dir; a trailing empty entry keeps the system defaults
                 prev = os.environ.get('TERMINFO_DIRS', '')
                 os.environ['TERMINFO_DIRS'] = terminfo_dir + ':' + (prev or '')
-            # Scrub terminal-fingerprint vars inherited from whatever terminal
-            # launched us, so the child (and any host it ssh's into) cannot learn
-            # the host emulator's identity/version or a correlatable session id.
-            # LINES/COLUMNS are dropped too: the real size comes from TIOCSWINSZ,
-            # and a stale value here would mislead programs. The SECURE_TERMINAL_*
-            # entries are OUR OWN app-config vars (screenshot / solid-cursor /
-            # transcript modes): they are read once by the app at construction and
-            # are meaningless to a child shell, so they must not ride into it, into a
-            # host it ssh's into, or into a NESTED secure-terminal (which would
-            # silently inherit this process's modes instead of using its own flags).
-            for _var in ('TERM_PROGRAM', 'TERM_PROGRAM_VERSION',
-                         'VTE_VERSION', 'KONSOLE_VERSION', 'KONSOLE_DBUS_SERVICE',
-                         'KONSOLE_DBUS_SESSION', 'WT_SESSION', 'WT_PROFILE_ID',
-                         'ITERM_SESSION_ID', 'ITERM_PROFILE', 'KITTY_WINDOW_ID',
-                         'KITTY_PID', 'ALACRITTY_WINDOW_ID', 'LINES', 'COLUMNS',
-                         'SECURE_TERMINAL_SHOT', 'SECURE_TERMINAL_SOLID_CURSOR',
-                         'SECURE_TERMINAL_TRANSCRIPT_FILE'):
-                os.environ.pop(_var, None)
+            # Scrub terminal-fingerprint vars + our own app-config vars from the child
+            # (shared denylist, see sanitize.CHILD_ENV_SCRUB) so neither the host
+            # emulator's identity nor this process's screenshot/solid-cursor/transcript
+            # modes ride into the child, a host it ssh's into, or a NESTED secure-terminal.
+            scrub_child_env()
             # We render 24-bit colour faithfully (with a contrast guard) in both
             # modes, so advertise it -- a fixed value, not inherited, so it is not a
             # fingerprint. Programs then emit truecolor instead of down-mapping.

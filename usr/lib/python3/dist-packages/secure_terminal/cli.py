@@ -54,7 +54,7 @@ import argparse
 
 from secure_terminal.sanitize import (
     render_output, cap_zalgo_show, feed_chunk_carry, DISPLAY_MODES, sanitize_paste,
-    ensure_utf8_ctype)
+    ensure_utf8_ctype, scrub_child_env)
 
 # Bracketed-paste framing the OUTER terminal wraps a paste in once DECSET 2004 is
 # enabled. Stripped before the child sees it (the child runs TERM=dumb and never
@@ -203,6 +203,12 @@ def _run(argv, mode):
         # coverage tracer in the parent never receives the child's line data;
         # the behaviour is exercised end-to-end by the CLI tests instead.)
         os.environ['TERM'] = 'dumb'
+        # The CLI wrapper runs atop a REAL outer terminal, so the child would else
+        # inherit that emulator's fingerprint vars (TERM_PROGRAM etc.) and any of our
+        # own app-config vars (SECURE_TERMINAL_*) -- defeating the anti-fingerprinting
+        # guarantee the GUI already upholds. Strip the shared denylist here too so an
+        # untrusted program run under the wrapper cannot fingerprint/correlate.
+        scrub_child_env()
         # The decode side assumes UTF-8; make the child emit UTF-8. No-op when the
         # ambient locale is already UTF-8.
         ensure_utf8_ctype()

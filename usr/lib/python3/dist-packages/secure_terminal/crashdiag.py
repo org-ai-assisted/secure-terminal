@@ -305,6 +305,8 @@ def install(state_root, stderr=None):
     try:
         register_hang_dumper(stderr)
     except (OSError, RuntimeError, ValueError):
+        # non-fatal: an unusable stderr must not abort install; the durable-log
+        # registration below is the real target.
         pass
     path = crash_log_path(state_root)
     log = _open_append(path)
