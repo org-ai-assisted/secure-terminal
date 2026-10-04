@@ -249,14 +249,26 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             #    cursor (a status/hint line) and REPAINTS on the SIGWINCH, so preserving
             #    would leave stale duplicate scrollback and cost it the fixed-canvas
             #    treatment; a shell's cursor sits at the LAST content row (the prompt),
-            #    nothing below. Preserve only the shell shape (last_content <= cursor.y).
+            #    nothing below -- the shell shape (last_content <= cursor.y).
+            #  - BUT a shell editing a multi-line command that AUTOWRAPPED has the cursor
+            #    moved UP into the wrap (Left-Arrow / Alt-B), so content is still drawn
+            #    below it -- on rows that are wrap-CONTINUATIONS of the cursor's OWN logical
+            #    line. That is still the shell shape (real output above, one command below),
+            #    not a fixed canvas, so preserve it too. Content below the cursor marks a
+            #    canvas only when it is NOT all wrap-continuation of the cursor's line (a
+            #    canvas's below-cursor rows are independent lines). A backslash-continued
+            #    multi-line command has independent (non-wrapped) continuation lines and
+            #    stays, like a canvas, in the conservative not-preserved case.
             #  - Never push a trailing-blank row: an empty or just-cleared grid must not
             #    manufacture blank scrollback, matching a plain terminal resize.
             last_content = max(
                 (y for y in range(old_lines)
                  if any(c.data != ' ' for c in self.buffer[y].values())),
                 default=-1)
-            if last_content <= self.cursor.y:
+            wrapped_below = last_content > self.cursor.y and all(
+                getattr(self.buffer.get(y), 'wrapped', False)
+                for y in range(self.cursor.y, last_content))
+            if last_content <= self.cursor.y or wrapped_below:
                 for y in range(min(drop, last_content + 1)):
                     self.history.top.append(self.buffer[y])
         super().resize(lines, columns)
