@@ -2145,13 +2145,26 @@ def ensure_utf8_ctype(environ=None):
 #     a host it ssh's into, or into a NESTED secure-terminal (which would silently inherit
 #     this process's modes instead of using its own flags).
 CHILD_ENV_SCRUB = (
-    'TERM_PROGRAM', 'TERM_PROGRAM_VERSION',
+    # Mainstream emulators' identity / version / per-session id, and their control
+    # SOCKETS (a leaked socket is also a capability: a child could drive the host
+    # emulator). Several of these forward over ssh by default (OpenSSH ships
+    # `SendEnv LANG LC_*`), so LC_TERMINAL/LC_TERMINAL_VERSION reach a remote host too.
+    'TERM_PROGRAM', 'TERM_PROGRAM_VERSION', 'TERM_SESSION_ID',
+    'LC_TERMINAL', 'LC_TERMINAL_VERSION',
     'VTE_VERSION', 'KONSOLE_VERSION', 'KONSOLE_DBUS_SERVICE',
-    'KONSOLE_DBUS_SESSION', 'WT_SESSION', 'WT_PROFILE_ID',
-    'ITERM_SESSION_ID', 'ITERM_PROFILE', 'KITTY_WINDOW_ID',
-    'KITTY_PID', 'ALACRITTY_WINDOW_ID', 'LINES', 'COLUMNS',
+    'KONSOLE_DBUS_SESSION', 'GNOME_TERMINAL_SCREEN', 'GNOME_TERMINAL_SERVICE',
+    'TILIX_ID', 'XTERM_VERSION', 'WT_SESSION', 'WT_PROFILE_ID',
+    'ITERM_SESSION_ID', 'ITERM_PROFILE',
+    'KITTY_WINDOW_ID', 'KITTY_PID', 'KITTY_LISTEN_ON',
+    'ALACRITTY_WINDOW_ID', 'ALACRITTY_SOCKET',
+    'WEZTERM_UNIX_SOCKET', 'WEZTERM_PANE',
+    'LINES', 'COLUMNS',
+    # our own app-config vars (every SECURE_TERMINAL_* the app reads); COLORTERM is NOT
+    # here -- the GUI resets it to a fixed `truecolor` after this scrub, so it is a fixed
+    # value, not a fingerprint.
     'SECURE_TERMINAL_SHOT', 'SECURE_TERMINAL_SOLID_CURSOR',
-    'SECURE_TERMINAL_TRANSCRIPT_FILE')
+    'SECURE_TERMINAL_TRANSCRIPT_FILE', 'SECURE_TERMINAL_IPC_DEBUG',
+    'SECURE_TERMINAL_HANG_WATCHDOG_SECS')
 
 
 def scrub_child_env(environ=None):
