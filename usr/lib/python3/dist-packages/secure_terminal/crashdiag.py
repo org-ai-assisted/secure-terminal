@@ -11,8 +11,10 @@ exactly the reported gap. Three failure paths matter:
 - a HANG: a wedged event loop emits no signal and no exception, so neither path
   above fires and the log stays empty. On a ptrace-restricted VM (Kicksecure
   security-misc `kernel.yama.ptrace_scope=3`, no py-spy/gdb) a live freeze is then
-  un-introspectable. An on-demand SIGUSR1 dumper closes that: `kill -USR1 <pid>`
-  appends every thread's Python stack to the same log.
+  un-introspectable. Two complementary dumpers close that: an ALWAYS-ON watchdog
+  thread auto-dumps every thread's stack when the main-thread heartbeat stalls
+  (no human action, catches an unattended freeze), and an on-demand SIGUSR1 dumper
+  (`kill -USR1 <pid>`) does the same on request. Both append to the same log.
 
 The first two are teed to a durable, owner-only file at one fixed path under the
 state root (found regardless of instance group), and to stderr for a terminal
@@ -28,9 +30,21 @@ import os
 import signal
 import stat
 import sys
+import threading
+import time
 import traceback
 
 CRASH_LOG_NAME = 'crash.log'
+
+# Always-on hang detector knobs. The main-thread heartbeat timer ticks every
+# HANG_HEARTBEAT_MS; the watchdog thread declares a stall when the loop has not
+# advanced the heartbeat for HANG_WATCHDOG_DEFAULT_SECS (env-overridable). The
+# threshold is kept well above the longest legitimate main-thread pause (the 5s
+# exec handshake, a modal still ticks timers) so a busy app is never mis-flagged.
+HANG_HEARTBEAT_MS = 1000
+HANG_WATCHDOG_DEFAULT_SECS = 12.0
+HANG_WATCHDOG_MIN_SECS = 2.0
+HANG_WATCHDOG_ENV = 'SECURE_TERMINAL_HANG_WATCHDOG_SECS'
 
 
 def crash_log_path(state_root):
@@ -95,6 +109,16 @@ def write_note(log, kind, text):
     _tee((log,), _banner(kind) + text)
 
 
+def append_line(log, text):
+    """Append one newline-terminated line to the durable log, with NO banner, for
+    dense opt-in tracing (e.g. the IPC lifecycle under SECURE_TERMINAL_IPC_DEBUG).
+    A no-op when there is no log. Best-effort -- a trace must never raise out of a
+    Qt slot."""
+    if log is None:
+        return
+    _tee((log,), text + '\n')
+
+
 def echo_stderr(text, stream=None):
     """Best-effort stderr echo of a Qt message line. A broken/closed stderr -- the
     exact GUI case the durable log exists for -- must never raise out of the Qt
@@ -129,6 +153,132 @@ def register_hang_dumper(stream):
     unhandled SIGUSR1's default action is to TERMINATE -- so registering it is also
     what makes the signal safe to send."""
     faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True, chain=False)
+
+
+class _HangWatchdog:
+    """Auto hang detector. A wedged Qt event loop raises no exception and triggers
+    no fatal signal, so excepthook/faulthandler never fire and the on-demand SIGUSR1
+    dumper needs a human to send the signal -- useless for a freeze nobody is
+    watching. This daemon thread watches a heartbeat the MAIN thread advances (via a
+    QTimer); when the loop stops servicing it past `threshold` seconds, the thread --
+    which keeps running while the main thread is wedged -- dumps EVERY thread's Python
+    stack to the durable log. Dump-only: it never kills or recovers the app (a
+    security terminal; recovery is the operator's call). One dump per wedge; it
+    re-arms when the heartbeat advances again, so a recover-then-hang is captured
+    twice rather than lost."""
+
+    def __init__(self, log, threshold):
+        self._log = log
+        self._threshold = threshold
+        self._lock = threading.Lock()
+        self._beat = time.monotonic()
+        self._dumped = False
+        self._stop = threading.Event()
+        # Poll a quarter of the threshold so detection latency stays small relative
+        # to it (worst case ~1.25x the threshold), floored at 0.25s to avoid a hot
+        # spin. At the shipped 12s threshold this is a 3s poll; the floor only bites
+        # for the tiny thresholds a test uses.
+        self._interval = max(0.25, threshold / 4.0)
+        self._thread = threading.Thread(target=self._run, name='st-hang-watchdog',
+                                        daemon=True)
+
+    def beat(self):
+        """Advance the heartbeat (called from the main thread by the heartbeat
+        timer). Re-arms the dumper after a recovery."""
+        with self._lock:
+            self._beat = time.monotonic()
+            self._dumped = False
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        """Stop the watchdog thread (tests; the process otherwise runs it for life
+        as a daemon thread that never blocks exit)."""
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            with self._lock:
+                stalled = time.monotonic() - self._beat
+                already = self._dumped
+            if stalled >= self._threshold and not already:
+                self._dump(stalled)
+                with self._lock:
+                    self._dumped = True
+
+    def _dump(self, stalled):
+        try:
+            self._log.write(
+                _banner('hang detected')
+                + 'event loop stalled %.1fs (threshold %.1fs); '
+                  'all-thread stack follows\n' % (stalled, self._threshold))
+            self._log.flush()
+        except Exception:      # pylint: disable=broad-except
+            pass               # a hang handler must never raise -- diagnostic first
+        try:
+            # dump_traceback is safe to call from a non-main thread and prints every
+            # thread's Python stack, so the wedged MAIN thread's frames are captured.
+            faulthandler.dump_traceback(all_threads=True, file=self._log)
+            self._log.flush()
+        except Exception:      # pylint: disable=broad-except
+            pass
+
+
+def hang_threshold_from_env():
+    """The watchdog stall threshold in seconds: env override, floored at
+    HANG_WATCHDOG_MIN_SECS, else the default. A malformed value falls back to the
+    default rather than disabling the watchdog."""
+    raw = os.environ.get(HANG_WATCHDOG_ENV)
+    if raw is None:
+        return HANG_WATCHDOG_DEFAULT_SECS
+    try:
+        val = float(raw)
+    except ValueError:
+        return HANG_WATCHDOG_DEFAULT_SECS
+    return max(HANG_WATCHDOG_MIN_SECS, val)
+
+
+# The live watchdog, set by start_hang_watchdog so the main-thread heartbeat()
+# timer can find it without the caller threading a handle through.
+_watchdog = None
+
+
+def start_hang_watchdog(log, threshold=None):
+    """Start the always-on auto hang detector against `log` and return it (or None
+    when there is no log). Call once from main() as the Qt event loop is about to
+    run -- NOT during startup, whose synchronous window/tab build can legitimately
+    exceed the threshold under load. Pair with heartbeat() driven by a main-thread
+    QTimer at HANG_HEARTBEAT_MS."""
+    global _watchdog
+    if log is None:
+        return None
+    if threshold is None:
+        threshold = hang_threshold_from_env()
+    _watchdog = _HangWatchdog(log, threshold).start()
+    return _watchdog
+
+
+def stop_hang_watchdog():
+    """Stop the live hang watchdog, if any, and clear it. Called once after the Qt
+    event loop returns (app.exec), so the detector lives exactly as long as the loop
+    it watches -- and a test that drives main() with a mocked app.exec starts then
+    stops it at once rather than leaking a thread that would later false-dump.
+    Idempotent."""
+    global _watchdog
+    watchdog = _watchdog
+    _watchdog = None
+    if watchdog is not None:
+        watchdog.stop()
+
+
+def heartbeat():
+    """Advance the hang watchdog's heartbeat. Wired to a main-thread QTimer; a no-op
+    when no watchdog is running, so the timer can call it unconditionally."""
+    watchdog = _watchdog
+    if watchdog is not None:
+        watchdog.beat()
 
 
 def install(state_root, stderr=None):
