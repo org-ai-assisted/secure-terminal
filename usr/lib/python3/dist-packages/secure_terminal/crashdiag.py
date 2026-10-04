@@ -200,13 +200,18 @@ class _HangWatchdog:
 
     def _run(self):
         while not self._stop.wait(self._interval):
+            do_dump = False
             with self._lock:
                 stalled = time.monotonic() - self._beat
-                already = self._dumped
-            if stalled >= self._threshold and not already:
-                self._dump(stalled)
-                with self._lock:
+                if stalled >= self._threshold and not self._dumped:
+                    # Claim the dump UNDER the lock, BEFORE the (possibly slow) _dump: a
+                    # beat() that recovers the loop mid-dump then correctly re-arms (sets
+                    # _dumped False) instead of being clobbered back to True afterwards --
+                    # which would leave the NEXT real wedge undumped until another beat.
                     self._dumped = True
+                    do_dump = True
+            if do_dump:
+                self._dump(stalled)
 
     def _dump(self, stalled):
         try:
@@ -256,6 +261,7 @@ def start_hang_watchdog(log, threshold=None):
         return None
     if threshold is None:
         threshold = hang_threshold_from_env()
+    stop_hang_watchdog()          # never leak a prior watchdog thread on a second call
     _watchdog = _HangWatchdog(log, threshold).start()
     return _watchdog
 

@@ -260,10 +260,14 @@ _PERSIST_DEFAULTS = {
 _MAX_OPEN_TABS = 64
 
 # Bound (seconds) for synchronously reading one framed request off an accepted
-# single-instance socket and flushing its reply. Matches the client send_request
-# timeout so the server answers within the client's wait; a slow/stuck client is
-# dropped rather than blocking the main thread indefinitely.
-_IPC_SERVE_TIMEOUT = 1.5
+# single-instance socket, and for flushing its reply, on the Qt MAIN thread. A legit
+# client sends its (tiny) frame before/at connect, so the first read returns it with NO
+# wait; this bound only caps a slow/partial/non-reading client. Kept well UNDER the
+# client's 1.5s send_request timeout and the hang-watchdog threshold, so a same-UID client
+# that connects and then stalls cannot freeze the UI for long -- the socket is owner-only,
+# so the worst case is a bounded same-UID self-DoS, not a cross-user one. A dropped slow
+# client just retries via _handoff; it is never a crash.
+_IPC_SERVE_TIMEOUT = 0.5
 
 # menu label -> scrollback limit in lines (0 = unlimited)
 SCROLLBACK_CHOICES = [
@@ -2405,7 +2409,9 @@ class MainWindow(QMainWindow):
         conn.write(ipc.frame(json.dumps(reply).encode('utf-8')))
         conn.flush()
         # Flush the reply to the kernel before the caller abort()s the socket (abort discards
-        # unsent data). Bounded, same budget.
+        # unsent data). Bounded (reply delivery is best-effort): if a client stops reading, its
+        # reply for an already-applied open is lost and it may retry -- open-all passes
+        # --if-absent, which dedups the retry. The old async design was equally best-effort here.
         conn.waitForBytesWritten(int(_IPC_SERVE_TIMEOUT * 1000))
         _ipc_trace('replied', cid)
 
