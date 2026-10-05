@@ -117,6 +117,13 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
     this weakens the cell filter: it only governs how pyte parses, never what reaches the
     screen."""
 
+    # Declare the pyte Screen size attrs for the static checker: pyte is an unresolved import
+    # under mypy --ignore-missing-imports, so reassigning self.lines / self.columns in
+    # resize_preserving_scrollback would otherwise leave them untyped and flag has-type on every
+    # read. Annotation only (no value) -- pyte's __init__ still sets the instance values.
+    lines: int
+    columns: int
+
     def select_graphic_rendition(self, *attrs, private=False, **kwargs):
         if private:
             return
@@ -222,44 +229,47 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         super().linefeed()
 
     def resize_preserving_scrollback(self, lines, columns):
-        """Resize the PRIMARY screen without destroying scrollback content. Stock pyte
-        Screen.resize clips the TOP rows on a height shrink (cursor to 0,0 +
-        delete_lines from the top) and drops them outright -- so the output above the
-        prompt VANISHES on a shrink, and a later grow (the copy/paste review bar
-        opening then closing, a window drag) never brings it back. Instead scroll the
-        clipped CONTENT rows into history first, exactly as index() does when output
-        scrolls a line off the top; the renderer draws that history ABOVE the live grid
-        and trims the grow's trailing blanks (Bug #64), so a shrink+grow round trip is
-        visually lossless. Only the height shrink of a BOTTOM-ANCHORED (shell) frame with
-        DEFAULT margins is preserved; a grow, a width change, a scroll region, and the
-        identical-size fast path defer to pyte. NOT for the alt screen -- caller gates."""
-        old_lines = self.lines
-        # A DECSTBM scroll region (margins set) breaks the "clip from the top" model this
-        # relies on: pyte's resize runs delete_lines at row 0, which a region NOT starting
-        # at row 0 makes a NO-OP (delete_lines is margin-clamped), so the top rows are NOT
-        # dropped -- pushing them would DUPLICATE them into scrollback while the region's
-        # most recent rows vanish (an ncurses/tmux app reserving a top status line, then
-        # resized). Such a program owns a fixed region and repaints on SIGWINCH, so defer
-        # wholesale to pyte when a region is set.
+        """Resize the PRIMARY screen the way real terminals do a HEIGHT SHRINK, instead of
+        stock pyte Screen.resize (cursor to 0,0 + delete_lines from the top), which drops the
+        TOP rows outright -- destroying the output above the prompt on a transient shrink (the
+        copy/paste review bar opening then closing, a window drag). The canonical rule
+        (xterm ScreenResize/saveEditBufLines, alacritty shrink_lines, VTE screen_set_size)
+        ANCHORS THE CURSOR: scroll only as many TOP rows into history as are needed to keep the
+        cursor row on screen -- `max(0, cursor.y + 1 - new_lines)` -- and drop the rest from the
+        BOTTOM (the program repaints below-cursor rows on SIGWINCH). The cursor follows its
+        content up. Consequences: real scrollback above the cursor is NEVER lost; and a shrink
+        that still fits the cursor scrolls NOTHING into history, so a no-scrollback full-screen
+        frame (a primary-buffer fixed canvas) stays one -- scrollback appears only when the
+        cursor genuinely cannot fit, exactly as every mainstream terminal behaves. A grow, a
+        width-only change, a scroll region (margins set) and the identical-size fast path defer
+        to pyte. NOT for the alt screen -- caller gates.
+        (A DECSTBM region defers to pyte: its delete_lines is margin-clamped, so a region past
+        row 0 drops nothing and preserving would duplicate; such a program repaints on SIGWINCH.
+        RESIDUAL: a region starting at row 0 still has its top rows dropped by pyte.)"""
+        old_lines, old_columns = self.lines, self.columns
         if lines < old_lines and self.margins is None:
-            drop = old_lines - lines
-            # last_content: the last non-blank row (pyte fills unwritten cells with a
-            # plain space, so a written non-space is real content). Two uses:
-            #  - A program managing a fixed canvas (Claude Code) draws content BELOW the
-            #    cursor (a status/hint line) and REPAINTS on the SIGWINCH, so preserving
-            #    would leave stale duplicate scrollback and cost it the fixed-canvas
-            #    treatment; a shell's cursor sits at the LAST content row (the prompt),
-            #    nothing below. Preserve only the shell shape (last_content <= cursor.y).
-            #  - Never push a trailing-blank row: an empty or just-cleared grid must not
-            #    manufacture blank scrollback, matching a plain terminal resize.
-            last_content = max(
-                (y for y in range(old_lines)
-                 if any(c.data != ' ' for c in self.buffer[y].values())),
-                default=-1)
-            if last_content <= self.cursor.y:
-                for y in range(min(drop, last_content + 1)):
-                    self.history.top.append(self.buffer[y])
-        super().resize(lines, columns)
+            # Rows [0, scroll_off) scroll into scrollback (kept); rows [scroll_off, +lines) are
+            # the new grid; rows below drop from the bottom. scroll_off == 0 for a small shrink
+            # that still fits the cursor -- nothing is promoted, so a fixed canvas stays one.
+            scroll_off = max(0, (self.cursor.y + 1) - lines)
+            for y in range(scroll_off):
+                self.history.top.append(self.buffer[y])
+            # Shift the kept rows up by scroll_off; the membership test avoids materialising a
+            # phantom blank for a never-written (sparse) source row.
+            kept = {y: self.buffer[y + scroll_off]
+                    for y in range(lines) if (y + scroll_off) in self.buffer}
+            self.buffer.clear()
+            self.buffer.update(kept)
+            self.cursor.y = max(0, min(self.cursor.y - scroll_off, lines - 1))
+            if columns < old_columns:
+                for line in self.buffer.values():
+                    for x in range(columns, old_columns):
+                        line.pop(x, None)
+            self.lines, self.columns = lines, columns
+            self.dirty.update(range(lines))
+            self.set_margins()
+        else:
+            super().resize(lines, columns)
 
     def draw(self, data):
         # New glyphs make any no-trailing-newline flag on the cursor row STALE (a
