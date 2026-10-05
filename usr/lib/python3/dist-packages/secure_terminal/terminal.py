@@ -230,9 +230,8 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         clipped CONTENT rows into history first, exactly as index() does when output
         scrolls a line off the top; the renderer draws that history ABOVE the live grid
         and trims the grow's trailing blanks (Bug #64), so a shrink+grow round trip is
-        visually lossless. Only the height shrink of a BOTTOM-ANCHORED (shell) frame with
-        DEFAULT margins is preserved; a grow, a width change, a scroll region, and the
-        identical-size fast path defer to pyte. NOT for the alt screen -- caller gates."""
+        visually lossless. A grow, a width change, a scroll region, and the identical-size
+        fast path defer to pyte. NOT for the alt screen -- caller gates."""
         old_lines = self.lines
         # A DECSTBM scroll region (margins set) breaks the "clip from the top" model this
         # relies on: pyte's resize runs delete_lines at row 0, which a region NOT starting
@@ -241,37 +240,34 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         # most recent rows vanish (an ncurses/tmux app reserving a top status line, then
         # resized). Such a program owns a fixed region and repaints on SIGWINCH, so defer
         # wholesale to pyte when a region is set.
-        if lines < old_lines and self.margins is None:
+        shrink = lines < old_lines and self.margins is None
+        if shrink:
             drop = old_lines - lines
-            # last_content: the last non-blank row (pyte fills unwritten cells with a
-            # plain space, so a written non-space is real content). Two uses:
-            #  - A program managing a fixed canvas (Claude Code) draws content BELOW the
-            #    cursor (a status/hint line) and REPAINTS on the SIGWINCH, so preserving
-            #    would leave stale duplicate scrollback and cost it the fixed-canvas
-            #    treatment; a shell's cursor sits at the LAST content row (the prompt),
-            #    nothing below -- the shell shape (last_content <= cursor.y).
-            #  - BUT a shell editing a multi-line command that AUTOWRAPPED has the cursor
-            #    moved UP into the wrap (Left-Arrow / Alt-B), so content is still drawn
-            #    below it -- on rows that are wrap-CONTINUATIONS of the cursor's OWN logical
-            #    line. That is still the shell shape (real output above, one command below),
-            #    not a fixed canvas, so preserve it too. Content below the cursor marks a
-            #    canvas only when it is NOT all wrap-continuation of the cursor's line (a
-            #    canvas's below-cursor rows are independent lines). A backslash-continued
-            #    multi-line command has independent (non-wrapped) continuation lines and
-            #    stays, like a canvas, in the conservative not-preserved case.
-            #  - Never push a trailing-blank row: an empty or just-cleared grid must not
-            #    manufacture blank scrollback, matching a plain terminal resize.
+            # ALWAYS preserve the clipped top content rows on a primary-screen shrink.
+            # There is no reliable signal at resize time to tell a shell's real scrollback
+            # (which the program will NEVER repaint, so it must survive) from a fixed-canvas
+            # program's rows (which it repaints on SIGWINCH): the cursor position, the
+            # per-row wrapped flag and the promoted-scrollback count each misclassify real
+            # cases in both directions. So choose the only non-lossy side -- never DROP.
+            # Dropped output is unrecoverable; at worst a primary-screen fixed-canvas program
+            # (e.g. Claude Code) leaves cosmetic duplicate rows in scrollback that scroll
+            # away. Never push a trailing-blank row: an empty or just-cleared grid must not
+            # manufacture blank scrollback, matching a plain terminal resize.
             last_content = max(
                 (y for y in range(old_lines)
                  if any(c.data != ' ' for c in self.buffer[y].values())),
                 default=-1)
-            wrapped_below = last_content > self.cursor.y and all(
-                getattr(self.buffer.get(y), 'wrapped', False)
-                for y in range(self.cursor.y, last_content))
-            if last_content <= self.cursor.y or wrapped_below:
-                for y in range(min(drop, last_content + 1)):
-                    self.history.top.append(self.buffer[y])
+            for y in range(min(drop, last_content + 1)):
+                self.history.top.append(self.buffer[y])
         super().resize(lines, columns)
+        if shrink:
+            # pyte's resize deletes the top `drop` rows and restores the pre-resize cursor
+            # UNCHANGED, but the grid content shifted UP by `drop`; move the cursor with it
+            # so a mid-grid caret (editing a wrapped / multi-line command whose output
+            # scrolled into history) is not stranded `drop` rows below its content on a
+            # blank row, which would misplace the shell's post-SIGWINCH redraw. A
+            # bottom-anchored caret lands on the new last row, as before.
+            self.cursor.y = max(0, self.cursor.y - drop)
 
     def draw(self, data):
         # New glyphs make any no-trailing-newline flag on the cursor row STALE (a
