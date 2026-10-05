@@ -117,6 +117,13 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
     this weakens the cell filter: it only governs how pyte parses, never what reaches the
     screen."""
 
+    # Declare the pyte Screen size attrs for the static checker: pyte is an unresolved import
+    # under mypy --ignore-missing-imports, so reassigning self.lines / self.columns in
+    # resize_preserving_scrollback would otherwise leave them untyped and flag has-type on every
+    # read. Annotation only (no value) -- pyte's __init__ still sets the instance values.
+    lines: int
+    columns: int
+
     def select_graphic_rendition(self, *attrs, private=False, **kwargs):
         if private:
             return
