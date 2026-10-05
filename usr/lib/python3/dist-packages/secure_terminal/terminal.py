@@ -233,41 +233,43 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         visually lossless. A grow, a width change, a scroll region, and the identical-size
         fast path defer to pyte. NOT for the alt screen -- caller gates."""
         old_lines = self.lines
-        # A DECSTBM scroll region (margins set) breaks the "clip from the top" model this
-        # relies on: pyte's resize runs delete_lines at row 0, which a region NOT starting
-        # at row 0 makes a NO-OP (delete_lines is margin-clamped), so the top rows are NOT
-        # dropped -- pushing them would DUPLICATE them into scrollback while the region's
-        # most recent rows vanish (an ncurses/tmux app reserving a top status line, then
-        # resized). Such a program owns a fixed region and repaints on SIGWINCH, so defer
-        # wholesale to pyte when a region is set.
-        shrink = lines < old_lines and self.margins is None
-        if shrink:
+        # Only the height shrink of a DEFAULT-margins primary frame is preserved. A DECSTBM
+        # scroll region (margins set) breaks the "clip from the top" model: pyte's resize runs
+        # delete_lines at row 0, which a region NOT starting at row 0 makes a NO-OP (delete_lines
+        # is margin-clamped), so the top rows are NOT dropped -- pushing them would DUPLICATE
+        # them into scrollback. Such a program owns a fixed region and repaints on SIGWINCH, so
+        # defer wholesale to pyte when a region is set. (RESIDUAL: a region that DOES start at
+        # row 0 still has its top rows dropped by pyte; a region + shrink is rare and the program
+        # repaints, so it is left to pyte rather than special-cased.)
+        if lines < old_lines and self.margins is None:
             drop = old_lines - lines
-            # ALWAYS preserve the clipped top content rows on a primary-screen shrink.
-            # There is no reliable signal at resize time to tell a shell's real scrollback
-            # (which the program will NEVER repaint, so it must survive) from a fixed-canvas
-            # program's rows (which it repaints on SIGWINCH): the cursor position, the
-            # per-row wrapped flag and the promoted-scrollback count each misclassify real
-            # cases in both directions. So choose the only non-lossy side -- never DROP.
-            # Dropped output is unrecoverable; at worst a primary-screen fixed-canvas program
-            # (e.g. Claude Code) leaves cosmetic duplicate rows in scrollback that scroll
-            # away. Never push a trailing-blank row: an empty or just-cleared grid must not
+            # ALWAYS preserve the clipped top content rows on a primary-screen shrink. There is
+            # no reliable signal at resize time to tell a shell's real scrollback (which the
+            # program never repaints, so it must survive) from a fixed-canvas program's rows
+            # (which it repaints on SIGWINCH): cursor position, the per-row wrapped flag and the
+            # promoted-scrollback count each misclassify real cases BOTH ways. So choose the only
+            # non-lossy side -- never DROP. Lost output is unrecoverable; at worst a primary-screen
+            # fixed-canvas program (e.g. Claude Code) leaves cosmetic duplicate rows in scrollback
+            # that scroll away. A cell counts as content when it shows anything -- a glyph OR a
+            # visible attribute on a space (reverse / background / underline / strikethrough, e.g.
+            # a styled status bar) -- so such a row is preserved, not mistaken for a trailing blank.
+            # Never push a genuinely blank trailing row: an empty / just-cleared grid must not
             # manufacture blank scrollback, matching a plain terminal resize.
             last_content = max(
                 (y for y in range(old_lines)
-                 if any(c.data != ' ' for c in self.buffer[y].values())),
+                 if any(c.data != ' ' or c.reverse or c.bg != 'default'
+                        or c.underscore or c.strikethrough
+                        for c in self.buffer[y].values())),
                 default=-1)
             for y in range(min(drop, last_content + 1)):
                 self.history.top.append(self.buffer[y])
+        # Cursor: pyte restores the pre-resize caret and the caller (_sync_tui_size) clamps it
+        # into the new grid. A bottom-anchored caret (the common review-bar case) lands on the
+        # new last row, correct. A mid-grid caret (editing a multi-line command whose output
+        # scrolled up) is left to the shell's SIGWINCH redraw to re-home -- NOT shifted here: a
+        # blanket `cursor.y -= drop` corrupts an absolute-addressed / cleared screen and the
+        # caret's own clipped row, so no shift is safe across all cases (RESIDUAL).
         super().resize(lines, columns)
-        if shrink:
-            # pyte's resize deletes the top `drop` rows and restores the pre-resize cursor
-            # UNCHANGED, but the grid content shifted UP by `drop`; move the cursor with it
-            # so a mid-grid caret (editing a wrapped / multi-line command whose output
-            # scrolled into history) is not stranded `drop` rows below its content on a
-            # blank row, which would misplace the shell's post-SIGWINCH redraw. A
-            # bottom-anchored caret lands on the new last row, as before.
-            self.cursor.y = max(0, self.cursor.y - drop)
 
     def draw(self, data):
         # New glyphs make any no-trailing-newline flag on the cursor row STALE (a
