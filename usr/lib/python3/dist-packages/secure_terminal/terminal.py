@@ -2294,6 +2294,9 @@ class SecureTerminal(_RenderedTextView):
         # restores this. The protection is restore-on-LEAVE: alt ENTRY deliberately KEEPS the
         # primary region (a real terminal's smcup carries no region reset), never clears it.
         self._alt_saved_margins = None
+        # Entry-time grid size, so _alt_leave can reconcile the restored primary to a size
+        # the window CHANGED during the alt session (the snapshot below is at ENTRY size).
+        self._alt_saved_size = None
         # 'Save Transcript' scrollback (Option B): the alt screen is NOT scrollback, so
         # the primary transcript text is frozen at alt entry (returned while the program
         # runs, instead of the ephemeral grid), and each finished full-screen session
@@ -5644,6 +5647,10 @@ class SecureTerminal(_RenderedTextView):
         # shell and permanently disabling the scrollback-preserving shrink (which gates on
         # margins is None). _alt_leave restores this.
         self._alt_saved_margins = s.margins
+        # Entry grid size: the buffer/cursor snapshot above is at THIS size. A window resize
+        # during the alt session leaves the shared Screen at a different size, so _alt_leave
+        # replays that resize onto the restored primary (see there).
+        self._alt_saved_size = (s.lines, s.columns)
         # The snapshot above hid the scrollbar while _alt_screen was False, so the later
         # alt paint no longer toggles the bar -- and the resize that reclaims the bar's
         # column for the (wider, scrollback-free) alt canvas never fires. Reconcile the
@@ -5689,6 +5696,19 @@ class SecureTerminal(_RenderedTextView):
             self._append_exit_snapshot(self._walk_document_text())
         self._screen.buffer, self._screen.history, self._screen.cursor = \
             self._alt_saved
+        # Reconcile the restored primary to a size the window CHANGED during the alt session.
+        # _alt_saved is the ENTRY-size snapshot, but a resize while the full-screen program ran
+        # left self._screen at a different size; restoring buffer/cursor verbatim would strand
+        # the cursor (and the shell's prompt row) off a shrunk screen -- next linefeed clamps and
+        # new output lands mid-screen. Replay the resize through the canonical scrollback-
+        # preserving shrink (the same path a live primary resize takes): make the model
+        # consistent at the entry size, then resize to the current size so excess top rows scroll
+        # into history and the cursor reconciles. margins is None here (the during-alt resize
+        # cleared it); the primary region is restored just below. No-op when size is unchanged.
+        _cur_size = (self._screen.lines, self._screen.columns)
+        if self._alt_saved_size is not None and _cur_size != self._alt_saved_size:
+            self._screen.lines, self._screen.columns = self._alt_saved_size
+            self._screen.resize_preserving_scrollback(*_cur_size)
         # Restore the primary's margins, undoing any DECSTBM region the alt program left
         # set (see _alt_enter) so the returned-to shell is region-free again. Drop a saved
         # region that no longer FITS: a resize DURING the alt session can shrink the screen
@@ -5701,6 +5721,7 @@ class SecureTerminal(_RenderedTextView):
         self._screen.margins = _saved_m
         self._alt_saved = None
         self._alt_saved_margins = None
+        self._alt_saved_size = None
         self._alt_owner_pgrp = None
         self._alt_primary_text = ''       # the frozen primary is now restored, live again
         if not self._frozen:
