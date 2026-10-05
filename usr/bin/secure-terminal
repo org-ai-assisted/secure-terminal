@@ -5,6 +5,9 @@
 
 ## AI-Assisted
 
+## Shell-invocation guard.
+"exec" "bash" "-c" "printf '%s\n' '$0: ERROR: Do not execute this script with bash!' >&2; exit 1"
+
 import os
 import sys
 
@@ -41,18 +44,25 @@ require(
 )
 
 from secure_terminal.main import main
-from secure_terminal.resource_isolation import base_setup
+from secure_terminal.resource_isolation import base_setup, isolation_notice
 
 if __name__ == '__main__':
+    ## 'ctl' is a pure client (no window, opens no tabs): it must not relocate this
+    ## process's cgroup nor emit the isolation notice -- that noise polluted every ctl
+    ## invocation. main() dispatches ctl itself.
+    if sys.argv[1:2] == ['ctl']:
+        sys.exit(main())
     ## Prepare per-tab resource isolation ONCE, here in the launcher. base_setup()
     ## relocates THIS process's cgroup (the cgroup v2 "no internal processes" rule) so
     ## each tab can get its own limited child cgroup -- a one-time side effect that
     ## belongs to the real app process, not the importable main() the in-process tests
     ## drive. None when the host does not delegate memory+pids cgroup v2 controllers;
-    ## tabs then just share the session's own limits. Note it on stderr, once.
+    ## tabs then just share the session's own limits. This fail-open is SILENT by design
+    ## (isolation_notice): a non-delegated host (the common Qubes AppVM case) is normal,
+    ## not an error, so do not spew a warning on every launch; surface it only under
+    ## SECURE_TERMINAL_CGROUP_DEBUG=1 for diagnostics.
     _cg_base = base_setup()
-    if _cg_base is None:
-        sys.stderr.write(
-            'secure-terminal: per-tab resource isolation unavailable (no cgroup v2 '
-            'delegation); tabs share the session limits\n')
+    _notice = isolation_notice(_cg_base)
+    if _notice:
+        sys.stderr.write(_notice + '\n')
     sys.exit(main(cg_base=_cg_base))

@@ -1664,6 +1664,14 @@ class _RenderedTextView(QPlainTextEdit):
         g.setGeometry(QRect(self.contentsRect().left(), vp.top(),
                             self._gutter_width_px(), vp.height()))
 
+    def resizeEvent(self, event):
+        """Re-align the gutter strip with the viewport on every resize -- shared by
+        both views, so any surface using the base gutter tracks the viewport by default
+        (updateRequest only re-reserves the margin WIDTH, never the strip geometry).
+        SecureTerminal extends this; RevealedEditor relies on it unchanged."""
+        super().resizeEvent(event)
+        self._position_gutter()
+
     def _block_no_newline(self, block):
         """True if `block`'s line carries the no-trailing-newline annotation, in BOTH
         render paths: a TUI grid block records it on its _GridRow; a CLI line block
@@ -4252,7 +4260,13 @@ class SecureTerminal(_RenderedTextView):
         # scrollback above, keep the trim (Bug #64: no scrolling into empty space below a short
         # frame). A no-op in the common scroll case (cursor at the bottom -> last already
         # lines-1); it only changes a short frame that has history above.
-        if screen.history.top:
+        # Only fill when the block cap can actually hold the whole grid: under a
+        # scrollback cap smaller than the viewport (reachable only via the raw
+        # apply_scrollback API, never the shipped >=1000 choices) the padded trailing
+        # blanks would evict the leading non-blank rows as Qt prunes to the cap, so fall
+        # back to the trim there (content survives over a cosmetic fill).
+        cap = self.document().maximumBlockCount()
+        if screen.history.top and (cap == 0 or cap >= screen.lines):
             last = screen.lines - 1
         target = [screen.buffer[y] for y in range(last + 1)]
         tsig = all_runs[:last + 1]
@@ -7798,8 +7812,8 @@ class SecureTerminal(_RenderedTextView):
                 self._line_dirty = False
 
     def resizeEvent(self, event):
+        # Base resizeEvent re-aligns the gutter; extend with the spawn/reflow logic.
         super().resizeEvent(event)
-        self._position_gutter()
         if getattr(self, '_spawn_pending', False):
             # First real geometry: fork+exec the child NOW, sized to this grid, so the
             # shell draws its first prompt at the final width (no corrective SIGWINCH). A
