@@ -4252,7 +4252,13 @@ class SecureTerminal(_RenderedTextView):
         # scrollback above, keep the trim (Bug #64: no scrolling into empty space below a short
         # frame). A no-op in the common scroll case (cursor at the bottom -> last already
         # lines-1); it only changes a short frame that has history above.
-        if screen.history.top:
+        # Only fill when the block cap can actually hold the whole grid: under a
+        # scrollback cap smaller than the viewport (reachable only via the raw
+        # apply_scrollback API, never the shipped >=1000 choices) the padded trailing
+        # blanks would evict the leading non-blank rows as Qt prunes to the cap, so fall
+        # back to the trim there (content survives over a cosmetic fill).
+        cap = self.document().maximumBlockCount()
+        if screen.history.top and (cap == 0 or cap >= screen.lines):
             last = screen.lines - 1
         target = [screen.buffer[y] for y in range(last + 1)]
         tsig = all_runs[:last + 1]
