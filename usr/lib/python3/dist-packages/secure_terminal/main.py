@@ -8017,6 +8017,12 @@ def main(cg_base=None):
     qt_argv = [sys.argv[0]] + launch.qt_args
     if launch.wm_name:
         qt_argv += ['-name', launch.wm_name]     # Qt X11 resource/instance name
+    # Give THIS process a UTF-8 ctype before QApplication, or Qt prints a warning to
+    # (an often-invisible) stderr on a C/POSIX ambient locale: 'Detected locale "C" ...
+    # not UTF-8 ... switched to "C.UTF-8"'. Same rule the pty child uses -- override
+    # ONLY when the ambient locale is not already UTF-8, so a real user locale is kept.
+    from secure_terminal import sanitize      # noqa: PLC0415
+    sanitize.ensure_utf8_ctype()
     app = QApplication(qt_argv)
     if not _require_default_font():
         return 1
