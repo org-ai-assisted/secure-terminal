@@ -2288,9 +2288,11 @@ class SecureTerminal(_RenderedTextView):
         # pyte has no separate alt buffer, so without this the program's clear/draw
         # would destroy the primary screen and pollute the scrollback.
         self._alt_saved = None
-        # Margins ride WITH the alt snapshot: pyte shares one Screen, so a DECSTBM scroll
-        # region an alt program leaves set would leak into the primary (a real terminal
-        # keeps alt/primary margins independent).
+        # Margins ride WITH the alt snapshot: pyte shares one Screen (no alt buffer), so a
+        # DECSTBM region an alt program SETS and leaves behind would persist on the primary
+        # and permanently disable the margins==None scrollback-preserving shrink. _alt_leave
+        # restores this. The protection is restore-on-LEAVE: alt ENTRY deliberately KEEPS the
+        # primary region (a real terminal's smcup carries no region reset), never clears it.
         self._alt_saved_margins = None
         # 'Save Transcript' scrollback (Option B): the alt screen is NOT scrollback, so
         # the primary transcript text is frozen at alt entry (returned while the program
