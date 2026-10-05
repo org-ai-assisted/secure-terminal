@@ -39,13 +39,22 @@ cd -- "${SRC}/secure-terminal"
 ## be cloned here.
 export PYTHONPATH="${SRC}/secure-terminal/usr/lib/python3/dist-packages${PYTHONPATH+:${PYTHONPATH}}"
 
-## Shared CFLite smoke-run guard (single source of truth in dist-ai; the
-## Dockerfile clones it to $SRC/dist-ai). It bounds-runs each compiled fuzzer
-## with PYTHONPATH + every *_REPO override unset and FAILs the build on a
-## non-zero exit -- catching a frozen-bundle SystemExit(77) silent skip that
-## would otherwise pass vacuously.
+## Shared CFLite build-time guards (single source of truth in dist-ai; the
+## Dockerfile clones it to $SRC/dist-ai). Each turns a silent-green or confusing
+## build failure into a loud, clear one:
+##   smoke-run.bash    bounds-runs each compiled fuzzer with every *_REPO unset
+##                     and FAILs on a frozen-bundle SystemExit(77) silent skip;
+##   seed-corpus.bash  explodes the NAME<space>HEX corpus safely (keeps a final
+##                     line with no trailing newline, rejects a path-unsafe name,
+##                     FAILs loud on an empty corpus instead of a confusing zip);
+##   harness-glob.bash expands the harness glob with nullglob PLUS a zero-match
+##                     FATAL (never silently compiles zero fuzzers).
 # shellcheck disable=SC1090,SC1091
 source "${SRC}/dist-ai/usr/share/clusterfuzzlite-lib/smoke-run.bash"
+# shellcheck disable=SC1090,SC1091
+source "${SRC}/dist-ai/usr/share/clusterfuzzlite-lib/seed-corpus.bash"
+# shellcheck disable=SC1090,SC1091
+source "${SRC}/dist-ai/usr/share/clusterfuzzlite-lib/harness-glob.bash"
 
 ## Explode the shared seed corpus into individual input files. Without a seed
 ## corpus every run cold-starts from empty and burns its whole budget
@@ -55,30 +64,20 @@ source "${SRC}/dist-ai/usr/share/clusterfuzzlite-lib/smoke-run.bash"
 ##
 ## Stored as NAME<space>HEX so the file stays pure ASCII and survives the
 ## repo-wide non-ASCII gate; the same file is driven by the dist-ai suite
-## test_fuzz_harnesses.py, so the corpus cannot rot unnoticed.
+## test_fuzz_harnesses.py, so the corpus cannot rot unnoticed. Decoded via the
+## standalone seed-hex-to-bin.py (python3, not xxd: the base-builder-python image
+## guarantees python3, while xxd rides in vim-common and may be absent).
 seed_dir="$(mktemp --directory)"
-seed_count=0
-while read -r seed_name seed_hex; do
-  case "${seed_name}" in
-    ''|'##'*)
-      continue
-      ;;
-  esac
-  [ -n "${seed_hex}" ] || continue
-  ## Decode via the standalone seed-hex-to-bin.py (python3, not xxd: the
-  ## base-builder-python image guarantees python3, while xxd rides in
-  ## vim-common and may be absent).
-  printf '%s' "${seed_hex}" \
-    | .clusterfuzzlite/seed-hex-to-bin.py \
-    > "${seed_dir}/${seed_name}"
-  seed_count=$(( seed_count + 1 ))
-done < fuzz/corpus/seeds.txt
+seed_count="$(cflite_explode_hex_corpus \
+  fuzz/corpus/seeds.txt .clusterfuzzlite/seed-hex-to-bin.py "${seed_dir}")"
 printf 'prepared %s seed inputs\n' "${seed_count}"
 
 ## Wrap each fuzz/fuzz_*.py harness for OSS-Fuzz's Python runtime, and give each
 ## the same seed corpus (every harness reads these bytes through its own
 ## FuzzedDataProvider, so one seed exercises a different shape in each).
-for harness in fuzz/fuzz_*.py; do
+declare -a harnesses
+cflite_list_harnesses harnesses 'fuzz/fuzz_*.py'
+for harness in "${harnesses[@]}"; do
   name="$(basename -- "${harness}" .py)"
   compile_python_fuzzer "${harness}"
   ## Smoke-run the compiled onefile to catch a frozen-bundle SILENT SKIP.
