@@ -4238,6 +4238,19 @@ class SecureTerminal(_RenderedTextView):
         # cell.data.strip(), so a lone U+00A0 / tab / ideographic-space placeholder
         # keeps its row rather than being trimmed away and hidden.
         all_runs, last = self._grid_signatures(screen)
+        # Screen==viewport invariant (how xterm/VTE/kitty/alacritty avoid dup/blank rows on
+        # resize): when committed scrollback sits ABOVE the live grid, render the FULL grid so
+        # it fills the viewport and the committed old-frame rows stay above the fold. Trimming
+        # trailing blanks there lets a SHORTER post-SIGWINCH repaint (a zoom-in on a
+        # full-screen primary-buffer app that repaints its canvas) under-fill the viewport and
+        # surface the promoted old rows as duplicates/blanks. Gate on pyte scrollback existing
+        # (history.top) -- NOT blockCount > _grid_rows, which false-fires on a fresh grid (an
+        # empty QPlainTextEdit document reports blockCount 1 while _grid_rows is 0). With no
+        # scrollback above, keep the trim (Bug #64: no scrolling into empty space below a short
+        # frame). A no-op in the common scroll case (cursor at the bottom -> last already
+        # lines-1); it only changes a short frame that has history above.
+        if screen.history.top:
+            last = screen.lines - 1
         target = [screen.buffer[y] for y in range(last + 1)]
         tsig = all_runs[:last + 1]
 
