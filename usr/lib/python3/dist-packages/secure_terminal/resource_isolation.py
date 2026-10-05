@@ -113,6 +113,28 @@ def base_setup(root=CGROUP_ROOT, proc_cgroup=PROC_SELF_CGROUP):
     return base
 
 
+## The one-line notice shown when per-tab isolation is unavailable. SILENT by default:
+## a host that does not delegate cgroup v2 (the common Qubes AppVM case) is normal, not
+## an error -- the feature is fail-open by design -- so the launcher must not spew this on
+## every run (nor on a ctl client invocation). Opt in for diagnostics with the debug env.
+ISOLATION_NOTICE = ('secure-terminal: per-tab resource isolation unavailable (no cgroup '
+                    'v2 delegation); tabs share the session limits')
+ISOLATION_DEBUG_ENV = 'SECURE_TERMINAL_CGROUP_DEBUG'
+
+
+def isolation_notice(cg_base, environ=None):
+    """ISOLATION_NOTICE when per-tab isolation is unavailable AND diagnostics are opted
+    in, else None. `cg_base` is base_setup()'s result (None == unavailable). Keeps the
+    launcher silent by default while the condition stays discoverable under
+    SECURE_TERMINAL_CGROUP_DEBUG=1. Pure (no I/O) so the gating is unit-tested directly."""
+    env = os.environ if environ is None else environ
+    if cg_base is not None:
+        return None
+    if env.get(ISOLATION_DEBUG_ENV) != '1':
+        return None
+    return ISOLATION_NOTICE
+
+
 def effective_mem(base, meminfo=PROC_MEMINFO):
     """Byte budget the MEM_FRACTION applies to: the memory currently AVAILABLE
     (MemAvailable), NOT total RAM. Sizing the cap from available memory keeps it
