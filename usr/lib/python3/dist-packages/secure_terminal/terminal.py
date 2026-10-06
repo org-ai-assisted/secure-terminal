@@ -5687,7 +5687,13 @@ class SecureTerminal(_RenderedTextView):
         # still restored below, and unfreeze's _rerender(full=True) rebuilds to the live frame.
         # Tradeoff: a full-screen session that ends while the view is frozen leaves no
         # final-frame transcript snapshot -- acceptable versus a blanked view.
-        if not self._frozen:
+        # SEEDING: _seed_grid replays _raw through this same _feed_stream path, re-firing the
+        # alt enter/leave of any completed session already in _raw. The LIVE feed recorded that
+        # session's snapshot when its bytes first arrived, and _alt_exit_snapshots survives
+        # _make_screen (it is reset only in __init__), so recording again here would append a
+        # DUPLICATE final frame on every CLI<->TUI reseed -- enough toggles evict distinct older
+        # records past _EXIT_SNAPSHOTS_MAX. Suppress the record during the replay.
+        if not self._frozen and not self._seeding:
             # Append ONE final-frame snapshot of the full-screen session as a bounded record,
             # so 'Save Transcript' keeps a trace of what was displayed without logging every
             # frame. Render the alt screen to the document FIRST (same debounce reason as
