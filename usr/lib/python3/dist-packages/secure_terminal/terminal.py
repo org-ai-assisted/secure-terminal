@@ -645,7 +645,7 @@ from PyQt6.QtCore import (QSocketNotifier, Qt, QTimer, pyqtSignal, QEvent,
 from PyQt6.QtGui import (QFont, QTextCursor, QColor, QPalette, QTextCharFormat,
                          QTextFormat, QGuiApplication, QSyntaxHighlighter,
                          QTextBlockUserData, QPainter, QPen, QClipboard,
-                         QFontMetricsF)
+                         QFontMetricsF, QTextLayout)
 from PyQt6.QtWidgets import (QPlainTextEdit, QToolTip, QDialog, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QApplication,
                              QWidget)
@@ -2256,6 +2256,12 @@ class SecureTerminal(_RenderedTextView):
         self._screen = None
         self._stream = None
         self._fmt_cache = {}
+        # Memoized _grid_space_is_visible verdict, keyed by the cell SGR identity that
+        # drives the painted background (fg, bg, bold, reverse). A full-history rebuild
+        # scans every space cell (rows are space-padded); recomputing the format +
+        # luminance compare per cell dominates a ~2000-line scrollback redraw. Cleared
+        # wherever _fmt_cache is (theme / mode / marking / colour change).
+        self._space_vis_cache = {}
         # sgr-format cache for the grid, plus a codepoint-keyed cache of the
         # risk-class marking format a neutralized grid cell wears (see
         # _grid_cell_format), so the TUI grid names WHY a byte was boxed, exactly
@@ -2656,6 +2662,7 @@ class SecureTerminal(_RenderedTextView):
         pal.setColor(QPalette.ColorRole.Text, QColor(text))
         self.setPalette(pal)
         self._fmt_cache = {}          # theme changes the resolved cell colours
+        self._space_vis_cache = {}    # and the space-visibility verdict (theme/OSC bg)
         self._line_fmt_cache = {}     # and the line-mode SGR format cache
         self._grid_mark_cache = {}    # and the grid risk-class marking formats
         self._row_sig_cache = {}      # so cached grid rows re-render in the new theme
@@ -2919,6 +2926,7 @@ class SecureTerminal(_RenderedTextView):
         # by that state. Stale would let a Show-mode structural bypass persist into a
         # strict mode and hide a neutralized placeholder.
         self._fmt_cache = {}
+        self._space_vis_cache = {}
         self._grid_mark_cache = {}
         self._line_fmt_cache = {}
         self._row_sig_cache = {}   # mode/marking/colour change re-renders every grid row
@@ -3517,11 +3525,38 @@ class SecureTerminal(_RenderedTextView):
         return (max(1, vp.width() - reserve - 2 * margin),
                 max(1, vp.height() - 2 * margin))
 
+    def _line_pitch(self):
+        """The REAL painted vertical pitch of one grid row, in device pixels, as a FLOAT.
+        Each row is one block the document paints at QTextLine.height() -- Qt's ceil'd
+        ascent+descent for the font, which exceeds fontMetrics().height() by ~1px at some
+        zooms (23 vs a 22 font height). Dividing the available height by THIS, not
+        fontMetrics().height(), keeps rows * pitch <= viewport_height so the bottom row is
+        never clipped; the mouse hit-test in _event_cell divides by the same value so
+        hit-test and grid stay in step.
+
+        Measured from a probe QTextLayout at the current font -- a stable function of the
+        FONT, not of whichever row is scrolled into view. Reading the live first visible
+        block instead would make the pitch (and thus the winsize) FLAP as the user scrolls,
+        because a fallback-glyph row (e.g. a CJK line) lays out taller than an ASCII one;
+        the canonical monospace cell is the primary-font 'M' box, which the probe gives
+        directly and content-independently (so the first winsize is right before any
+        content too). Returned as a float and floored ONLY at the row division (never
+        truncated here), so a fractional height cannot round UP into an over-count that
+        re-clips the bottom row. fontMetrics().height() is the last-resort non-zero floor.
+        NOT blockBoundingRect().height() -- that is the whole block (N * line when
+        wrapping)."""
+        probe = QTextLayout('M', self.font())
+        probe.beginLayout()
+        line = probe.createLine()
+        line.setLineWidth(1 << 24)
+        probe.endLayout()
+        pitch = float(line.height())
+        return pitch if pitch > 0 else float(self.fontMetrics().height() or 1)
+
     def _grid_size(self):
         """Columns and rows that fit the viewport at the current font. Used for
         the LINE-mode winsize, so it tracks the actual text width (scrollbar
         excluded), matching how the shell wraps and fills the prompt."""
-        metrics = self.fontMetrics()
         # cols from the FRACTIONAL advance: the document engine lays glyphs out at the
         # font's real (fractional) advance, but horizontalAdvance('M') is qRound()ed.
         # Flooring the rounded value gave one column too many whenever the true advance
@@ -3529,10 +3564,11 @@ class SecureTerminal(_RenderedTextView):
         # column(s) clipped with no h-scrollbar (the zoom right-truncation bug). Flooring
         # width / fractional-advance guarantees cols * advance <= width at every size.
         char_wf = QFontMetricsF(self.font()).horizontalAdvance('M') or 1.0
-        char_h = metrics.height() or 1
         width, height = self._text_area()
         cols = max(2, int(width / char_wf))
-        rows = max(2, height // char_h)
+        # rows against the REAL painted pitch (see _line_pitch), so rows * pitch <= height
+        # and the bottom row is never clipped off the viewport. Float pitch, floored here.
+        rows = max(2, int(height // self._line_pitch()))
         return cols, rows
 
     def _tui_grid_size(self):
@@ -3540,7 +3576,6 @@ class SecureTerminal(_RenderedTextView):
         document margins) at the current font. TUI mode now keeps the vertical
         scrollbar (the grid has scrollback), so its width is part of the viewport
         and is not reclaimed."""
-        metrics = self.fontMetrics()
         # cols from the FRACTIONAL advance: the document engine lays glyphs out at the
         # font's real (fractional) advance, but horizontalAdvance('M') is qRound()ed.
         # Flooring the rounded value gave one column too many whenever the true advance
@@ -3548,10 +3583,11 @@ class SecureTerminal(_RenderedTextView):
         # column(s) clipped with no h-scrollbar (the zoom right-truncation bug). Flooring
         # width / fractional-advance guarantees cols * advance <= width at every size.
         char_wf = QFontMetricsF(self.font()).horizontalAdvance('M') or 1.0
-        char_h = metrics.height() or 1
         width, height = self._text_area()
         cols = max(2, int(width / char_wf))
-        rows = max(2, height // char_h)
+        # rows against the REAL painted pitch (see _line_pitch), so rows * pitch <= height
+        # and a full-screen program's bottom row is never clipped. Float pitch, floored here.
+        rows = max(2, int(height // self._line_pitch()))
         return cols, rows
 
     def _set_winsize(self, cols, rows):
@@ -4053,15 +4089,30 @@ class SecureTerminal(_RenderedTextView):
         EFFECTIVE painted format (via _grid_cell_format, the same path the cell renders
         through), not the raw cell: with colours OFF the program bg is stripped, and a
         bg set to the theme background paints as ordinary padding -- both must still be
-        dotted. Reverse video that swaps a distinct fg into the bg stays visible."""
+        dotted. Reverse video that swaps a distinct fg into the bg stays visible.
+
+        Memoized by the cell SGR identity (fg, bg, bold, reverse) -- the inputs that drive
+        the painted background (bold promotes fg to its bright variant, which reverse then
+        swaps into the bg). Within one render the theme/OSC bg and mode/colours are fixed
+        (a change clears _space_vis_cache alongside _fmt_cache), so the verdict is a pure
+        function of that identity. A full-history rebuild (session exit, ~2000 padded rows)
+        otherwise recomputes the format resolve + luminance compare for every space cell."""
+        key = (cell.fg, cell.bg, cell.bold, cell.reverse)
+        cached = self._space_vis_cache.get(key)
+        if cached is not None:
+            return cached
         brush = self._grid_cell_format(cell, ' ').background()
         if brush.style() == Qt.BrushStyle.NoBrush:
-            return False                        # no distinct bg painted -> padding
-        theme_bg = THEMES.get(self._theme, THEMES['dark'])[0]
-        base_bg = self._osc_palette.get('bg', theme_bg)
-        # PERCEPTUAL, not exact: a bg a hair off the terminal background (e.g. #fffffe on
-        # a #ffffff theme) is indistinguishable from padding, so it must still be dotted.
-        return not too_close(_rgb(brush.color()), _rgb(QColor(base_bg)))
+            visible = False                     # no distinct bg painted -> padding
+        else:
+            theme_bg = THEMES.get(self._theme, THEMES['dark'])[0]
+            base_bg = self._osc_palette.get('bg', theme_bg)
+            # PERCEPTUAL, not exact: a bg a hair off the terminal background (e.g. #fffffe
+            # on a #ffffff theme) is indistinguishable from padding, so it must still dot.
+            visible = not too_close(_rgb(brush.color()), _rgb(QColor(base_bg)))
+        # Admission-capped like _fmt_cache: untrusted truecolor SGR spam cannot grow the
+        # (fg, bg, ...) key space without bound.
+        return _cache_bounded(self._space_vis_cache, key, visible)
 
     def _grid_row_runs(self, row, columns):
         """The (text, format) runs one pyte row renders to, same-format cells
@@ -4789,18 +4840,16 @@ class SecureTerminal(_RenderedTextView):
         # grid column (xterm parity), which a character hit-test cannot give. contentOffset().x
         # does NOT include the left document margin (unlike y), so col subtracts it here.
         col = int((pos.x() - margin - off.x()) // char_w) + 1
-        # ROW from the REAL painted line height, not fontMetrics().height(): QTextLine rounds the
-        # line UP by ~1px at some zooms (23px vs a 22px font height at zoom 170), so a
-        # fontMetrics().height() step DRIFTS and, near a cell's lower edge in the lower rows,
-        # names the row BELOW -- the off-by-one that left Claude Code's "jump to bottom" pill
-        # non-clickable while the line ABOVE was. Use the first visible block's SINGLE visual
-        # line height -- NOT blockBoundingRect().height(), which is the whole block (N*line in a
-        # wrapping mode); the geometric step still EXTRAPOLATES a click below the content to a
-        # high row (then clamped to the grid height), matching a real terminal's blank cells.
-        _layout = self.firstVisibleBlock().layout()
-        pitch = ((_layout.lineAt(0).height() if _layout and _layout.lineCount() else 0)
-                 or metrics.height() or 1)
-        row = int((pos.y() - off.y()) // pitch) + 1
+        # ROW from the REAL painted line pitch (_line_pitch), not fontMetrics().height():
+        # QTextLine rounds the line UP by ~1px at some zooms (23px vs a 22px font height at
+        # zoom 170), so a fontMetrics().height() step DRIFTS and, near a cell's lower edge in
+        # the lower rows, names the row BELOW -- the off-by-one that left Claude Code's "jump
+        # to bottom" pill non-clickable while the line ABOVE was. _line_pitch is the same
+        # value the winsize rows are computed against, so hit-test and grid stay in step
+        # (float, so a fractional pitch floors the same way the row count does). The geometric
+        # step still EXTRAPOLATES a click below the content to a high row (then clamped to the
+        # grid height), matching a real terminal's blank cells.
+        row = int((pos.y() - off.y()) // self._line_pitch()) + 1
         cols = self._cols if self._cols and self._cols > 0 else self._MAX_LINE
         rows = self._rows if self._rows and self._rows > 0 else self._MAX_LINE
         col = min(col, cols) if col > 1 else 1
@@ -5935,6 +5984,7 @@ class SecureTerminal(_RenderedTextView):
         # timer (started after _handle_osc), so a program flooding OSC 4 palette
         # changes cannot force one full re-render per change.
         self._fmt_cache.clear()
+        self._space_vis_cache.clear()   # OSC 10/11 move the base bg -> verdict changes
         self._grid_mark_cache.clear()   # markings-off grid formats clone _pyte_format
         self._row_sig_cache.clear()     # palette recolours cells with no pyte dirty mark
 
