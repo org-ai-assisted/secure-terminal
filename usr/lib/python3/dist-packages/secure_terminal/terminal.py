@@ -2274,10 +2274,6 @@ class SecureTerminal(_RenderedTextView):
         # the document. Lets each frame re-render only the grid.
         self._top_rows = []
         self._grid_rows = 0
-        # Last real resize was a height GROW (vs a shrink / width-only / same height).
-        # Gates the primary screen==viewport fill (see _render_primary_grid): a grow
-        # promotes no rows, so the fill would only pad a blank band below the prompt.
-        self._grid_grew = False
         # Per-row incremental grid model: the row objects (by id) currently
         # rendered as the live grid's blocks, and the (text, format) runs each
         # one rendered to. A frame re-renders only the rows whose runs changed
@@ -3638,9 +3634,6 @@ class SecureTerminal(_RenderedTextView):
         self._stream = _Utf8CharsetByteStream(self._screen)
         self._set_winsize(cols, rows)
         self._reset_grid_view()
-        # Fresh screen: a new size baseline, not a grow. (Not reset in _reset_grid_view --
-        # an alt-leave / seed / theme rebuild must keep the last real resize direction.)
-        self._grid_grew = False
 
     def _pyte_bell(self):
         """pyte dispatched a BEL in TUI mode. Ring per policy, unless we are
@@ -3683,12 +3676,6 @@ class SecureTerminal(_RenderedTextView):
         cols, rows = self._tui_grid_size()
         if (cols, rows) == (self._screen.columns, self._screen.lines):
             return                        # no real change -> no destructive resize
-        # Record the resize DIRECTION for the primary render's screen==viewport fill
-        # (_render_primary_grid). A height GROW promotes nothing into scrollback and leaves
-        # the cursor put, so the new bottom rows are genuinely empty; filling them would pad a
-        # blank band below the prompt. A shrink/width-only/same-height change re-enables the
-        # fill. Computed BEFORE the resize, while self._screen.lines is still the OLD height.
-        self._grid_grew = rows > self._screen.lines
         # pyte.resize() clears the alternate screen; the running program redraws
         # on the SIGWINCH from the new winsize, so do not force a render here (that
         # would flash a blank frame). The document keeps the last frame until the
@@ -4338,19 +4325,13 @@ class SecureTerminal(_RenderedTextView):
         # scrollback above, keep the trim (Bug #64: no scrolling into empty space below a short
         # frame). A no-op in the common scroll case (cursor at the bottom -> last already
         # lines-1); it only changes a short frame that has history above.
-        # EXCEPT after a height GROW (_grid_grew): the fill compensates for SHRINK-promoted
-        # scrollback that a short repaint would surface as dup/blank rows, but a grow promotes
-        # NOTHING -- its new bottom rows are genuinely empty, so filling them pads a blank band
-        # BELOW the prompt and strands it mid-viewport. Trim there and let the genuine scrollback
-        # fill the grown viewport from above, as xterm/VTE reflow history down on a grow.
         # Only fill when the block cap can actually hold the whole grid: under a
         # scrollback cap smaller than the viewport (reachable only via the raw
         # apply_scrollback API, never the shipped >=1000 choices) the padded trailing
         # blanks would evict the leading non-blank rows as Qt prunes to the cap, so fall
         # back to the trim there (content survives over a cosmetic fill).
         cap = self.document().maximumBlockCount()
-        if (screen.history.top and not self._grid_grew
-                and (cap == 0 or cap >= screen.lines)):
+        if screen.history.top and (cap == 0 or cap >= screen.lines):
             last = screen.lines - 1
         target = [screen.buffer[y] for y in range(last + 1)]
         tsig = all_runs[:last + 1]
