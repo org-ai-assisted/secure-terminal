@@ -3272,11 +3272,25 @@ class SecureTerminal(_RenderedTextView):
         by _raw's own cap; feeding is contained like the live stream."""
         if self._screen is None or not self._raw:
             return
+        # The replay re-fires every alt enter/leave in _raw, so _alt_leave re-records each
+        # completed session's exit snapshot. REBUILD the in-_raw snapshot set from this one
+        # replay rather than appending to the live-recorded list: appending duplicated every
+        # session already captured live on each CLI<->TUI reseed (evicting distinct older
+        # records past the cap), while a blanket suppression would drop a session that ran
+        # ENTIRELY in CLI mode -- CLI never feeds pyte (_read_and_render), so the replay is its
+        # ONLY capture. Preserve any prior frame the replay cannot reproduce (its raw bytes have
+        # aged past _RAW_MAX), so the bounded transcript record survives the reseed.
+        prior = self._alt_exit_snapshots
+        self._alt_exit_snapshots = []
         self._seeding = True          # replayed bells already happened; do not ring
         try:
             self._feed_stream(self._raw.encode('utf-8', 'replace'))
         finally:
             self._seeding = False
+        rebuilt = set(self._alt_exit_snapshots)
+        self._alt_exit_snapshots = [s for s in prior if s not in rebuilt] \
+            + self._alt_exit_snapshots
+        self._trim_exit_snapshots()
 
     def current_tui(self):
         return self._tui
@@ -5687,13 +5701,7 @@ class SecureTerminal(_RenderedTextView):
         # still restored below, and unfreeze's _rerender(full=True) rebuilds to the live frame.
         # Tradeoff: a full-screen session that ends while the view is frozen leaves no
         # final-frame transcript snapshot -- acceptable versus a blanked view.
-        # SEEDING: _seed_grid replays _raw through this same _feed_stream path, re-firing the
-        # alt enter/leave of any completed session already in _raw. The LIVE feed recorded that
-        # session's snapshot when its bytes first arrived, and _alt_exit_snapshots survives
-        # _make_screen (it is reset only in __init__), so recording again here would append a
-        # DUPLICATE final frame on every CLI<->TUI reseed -- enough toggles evict distinct older
-        # records past _EXIT_SNAPSHOTS_MAX. Suppress the record during the replay.
-        if not self._frozen and not self._seeding:
+        if not self._frozen:
             # Append ONE final-frame snapshot of the full-screen session as a bounded record,
             # so 'Save Transcript' keeps a trace of what was displayed without logging every
             # frame. Render the alt screen to the document FIRST (same debounce reason as
@@ -5758,6 +5766,10 @@ class SecureTerminal(_RenderedTextView):
             return
         self._alt_exit_snapshots.append(
             '\n----- full-screen application (final screen) -----\n' + frame + '\n')
+        self._trim_exit_snapshots()
+
+    def _trim_exit_snapshots(self):
+        """Drop the oldest exit snapshots past the bounded size cap (keep at least one)."""
         total = sum(len(s) for s in self._alt_exit_snapshots)
         while total > self._EXIT_SNAPSHOTS_MAX and len(self._alt_exit_snapshots) > 1:
             total -= len(self._alt_exit_snapshots.pop(0))
