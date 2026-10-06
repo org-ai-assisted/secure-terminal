@@ -3272,11 +3272,25 @@ class SecureTerminal(_RenderedTextView):
         by _raw's own cap; feeding is contained like the live stream."""
         if self._screen is None or not self._raw:
             return
+        # The replay re-fires every alt enter/leave in _raw, so _alt_leave re-records each
+        # completed session's exit snapshot. REBUILD the in-_raw snapshot set from this one
+        # replay rather than appending to the live-recorded list: appending duplicated every
+        # session already captured live on each CLI<->TUI reseed (evicting distinct older
+        # records past the cap), while a blanket suppression would drop a session that ran
+        # ENTIRELY in CLI mode -- CLI never feeds pyte (_read_and_render), so the replay is its
+        # ONLY capture. Preserve any prior frame the replay cannot reproduce (its raw bytes have
+        # aged past _RAW_MAX), so the bounded transcript record survives the reseed.
+        prior = self._alt_exit_snapshots
+        self._alt_exit_snapshots = []
         self._seeding = True          # replayed bells already happened; do not ring
         try:
             self._feed_stream(self._raw.encode('utf-8', 'replace'))
         finally:
             self._seeding = False
+        rebuilt = set(self._alt_exit_snapshots)
+        self._alt_exit_snapshots = [s for s in prior if s not in rebuilt] \
+            + self._alt_exit_snapshots
+        self._trim_exit_snapshots()
 
     def current_tui(self):
         return self._tui
@@ -5752,6 +5766,10 @@ class SecureTerminal(_RenderedTextView):
             return
         self._alt_exit_snapshots.append(
             '\n----- full-screen application (final screen) -----\n' + frame + '\n')
+        self._trim_exit_snapshots()
+
+    def _trim_exit_snapshots(self):
+        """Drop the oldest exit snapshots past the bounded size cap (keep at least one)."""
         total = sum(len(s) for s in self._alt_exit_snapshots)
         while total > self._EXIT_SNAPSHOTS_MAX and len(self._alt_exit_snapshots) > 1:
             total -= len(self._alt_exit_snapshots.pop(0))
