@@ -3526,28 +3526,32 @@ class SecureTerminal(_RenderedTextView):
                 max(1, vp.height() - 2 * margin))
 
     def _line_pitch(self):
-        """The REAL painted vertical pitch of one grid row, in device pixels. Each row is
-        one block the document paints at QTextLine.height(), which Qt rounds UP and can
-        exceed fontMetrics().height() by ~1px at some zooms (23px vs a 22px font height).
-        Dividing the available height by THIS -- not fontMetrics().height() -- keeps
-        rows * pitch <= viewport_height, so the child is told only as many rows as fully
-        fit and the bottom row is never clipped (the mouse hit-test in _event_cell divides
-        by the same pitch). The live first-visible block's single visual-line height is the
-        ground truth once laid out; a probe QTextLayout at the current font covers the
-        empty / not-yet-shown document (initial sizing) so the FIRST winsize is already
-        correct and no corrective SIGWINCH fires; fontMetrics().height() is the last-resort
-        non-zero floor. NOT blockBoundingRect().height() -- that is the whole block
-        (N * line in a wrapping mode)."""
-        layout = self.firstVisibleBlock().layout()
-        pitch = (layout.lineAt(0).height() if layout and layout.lineCount() else 0)
-        if not pitch:
-            probe = QTextLayout('M', self.font())
-            probe.beginLayout()
-            line = probe.createLine()
-            line.setLineWidth(1 << 24)
-            probe.endLayout()
-            pitch = line.height()
-        return int(pitch) or self.fontMetrics().height() or 1
+        """The REAL painted vertical pitch of one grid row, in device pixels, as a FLOAT.
+        Each row is one block the document paints at QTextLine.height() -- Qt's ceil'd
+        ascent+descent for the font, which exceeds fontMetrics().height() by ~1px at some
+        zooms (23 vs a 22 font height). Dividing the available height by THIS, not
+        fontMetrics().height(), keeps rows * pitch <= viewport_height so the bottom row is
+        never clipped; the mouse hit-test in _event_cell divides by the same value so
+        hit-test and grid stay in step.
+
+        Measured from a probe QTextLayout at the current font -- a stable function of the
+        FONT, not of whichever row is scrolled into view. Reading the live first visible
+        block instead would make the pitch (and thus the winsize) FLAP as the user scrolls,
+        because a fallback-glyph row (e.g. a CJK line) lays out taller than an ASCII one;
+        the canonical monospace cell is the primary-font 'M' box, which the probe gives
+        directly and content-independently (so the first winsize is right before any
+        content too). Returned as a float and floored ONLY at the row division (never
+        truncated here), so a fractional height cannot round UP into an over-count that
+        re-clips the bottom row. fontMetrics().height() is the last-resort non-zero floor.
+        NOT blockBoundingRect().height() -- that is the whole block (N * line when
+        wrapping)."""
+        probe = QTextLayout('M', self.font())
+        probe.beginLayout()
+        line = probe.createLine()
+        line.setLineWidth(1 << 24)
+        probe.endLayout()
+        pitch = float(line.height())
+        return pitch if pitch > 0 else float(self.fontMetrics().height() or 1)
 
     def _grid_size(self):
         """Columns and rows that fit the viewport at the current font. Used for
@@ -3563,8 +3567,8 @@ class SecureTerminal(_RenderedTextView):
         width, height = self._text_area()
         cols = max(2, int(width / char_wf))
         # rows against the REAL painted pitch (see _line_pitch), so rows * pitch <= height
-        # and the bottom row is never clipped off the viewport.
-        rows = max(2, height // self._line_pitch())
+        # and the bottom row is never clipped off the viewport. Float pitch, floored here.
+        rows = max(2, int(height // self._line_pitch()))
         return cols, rows
 
     def _tui_grid_size(self):
@@ -3582,8 +3586,8 @@ class SecureTerminal(_RenderedTextView):
         width, height = self._text_area()
         cols = max(2, int(width / char_wf))
         # rows against the REAL painted pitch (see _line_pitch), so rows * pitch <= height
-        # and a full-screen program's bottom row is never clipped off the viewport.
-        rows = max(2, height // self._line_pitch())
+        # and a full-screen program's bottom row is never clipped. Float pitch, floored here.
+        rows = max(2, int(height // self._line_pitch()))
         return cols, rows
 
     def _set_winsize(self, cols, rows):
@@ -4841,9 +4845,10 @@ class SecureTerminal(_RenderedTextView):
         # zoom 170), so a fontMetrics().height() step DRIFTS and, near a cell's lower edge in
         # the lower rows, names the row BELOW -- the off-by-one that left Claude Code's "jump
         # to bottom" pill non-clickable while the line ABOVE was. _line_pitch is the same
-        # value the winsize rows are computed against, so hit-test and grid stay in step. The
-        # geometric step still EXTRAPOLATES a click below the content to a high row (then
-        # clamped to the grid height), matching a real terminal's blank cells.
+        # value the winsize rows are computed against, so hit-test and grid stay in step
+        # (float, so a fractional pitch floors the same way the row count does). The geometric
+        # step still EXTRAPOLATES a click below the content to a high row (then clamped to the
+        # grid height), matching a real terminal's blank cells.
         row = int((pos.y() - off.y()) // self._line_pitch()) + 1
         cols = self._cols if self._cols and self._cols > 0 else self._MAX_LINE
         rows = self._rows if self._rows and self._rows > 0 else self._MAX_LINE
