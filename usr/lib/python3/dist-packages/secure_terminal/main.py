@@ -3048,6 +3048,7 @@ class MainWindow(QMainWindow):
         prefill = current or self.tabs.tabText(index)
         dlg = _TabEditDialog(self, prefill,
                              self._tab_colors.get(term), self._TAB_COLOR_PRESETS)
+        _select_labels(dlg, self._ui_scale)   # enlargeable chrome, like every other dialog
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         # The tab's shell may have exited during the modal, deleting term; a stale
