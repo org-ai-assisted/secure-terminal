@@ -190,7 +190,8 @@ source of truth for behaviour.
   below the prompt (prompt mid-screen until the next line of output). That
   top-anchored grow is the IDIOMATIC default for a split-store terminal - kitty
   default (`scrollback_fill_enlarged_window=no`), xterm NorthWest gravity, pyte
-  native - and it self-heals on the next output line. The bottom-gravity alternative
+  native - and the blank band clears only as output advances the cursor (one line
+  per row of a multi-row grow) or the program redraws its screen. The bottom-gravity alternative
   pops scrolled-off rows from `history.top` back into the screen top and shifts the
   cursor down (xterm SouthWest / konsole-reflow / kitty opt-in). It is a fragile
   primitive even upstream (kitty guards it off-by-default behind cursor-tracking plus
