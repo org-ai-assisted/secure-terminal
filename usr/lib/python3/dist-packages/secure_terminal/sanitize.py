@@ -1505,26 +1505,33 @@ def _build_fold_maps():
                                  'confusables.json')
         with open(data_path, encoding='utf-8') as handle:
             data = json.load(handle)
+        # Build into TEMP maps and commit only on FULL success: a malformed record
+        # mid-parse must DISCARD the partial homoglyph set, never publish it -- a partial
+        # map silently drops every look-alike after the bad record while still looking
+        # populated, so those homoglyphs read as safe 'nonascii' (a security hole).
+        _hsingle, _hmulti = {}, {}
         for source, alternatives in data.items():
             if len(source) != 1 or ord(source) <= 0x7F:
                 continue              # only NON-ASCII sources can pose as ASCII
             for alt in alternatives:
                 glyph = alt.get('c', '')
                 if len(glyph) == 1 and 0x20 <= ord(glyph) <= 0x7E:
-                    single[source] = glyph        # the single ASCII char it imitates
+                    _hsingle[source] = glyph      # the single ASCII char it imitates
                     break
             else:                     # no single-char ASCII look-alike
                 for alt in alternatives:
                     glyph = alt.get('c', '')
                     if len(glyph) >= 2 and all(0x20 <= ord(g) <= 0x7E
                                                for g in glyph):
-                        multi[source] = glyph     # the multi-char ASCII it imitates
+                        _hmulti[source] = glyph   # the multi-char ASCII it imitates
                         break
+        single.update(_hsingle)
+        multi.update(_hmulti)
     except ImportError as exc:        # the PACKAGE is absent -> provisioning error, fail loud
-        # Distinct from an unreadable data file below: a missing package silently degrades
-        # the confusable/homoglyph detection (a core security guarantee) with no signal, and
-        # masquerades as oracle/summary "drift" in the tests. require_confusables_data()
-        # surfaces this at startup and in the test gate.
+        # Distinct from an unreadable/corrupt data file below: a missing package silently
+        # degrades the confusable/homoglyph detection (a core security guarantee) with no
+        # signal, and masquerades as oracle/summary "drift" in the tests.
+        # require_confusables_data() surfaces this at startup and in the test gate.
         raise ImportError(
             'secure-terminal: the Unicode confusables data '
             '(python3-confusable-homoglyphs) is not installed. It is a hard '
@@ -1532,7 +1539,9 @@ def _build_fold_maps():
             'degrades. Install: sudo apt install python3-confusable-homoglyphs'
         ) from exc
     except Exception:                 # pylint: disable=broad-except
-        pass                          # package present but the data file is unreadable/corrupt
+        pass                          # data file unreadable/corrupt OR a malformed record ->
+                                      # NO homoglyph data (temp discarded); degrade to the
+                                      # stdlib NFKC posers below, never a partial map
                                       # -> degrade (stdlib NFKC posers survive), do not crash
     # Compatibility characters that NFKC-decompose to printable ASCII (superscripts,
     # subscripts, circled/parenthesised letters and digits, modifier letters, ...) POSE AS
@@ -1609,22 +1618,18 @@ def _ascii_confusables():
 
 
 def require_confusables_data():
-    """Fail loud (raise) when the Unicode confusables data is unavailable or
-    degenerate. python3-confusable-homoglyphs is a HARD dependency; without it the
-    confusable/homoglyph detection -- the app's core security guarantee -- silently
-    degrades to an empty set. Mirrors main._require_default_font: call at startup and
-    in the test gate so a missing dep fails with a clear message instead of masquerading
-    as data drift. Building the fold map raises a clear ImportError when the package is
-    absent; the sentinel also catches present-but-empty data."""
-    fold = _ascii_fold_map()
-    # CYRILLIC SMALL LETTER A folds to 'a' in every real confusables dataset; its
-    # absence means the homoglyph data did not load (only the stdlib NFKC set did).
-    if fold.get(chr(0x0430)) != 'a':
-        raise RuntimeError(
-            'secure-terminal: the Unicode confusables data '
-            '(python3-confusable-homoglyphs) is installed but missing expected '
-            'homoglyph mappings (e.g. U+0430 -> a); confusable detection would be '
-            'degraded. Reinstall python3-confusable-homoglyphs.')
+    """Fail loud (raise ImportError) at startup / in the test gate when
+    python3-confusable-homoglyphs (a HARD dependency) is NOT installed: building the fold
+    map raises a clear ImportError, which a silent degrade would hide -- masquerading as
+    oracle/summary "drift" in the tests. Mirrors main._require_default_font.
+
+    A present-but-unreadable/corrupt data file is deliberately NOT failed closed here:
+    _build_fold_maps degrades gracefully to the stdlib NFKC posers, and failing the app over
+    it would needlessly refuse to start under the enforced AppArmor profile. The
+    missing-PACKAGE check propagates through EVERY caller of _build_fold_maps (marking_class,
+    ascii_fold, ...), not just this gate, so a single value sentinel here would add fragility
+    without extending that protection."""
+    _ascii_fold_map()           # triggers _build_fold_maps -> clear ImportError if absent
 
 
 def ascii_fold(text):
