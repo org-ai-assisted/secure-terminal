@@ -1505,23 +1505,44 @@ def _build_fold_maps():
                                  'confusables.json')
         with open(data_path, encoding='utf-8') as handle:
             data = json.load(handle)
+        # Build into TEMP maps and commit only on FULL success: a malformed record
+        # mid-parse must DISCARD the partial homoglyph set, never publish it -- a partial
+        # map silently drops every look-alike after the bad record while still looking
+        # populated, so those homoglyphs read as safe 'nonascii' (a security hole).
+        _hsingle, _hmulti = {}, {}
         for source, alternatives in data.items():
             if len(source) != 1 or ord(source) <= 0x7F:
                 continue              # only NON-ASCII sources can pose as ASCII
             for alt in alternatives:
                 glyph = alt.get('c', '')
                 if len(glyph) == 1 and 0x20 <= ord(glyph) <= 0x7E:
-                    single[source] = glyph        # the single ASCII char it imitates
+                    _hsingle[source] = glyph      # the single ASCII char it imitates
                     break
             else:                     # no single-char ASCII look-alike
                 for alt in alternatives:
                     glyph = alt.get('c', '')
                     if len(glyph) >= 2 and all(0x20 <= ord(g) <= 0x7E
                                                for g in glyph):
-                        multi[source] = glyph     # the multi-char ASCII it imitates
+                        _hmulti[source] = glyph   # the multi-char ASCII it imitates
                         break
+        single.update(_hsingle)
+        multi.update(_hmulti)
+    except ImportError as exc:        # the PACKAGE is absent -> provisioning error, fail loud
+        # Distinct from an unreadable/corrupt data file below: a missing package silently
+        # degrades the confusable/homoglyph detection (a core security guarantee) with no
+        # signal, and masquerades as oracle/summary "drift" in the tests.
+        # require_confusables_data() surfaces this at startup and in the test gate.
+        raise ImportError(
+            'secure-terminal: the Unicode confusables data '
+            '(python3-confusable-homoglyphs) is not installed. It is a hard '
+            'dependency; without it confusable/homoglyph detection silently '
+            'degrades. Install: sudo apt install python3-confusable-homoglyphs'
+        ) from exc
     except Exception:                 # pylint: disable=broad-except
-        pass                          # no data -> no refinement / no fold
+        pass                          # data file unreadable/corrupt OR a malformed record ->
+                                      # NO homoglyph data (temp discarded); degrade to the
+                                      # stdlib NFKC posers below, never a partial map
+                                      # -> degrade (stdlib NFKC posers survive), do not crash
     # Compatibility characters that NFKC-decompose to printable ASCII (superscripts,
     # subscripts, circled/parenthesised letters and digits, modifier letters, ...) POSE AS
     # that ASCII even though the confusables data does not list them -- e.g. U+00B2 SUPERSCRIPT
@@ -1594,6 +1615,33 @@ def _ascii_confusables():
     if _ASCII_CONFUSABLES is None:
         _ASCII_CONFUSABLES = frozenset(ord(ch) for ch in _ascii_fold_map())
     return _ASCII_CONFUSABLES
+
+
+def require_confusables_data():
+    """Fail loud when the Unicode confusables data is UNUSABLE, so confusable/homoglyph
+    detection (a core security guarantee) is never silently disabled. python3-confusable-
+    homoglyphs is a HARD dependency:
+      - PACKAGE absent -> _build_fold_maps raises a clear ImportError (which also propagates
+        through every other caller -- marking_class, ascii_fold -- not just this gate);
+      - data present but EMPTY / corrupt / truncated -> the canonical homoglyphs below are
+        missing (only the stdlib NFKC posers remain) -> RuntimeError.
+    The data read IS granted by the shipped AppArmor profile, so under enforcement the data
+    loads and this gate passes; it fires only on a genuinely unusable file. Mirrors
+    main._require_default_font. Call at startup and in the test gate."""
+    fold = _ascii_fold_map()    # triggers _build_fold_maps -> clear ImportError if absent
+    # Canonical Cyrillic/Greek homoglyphs (the paypal / microsoft phishing letters). None
+    # has an NFKC decomposition, so each is present ONLY via the confusables package data;
+    # spreading the check across the dataset means a truncated or empty file misses them.
+    expected = {0x0430: 'a', 0x03BF: 'o', 0x0435: 'e', 0x0441: 'c',
+                0x0440: 'p', 0x0455: 's', 0x04BB: 'h'}
+    missing = [cp for cp, ch in expected.items() if fold.get(chr(cp)) != ch]
+    if missing:
+        raise RuntimeError(
+            'secure-terminal: the Unicode confusables data '
+            '(python3-confusable-homoglyphs) is installed but did not load usable homoglyph '
+            'mappings (%d of %d canonical look-alikes missing); confusable detection would be '
+            'silently disabled. Reinstall python3-confusable-homoglyphs.'
+            % (len(missing), len(expected)))
 
 
 def ascii_fold(text):

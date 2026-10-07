@@ -35,6 +35,11 @@ profile secure-terminal /usr/bin/secure-terminal {
   /usr/bin/ r,
   /usr/bin/secure-terminal r,
   /usr/lib/python3/dist-packages/secure_terminal/{,**} r,
+  # confusable_homoglyphs ships its homoglyph table as a JSON data file, which the
+  # python abstraction (modules only) does not cover; sanitize.py reads it for the
+  # confusable/homoglyph detection -- a core security guarantee. Without this rule the
+  # read is denied under enforcement and detection silently degrades to the NFKC posers.
+  /usr/lib/python3/dist-packages/confusable_homoglyphs/{,**} r,
   /usr/share/secure-terminal/{,**} r,
   /usr/share/applications/secure-terminal.desktop r,
   /usr/share/icons/{,**} r,

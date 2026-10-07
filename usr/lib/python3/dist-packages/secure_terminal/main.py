@@ -7407,6 +7407,22 @@ def _require_default_font():
     return False
 
 
+def _require_confusables_data():
+    """Fail loud, like _require_default_font, if the Unicode confusables data
+    (python3-confusable-homoglyphs -- a hard dependency) is missing: the
+    confusable/homoglyph detection, a core security guarantee, would otherwise
+    silently degrade to nothing. Returns True when present; on absence writes the
+    message and returns False so the caller aborts. Stdlib-only, so it runs before
+    QApplication."""
+    from secure_terminal import sanitize      # noqa: PLC0415
+    try:
+        sanitize.require_confusables_data()
+    except Exception as exc:          # pylint: disable=broad-except
+        sys.stderr.write('%s\n' % exc)
+        return False
+    return True
+
+
 class _Launch:
     """The parsed launch command line: window identity, an optional session file,
     Qt pass-through args, and a list of tab specs to open."""
@@ -8024,6 +8040,8 @@ def main(cg_base=None):
     # ONLY when the ambient locale is not already UTF-8, so a real user locale is kept.
     from secure_terminal import sanitize      # noqa: PLC0415
     sanitize.ensure_utf8_ctype()
+    if not _require_confusables_data():
+        return 1
     app = QApplication(qt_argv)
     if not _require_default_font():
         return 1
