@@ -82,4 +82,10 @@ dist-ai-tests:
   ## so each captured window resolves an HONEST per-app favicon (Papirus carries the competitors'
   ## declared icon names bare hicolor lacks; it inherits hicolor, so secure-terminal's own
   ## session-installed icon resolves too). Absent, every favicon silently reverts to labwc's logo.
-  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia qt6-wayland qt6-svg-plugins labwc papirus-icon-theme python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git procps"
+  ## grim + wlr-randr back secure-terminal-shots-tests' rendered-favicon e2e
+  ## (favicon_rendered_e2e_test.sh), whose gate probes `labwc grim compare convert
+  ## wlr-randr`. labwc + imagemagick are already pinned above; grim (wlr-screencopy
+  ## capture) and wlr-randr (output scale) are not, so without them the e2e exits 77
+  ## and the strict --component run scores it SKIP-UNAUTHORIZED -- reddening the whole
+  ## dist-ai-tests job. Install the deps so it RUNS; do not authorize the skip.
+  apt-packages: "python3 python3-pyqt6 python3-pyte python3-hypothesis python3-z3 python3-coverage python3-pyqt6.qtmultimedia qt6-wayland qt6-svg-plugins labwc papirus-icon-theme python3-confusable-homoglyphs python3-regex python3-wcwidth python3-pil imagemagick fonts-hack ncurses-bin ncurses-term vim htop nano tmux python3-pytest python3-jsonschema python3-yaml build-essential libtool-bin perl pkg-config xclip wl-clipboard git procps grim wlr-randr"
