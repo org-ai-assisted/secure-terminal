@@ -1520,8 +1520,20 @@ def _build_fold_maps():
                                                for g in glyph):
                         multi[source] = glyph     # the multi-char ASCII it imitates
                         break
+    except ImportError as exc:        # the PACKAGE is absent -> provisioning error, fail loud
+        # Distinct from an unreadable data file below: a missing package silently degrades
+        # the confusable/homoglyph detection (a core security guarantee) with no signal, and
+        # masquerades as oracle/summary "drift" in the tests. require_confusables_data()
+        # surfaces this at startup and in the test gate.
+        raise ImportError(
+            'secure-terminal: the Unicode confusables data '
+            '(python3-confusable-homoglyphs) is not installed. It is a hard '
+            'dependency; without it confusable/homoglyph detection silently '
+            'degrades. Install: sudo apt install python3-confusable-homoglyphs'
+        ) from exc
     except Exception:                 # pylint: disable=broad-except
-        pass                          # no data -> no refinement / no fold
+        pass                          # package present but the data file is unreadable/corrupt
+                                      # -> degrade (stdlib NFKC posers survive), do not crash
     # Compatibility characters that NFKC-decompose to printable ASCII (superscripts,
     # subscripts, circled/parenthesised letters and digits, modifier letters, ...) POSE AS
     # that ASCII even though the confusables data does not list them -- e.g. U+00B2 SUPERSCRIPT
@@ -1594,6 +1606,25 @@ def _ascii_confusables():
     if _ASCII_CONFUSABLES is None:
         _ASCII_CONFUSABLES = frozenset(ord(ch) for ch in _ascii_fold_map())
     return _ASCII_CONFUSABLES
+
+
+def require_confusables_data():
+    """Fail loud (raise) when the Unicode confusables data is unavailable or
+    degenerate. python3-confusable-homoglyphs is a HARD dependency; without it the
+    confusable/homoglyph detection -- the app's core security guarantee -- silently
+    degrades to an empty set. Mirrors main._require_default_font: call at startup and
+    in the test gate so a missing dep fails with a clear message instead of masquerading
+    as data drift. Building the fold map raises a clear ImportError when the package is
+    absent; the sentinel also catches present-but-empty data."""
+    fold = _ascii_fold_map()
+    # CYRILLIC SMALL LETTER A folds to 'a' in every real confusables dataset; its
+    # absence means the homoglyph data did not load (only the stdlib NFKC set did).
+    if fold.get(chr(0x0430)) != 'a':
+        raise RuntimeError(
+            'secure-terminal: the Unicode confusables data '
+            '(python3-confusable-homoglyphs) is installed but missing expected '
+            'homoglyph mappings (e.g. U+0430 -> a); confusable detection would be '
+            'degraded. Reinstall python3-confusable-homoglyphs.')
 
 
 def ascii_fold(text):
