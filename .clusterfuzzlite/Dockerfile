@@ -36,6 +36,12 @@ FROM gcr.io/oss-fuzz-base/base-builder-python@sha256:9dd557a4ba0e0cdfbeabc0bb115
 ## bad_build_check at startup with ModuleNotFoundError.
 RUN pip3 install --no-cache-dir regex
 
+## sanitize.py imports confusable_homoglyphs as a HARD dependency too: the confusable/
+## homoglyph detection fails loud (ImportError) if the package is absent rather than
+## silently degrading. The base image has no Debian packaging, so install the wheel;
+## without it every harness fails bad_build_check at startup with ModuleNotFoundError.
+RUN pip3 install --no-cache-dir confusable-homoglyphs
+
 ## The base image compiles CPython into /usr/local (no apt python3), so it ships
 ## python3 at /usr/local/bin/python3 with NO /usr/bin/python3. Our scripts use the
 ## project-standard `#!/usr/bin/python3` shebang and are run DIRECTLY (style R-193:
