@@ -185,6 +185,29 @@ source of truth for behaviour.
   took the pathological full-viewport distinct-colour board from ~15s to ~0.55s
   shot-mode; real program output has runs of near-equal colour that coalesce, so it
   was never the slow case.
+- **Bottom-gravity grow (pull scrollback back onto the screen so the prompt stays at
+  the bottom)**: rejected. A vertical window GROW with scrollback leaves a blank band
+  below the prompt (prompt mid-screen until the next line of output). That
+  top-anchored grow is the IDIOMATIC default for a split-store terminal - kitty
+  default (`scrollback_fill_enlarged_window=no`), xterm NorthWest gravity, pyte
+  native - and it self-heals on the next output line. The bottom-gravity alternative
+  pops scrolled-off rows from `history.top` back into the screen top and shifts the
+  cursor down (xterm SouthWest / konsole-reflow / kitty opt-in). It is a fragile
+  primitive even upstream (kitty guards it off-by-default behind cursor-tracking plus
+  copy/restore-the-shell-prompt machinery), and in OUR split store it is worse: pyte
+  history caps at ~2000 lines (`_history_size`) while the QPlainTextEdit holds up to
+  10000 blocks (`_scrollback`), so the restore's `_reset_grid_view` rebuild from pyte
+  history DROPS document scrollback older than the cap on an ordinary grow, and the
+  restored rows (history keeps full written width) either lose their off-screen tail
+  when clipped or seat invisible, reappearing cells when not. Three AI-review rounds
+  surfaced cascading data-loss findings. Do NOT re-attempt the pyte-mutating restore.
+  The only clean "prompt stays at the bottom" design is a unified screen+scrollback
+  store with the view as a pure VIEWPORT (konsole ScreenWindow / VTE ring / alacritty
+  grid: screen = last N rows, grow = viewport-offset change, loss-free) - a
+  rearchitecture of the pyte model, not worth it for a cosmetic self-healing band. (A
+  separate earlier attempt, a sticky `_grid_grew` flag that trimmed the
+  screen==viewport fill on grow, was also wrong: it regressed the screen==viewport
+  invariant for full-screen primary-buffer apps that repaint a short frame.)
 
 ## Screenshots (generators already exist - do not hand-roll)
 
