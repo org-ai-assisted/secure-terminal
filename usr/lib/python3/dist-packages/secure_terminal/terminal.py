@@ -228,7 +228,7 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
                 _wrapped_row.wrapped = True
         super().linefeed()
 
-    def resize_preserving_scrollback(self, lines, columns, restore_scrollback=True):
+    def resize_preserving_scrollback(self, lines, columns):
         """Resize the PRIMARY screen the way real terminals do a HEIGHT SHRINK, instead of
         stock pyte Screen.resize (cursor to 0,0 + delete_lines from the top), which drops the
         TOP rows outright -- destroying the output above the prompt on a transient shrink (the
@@ -240,19 +240,9 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
         content up. Consequences: real scrollback above the cursor is NEVER lost; and a shrink
         that still fits the cursor scrolls NOTHING into history, so a no-scrollback full-screen
         frame (a primary-buffer fixed canvas) stays one -- scrollback appears only when the
-        cursor genuinely cannot fit, exactly as every mainstream terminal behaves. A pure HEIGHT
-        GROW with scrollback does the INVERSE (xterm saveEditBufLines): restore the most-recent
-        scrolled-off rows into the top of the grid, the cursor riding DOWN with them, so the grown
-        viewport fills with real history instead of a blank band below the prompt; the restored
-        rows are CLIPPED to the current width (like the shrink), so a history row wider than the
-        screen -- from an earlier width shrink -- cannot seat invisible, reappearing cells into the
-        live grid. Returns the number of rows restored (0 otherwise). The grow restore is gated to
-        a view the widget can safely rebuild: `restore_scrollback` False (the caller is frozen /
-        has a live selection / is scrolled up reading history, or this is the alt-leave replay)
-        defers to pyte's bottom pad, as does an active DECSC savepoint (its saved cursor would
-        strand), a width-only change, a mixed width+height change, a scroll region (margins set), a
-        grow with no scrollback, and the identical-size fast path. NOT for the alt screen -- caller
-        gates.
+        cursor genuinely cannot fit, exactly as every mainstream terminal behaves. A grow, a
+        width-only change, a scroll region (margins set) and the identical-size fast path defer
+        to pyte. NOT for the alt screen -- caller gates.
         (A DECSTBM region defers to pyte: its delete_lines is margin-clamped, so a region past
         row 0 drops nothing and preserving would duplicate; such a program repaints on SIGWINCH.
         RESIDUAL: a region starting at row 0 still has its top rows dropped by pyte.)"""
@@ -278,40 +268,8 @@ class _SafeHistoryScreen(pyte.HistoryScreen):
             self.lines, self.columns = lines, columns
             self.dirty.update(range(lines))
             self.set_margins()
-            return 0
-        if (lines > old_lines and columns == old_columns and self.margins is None
-                and self.history.top and restore_scrollback and not self.savepoints):
-            # HEIGHT GROW with scrollback -- the INVERSE of the shrink promotion above (xterm
-            # saveEditBufLines). The shift-branch appends clipped TOP rows to history.top's RIGHT,
-            # so its right end is the row that was just above the screen: pop `restore` of them
-            # (most-recent first), reverse to top-to-bottom, and seat them at the TOP of the grid,
-            # shifting the kept rows down. The cursor rides DOWN with its content, so a prompt at
-            # the old bottom stays at the new bottom (readline redraws there on SIGWINCH) and the
-            # render fills the grown viewport with real history instead of padding a blank band
-            # below the prompt. Pure height grow only: a width change would need to reflow the
-            # restored rows (history keeps its written width), out of scope -- it defers to pyte.
-            restore = min(lines - old_lines, len(self.history.top))
-            restored = [self.history.top.pop() for _ in range(restore)][::-1]
-            kept = {y: self.buffer[y] for y in range(old_lines) if y in self.buffer}
-            self.buffer.clear()
-            for y, row in enumerate(restored):
-                # Clip the restored row to the current width, exactly as the shrink branch pops
-                # cells past `columns`: history keeps a row's full written width, so one written
-                # wider than the screen (an earlier width shrink) would else seat invisible cells
-                # that reappear when the width grows again -- the display-integrity bug the live
-                # grid never holds.
-                for _x in [k for k in row if k >= columns]:
-                    row.pop(_x, None)
-                self.buffer[y] = row
-            for y, row in kept.items():
-                self.buffer[restore + y] = row
-            self.cursor.y = min(self.cursor.y + restore, lines - 1)
-            self.lines, self.columns = lines, columns
-            self.dirty.update(range(lines))
-            self.set_margins()
-            return restore
-        super().resize(lines, columns)
-        return 0
+        else:
+            super().resize(lines, columns)
 
     def draw(self, data):
         # New glyphs make any no-trailing-newline flag on the cursor row STALE (a
@@ -3722,7 +3680,6 @@ class SecureTerminal(_RenderedTextView):
         # on the SIGWINCH from the new winsize, so do not force a render here (that
         # would flash a blank frame). The document keeps the last frame until the
         # program's redraw arrives.
-        restored = 0
         if self._alt_screen:
             # Alt screen: a plain clip -- the full-screen program repaints on SIGWINCH,
             # and preserving would pollute the primary history the snapshot restores on
@@ -3732,19 +3689,8 @@ class SecureTerminal(_RenderedTextView):
             # Primary screen: preserve the clipped top rows into scrollback on a shrink
             # for a bottom-anchored (shell) frame, so a transient shrink (the copy/paste
             # review bar opening then closing) never destroys the output above the prompt.
-            # The method itself no-ops the preservation for a program-managed canvas, and on a
-            # height GROW restores scrolled-off rows into the grid (returns how many). Gate the
-            # grow restore to a view we can safely REBUILD below: a restore forces a full
-            # _reset_grid_view, which would drop a live text selection, blank a frozen frame, or
-            # yank a user who has scrolled up to read history. When any of those holds, pass
-            # restore_scrollback=False so the grow defers to pyte's bottom pad (the pre-restore
-            # behaviour, no regression) -- the common case (at the prompt, following, not frozen,
-            # no selection) still restores and loses the blank band.
-            can_restore = (self._tui_follow and not self._frozen
-                           and not self._mouse_selecting
-                           and not self.textCursor().hasSelection())
-            restored = self._screen.resize_preserving_scrollback(
-                rows, cols, restore_scrollback=can_restore)
+            # The method itself no-ops the preservation for a program-managed canvas.
+            self._screen.resize_preserving_scrollback(rows, cols)
         # pyte.Screen.resize() does NOT clamp the cursor on a shrink, so a subsequent
         # \r-only redraw (an ordinary status/spinner) would write to a now-out-of-range
         # row that render skips -- then reappears verbatim when the window grows back
@@ -3761,14 +3707,6 @@ class SecureTerminal(_RenderedTextView):
         if self._screen.cursor.x > cols:
             self._screen.cursor.x = cols - 1
         self._set_winsize(cols, rows)
-        if restored:
-            # A grow restored scrolled-off rows into the grid. Those rows are EMULATOR state the
-            # child never redraws (unlike the normal resize, where the program repaints on
-            # SIGWINCH), so paint now. Rebuild the grid view first: the incremental render promotes
-            # rows INTO history but cannot un-promote, so a plain re-render would leave the
-            # restored rows as both stale scrollback blocks and fresh grid rows (duplicates).
-            self._reset_grid_view()
-            self._render_tui()
 
     def _pyte_qcolor(self, color, default, bright=False):
         if not color or color == 'default':
@@ -5847,11 +5785,7 @@ class SecureTerminal(_RenderedTextView):
         _cur_size = (self._screen.lines, self._screen.columns)
         if self._alt_saved_size is not None and _cur_size != self._alt_saved_size:
             self._screen.lines, self._screen.columns = self._alt_saved_size
-            # restore_scrollback=False: a grow here must NOT pull history up and shift the cursor
-            # down -- the saved DECSTBM region is restored just below at the pre-shift rows, so a
-            # shift would strand the cursor outside the region. Match the pre-restore pyte pad
-            # (the cursor stays on the region bottom); _reset_grid_view rebuilds the view anyway.
-            self._screen.resize_preserving_scrollback(*_cur_size, restore_scrollback=False)
+            self._screen.resize_preserving_scrollback(*_cur_size)
         # Restore the primary's margins, undoing any DECSTBM region the alt program left
         # set (see _alt_enter) so the returned-to shell is region-free again. Drop a saved
         # region that no longer FITS: a resize DURING the alt session can shrink the screen
