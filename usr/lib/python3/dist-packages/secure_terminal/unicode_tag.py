@@ -35,8 +35,11 @@ readable Latin, not a gap here. Stacked combining marks (Zalgo) pass through as
 honest, visible code points (they neither hide, reorder, nor execute).
 """
 
+import json
+import math
 import sys
 import unicodedata
+from typing import Any
 
 # python3-regex: Unicode-aware \\w for the homoglyph-scope token split (stdlib
 # re's \\w is ASCII-narrow under the default flags); the sanitize core takes the
@@ -205,14 +208,89 @@ def main(argv=None):
     return _write_tagged(data)
 
 
+## --json envelope keys. The result key differs from the request key, so a tool
+## without --json (which echoes its input) can never be mistaken for a tagged reply.
+JSON_REQUEST_KEY = 'unicode-tag-json'
+JSON_RESULT_KEY = 'unicode-tag-json-result'
+
+
+def _tag_json_str(text):
+    # A JSON \uD800-\uDFFF escape decodes to a lone surrogate, which is not UTF-8:
+    # scrub it to U+FFFD, the same bytes the stream path is fed, then tag.
+    return tag_text(text.encode('utf-8', 'surrogatepass').decode('utf-8', 'replace'))
+
+
+def tag_json(value):
+    """Tag every string -- dict keys and values, at any depth -- of a decoded JSON
+    value, in ONE process. Explicit stack, not recursion, so any depth json.loads
+    accepted is walked."""
+    if not isinstance(value, (list, dict)):
+        return _tag_json_str(value) if isinstance(value, str) else value
+    root: Any = [] if isinstance(value, list) else {}
+    stack = [(value, root)]
+    while stack:
+        src, out = stack.pop()
+        for key, val in (enumerate(src) if isinstance(src, list) else src.items()):
+            if isinstance(val, (list, dict)):
+                child: Any = [] if isinstance(val, list) else {}
+                stack.append((val, child))
+            else:
+                child = _tag_json_str(val) if isinstance(val, str) else val
+            if isinstance(out, list):
+                out.append(child)
+                continue
+            ## A tagged key can equal a literal sibling key ('a\u200bb' vs
+            ## 'a[U+200B ZERO WIDTH SPACE]b'); suffix it so no value is dropped.
+            new_key = base = _tag_json_str(key)
+            suffix = 2
+            while new_key in out:
+                new_key = '%s#%d' % (base, suffix)
+                suffix += 1
+            out[new_key] = child
+    return root
+
+
+def _reject_constant(name):
+    raise ValueError('non-standard JSON constant %s' % name)
+
+
+def _finite_float(text):
+    # '1e400' overflows to inf, which json.dumps would emit as a bare Infinity.
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError('non-finite JSON number %s' % text)
+    return number
+
+
+def _write_tagged_json(data):
+    # Request {JSON_REQUEST_KEY: value} -> reply {JSON_RESULT_KEY: tag_json(value)}.
+    # Strict JSON only: Python's json accepts NaN/Infinity and overflowing numbers
+    # and re-emits them as bare tokens, an invalid reply a strict consumer rejects.
+    try:
+        value = json.loads(data, parse_constant=_reject_constant,
+                           parse_float=_finite_float)[JSON_REQUEST_KEY]
+    except (ValueError, TypeError, KeyError, RecursionError) as exc:
+        sys.stderr.write('unicode-tag: --json: bad request: %s\n' % type(exc).__name__)
+        return 1
+    try:
+        sys.stdout.write(json.dumps({JSON_RESULT_KEY: tag_json(value)}))
+    except BrokenPipeError:
+        return 1
+    return 0
+
+
 def main_stdin(argv=None):
     # Stdin-only entry point: reads NO files, so a confining AppArmor profile can
-    # deny all data-file access. argv is accepted and ignored for a uniform
-    # signature. Drives the AppArmor-confined `unicode-tag-stdin` (the hook path).
+    # deny all data-file access. Drives the AppArmor-confined `unicode-tag-stdin`
+    # (the hook path). `--json` tags a whole JSON document in one process; any
+    # other argv is ignored (never opened as a path).
+    argv = sys.argv[1:] if argv is None else argv
     try:
         data = sys.stdin.buffer.read()
     except OSError as exc:
         # e.g. stdin is a directory (`unicode-tag-stdin < /etc`): report cleanly.
         sys.stderr.write('unicode-tag: %s\n' % exc)
         return 1
+    if argv[:1] == ['--json']:
+        return _write_tagged_json(data)
     return _write_tagged(data)

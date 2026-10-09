@@ -4,10 +4,14 @@
 .SH "NAME"
 \fBunicode\-tag\-stdin\fR \- stdin\-only unicode\-tag for confined use
 .SH "SYNOPSIS"
-\fBunicode\-tag\-stdin\fR
+\fBunicode\-tag\-stdin\fR [\fB\-\-json\fR]
 .SH "DESCRIPTION"
 unicode\-tag\-stdin is \fBunicode\-tag\fR(1) restricted to standard input: it reads no files and takes no path arguments, so it can run under a tight AppArmor profile (named \fBunicode\-tag\-stdin\fR) that denies all data\-file access\. It is the tool the tool\-output neutralizer pipes untrusted text through\. The tagging is identical to \fBunicode\-tag\fR(1)\.
+.SH "OPTIONS"
+.TP
+\fB\-\-json\fR
+Read a JSON request \fB{"unicode\-tag\-json": VALUE}\fR and write \fB{"unicode\-tag\-json\-result": TAGGED}\fR, where every string in VALUE (object keys and values, at any depth) is tagged\. One process tags a whole document, instead of one process per string\.
 .SH "EXIT STATUS"
-0 on success; 1 on an unreadable standard input or a closed output pipe\.
+0 on success; 1 on an unreadable standard input, a malformed \fB\-\-json\fR request, or a closed output pipe\.
 .SH "SEE ALSO"
 \fBunicode\-tag\fR(1)

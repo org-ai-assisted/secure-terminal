@@ -8,7 +8,7 @@ unicode-tag-stdin(1) -- stdin-only unicode-tag for confined use
 
 ## SYNOPSIS
 
-`unicode-tag-stdin`
+`unicode-tag-stdin` [`--json`]
 
 ## DESCRIPTION
 
@@ -18,9 +18,18 @@ files and takes no path arguments, so it can run under a tight AppArmor profile
 tool-output neutralizer pipes untrusted text through. The tagging is identical
 to `unicode-tag`(1).
 
+## OPTIONS
+
+* `--json`:
+  Read a JSON request `{"unicode-tag-json": VALUE}` and write
+  `{"unicode-tag-json-result": TAGGED}`, where every string in VALUE (object
+  keys and values, at any depth) is tagged. One process tags a whole document,
+  instead of one process per string.
+
 ## EXIT STATUS
 
-0 on success; 1 on an unreadable standard input or a closed output pipe.
+0 on success; 1 on an unreadable standard input, a malformed `--json` request,
+or a closed output pipe.
 
 ## SEE ALSO
 
