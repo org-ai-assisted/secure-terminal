@@ -36,8 +36,10 @@ honest, visible code points (they neither hide, reorder, nor execute).
 """
 
 import json
+import math
 import sys
 import unicodedata
+from typing import Any
 
 # python3-regex: Unicode-aware \\w for the homoglyph-scope token split (stdlib
 # re's \\w is ASCII-narrow under the default flags); the sanitize core takes the
@@ -224,13 +226,13 @@ def tag_json(value):
     accepted is walked."""
     if not isinstance(value, (list, dict)):
         return _tag_json_str(value) if isinstance(value, str) else value
-    root = [] if isinstance(value, list) else {}
+    root: Any = [] if isinstance(value, list) else {}
     stack = [(value, root)]
     while stack:
         src, out = stack.pop()
         for key, val in (enumerate(src) if isinstance(src, list) else src.items()):
             if isinstance(val, (list, dict)):
-                child = [] if isinstance(val, list) else {}
+                child: Any = [] if isinstance(val, list) else {}
                 stack.append((val, child))
             else:
                 child = _tag_json_str(val) if isinstance(val, str) else val
@@ -248,10 +250,25 @@ def tag_json(value):
     return root
 
 
+def _reject_constant(name):
+    raise ValueError('non-standard JSON constant %s' % name)
+
+
+def _finite_float(text):
+    # '1e400' overflows to inf, which json.dumps would emit as a bare Infinity.
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError('non-finite JSON number %s' % text)
+    return number
+
+
 def _write_tagged_json(data):
     # Request {JSON_REQUEST_KEY: value} -> reply {JSON_RESULT_KEY: tag_json(value)}.
+    # Strict JSON only: Python's json accepts NaN/Infinity and overflowing numbers
+    # and re-emits them as bare tokens, an invalid reply a strict consumer rejects.
     try:
-        value = json.loads(data)[JSON_REQUEST_KEY]
+        value = json.loads(data, parse_constant=_reject_constant,
+                           parse_float=_finite_float)[JSON_REQUEST_KEY]
     except (ValueError, TypeError, KeyError, RecursionError) as exc:
         sys.stderr.write('unicode-tag: --json: bad request: %s\n' % type(exc).__name__)
         return 1
