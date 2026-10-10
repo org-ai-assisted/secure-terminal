@@ -214,18 +214,12 @@ JSON_REQUEST_KEY = 'unicode-tag-json'
 JSON_RESULT_KEY = 'unicode-tag-json-result'
 
 
-def _tag_json_str(text):
-    # A JSON \uD800-\uDFFF escape decodes to a lone surrogate, which is not UTF-8:
-    # scrub it to U+FFFD, the same bytes the stream path is fed, then tag.
-    return tag_text(text.encode('utf-8', 'surrogatepass').decode('utf-8', 'replace'))
-
-
 def tag_json(value):
     """Tag every string -- dict keys and values, at any depth -- of a decoded JSON
     value, in ONE process. Explicit stack, not recursion, so any depth json.loads
     accepted is walked."""
     if not isinstance(value, (list, dict)):
-        return _tag_json_str(value) if isinstance(value, str) else value
+        return tag_text(value) if isinstance(value, str) else value
     root: Any = [] if isinstance(value, list) else {}
     stack = [(value, root)]
     while stack:
@@ -235,13 +229,13 @@ def tag_json(value):
                 child: Any = [] if isinstance(val, list) else {}
                 stack.append((val, child))
             else:
-                child = _tag_json_str(val) if isinstance(val, str) else val
+                child = tag_text(val) if isinstance(val, str) else val
             if isinstance(out, list):
                 out.append(child)
                 continue
             ## A tagged key can equal a literal sibling key ('a\u200bb' vs
             ## 'a[U+200B ZERO WIDTH SPACE]b'); suffix it so no value is dropped.
-            new_key = base = _tag_json_str(key)
+            new_key = base = tag_text(key)
             suffix = 2
             while new_key in out:
                 new_key = '%s#%d' % (base, suffix)
@@ -262,13 +256,26 @@ def _finite_float(text):
     return number
 
 
+def _no_duplicate_keys(pairs):
+    # Untrusted input: a repeated key collapses last-wins in a plain dict, silently
+    # dropping a sibling value -- a payload a first-wins downstream parser still sees.
+    # Reject it as a bad request rather than tag only the surviving copy.
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError('duplicate JSON key %r' % key)
+        out[key] = value
+    return out
+
+
 def _write_tagged_json(data):
     # Request {JSON_REQUEST_KEY: value} -> reply {JSON_RESULT_KEY: tag_json(value)}.
     # Strict JSON only: Python's json accepts NaN/Infinity and overflowing numbers
     # and re-emits them as bare tokens, an invalid reply a strict consumer rejects.
     try:
         value = json.loads(data, parse_constant=_reject_constant,
-                           parse_float=_finite_float)[JSON_REQUEST_KEY]
+                           parse_float=_finite_float,
+                           object_pairs_hook=_no_duplicate_keys)[JSON_REQUEST_KEY]
     except (ValueError, TypeError, KeyError, RecursionError) as exc:
         sys.stderr.write('unicode-tag: --json: bad request: %s\n' % type(exc).__name__)
         return 1
