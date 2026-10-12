@@ -134,15 +134,29 @@ def _has_confusable(text):
     return False
 
 
-def tag_text(text):
+def tag_text(text, surrogateescape=True):
     """Return text with every deceptive code point replaced by an inline
-    `[U+XXXX NAME]` token; everything else is byte-for-byte identical."""
+    `[U+XXXX NAME]` token; everything else is byte-for-byte identical.
+
+    A lone surrogate (U+D800..U+DFFF) is invalid Unicode and is always tagged, with a
+    label chosen by the CALLER'S path -- the two cannot be told apart from the code
+    point alone (a surrogateescape byte stand-in and a JSON `\\uDCxx` literal are the
+    SAME str code point):
+      * surrogateescape=True (the tag_bytes path): U+DC80..U+DCFF are the PEP 383
+        stand-ins for raw undecodable bytes 0x80..0xFF, so they tag as the honest byte
+        `[INVALID-BYTE 0xNN]`. surrogateescape decoding can produce no other surrogate.
+      * surrogateescape=False (the tag_json path): json.loads yields a GENUINE lone
+        surrogate code point (any of U+D800..U+DFFF), never a byte, so it tags as
+        `[INVALID-SURROGATE U+XXXX]` -- claiming a byte here would fabricate one.
+    """
     confusable = _confusable_positions(text)
     out = []
     for index, ch in enumerate(text):
         cp = ord(ch)
-        if 0xDC80 <= cp <= 0xDCFF:         # surrogateescape: a raw undecodable byte
-            out.append('[INVALID-BYTE 0x%02X]' % (cp & 0xFF))
+        if surrogateescape and 0xDC80 <= cp <= 0xDCFF:
+            out.append('[INVALID-BYTE 0x%02X]' % (cp & 0xFF))   # raw undecodable byte
+        elif 0xD800 <= cp <= 0xDFFF:
+            out.append('[INVALID-SURROGATE U+%04X]' % cp)       # genuine lone surrogate
         elif ch in ('\n', '\t') or 0x20 <= cp <= 0x7E:
             out.append(ch)                 # allowlisted whitespace / printable ASCII
         elif marking_class(cp) in _ALWAYS_TAG:
@@ -160,7 +174,10 @@ def has_deceptive(text):
     clipboard of ANY size in O(1) extra memory and early-exits at the first hazard.
     The decision matches tag_text exactly: a surrogateescape raw byte or a
     never-legitimate bidi/control/invisible code point (per char, early-exit), or a
-    homoglyph inside a mixed-script token (token-scoped, via _has_confusable)."""
+    homoglyph inside a mixed-script token (token-scoped, via _has_confusable). Needs no
+    surrogateescape mode: tag_text tags EVERY lone surrogate in both modes (only the
+    LABEL differs), and any lone surrogate is caught here -- U+DC80..U+DCFF directly, the
+    rest as marking_class 'invisible' -- so the changed/unchanged verdict is mode-free."""
     for ch in text:
         cp = ord(ch)
         if 0xDC80 <= cp <= 0xDCFF:             # surrogateescape: a raw undecodable byte
@@ -217,9 +234,11 @@ JSON_RESULT_KEY = 'unicode-tag-json-result'
 def tag_json(value):
     """Tag every string -- dict keys and values, at any depth -- of a decoded JSON
     value, in ONE process. Explicit stack, not recursion, so any depth json.loads
-    accepted is walked."""
+    accepted is walked. surrogateescape=False: json.loads produces a genuine lone
+    surrogate CODE POINT (never a raw byte), so it tags as `[INVALID-SURROGATE U+XXXX]`,
+    not the byte label."""
     if not isinstance(value, (list, dict)):
-        return tag_text(value) if isinstance(value, str) else value
+        return tag_text(value, surrogateescape=False) if isinstance(value, str) else value
     root: Any = [] if isinstance(value, list) else {}
     stack = [(value, root)]
     while stack:
@@ -229,13 +248,13 @@ def tag_json(value):
                 child: Any = [] if isinstance(val, list) else {}
                 stack.append((val, child))
             else:
-                child = tag_text(val) if isinstance(val, str) else val
+                child = tag_text(val, surrogateescape=False) if isinstance(val, str) else val
             if isinstance(out, list):
                 out.append(child)
                 continue
             ## A tagged key can equal a literal sibling key ('a\u200bb' vs
             ## 'a[U+200B ZERO WIDTH SPACE]b'); suffix it so no value is dropped.
-            new_key = base = tag_text(key)
+            new_key = base = tag_text(key, surrogateescape=False)
             suffix = 2
             while new_key in out:
                 new_key = '%s#%d' % (base, suffix)
