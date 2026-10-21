@@ -207,6 +207,30 @@ def _write_tagged(data):
     return 0
 
 
+def _write_tagged_stream():
+    # Tag stdin line by line, flushing each line, so a long-running producer
+    # (a remote command feeding qube-ctl's display sanitizer) streams instead of
+    # buffering until EOF. Byte-for-byte IDENTICAL output to the whole-stream
+    # _write_tagged: \n and \t pass verbatim and no tag spans a newline, and the
+    # homoglyph token scope never crosses a \n (readline keeps the \n on the line),
+    # so chunking at \n changes only flush cadence, never the tagging.
+    out = sys.stdout.buffer
+    try:
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                break
+            out.write(tag_bytes(line).encode('utf-8'))
+            out.flush()
+    except BrokenPipeError:
+        return 1
+    except OSError as exc:
+        # e.g. stdin is a directory: report cleanly, no traceback.
+        sys.stderr.write('unicode-tag: %s\n' % exc)
+        return 1
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     try:
@@ -308,9 +332,13 @@ def _write_tagged_json(data):
 def main_stdin(argv=None):
     # Stdin-only entry point: reads NO files, so a confining AppArmor profile can
     # deny all data-file access. Drives the AppArmor-confined `unicode-tag-stdin`
-    # (the hook path). `--json` tags a whole JSON document in one process; any
-    # other argv is ignored (never opened as a path).
+    # (the hook path). `--json` tags a whole JSON document in one process;
+    # `--stream` tags line by line with a per-line flush (for a display pipeline
+    # that must stream a long-running command); any other argv is ignored (never
+    # opened as a path).
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['--stream']:
+        return _write_tagged_stream()
     try:
         data = sys.stdin.buffer.read()
     except OSError as exc:
