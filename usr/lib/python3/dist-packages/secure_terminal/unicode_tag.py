@@ -197,12 +197,19 @@ def tag_bytes(data):
 
 
 def _write_tagged(data):
-    # Shared emit path for both entry points. tag_text removed every surrogate,
-    # so the UTF-8 re-encode cannot raise; only a downstream pipe closing early
-    # (e.g. `... | head`) can, and that exits 1 without a traceback.
+    # Shared emit path for both entry points. tag_text removed every surrogate, so the
+    # UTF-8 re-encode cannot raise. FLUSH explicitly so a deferred write error (ENOSPC /
+    # EFBIG on a redirected file, a buffered write only surfacing at flush) FAILS CLOSED
+    # here (rc 1) -- a silent exit 0 with truncated output would let a downstream capture
+    # read a partial result as complete. BrokenPipeError (downstream closed, e.g. `| head`)
+    # is the benign case: still rc 1, but no diagnostic.
     try:
         sys.stdout.buffer.write(tag_bytes(data).encode('utf-8'))
+        sys.stdout.buffer.flush()
     except BrokenPipeError:
+        return 1
+    except OSError as exc:
+        sys.stderr.write('unicode-tag: %s\n' % exc)
         return 1
     return 0
 
@@ -324,7 +331,13 @@ def _write_tagged_json(data):
         return 1
     try:
         sys.stdout.write(json.dumps({JSON_RESULT_KEY: tag_json(value)}))
+        sys.stdout.flush()
     except BrokenPipeError:
+        return 1
+    except OSError as exc:
+        # FAIL CLOSED on a write/flush error (ENOSPC/EFBIG): a truncated reply must not
+        # read as a complete tagged result -- exit 1 rather than a silent exit 0.
+        sys.stderr.write('unicode-tag: --json: %s\n' % exc)
         return 1
     return 0
 

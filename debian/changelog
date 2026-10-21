@@ -1,6 +1,7 @@
 secure-terminal (0.0.3-1) unstable; urgency=medium
 
   * unicode-tag-stdin: add --stream line mode.
+  * unicode-tag-stdin: fail closed on a write error (not exit 0 truncated).
 
  -- ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>  Wed, 21 Oct 2026 06:15:46 -0400
 
