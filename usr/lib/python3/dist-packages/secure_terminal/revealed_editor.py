@@ -192,15 +192,34 @@ class RevealedEditor(_RenderedTextView):
         content and could not round-trip; mapping the selected document range back to
         source indices (the same doc-pos -> source seam the caret uses) and
         re-sanitizing keeps copy-out faithful to the box and consistent with Deliver.
-        No selection -> the base (an empty mime)."""
+        No selection -> the base (an empty mime).
+
+        Map the selection to the source cells it TOUCHES -- FLOOR the start into its
+        cell, CEIL the end past its last. The nearest-snap _source_index_for_doc_pos
+        (right for the caret) would snap BOTH ends of a selection sitting inside ONE
+        multi-column badge to the same boundary -> an empty range -> setText('') that
+        CLOBBERS the clipboard; floor/ceil keep a partial-badge selection = that badge's
+        one source char. Copy-out is a clipboard copy of ALREADY-SANITIZED text (no
+        hidden char survives sanitize_clipboard_unicode), NOT the Deliver path into the
+        shell, so it is available even while Deliver is gated -- what it emits is clean."""
         cur = self.textCursor()
         if not cur.hasSelection():
             return super().createMimeDataFromSelection()
-        a = self._source_index_for_doc_pos(cur.selectionStart())
-        b = self._source_index_for_doc_pos(cur.selectionEnd())
+        start = self._floor_index(cur.selectionStart())
+        end = self._ceil_index(cur.selectionEnd())
         data = QMimeData()
-        data.setText(sanitize_clipboard_unicode(self._text[min(a, b):max(a, b)]))
+        data.setText(sanitize_clipboard_unicode(self._text[start:end]))
         return data
+
+    def _floor_index(self, doc_pos):
+        """The LAST source index whose caret document offset is <= `doc_pos` -- the cell
+        `doc_pos` falls INTO. The ceil crossing point, stepped back one when it overshot
+        (doc_pos lands inside a cell, not on its start). Pairs with _ceil_index to cover
+        every cell a selection touches (see createMimeDataFromSelection)."""
+        lo = self._ceil_index(doc_pos)
+        if self._offset(lo) > doc_pos:
+            lo = max(0, lo - 1)
+        return lo
 
     @staticmethod
     def _cap_combining(text):
