@@ -197,12 +197,43 @@ def tag_bytes(data):
 
 
 def _write_tagged(data):
-    # Shared emit path for both entry points. tag_text removed every surrogate,
-    # so the UTF-8 re-encode cannot raise; only a downstream pipe closing early
-    # (e.g. `... | head`) can, and that exits 1 without a traceback.
+    # Shared emit path for both entry points. tag_text removed every surrogate, so the
+    # UTF-8 re-encode cannot raise. FLUSH explicitly so a deferred write error (ENOSPC /
+    # EFBIG on a redirected file, a buffered write only surfacing at flush) FAILS CLOSED
+    # here (rc 1) -- a silent exit 0 with truncated output would let a downstream capture
+    # read a partial result as complete. BrokenPipeError (downstream closed, e.g. `| head`)
+    # is the benign case: still rc 1, but no diagnostic.
     try:
         sys.stdout.buffer.write(tag_bytes(data).encode('utf-8'))
+        sys.stdout.buffer.flush()
     except BrokenPipeError:
+        return 1
+    except OSError as exc:
+        sys.stderr.write('unicode-tag: %s\n' % exc)
+        return 1
+    return 0
+
+
+def _write_tagged_stream():
+    # Tag stdin line by line, flushing each line, so a long-running producer
+    # (a remote command feeding qube-ctl's display sanitizer) streams instead of
+    # buffering until EOF. Byte-for-byte IDENTICAL output to the whole-stream
+    # _write_tagged: \n and \t pass verbatim and no tag spans a newline, and the
+    # homoglyph token scope never crosses a \n (readline keeps the \n on the line),
+    # so chunking at \n changes only flush cadence, never the tagging.
+    out = sys.stdout.buffer
+    try:
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                break
+            out.write(tag_bytes(line).encode('utf-8'))
+            out.flush()
+    except BrokenPipeError:
+        return 1
+    except OSError as exc:
+        # e.g. stdin is a directory: report cleanly, no traceback.
+        sys.stderr.write('unicode-tag: %s\n' % exc)
         return 1
     return 0
 
@@ -300,7 +331,13 @@ def _write_tagged_json(data):
         return 1
     try:
         sys.stdout.write(json.dumps({JSON_RESULT_KEY: tag_json(value)}))
+        sys.stdout.flush()
     except BrokenPipeError:
+        return 1
+    except OSError as exc:
+        # FAIL CLOSED on a write/flush error (ENOSPC/EFBIG): a truncated reply must not
+        # read as a complete tagged result -- exit 1 rather than a silent exit 0.
+        sys.stderr.write('unicode-tag: --json: %s\n' % exc)
         return 1
     return 0
 
@@ -308,9 +345,13 @@ def _write_tagged_json(data):
 def main_stdin(argv=None):
     # Stdin-only entry point: reads NO files, so a confining AppArmor profile can
     # deny all data-file access. Drives the AppArmor-confined `unicode-tag-stdin`
-    # (the hook path). `--json` tags a whole JSON document in one process; any
-    # other argv is ignored (never opened as a path).
+    # (the hook path). `--json` tags a whole JSON document in one process;
+    # `--stream` tags line by line with a per-line flush (for a display pipeline
+    # that must stream a long-running command); any other argv is ignored (never
+    # opened as a path).
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['--stream']:
+        return _write_tagged_stream()
     try:
         data = sys.stdin.buffer.read()
     except OSError as exc:
