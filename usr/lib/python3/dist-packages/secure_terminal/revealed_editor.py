@@ -31,7 +31,7 @@ invisibles are dropped for display; the '\n'->'\r' shell-submit mapping and the
 defensive re-drop happen only on DELIVER, in review.py.
 """
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QMimeData, pyqtSignal
 from PyQt6.QtGui import QTextCursor, QGuiApplication
 
 from secure_terminal.sanitize import (
@@ -181,6 +181,26 @@ class RevealedEditor(_RenderedTextView):
         """The box's current source string -- the exact text (display form, '\n'
         line breaks) that DELIVER will sanitize and send."""
         return self._text
+
+    def createMimeDataFromSelection(self):
+        """Copy-OUT (Ctrl+C / Ctrl+Insert / X11 PRIMARY -- all route through here)
+        carries the REVIEWED SOURCE re-sanitized the SAME way Deliver's Copy sends it
+        (sanitize_clipboard_unicode: printable look-alikes kept VISIBLE, invisibles /
+        bidi / control dropped), NOT the rendered badge text. The base would lift the
+        DISPLAY glyphs out of the document -- a revealed invisible as a literal
+        <U+XXXX ...> badge, a box-mode stand-in -- so a copy-out mangled the user's
+        content and could not round-trip; mapping the selected document range back to
+        source indices (the same doc-pos -> source seam the caret uses) and
+        re-sanitizing keeps copy-out faithful to the box and consistent with Deliver.
+        No selection -> the base (an empty mime)."""
+        cur = self.textCursor()
+        if not cur.hasSelection():
+            return super().createMimeDataFromSelection()
+        a = self._source_index_for_doc_pos(cur.selectionStart())
+        b = self._source_index_for_doc_pos(cur.selectionEnd())
+        data = QMimeData()
+        data.setText(sanitize_clipboard_unicode(self._text[min(a, b):max(a, b)]))
+        return data
 
     @staticmethod
     def _cap_combining(text):
@@ -341,8 +361,9 @@ class RevealedEditor(_RenderedTextView):
         """Ctrl+X: DELETE the selection through _text -- a trim, not a clipboard cut.
         Deliberately writes NOTHING to the OS clipboard: the box holds text that has
         not yet been reviewed to cross a trust boundary, so a reflexive Ctrl+X must not
-        exfiltrate it (and the base cut would also desync _text). Copy (Ctrl+C, the
-        inert rendered form) stays available for a deliberate copy-out."""
+        exfiltrate it (and the base cut would also desync _text). Copy (Ctrl+C) stays
+        available for a deliberate copy-out, carrying the reviewed source re-sanitized
+        at the unicode tier (createMimeDataFromSelection), like Deliver's Copy."""
         start, end = self._edit_range()
         if end > start:
             self._replace(self._text[:start] + self._text[end:], start)
@@ -382,10 +403,11 @@ class RevealedEditor(_RenderedTextView):
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         if ctrl:
             # WHITELIST, not blacklist: only the base ops that CANNOT mutate the
-            # document (select-all, copy the rendered selection) fall through to the
-            # base; the mutating chords are routed through _text; and EVERY other Ctrl
-            # chord is swallowed, so no base edit action can ever reach the document
-            # unhandled (a blacklist of named chords would leave the next one open).
+            # document (select-all; copy, whose clipboard text is remapped to the
+            # reviewed source by createMimeDataFromSelection) fall through to the base;
+            # the mutating chords are routed through _text; and EVERY other Ctrl chord is
+            # swallowed, so no base edit action can ever reach the document unhandled (a
+            # blacklist of named chords would leave the next one open).
             if key in (Qt.Key.Key_A, Qt.Key.Key_C, Qt.Key.Key_Insert):
                 super().keyPressEvent(event)      # select-all / copy: no mutation
             elif key == Qt.Key.Key_V:

@@ -7095,9 +7095,19 @@ class SecureTerminal(_RenderedTextView):
         self._set_clipboard(safe)
 
     def _set_clipboard(self, text):
+        """Write a DELIVERED copy to BOTH the Ctrl+V clipboard AND, where it exists
+        (X11), the PRIMARY selection, so a MIDDLE-CLICK paste yields the REVIEWED text
+        too. Without the PRIMARY write the terminal's own mouse-selection -- published
+        to PRIMARY, ASCII-stripped, by _publish_primary -- still owns PRIMARY, so a
+        middle-click after a copy-review edit pasted the ORIGINAL selection, not the
+        user's edits (and a copy-review transform would be silently bypassed). No-op on
+        PRIMARY where there is none (Wayland/macOS)."""
         board = QGuiApplication.clipboard()
-        if board is not None:
-            board.setText(text)
+        if board is None:
+            return
+        board.setText(text)
+        if board.supportsSelection():
+            board.setText(text, QClipboard.Mode.Selection)
 
     def _reviewed_context_menu(self, pos):
         """The standard context menu, but with Copy/Cut rerouted through our
