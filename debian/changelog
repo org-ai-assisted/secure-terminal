@@ -1,3 +1,9 @@
+secure-terminal (0.0.3-1) unstable; urgency=medium
+
+  * unicode-tag-stdin: add --stream line mode.
+
+ -- ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>  Wed, 21 Oct 2026 06:15:46 -0400
+
 secure-terminal (0.0.2-1) unstable; urgency=medium
 
   * New upstream version (local package).
