@@ -8332,8 +8332,14 @@ class SecureTerminal(_RenderedTextView):
         if not clip.supportsSelection():
             return
         md = clip.mimeData(QClipboard.Mode.Selection)
-        if md is not None:
-            self.insertFromMimeData(md)
+        if md is None:
+            return
+        # A held selection freezes _render_tui, so the pasted input's output would not
+        # surface until a later action cleared it (Qt's own middle-paste moved the caret,
+        # which cleared it). md is already captured and the PRIMARY buffer is independent
+        # of the widget's text selection, so clearing here does not lose the paste.
+        self._clear_grid_selection()
+        self.insertFromMimeData(md)
 
     def _extend_unit_selection(self, point):
         """Grow a word/line selection to cover every whole unit between the drag anchor
