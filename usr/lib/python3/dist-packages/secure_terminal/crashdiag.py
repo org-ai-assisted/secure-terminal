@@ -26,6 +26,7 @@ one unacceptable outcome.
 
 import datetime
 import faulthandler
+import math
 import os
 import signal
 import stat
@@ -44,6 +45,11 @@ CRASH_LOG_NAME = 'crash.log'
 HANG_HEARTBEAT_MS = 1000
 HANG_WATCHDOG_DEFAULT_SECS = 12.0
 HANG_WATCHDOG_MIN_SECS = 2.0
+# Ceiling on the accepted threshold: the watchdog polls at threshold/4.0 via
+# Event.wait(), which raises OverflowError past threading.TIMEOUT_MAX
+# (9223372036s) and silently kills the daemon thread. 1 day is far below that
+# and far above any real stall, so no accepted value can disable it by overflow.
+HANG_WATCHDOG_MAX_SECS = 86400.0
 HANG_WATCHDOG_ENV = 'SECURE_TERMINAL_HANG_WATCHDOG_SECS'
 
 
@@ -232,9 +238,9 @@ class _HangWatchdog:
 
 
 def hang_threshold_from_env():
-    """The watchdog stall threshold in seconds: env override, floored at
-    HANG_WATCHDOG_MIN_SECS, else the default. A malformed value falls back to the
-    default rather than disabling the watchdog."""
+    """The watchdog stall threshold in seconds: env override, clamped into
+    [HANG_WATCHDOG_MIN_SECS, HANG_WATCHDOG_MAX_SECS], else the default. A malformed or
+    non-finite value falls back to the default rather than disabling the watchdog."""
     raw = os.environ.get(HANG_WATCHDOG_ENV)
     if raw is None:
         return HANG_WATCHDOG_DEFAULT_SECS
@@ -242,7 +248,11 @@ def hang_threshold_from_env():
         val = float(raw)
     except ValueError:
         return HANG_WATCHDOG_DEFAULT_SECS
-    return max(HANG_WATCHDOG_MIN_SECS, val)
+    # inf/nan parse fine but would disable the watchdog (inf -> OverflowError in
+    # wait(), nan -> comparisons never fire), so treat them as malformed too.
+    if not math.isfinite(val):
+        return HANG_WATCHDOG_DEFAULT_SECS
+    return min(HANG_WATCHDOG_MAX_SECS, max(HANG_WATCHDOG_MIN_SECS, val))
 
 
 # The live watchdog, set by start_hang_watchdog so the main-thread heartbeat()
