@@ -8318,6 +8318,29 @@ class SecureTerminal(_RenderedTextView):
             clip.setMimeData(self.createMimeDataFromSelection(),
                              QClipboard.Mode.Selection)
 
+    def _paste_primary(self):
+        """Middle-click PRIMARY paste, routed through the SAME sanitized pipeline as
+        Ctrl+V (insertFromMimeData -> review/sanitize). Owned here rather than left to
+        the base control: QWidgetTextControl gates its own middle-paste behind
+        `else if (!mousePressed)`, and our word/line left-release is deliberately
+        swallowed before super() (keeping the custom unit selection), which LATCHES
+        that mousePressed flag -- so the base paste was silently dead after any
+        double/triple-click select. Owning it makes the paste deterministic across
+        platforms and independent of that internal state. No-op where there is no
+        PRIMARY buffer (Wayland/macOS fall back to Shift+Insert / Ctrl+V)."""
+        clip = QGuiApplication.clipboard()
+        if not clip.supportsSelection():
+            return
+        md = clip.mimeData(QClipboard.Mode.Selection)
+        if md is None:
+            return
+        # A held selection freezes _render_tui, so the pasted input's output would not
+        # surface until a later action cleared it (Qt's own middle-paste moved the caret,
+        # which cleared it). md is already captured and the PRIMARY buffer is independent
+        # of the widget's text selection, so clearing here does not lose the paste.
+        self._clear_grid_selection()
+        self.insertFromMimeData(md)
+
     def _extend_unit_selection(self, point):
         """Grow a word/line selection to cover every whole unit between the drag anchor
         and the point (union of the anchor range and the unit under the pointer). The
@@ -8444,10 +8467,18 @@ class SecureTerminal(_RenderedTextView):
                 self._mouse_report_cell = None
             event.accept()
             return
+        # A middle release that was NOT reported to the child (default CLI mode, or a
+        # Shift bypass of a mouse-grabbing TUI) pastes the PRIMARY selection. Own it
+        # instead of falling to super, whose middle-paste is dead whenever the base
+        # control's mousePressed is latched -- which our word/line left-release below
+        # leaves it after any double/triple-click select (see _paste_primary).
+        if btn == Qt.MouseButton.MiddleButton:
+            self._paste_primary()
+            event.accept()
+            return
         # The LEFT release that ends a word/line select is ours; do not let the base class
-        # re-finalize it from its own (stale) anchor. Only the left button -- a middle
-        # release must fall through to super so its PRIMARY paste runs (the mode stays
-        # 'word'/'line' until the next left press).
+        # re-finalize it from its own (stale) anchor. (A non-reported middle release was
+        # already handled above; the mode stays 'word'/'line' until the next left press.)
         if btn == Qt.MouseButton.LeftButton and self._select_mode in ('word', 'line'):
             self._mouse_selecting = False
             if self._grid_mode():
