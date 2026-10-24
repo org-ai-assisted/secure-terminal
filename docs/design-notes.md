@@ -137,6 +137,22 @@ source of truth for behaviour.
   (which fire Qt's NON-virtual C++ copy() and would bypass the override - rerouted
   through the reviewed copy()). Paste via the menu is already safe
   (insertFromMimeData is virtual).
+- **Review-box editor copy-out** (`RevealedEditor`, `revealed_editor.py`): it
+  subclasses `_RenderedTextView`, a SIBLING of `SecureTerminal`, so it does NOT
+  inherit `SecureTerminal.copy()` / `createMimeDataFromSelection()`. WITHOUT an
+  override, native Ctrl+C / Ctrl+Insert / mouse-select / drag would copy the
+  RENDERED badge glyphs (`<U+XXXX>`), not the reviewed source. It overrides
+  `createMimeDataFromSelection` to map the selection back to the box `source()`
+  re-sanitised at the unicode tier - one override covers Ctrl+C, Ctrl+Insert and
+  X11 PRIMARY.
+- **Deliver writes both clipboards**: `_set_clipboard` (`terminal.py`) writes the
+  Ctrl+V clipboard AND `QClipboard.Mode.Selection` (X11 PRIMARY) where
+  `supportsSelection()`. The terminal's mouse-selection owns PRIMARY, so without
+  the PRIMARY write a MIDDLE-CLICK paste pastes the pre-edit selection, not the
+  delivered edits.
+- **OSC 52 write stays clipboard-only** (no PRIMARY): a program's OUTPUT must not
+  hijack the user's PRIMARY selection, so the program clipboard-write path writes
+  `Mode.Clipboard` only.
 
 ## Clipboard sanitisers (shared)
 
