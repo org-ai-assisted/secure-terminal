@@ -196,6 +196,18 @@ def tag_bytes(data):
     return tag_text(data.decode('utf-8', 'surrogateescape'))
 
 
+def _buffer(stream):
+    # sys.stdin / sys.stdout is None when its fd was CLOSED at interpreter startup
+    # (a caller's `exec >&-` / `exec 0<&-`): there is no stream object, so `.buffer` would
+    # AttributeError -- a Python TRACEBACK in the display path, where this tool is the
+    # untrusted-output neutralizer and must fail CLEANLY. It is the same "the stream is
+    # gone" case the write paths already treat as benign for BrokenPipeError (`| head`):
+    # return None so the caller exits 1 (no output possible / nothing to read), never a
+    # stack trace. rc 1 (not 0) keeps it HONEST -- a closed destination means the
+    # neutralized output did not reach the reader, which the caller surfaces as such.
+    return stream.buffer if stream is not None else None
+
+
 def _write_tagged(data):
     # Shared emit path for both entry points. tag_text removed every surrogate, so the
     # UTF-8 re-encode cannot raise. FLUSH explicitly so a deferred write error (ENOSPC /
@@ -203,9 +215,12 @@ def _write_tagged(data):
     # here (rc 1) -- a silent exit 0 with truncated output would let a downstream capture
     # read a partial result as complete. BrokenPipeError (downstream closed, e.g. `| head`)
     # is the benign case: still rc 1, but no diagnostic.
+    out = _buffer(sys.stdout)
+    if out is None:
+        return 1
     try:
-        sys.stdout.buffer.write(tag_bytes(data).encode('utf-8'))
-        sys.stdout.buffer.flush()
+        out.write(tag_bytes(data).encode('utf-8'))
+        out.flush()
     except BrokenPipeError:
         return 1
     except OSError as exc:
@@ -221,10 +236,13 @@ def _write_tagged_stream():
     # _write_tagged: \n and \t pass verbatim and no tag spans a newline, and the
     # homoglyph token scope never crosses a \n (readline keeps the \n on the line),
     # so chunking at \n changes only flush cadence, never the tagging.
-    out = sys.stdout.buffer
+    out = _buffer(sys.stdout)
+    src = _buffer(sys.stdin)
+    if out is None or src is None:
+        return 1
     try:
         while True:
-            line = sys.stdin.buffer.readline()
+            line = src.readline()
             if not line:
                 break
             out.write(tag_bytes(line).encode('utf-8'))
@@ -248,7 +266,10 @@ def main(argv=None):
                     chunks.append(handle.read())
             data = b''.join(chunks)
         else:
-            data = sys.stdin.buffer.read()
+            src = _buffer(sys.stdin)
+            if src is None:
+                return 1
+            data = src.read()
     except OSError as exc:
         # An unreadable file: report cleanly and exit non-zero, no traceback.
         sys.stderr.write('unicode-tag: %s\n' % exc)
@@ -329,6 +350,11 @@ def _write_tagged_json(data):
     except (ValueError, TypeError, KeyError, RecursionError) as exc:
         sys.stderr.write('unicode-tag: --json: bad request: %s\n' % type(exc).__name__)
         return 1
+    # A closed stdout (fd 1 shut at startup -> sys.stdout is None) cannot carry the reply;
+    # exit 1 cleanly rather than AttributeError on `.write`. The TEXT stream is used here
+    # (not `.buffer`), so guard sys.stdout itself.
+    if sys.stdout is None:
+        return 1
     try:
         sys.stdout.write(json.dumps({JSON_RESULT_KEY: tag_json(value)}))
         sys.stdout.flush()
@@ -352,8 +378,11 @@ def main_stdin(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['--stream']:
         return _write_tagged_stream()
+    src = _buffer(sys.stdin)
+    if src is None:
+        return 1
     try:
-        data = sys.stdin.buffer.read()
+        data = src.read()
     except OSError as exc:
         # e.g. stdin is a directory (`unicode-tag-stdin < /etc`): report cleanly.
         sys.stderr.write('unicode-tag: %s\n' % exc)
