@@ -7599,13 +7599,18 @@ class SecureTerminal(_RenderedTextView):
         # full-screen program cannot steal them (konsole parity: Shift+PageUp is
         # the scrollback key on the primary buffer). Precedes the TUI dispatch for
         # exactly that reason; the CLI path's own Shift+scroll handling is below.
-        # On the alternate screen the document is only the pinned grid, so this is
-        # a harmless no-op there -- as Shift+wheel already is. Shift+Home/End are
-        # deliberately NOT taken here: in TUI mode they stay modified cursor keys
-        # sent to the child (ESC[1;2H / ESC[1;2F), matching the modified-key
-        # encoding the running program expects; CLI mode still scrolls them below.
+        # EXCEPT on a fixed TUI canvas (the alt screen, or an exact-fit primary grid
+        # with no promoted scrollback): there is no scrollback to reach, and the
+        # canvas carries the SPURIOUS 1-row scrollbar range _grid_fixed_canvas
+        # documents (the exact-fit fencepost), so a page-scroll would ride it and
+        # shove the program's own row 0 off the top. There these fall THROUGH to the
+        # child (konsole AppScreen behaviour), which pages its own content. Gated on
+        # _grid_mode() so CLI mode (no grid) always scrolls. Shift+Home/End are never
+        # taken here: in TUI mode they stay modified cursor keys to the child
+        # (ESC[1;2H / ESC[1;2F); CLI mode still scrolls them below.
         if (shift and not ctrl and not alt
                 and key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown)
+                and not (self._grid_mode() and self._grid_fixed_canvas())
                 and self._scroll_key(key, True)):
             return
 
