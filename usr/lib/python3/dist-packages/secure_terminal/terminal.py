@@ -6599,30 +6599,39 @@ class SecureTerminal(_RenderedTextView):
         edit.setPosition(blk_start)
         edit.movePosition(QTextCursor.MoveOperation.End,
                           QTextCursor.MoveMode.KeepAnchor)
-        edit.removeSelectedText()            # drop the old current line
-        for text, key in runs:
-            if key == WRAP_NL:
-                # a soft-autowrap break: a real newline for display, but the new
-                # block is marked a continuation so copy joins the wrapped rows.
-                edit.insertText('\n')
-                blk = edit.block()
-                blk.setUserState(_blk_flags(blk) | _BLK_WRAP_CONT)
-            elif key == _NO_NEWLINE_KEY:
-                # the no-trailing-newline marker: inserts NO text (unforgeable and
-                # copy-safe), only annotates this line's block so the left gutter
-                # paints its glyph. OR-in, so a wrapped last row keeps its cont bit.
-                blk = edit.block()
-                blk.setUserState(_blk_flags(blk) | _BLK_NO_NEWLINE)
-            elif key == _REDRAW_KEY:
-                # append-only redraw marker: same zero-text channel; annotates this
-                # block so the left gutter paints the "redraw attempted" glyph.
-                blk = edit.block()
-                blk.setUserState(_blk_flags(blk) | _BLK_REDRAW)
-            else:
-                # A whitespace-only run has no fg ink to protect, so keep the
-                # program's background (the fg-vs-bg guard would otherwise drop a
-                # dark bg-only space to the theme default -> white).
-                edit.insertText(text, self._fmt_from_key(key, glyphless=not text.strip()))
+        # One edit block for the whole repaint: a single feed with no newline renders
+        # as many runs on one (hard-wrapped) block, and per-run insertText OUTSIDE an
+        # edit block re-lays-out the growing block on every call -> O(n^2), a
+        # multi-second freeze on a few-KB adversarial line (a render DoS). beginEditBlock
+        # coalesces the inserts into a single relayout (undo is already off here).
+        edit.beginEditBlock()
+        try:
+            edit.removeSelectedText()            # drop the old current line
+            for text, key in runs:
+                if key == WRAP_NL:
+                    # a soft-autowrap break: a real newline for display, but the new
+                    # block is marked a continuation so copy joins the wrapped rows.
+                    edit.insertText('\n')
+                    blk = edit.block()
+                    blk.setUserState(_blk_flags(blk) | _BLK_WRAP_CONT)
+                elif key == _NO_NEWLINE_KEY:
+                    # the no-trailing-newline marker: inserts NO text (unforgeable and
+                    # copy-safe), only annotates this line's block so the left gutter
+                    # paints its glyph. OR-in, so a wrapped last row keeps its cont bit.
+                    blk = edit.block()
+                    blk.setUserState(_blk_flags(blk) | _BLK_NO_NEWLINE)
+                elif key == _REDRAW_KEY:
+                    # append-only redraw marker: same zero-text channel; annotates this
+                    # block so the left gutter paints the "redraw attempted" glyph.
+                    blk = edit.block()
+                    blk.setUserState(_blk_flags(blk) | _BLK_REDRAW)
+                else:
+                    # A whitespace-only run has no fg ink to protect, so keep the
+                    # program's background (the fg-vs-bg guard would otherwise drop a
+                    # dark bg-only space to the theme default -> white).
+                    edit.insertText(text, self._fmt_from_key(key, glyphless=not text.strip()))
+        finally:
+            edit.endEditBlock()
         disp = cells_display_col(self._line_cells, self._line_col, self._mode)
         target = blk_start + prefix + disp
         cursor.setPosition(min(target, self.document().characterCount() - 1))

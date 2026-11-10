@@ -269,10 +269,22 @@ class RevealedEditor(_RenderedTextView):
         runs, _prefix = cells_to_runs(completed, current, self._mode,
                                       colors=False, markings=self._markings)
         doc_cursor = QTextCursor(self.document())
-        doc_cursor.select(QTextCursor.SelectionType.Document)
-        doc_cursor.removeSelectedText()
-        for run_text, key in runs:
-            doc_cursor.insertText(run_text, self._marking_format(key))
+        # One edit block for the whole rebuild. _render replaces the ENTIRE document
+        # (not one line like the terminal's _paint_line), so a revealed payload that
+        # expands into hundreds of per-char marking runs (interleaved classes, each a
+        # badge) means hundreds of inserts into one growing block. OUTSIDE an edit block
+        # each insert re-lays-out that block -> O(n^2): a review paste of a few thousand
+        # mixed control/look-alike bytes froze the box for minutes (a DoS the review
+        # surface must shrug off). beginEditBlock coalesces the inserts into a single
+        # relayout and a single undo step.
+        doc_cursor.beginEditBlock()
+        try:
+            doc_cursor.select(QTextCursor.SelectionType.Document)
+            doc_cursor.removeSelectedText()
+            for run_text, key in runs:
+                doc_cursor.insertText(run_text, self._marking_format(key))
+        finally:
+            doc_cursor.endEditBlock()
         caret = self._caret_doc_pos()
         tc = self.textCursor()
         tc.setPosition(min(caret, self.document().characterCount() - 1))
