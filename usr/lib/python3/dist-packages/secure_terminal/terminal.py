@@ -7594,24 +7594,34 @@ class SecureTerminal(_RenderedTextView):
             return
 
         # Shift+PageUp/PageDown are the LOCAL scrollback override Shift carries
-        # throughout (Shift+wheel, Shift+click/drag, Shift+middle): they scroll
-        # THIS terminal's own scrollback, never the child -- in TUI mode too, so a
-        # full-screen program cannot steal them (konsole parity: Shift+PageUp is
-        # the scrollback key on the primary buffer). Precedes the TUI dispatch for
-        # exactly that reason; the CLI path's own Shift+scroll handling is below.
-        # EXCEPT on a fixed TUI canvas (the alt screen, or an exact-fit primary grid
-        # with no promoted scrollback): there is no scrollback to reach, and the
-        # canvas carries the SPURIOUS 1-row scrollbar range _grid_fixed_canvas
-        # documents (the exact-fit fencepost), so a page-scroll would ride it and
-        # shove the program's own row 0 off the top. There these fall THROUGH to the
-        # child (konsole AppScreen behaviour), which pages its own content. Gated on
-        # _grid_mode() so CLI mode (no grid) always scrolls. Shift+Home/End are never
-        # taken here: in TUI mode they stay modified cursor keys to the child
+        # throughout (Shift+wheel, Shift+click/drag, Shift+middle): on the PRIMARY
+        # buffer they scroll THIS terminal's own scrollback and are ALWAYS consumed
+        # here -- NEVER sent to the child -- in TUI mode too, so a full-screen program
+        # on the primary buffer cannot steal them (konsole parity: Shift+PageUp is the
+        # scrollback key on the primary buffer; an app that wants the raw key owns the
+        # screen via the alternate buffer). Precedes the TUI dispatch for exactly that
+        # reason; the CLI path's own Shift+scroll handling is below.
+        #
+        # The ALTERNATE screen is the one exception: it has no scrollback (the app owns
+        # paging), so there these fall THROUGH to the child as VT input. Gated on
+        # _grid_mode() so a lingering _alt_screen on a CLI tab still scrolls locally.
+        #
+        # The scroll itself is suppressed -- key still consumed, nothing sent -- when a
+        # TUI grid holds no promoted scrollback (its document is entirely the live
+        # frame, blockCount <= _grid_rows): such a canvas carries the SPURIOUS 1-row
+        # scrollbar range _grid_fixed_canvas documents (the exact-fit fencepost), so a
+        # page-scroll would ride it and shove the program's own row 0 off the top.
+        # Consuming-without-scrolling avoids both that shove AND leaking the key to the
+        # child (bash would read \e[5~ as history-search-backward). CLI mode (no grid)
+        # always has a real scrolling document, so it always scrolls. Shift+Home/End are
+        # never taken here: in TUI mode they stay modified cursor keys to the child
         # (ESC[1;2H / ESC[1;2F); CLI mode still scrolls them below.
         if (shift and not ctrl and not alt
                 and key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown)
-                and not (self._grid_mode() and self._grid_fixed_canvas())
-                and self._scroll_key(key, True)):
+                and not (self._grid_mode() and self._alt_screen)):
+            if not (self._grid_mode()
+                    and self.document().blockCount() <= self._grid_rows):
+                self._scroll_key(key, True)
             return
 
         # In TUI mode the running program owns the keyboard: Ctrl+Shift+<key>

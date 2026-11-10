@@ -91,6 +91,26 @@ source of truth for behaviour.
   PRIMARY -- none of those are forwarded, so text selection and paste stay reachable
   while a program grabs the mouse. (Reaching primary scrollback BEHIND an alt-screen
   app via Shift+wheel is a known follow-up; the alt grid is pinned there today.)
+- **Shift+PageUp/PageDown is the keyboard analog** (`keyPressEvent`, before the TUI
+  dispatch): on the PRIMARY buffer it is ALWAYS consumed as a local scrollback scroll
+  and NEVER sent to the child -- in TUI mode too, so a full-screen program on the
+  primary buffer cannot swallow the scrollback key (the original bug: a claude-rc TUI
+  tab's Shift+PageUp did nothing). The discriminator for falling through to the child is
+  the ALTERNATE screen alone (`_grid_mode() and _alt_screen`): the alt buffer has no
+  scrollback, so there the keys go to the app as `ESC[5~`/`ESC[6~`. The scroll itself is
+  SUPPRESSED (key still swallowed, nothing sent) when a TUI grid holds no promoted
+  scrollback (`blockCount <= _grid_rows`): that canvas carries a spurious 1-row scrollbar
+  range (ScrollBarAlwaysOff hides but does not clear it) a page-scroll would ride,
+  shoving the program's row 0 off the top. Using `_alt_screen` rather than
+  `_grid_fixed_canvas()` as the fall-through gate is deliberate -- the earlier
+  `blockCount <= _grid_rows` proxy LEAKED the key to a shell at a sub-screen prompt
+  (bash read `ESC[5~` as history-search). **REJECTED (do not re-fix): protecting a
+  full-screen app that runs on the PRIMARY buffer with scrollback behind it from being
+  scrolled.** blockCount cannot tell such an app from a shell with history, and konsole
+  scrolls history there too. An app that wants to own the scrollback key must take the
+  alternate screen (`?1049`) -- that is the contract. Oracle: `test_widget2.py` TUI
+  Shift+PageUp/Down blocks (`_tsc` primary-scrollback, `_fx` alt-screen fall-through,
+  `_f1` primary sub-screen no-leak/no-shove).
 - **Security trade (recorded)**: this drops the mouse-tracking-reflection hardening
   -- secure-terminal now reflects mouse reports like every mainstream terminal, so a
   program whose output you merely display can, by enabling 1003, learn your pointer
