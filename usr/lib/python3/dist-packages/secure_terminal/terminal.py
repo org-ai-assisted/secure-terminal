@@ -7593,6 +7593,22 @@ class SecureTerminal(_RenderedTextView):
             (self.tab_move if shift else self.tab_step).emit(step)
             return
 
+        # Shift+PageUp/PageDown are the LOCAL scrollback override Shift carries
+        # throughout (Shift+wheel, Shift+click/drag, Shift+middle): they scroll
+        # THIS terminal's own scrollback, never the child -- in TUI mode too, so a
+        # full-screen program cannot steal them (konsole parity: Shift+PageUp is
+        # the scrollback key on the primary buffer). Precedes the TUI dispatch for
+        # exactly that reason; the CLI path's own Shift+scroll handling is below.
+        # On the alternate screen the document is only the pinned grid, so this is
+        # a harmless no-op there -- as Shift+wheel already is. Shift+Home/End are
+        # deliberately NOT taken here: in TUI mode they stay modified cursor keys
+        # sent to the child (ESC[1;2H / ESC[1;2F), matching the modified-key
+        # encoding the running program expects; CLI mode still scrolls them below.
+        if (shift and not ctrl and not alt
+                and key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown)
+                and self._scroll_key(key, True)):
+            return
+
         # In TUI mode the running program owns the keyboard: Ctrl+Shift+<key>
         # still reaches the window shortcuts, but everything else is encoded as
         # VT input (arrows, function keys, control bytes) and sent raw.
