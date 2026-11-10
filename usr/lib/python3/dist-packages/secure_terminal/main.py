@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QMenu, QDialog, QGridLayout, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QButtonGroup, QFrame, QScrollArea,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QKeySequenceEdit,
-    QTextEdit, QFontDialog, QFontComboBox, QGroupBox, QToolButton, QSplitter,
+    QTextEdit, QFontComboBox, QGroupBox, QToolButton, QSplitter,
     QToolTip, QStyle, QStylePainter, QStyleOptionTab,
 )
 

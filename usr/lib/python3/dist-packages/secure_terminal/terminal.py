@@ -991,10 +991,6 @@ def _drop_prompt_sp_frames(completed, wraps, width):
         out_w.append(w)
     return out_c, out_w
 
-# Alternate-screen enter/leave, as BYTES: pyte has no alt buffer, so the feed path
-# acts on these to snapshot/restore the primary screen at the exact boundary.
-_ALT_ENTER_BYTES = (b'\x1b[?1049h', b'\x1b[?1047h', b'\x1b[?47h')
-_ALT_LEAVE_BYTES = (b'\x1b[?1049l', b'\x1b[?1047l', b'\x1b[?47l')
 # Bytes twin of sanitize.alt_screen_transitions: a private-mode CSI that sets/resets an
 # alt-screen mode, COMBINED forms included (ESC[?1047;1049h). Exact-substring markers missed
 # those, so _feed_stream never snapshotted the primary screen and full-screen frames polluted
@@ -5080,6 +5076,8 @@ class SecureTerminal(_RenderedTextView):
                 while os.read(go_r, 1):
                     pass
             except OSError:
+                # Barrier read failed (pipe error/race) -- end it early and exec anyway;
+                # a failed size handshake must not abort the just-forked child.
                 pass
             os.close(go_r)
             os.environ['TERM'] = term

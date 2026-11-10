@@ -148,6 +148,8 @@ def ensure_state_dir():
     try:
         os.chmod(directory, 0o700)
     except OSError:
+        # Best-effort hardening (docstring) -- a chmod failure must not crash a save;
+        # _makedirs_private already created it owner-only on the common path.
         pass
     return directory
 
